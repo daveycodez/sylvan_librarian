@@ -5,6 +5,31 @@ WITH computed_components AS (
     SELECT
         scryfall_id,
         JSONB_BUILD_OBJECT(
+            -- How heavily this ARTWORK has been reprinted, as a proxy for how canonical it
+            -- is. The numerator counts rows sharing the illustration, so it must count only
+            -- real printing events -- three kinds of row are not:
+            --
+            --   non-English  the same printing already counted in its English row. Mark
+            --                Poole's Birds of Paradise art picked up 4bb (Spanish) and fbb
+            --                (French) on top of the English 4th Edition printing.
+            --   memorabilia  World Championship decks, Collectors' Edition and 30th
+            --                Anniversary: not tournament-legal, not real sets. Four of the
+            --                eight on that same artwork are BLACK-bordered (30a x2, ced,
+            --                cei), so a border test alone misses half of them.
+            --   gold/yellow  any remaining non-standard product Scryfall types as something
+            --                other than memorabilia.
+            --
+            -- Together these took Poole's art from 21 counted printings to 11, against
+            -- Marcelo Vignali's 12 -- reversing which artwork the site shows for that card.
+            --
+            -- White borders are deliberately NOT filtered: 2ed-6ed are white-bordered and
+            -- perfectly real, and dropping them would penalise exactly the core-set reprints
+            -- this component should reward.
+            --
+            -- Evidence (docs/issues/00720-prefer-score-artwork-tuning.md): a 47-card blind
+            -- swap review returned 11 better, 36 same, 0 worse, and a later 378-card review
+            -- against production added 2 more with no regressions. This changes only the
+            -- numerator -- it does not stop such printings being displayed.
             'illustration_count', (
                 SELECT
                     ROUND((23 * LN(1 + COUNT(*)) / LN(40))::numeric, 4)
@@ -12,7 +37,10 @@ WITH computed_components AS (
                 WHERE (
                     query_target_cards.illustration_id = source.illustration_id AND
                     query_target_cards.illustration_id IS NOT NULL AND
-                    query_target_cards.card_name = source.card_name
+                    query_target_cards.card_name = source.card_name AND
+                    query_target_cards.raw_card_blob ->> 'lang' = 'en' AND
+                    COALESCE(query_target_cards.raw_card_blob ->> 'set_type', '') <> 'memorabilia' AND
+                    COALESCE(query_target_cards.card_border, '') NOT IN ('gold', 'yellow')
                 )
             ),
             'rarity', (
@@ -89,6 +117,43 @@ WITH computed_components AS (
                 CASE
                     WHEN card_set_code IS NULL OR card_set_code NOT IN ('dbl') THEN 20
                     ELSE 0
+                END
+            ),
+            -- Bonus for artwork in Magic's core style, i.e. NOT a licensed crossover and
+            -- not a stylistic departure. Written as a bonus for being on-style rather than
+            -- a penalty for being off-style so every component stays non-negative, like the
+            -- rest of this table.
+            --
+            -- `external-ip` is the Scryfall tagger's parent tag over ~57 licensed
+            -- franchises (Fallout, Warhammer, Marvel, Doctor Who, Fortnite, ...).
+            -- `dungeons-and-dragons` and `the-lord-of-the-rings` are deliberately exempt:
+            -- external IP whose art matches Magic's high-fantasy look. Verified complete --
+            -- no artwork carries a sibling tag (arda, hobbit, abeir-toril, dnd-multiverse)
+            -- without also carrying its parent, so no Middle-earth or Forgotten Realms art
+            -- is demoted by accident.
+            --
+            -- The second clause covers stylistic departures that are not licensed universes:
+            -- anime, comic-style, line-art and word-art-title. Note it applies even to the
+            -- exempt IPs -- Drizzt Do'Urden (afr #338) is tagged dungeons-and-dragons AND
+            -- line-art, and is demoted, because a line-art rendering is a departure from the
+            -- painted core style whoever owns the IP. Confirmed against the artwork.
+            --
+            -- Evidence (docs/issues/00720-prefer-score-artwork-tuning.md): in 177 labelled
+            -- artwork comparisons where exactly one side was off-style, the on-style side
+            -- was chosen 177 times. Blind swap review across weights 6, 9 and 14 gave 78
+            -- "better" and 0 "worse" over 114 changed cards. Fixes both cards that opened
+            -- the issue -- Puresteel Paladin was showing its Fallout printing and Sword of
+            -- the Animist its Marvel one.
+            --
+            -- A year/era term was the obvious alternative and was rejected: it would
+            -- permanently penalise all future art, whereas a tag on the artwork generalises.
+            'art_style', (
+                CASE
+                    WHEN (
+                        card_art_tags ? 'external-ip'
+                        AND NOT (card_art_tags ?| ARRAY['dungeons-and-dragons', 'the-lord-of-the-rings'])
+                    ) OR card_art_tags ?| ARRAY['anime', 'comic-style', 'line-art', 'word-art-title'] THEN 0
+                    ELSE 14
                 END
             )
         ) AS new_components
