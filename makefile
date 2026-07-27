@@ -20,9 +20,16 @@ BASE_COMPOSE := $(mkfile_dir)/docker-compose.yml
 ENVS := $(shell ls envs)
 LINTABLE_DIRS := .
 
-XPGDATABASE=magic
-XPGPASSWORD=foopassword
-XPGUSER=foouser
+# Local credentials come from env.json, created here on first run so that a fresh
+# clone has everything it needs to boot. Read them back into make variables (which
+# .EXPORT_ALL_VARIABLES puts in every recipe's environment) so the values compose
+# sees match .env exactly — compose gives the shell environment precedence over
+# --env-file, so any disagreement means env.json is silently ignored.
+$(shell $(GIT_ROOT)/scripts/gen_env_json.sh $(GIT_ROOT)/env.json)
+
+XPGDATABASE := $(shell jq -r '.XPGDATABASE' $(GIT_ROOT)/env.json)
+XPGPASSWORD := $(shell jq -r '.XPGPASSWORD' $(GIT_ROOT)/env.json)
+XPGUSER := $(shell jq -r '.XPGUSER' $(GIT_ROOT)/env.json)
 HOSTNAME := $(shell hostname)
 
 S3_BUCKET=biblioplex
@@ -60,6 +67,7 @@ IMAGE_TAG := $(BUILD_HASH)
 	lint \
 	mplantin_font \
 	postgres-config \
+	psql-dotfiles \
 	pull_images \
 	reset \
 	rolling-deploy \
@@ -86,26 +94,31 @@ hlep: help
 
 up_deps: images check_env .env api/static/app.min.js configs/postgres/conf/postgresql.conf
 
-deps-%: up_deps
+deps-%: up_deps psql-dotfiles
 	mkdir -p $(GIT_ROOT)/data/api/$* && chmod 755 $(GIT_ROOT)/data/api/$*
 
-env.json: # @doc create env.json from template only if it does not exist (never overwrite)
-	@test -f env.json || echo '{}' > env.json
+# Both files are bind-mounted into the postgres container. Docker silently creates
+# a directory in place of a missing bind-mount source, so on a host that has never
+# run psql they turn into directories rather than files.
+psql-dotfiles:
+	@touch ~/.psqlrc ~/.psql_history
+
+env.json: # @doc create env.json with generated local credentials if missing (never overwrite)
+	@$(GIT_ROOT)/scripts/gen_env_json.sh $@
 
 .env: env.json
 	cat env.json | jq -r 'to_entries[] | "\(.key)=\(.value)"' | sort > $@
 
-# Usage: make dev-up, make prod-up, make dev-up-detach, make prod-down, etc.
-%-up: deps-%
+%-up: deps-% # @doc start an environment in the foreground, e.g. make dev-up
 	cd $(GIT_ROOT) && docker compose --project-name sylvan_$* --env-file .env --env-file envs/$* --file $(BASE_COMPOSE) up --remove-orphans --abort-on-container-exit
 
-%-up-detach: deps-%
+%-up-detach: deps-% # @doc start an environment in the background, e.g. make dev-up-detach
 	cd $(GIT_ROOT) && docker compose --project-name sylvan_$* --env-file .env --env-file envs/$* --file $(BASE_COMPOSE) up --remove-orphans --detach
 
-%-down:
+%-down: | .env # @doc stop an environment, e.g. make dev-down
 	cd $(GIT_ROOT) && docker compose --project-name sylvan_$* --env-file .env --env-file envs/$* --file $(BASE_COMPOSE) down --remove-orphans
 
-status: # @doc show container status for all environments
+status: | .env # @doc show container status for all environments
 	@$(foreach env,$(ENVS), \
 	  python -c "import shutil; w=shutil.get_terminal_size().columns; print(' $(env) '.center(w, '='))" && \
 	  cd $(GIT_ROOT) && docker compose --project-name sylvan_$(env) --env-file .env --env-file envs/$(env) --file $(BASE_COMPOSE) ps --all ; \
@@ -118,19 +131,19 @@ rolling-deploy: deps-blue deps-green # @doc rolling blue/green deploy — update
 	cd $(GIT_ROOT) && docker compose --project-name sylvan_green --env-file .env --env-file envs/green --file $(BASE_COMPOSE) up --remove-orphans --detach --wait
 	@echo "=== Rolling deploy complete ==="
 
-down: $(addsuffix -down,$(ENVS))
+down: $(addsuffix -down,$(ENVS)) # @doc stop every environment
 
 images: build_images pull_images # @doc refresh images
 
 build_images: $(BUILD_STAMP) # @doc refresh locally built images
 
-$(BUILD_STAMP): $(image_sources)
+$(BUILD_STAMP): $(image_sources) | .env
 	mkdir -p $(BUILD_STAMP_DIR)
 	find $(BUILD_STAMP_DIR) -name "*.stamp" -mtime +3 -delete 2>/dev/null || true
 	cd $(GIT_ROOT) && docker compose --progress=plain --env-file .env --env-file envs/dev --file $(BASE_COMPOSE) build
 	touch $@
 
-pull_images: $(BASE_COMPOSE) # @doc pull images from remote repos
+pull_images: $(BASE_COMPOSE) | .env # @doc pull images from remote repos
 	true || docker compose --env-file .env --env-file envs/dev --file $(BASE_COMPOSE) pull
 
 ensure_pydocker: ensure_uv
@@ -171,19 +184,16 @@ dockerclean:
 	docker ps --all --format '{{.ID}}' | xargs $(MAYBENORUN) docker rm --force
 	docker images --format '{{.ID}}' | xargs $(MAYBENORUN) docker rmi --force
 
-# Usage: make dbconn-dev, make dbconn-prod
-dbconn-%:
-	test -f ~/.psqlrc || touch ~/.psqlrc
-	test -f ~/.psql_history || touch ~/.psql_history
+dbconn-%: psql-dotfiles | .env # @doc open psql against an environment, e.g. make dbconn-blue
 	cd $(GIT_ROOT) && docker compose --project-name sylvan_$* --env-file .env --env-file envs/$* --file $(BASE_COMPOSE) \
 	  exec -e PSQLRC=/var/lib/postgresql/.psqlrc -e PSQL_HISTORY=/var/lib/postgresql/.psql_history \
 	  postgres psql -U $(XPGUSER) -d $(XPGDATABASE) --host=localhost
 
-reset-%:
+reset-%: | .env # @doc destroy an environment including its database volume
 	docker compose --project-name sylvan_$* --env-file .env --env-file envs/$* --file $(BASE_COMPOSE) down --volumes --remove-orphans
 	rm -rvf data/api/$* data/postgres/$*
 
-reset: $(addprefix reset-,$(ENVS))
+reset: $(addprefix reset-,$(ENVS)) # @doc destroy every environment including databases
 
 install_deps:
 	python -m uv pip install -r requirements/base.txt
