@@ -2,7 +2,7 @@
 
 ![Web Interface](screenshot.webp)
 
-*Web interface in dark mode showing cards with CMC less than 10, ordered by USD price descending*
+*Web interface in dark mode: `t:beast` matching 525 cards, returned in 3 ms*
 
 **Legal Notice**: Magic: The Gathering is trademark and property of Wizards of the Coast LLC, a subsidiary of Hasbro, Inc. This project is unofficial Fan Content permitted under the [Wizards of the Coast Fan Content Policy](https://company.wizards.com/en/legal/fancontentpolicy).
 Not approved/endorsed by Wizards of the Coast.
@@ -152,7 +152,12 @@ sylvan_librarian/
 - PostgreSQL 17+ (for full functionality)
 - Rust toolchain with maturin (for the in-memory query engine; `make engine` builds it)
 - Docker and Docker Compose (for containerized development)
-- Node.js 26.1.0+ (for HTML formatting tools)
+- Node.js 26.1.0+ — required, not optional: `make <env>-up` minifies `app.js` with `npx terser`
+  before starting anything, so the build fails without it
+- `jq` (shipped with recent macOS; `apt install jq` on Debian/Ubuntu)
+
+On macOS, `python3` from the Xcode command line tools is enough — the makefile finds either `python`
+or `python3`, and falls back to `sysctl` where GNU `nproc` is absent.
 
 ### Setup Instructions
 
