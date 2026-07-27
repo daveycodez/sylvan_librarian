@@ -109,32 +109,23 @@ should match the story: long enough to explain the mechanism and show evidence, 
 
 ## Issue Tracking
 
-`docs/issues/` holds the deep design/implementation notes for both engine and product work — this
-is the primary source of truth, tracked in git (all of it, no exceptions; `docs/issues/done/` for
-finished work). GitHub issues are secondary: a triage-and-status layer that must stand on its own —
-a reader should understand the problem and the gist of the approach from the GitHub issue alone,
-without needing to open the doc — but the doc is where the real depth (measurements, rejected
-alternatives, iteration history) lives, so the GitHub issue doesn't need to duplicate all of that,
-just link to it.
+`docs/issues/` holds the deep design/implementation notes for engine and product work — the primary
+source of truth, tracked in git, with `done/` for finished work. GitHub issues are a secondary
+triage layer that must stand on its own, and link to the doc rather than duplicating its depth.
 
-**Naming:** `#####-slug.md`, 5-digit zero-padded GitHub issue (or PR, if no issue exists)
-number, e.g. `00623-engine-flavor-absent-gram-bitmap.md` for #623. Prefer the issue number over its
-merging PR's number when both exist. Docs with no GitHub issue of their own use a prefix that signals
-intent, so a reader can tell backlog from background at a glance:
+Naming: `#####-slug.md` by GitHub issue number (`00623-engine-flavor-absent-gram-bitmap.md`), or a
+prefix when there is no issue — `local-` for proposed work, `reference-` for material that is
+deliberately not scheduled, `security-` for unfixed findings.
 
-- `local-slug.md` — **proposed / not-yet-filed work**: a design or fix meant to happen but not yet
-  filed as an issue (e.g. `local-engine-range-veto-redundancy.md`). When a `local-` doc later gets a
-  GitHub issue, rename it to the assigned number.
-- `reference-slug.md` — **reference material that is deliberately not scheduled**: a general pattern,
-  design study, or rejected-but-preserved approach that is *not* todo work and shouldn't be read as a
-  backlog item (e.g. `reference-engine-printing-varying-plane-repair-pattern.md`). Promote to `local-`
-  or a number only if it actually becomes planned work.
+**`security-*` is gitignored and must never be committed** — this repo is public, so publishing an
+unfixed finding is a working recipe against the live deployment, permanently. This applies to the
+*design doc for the fix* as much as to the finding itself: the bar is not whether specifics were
+omitted but whether a reader could derive the issue from what remains. Default to the prefix, keep
+fix commit messages factual rather than descriptive of the defect, and rename off the prefix once
+the fix ships.
 
-**Length and scope:** issue docs are not subject to the ~100-line length ideal in the global markdown
-rules — they are the deep source of truth, so length should match the material (measurements, rejected
-alternatives, iteration history). What governs instead is **one shippable idea per doc**: the split
-signal is not line count but whether the doc holds multiple *independent* ideas that would land as
-separate PRs. When it does, extract each into its own doc and cross-link. In practice docs cluster
-around 100–300 lines; treat ~500 as the prompt to check for an independent idea hiding inside. The
-other global conventions still apply in full — cross-link rather than duplicate, and prefer a
-well-linked narrative over bare index docs.
+Issue docs are exempt from the ~100-line ideal in the global markdown rules; **one shippable idea per
+doc** governs instead.
+
+Full conventions — prefix rationale, the security caveats and blast-radius rule, length and scope:
+[docs/issues/README.md](docs/issues/README.md). Read it before creating or renaming an issue doc.
