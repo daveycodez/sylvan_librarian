@@ -25,7 +25,27 @@ from api.api_resource import (
     hostname_to_site_name,
 )
 from api.enums import ResponseShape
+from api.middlewares.caching_middleware import CachingMiddleware
 from api.settings import settings
+from api.utils.routing import BoundRoute, RouteSpec, route
+
+
+def make_bound_route(action: object, *, path: str = "search", positional_capacity: float = 0.0) -> BoundRoute:
+    """Build a route table entry around a stub handler, for tests that patch the table wholesale.
+
+    Args:
+        action: The stub to dispatch to.
+        path: Path the stub claims.
+        positional_capacity: How many trailing path segments it absorbs.
+
+    Returns:
+        An entry shaped like the ones __init__ builds.
+    """
+    return BoundRoute(
+        action=action,
+        positional_capacity=positional_capacity,
+        spec=RouteSpec(paths=(path,), methods=frozenset({"GET", "HEAD"}), advertise=True, ignore_unknown_params=False),
+    )
 
 
 def create_test_card(  # noqa: PLR0913, PLR0917
@@ -151,9 +171,9 @@ class TestAPIResourceInitializationNewStyle(TestBaseAPIResourceTest):
         assert api_resource._conn_pool == self.mock_conn_pool
 
         # Check that action map is populated
-        assert "get_pid" in api_resource.action_map
-        assert "search" in api_resource.action_map
-        assert "index" in api_resource.action_map
+        assert "get_pid" in api_resource.routes
+        assert "search" in api_resource.routes
+        assert "index" in api_resource.routes
 
         # Check that caches are initialized
         assert hasattr(api_resource, "_query_cache")
@@ -169,15 +189,19 @@ class TestAPIResourceInitializationNewStyle(TestBaseAPIResourceTest):
 
         assert api_resource._import_guard == custom_guard
 
-    def test_action_map_includes_all_public_methods(self) -> None:
-        """Test that action_map includes all public methods."""
+    def test_every_public_method_is_still_registered(self) -> None:
+        """Test the marker migration left no previously-routed method behind.
+
+        Registration used to take every public callable. This pins that the same set is reachable
+        now that each one has to opt in; step 3 is where that stops being true on purpose.
+        """
         api_resource = self.api_resource
         public_methods = [
             method for method in dir(api_resource) if not method.startswith("_") and callable(getattr(api_resource, method))
         ]
 
         for method in public_methods:
-            assert method in api_resource.action_map
+            assert method in api_resource.routes
 
 
 class TestRequestDispatch(TestBaseAPIResourceTest):
@@ -225,11 +249,29 @@ class TestRequestDispatch(TestBaseAPIResourceTest):
         with pytest.raises(falcon.HTTPNotFound):
             self._dispatch("/card/eoc/104/extra")
 
+    def test_two_routes_claiming_one_path_fail_at_construction(self) -> None:
+        # Registration is fail-closed both ways: an unmarked method is not routed, and a path two
+        # methods both claim is a startup error rather than one silently shadowing the other.
+        class Colliding(APIResource):
+            @route(paths=("search",))
+            def shadows_search(self, **_: object) -> None: ...
+
+        with pytest.raises(RuntimeError, match="claimed by both"):
+            Colliding(last_import_time=multiprocessing.Value("d", time.time(), lock=True))
+
+    def test_index_paths_redirect_instead_of_erroring(self) -> None:
+        # falcon.HTTPMovedPermanently subclasses HTTPStatus, which is a sibling of HTTPError rather
+        # than a subclass, so the generic `except Exception` swallowed the redirect and returned a
+        # 500. Falcon turns the propagated signal into a 301.
+        for path in ("/index", "/index.html"):
+            with pytest.raises(falcon.HTTPMovedPermanently):
+                self._dispatch(path)
+
     def test_keyword_only_injection_route_with_extra_segment_raises_not_found(self) -> None:
         # get_catalog's falcon_response is keyword-only, so the route has no positional capacity.
         # While it was positional the segment was absorbed and then silently overwritten by the
         # injected response, so a path identifying nothing still returned 200.
-        assert self.api_resource._action_positional_capacity["get_catalog"] == 0
+        assert self.api_resource.routes["get_catalog"].positional_capacity == 0
         with pytest.raises(falcon.HTTPNotFound):
             self._dispatch("/get_catalog/foo")
 
@@ -250,8 +292,8 @@ class TestRequestDispatch(TestBaseAPIResourceTest):
         assert "limit" in exc_info.value.description
 
     def test_positional_capacity_computed_at_init_not_per_request(self) -> None:
-        assert self.api_resource._action_positional_capacity["get_pid"] == 0
-        assert self.api_resource._action_positional_capacity["card"] == 2
+        assert self.api_resource.routes["get_pid"].positional_capacity == 0
+        assert self.api_resource.routes["card"].positional_capacity == 2
 
     def test_not_found_routes_precomputed_not_rebuilt_per_request(self) -> None:
         # _not_found_routes is built once in __init__ (see _build_routes_listing) from the fixed
@@ -312,6 +354,7 @@ class TestAPIResourceRequestHandling(unittest.TestCase):
     def test_handle_returns_early_if_response_complete(self) -> None:
         """Test _handle returns early if response is already complete."""
         mock_req = MagicMock()
+        mock_req.method = "GET"
         mock_req.path = mock_req.relative_uri = "/test"
         mock_resp = MagicMock()
         mock_resp.complete = True
@@ -323,6 +366,7 @@ class TestAPIResourceRequestHandling(unittest.TestCase):
     def test_handle_processes_valid_paths(self) -> None:
         """Test _handle processes valid paths correctly."""
         mock_req = MagicMock()
+        mock_req.method = "GET"
         mock_req.uri = mock_req.path = mock_req.relative_uri = "/get_pid"
         mock_req.params = {}
         mock_resp = MagicMock()
@@ -337,6 +381,7 @@ class TestAPIResourceRequestHandling(unittest.TestCase):
     def test_handle_raises_not_found_for_invalid_paths(self) -> None:
         """Test _handle raises HTTPNotFound for invalid paths."""
         mock_req = MagicMock()
+        mock_req.method = "GET"
         mock_req.uri = mock_req.path = mock_req.relative_uri = "/nonexistent"
         mock_req.params = {}
         mock_resp = MagicMock()
@@ -348,6 +393,7 @@ class TestAPIResourceRequestHandling(unittest.TestCase):
     def test_disallowed_query_params_do_not_cause_type_error(self) -> None:
         """Query params named after internal kwargs must be stripped before dispatch."""
         mock_req = MagicMock()
+        mock_req.method = "GET"
         mock_req.path = mock_req.relative_uri = "/"
         mock_req.params = {"falcon_response": "injected", "request_host": "evil.com"}
         mock_req.host = "localhost"
@@ -363,6 +409,7 @@ class TestAPIResourceRequestHandling(unittest.TestCase):
     def test_handle_handles_type_errors(self) -> None:
         """Test _handle handles TypeError exceptions."""
         mock_req = MagicMock()
+        mock_req.method = "GET"
         mock_req.uri = mock_req.path = mock_req.relative_uri = "/search"
         mock_req.params = {"invalid_param": "value"}
         mock_resp = MagicMock()
@@ -376,13 +423,14 @@ class TestAPIResourceRequestHandling(unittest.TestCase):
             raise TypeError(msg)
 
         # Patch the action_map directly to include our mock
-        with patch.object(self.api_resource, "action_map", {"search": mock_action_that_raises_type_error}):
+        with patch.object(self.api_resource, "routes", {"search": make_bound_route(mock_action_that_raises_type_error)}):
             with pytest.raises(falcon.HTTPBadRequest):
                 self.api_resource._handle(mock_req, mock_resp)
 
     def test_handle_handles_general_exceptions(self) -> None:
         """Test _handle handles general exceptions."""
         mock_req = MagicMock()
+        mock_req.method = "GET"
         mock_req.uri = mock_req.path = mock_req.relative_uri = "/search"
         mock_req.params = {}
         mock_resp = MagicMock()
@@ -393,7 +441,7 @@ class TestAPIResourceRequestHandling(unittest.TestCase):
             raise Exception(msg)
 
         # Mock search method to raise a general exception
-        with patch.object(self.api_resource, "action_map", {"search": raise_error}):
+        with patch.object(self.api_resource, "routes", {"search": make_bound_route(raise_error)}):
             with patch("api.api_resource.error_monitoring.error_handler") as mock_error_handler:
                 with pytest.raises(falcon.HTTPInternalServerError):
                     self.api_resource._handle(mock_req, mock_resp)
@@ -409,6 +457,7 @@ class TestAPIResourceRequestHandling(unittest.TestCase):
         regression, which is why it is asserted on the response rather than on the validation.
         """
         mock_req = MagicMock()
+        mock_req.method = "GET"
         mock_req.uri = mock_req.path = mock_req.relative_uri = "/search"
         mock_req.params = {}
         mock_resp = MagicMock()
@@ -420,7 +469,7 @@ class TestAPIResourceRequestHandling(unittest.TestCase):
             msg = f"Test error touching {db_password}"
             raise RuntimeError(msg)
 
-        with patch.object(self.api_resource, "action_map", {"search": raise_error}):
+        with patch.object(self.api_resource, "routes", {"search": make_bound_route(raise_error)}):
             with patch("api.api_resource.error_monitoring.error_handler"):
                 with pytest.raises(falcon.HTTPInternalServerError) as excinfo:
                     self.api_resource._handle(mock_req, mock_resp)
@@ -479,6 +528,7 @@ class TestSearchResponseShape(TestBaseAPIResourceTest):
     def test_handle_converts_shape_query_param(self) -> None:
         """The string 'columnar' from the query string is converted to the enum."""
         mock_req = MagicMock()
+        mock_req.method = "GET"
         mock_req.uri = mock_req.path = mock_req.relative_uri = "/search"
         mock_req.params = {"q": "test", "shape": "columnar"}
         mock_req.get_header.return_value = None
@@ -639,7 +689,13 @@ class TestAPIResourceStaticFileServing(unittest.TestCase):
         mock_response = MagicMock()
         mock_response.headers = {}
 
-        assert self.api_resource.action_map["static/social-preview_webp"] == self.api_resource.social_preview_webp
+        # One @route(paths=(...)) registers both the bare name and the static/ alias, so they are the
+        # same wrapper over the same handler. The alias used to be registered as the unwrapped method,
+        # which meant the two paths did not bind parameters the same way.
+        aliased = self.api_resource.routes["static/social-preview_webp"]
+        assert aliased is self.api_resource.routes["social_preview_webp"]
+        assert aliased.action.__wrapped__ == self.api_resource.social_preview_webp
+
         self.api_resource.social_preview_webp(falcon_response=mock_response)
 
         expected_contents = (pathlib.Path(__file__).parent.parent / "static" / "social-preview.webp").read_bytes()
@@ -1119,3 +1175,55 @@ class TestCardSiteNameInjection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMethodAwareCaching(TestBaseAPIResourceTest):
+    """A refused method must not poison the cache for a method the route does answer.
+
+    Before routes declared their methods, every method reached the same handler and returned the
+    same response, so a cache key without the method was harmless. Declaring methods makes a
+    response method-dependent: a POST to a GET-only route now 405s, and that 405 would be stored
+    under the key a subsequent GET looks up.
+    """
+
+    def _client(self) -> falcon.testing.TestClient:
+        app = falcon.App(middleware=[CachingMiddleware()])
+        app.add_sink(self.api_resource._handle, prefix="/")
+        return falcon.testing.TestClient(app)
+
+    @contextmanager
+    def _cache_enabled(self) -> Generator[None]:
+        with patch("api.middlewares.caching_middleware.settings") as mock_settings:
+            mock_settings.enable_cache = True
+            yield
+
+    def test_refused_post_does_not_poison_a_later_get(self) -> None:
+        client = self._client()
+        with self._cache_enabled():
+            refused = client.simulate_post("/get_pid")
+            after = client.simulate_get("/get_pid")
+
+        assert refused.status == falcon.HTTP_405
+        assert after.status == falcon.HTTP_200
+        assert after.headers.get("X-Cache") == "miss"
+
+        # The two properties this case depends on, asserted so that changing either one fails here
+        # rather than leaving the test passing for a reason it was not written to check.
+        # 1. The 405 is raised before the handler runs, so it carries none of get_pid's cache
+        #    headers and was therefore storable — that is what made poisoning possible at all.
+        assert "no-store" not in (refused.headers.get("Cache-Control") or "")
+        # 2. get_pid itself opts out of caching, so the route being poisoned is one that could
+        #    never have populated that key through its own successful response.
+        assert "no-store" in (after.headers.get("Cache-Control") or "")
+
+    def test_get_is_still_cached_across_requests(self) -> None:
+        # /robots.txt rather than /get_pid: get_pid sets Cache-Control: no-store, which is also why
+        # it makes a good poisoning case — the 405 is raised before the handler can set that header.
+        client = self._client()
+        with self._cache_enabled():
+            first = client.simulate_get("/robots.txt")
+            second = client.simulate_get("/robots.txt")
+
+        assert first.headers.get("X-Cache") == "miss"
+        assert second.headers.get("X-Cache") == "hit"
+        assert second.status == falcon.HTTP_200
