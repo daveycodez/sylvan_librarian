@@ -2646,6 +2646,24 @@ impl Candidates {
         }
     }
 
+    /// Which representation the narrowing produced, for `explain` to report. A vec-shaped
+    /// result means some site built a sorted vec — a `collect` + `sort_unstable` ran. A
+    /// bits-shaped one means the narrowing stayed word-wise and never sorted.
+    ///
+    /// Read at the *top* of the narrowing, so it is a proxy rather than a census of sort
+    /// events: `or_all` can scatter a vec-shaped arm into bits, hiding a sort that did
+    /// happen, and a bits-shaped arm can be extracted into a vec by `and_all`. Exact
+    /// per-site accounting needs the shared materialization helper that
+    /// docs/issues/local-engine-candidate-materialize.md proposes.
+    fn repr(&self) -> NarrowedRepr {
+        match self {
+            Candidates::Cards(_) => NarrowedRepr::Cards,
+            Candidates::Printings(_) => NarrowedRepr::Printings,
+            Candidates::CardBits(_) => NarrowedRepr::CardBits,
+            Candidates::PrintingBits(_) => NarrowedRepr::PrintingBits,
+        }
+    }
+
     /// The set as a bitmap over an n-element domain (scatters vec variants;
     /// space is unchanged — callers pass the domain size of the set's space).
     fn into_bits(self, n: usize) -> Vec<u64> {
@@ -4685,6 +4703,12 @@ fn aligned_page<'a>(
 /// selective range (the existing narrowing already wins, and restricting the walk to dense
 /// predicates keeps its worst case bounded), or an order-by without a card permutation (e.g. the
 /// range field itself — deferred).
+///
+/// Every exit records itself in `PAGING_TAKEN` (the `Range*` variants of [`PagingTaken`]), so a
+/// `None` from here reaches `explain_analyze` naming the gate rather than as a bare cost with no
+/// cause. Nothing predicts these the way `compose_paging` predicts the compose branch — the point
+/// is to size the declines, and to make `RangeNotBare`/`RangePermutationStale` visible if they ever
+/// fire, since neither should.
 fn printing_range_fastpath<'a>(
     ctx: &QueryCtx<'a>,
     params: &QueryParams,
@@ -4692,24 +4716,34 @@ fn printing_range_fastpath<'a>(
 ) -> Option<(usize, Vec<(&'a AOracleCard, &'a APrinting)>)> {
     let QueryCtx { cards, printings, indexes, .. } = *ctx;
     let QueryParams { sort_col, descending, limit, page_offset, .. } = *params;
-    let (idx, lo, hi) = bare_range_bounds(filter, indexes)?;
+    let Some((idx, lo, hi)) = bare_range_bounds(filter, indexes) else {
+        note_paging_taken(PagingTaken::RangeNotBare);
+        return None;
+    };
     let s = idx.partition_point(|p| u32::from(p.0) < lo);
     let e = idx.partition_point(|p| u32::from(p.0) < hi);
     let k = e - s;
     if !range_too_broad_to_narrow(k, idx.len()) {
+        note_paging_taken(PagingTaken::RangeSelective);
         return None; // selective: the existing narrowing path narrows tightly and wins
     }
     // total = matching printings = k (each priced printing in [lo, hi) is one row; NULL-valued
     // printings are absent from the index and don't match). Same value the count pass would sum.
     if k == 0 || page_offset >= k {
+        note_paging_taken(PagingTaken::EmptyPage);
         return Some((k, Vec::new()));
     }
     // Aligned: order by the range field itself. `usd` is the only range field that is also a sort
     // column, and only a price predicate makes `idx` the value-sorted permutation for that sort;
     // a non-price predicate ordered by usd has no aligned mapping (and no permutation) — bail.
     if matches!(sort_col, SortCol::PriceUsd) {
-        return is_price_leaf(filter)
-            .then(|| (k, aligned_page(idx, s, e, cards, printings, &indexes.printing_to_card, descending, page_offset, limit)));
+        if !is_price_leaf(filter) {
+            note_paging_taken(PagingTaken::RangeUnalignedPrice);
+            return None;
+        }
+        note_paging_taken(PagingTaken::RangeAligned);
+        let page = aligned_page(idx, s, e, cards, printings, &indexes.printing_to_card, descending, page_offset, limit);
+        return Some((k, page));
     }
     // The walk reproduces run_query_streamed's *stream* emission (per-card-contiguous), which the
     // general path only uses above STREAM_MIN_MATCHES; at or below it, run_query_streamed gathers
@@ -4719,12 +4753,18 @@ fn printing_range_fastpath<'a>(
     // index (broad needs k > index_len/4, so index_len < ~4096) -- never in production, where broad
     // means tens of thousands. aligned_page above matches the gathered path directly, so it's exempt.
     if k <= *STREAM_MIN_MATCHES {
+        note_paging_taken(PagingTaken::RangeSparse);
         return None;
     }
-    let perm = indexes.sort_perms.get(sort_col, descending)?;
+    let Some(perm) = indexes.sort_perms.get(sort_col, descending) else {
+        note_paging_taken(PagingTaken::RangeNoPermutation);
+        return None;
+    };
     if perm.len() != cards.len() {
+        note_paging_taken(PagingTaken::RangePermutationStale);
         return None;
     }
+    note_paging_taken(PagingTaken::RangeWalk);
     Some((k, walk_printing_page(ctx, params, filter, perm)))
 }
 
@@ -5504,6 +5544,7 @@ fn printing_compose_fastpath<'a>(
     let QueryCtx { cards, printings, offsets, indexes, .. } = *ctx;
     let QueryParams { mode, sort_col, descending, limit, page_offset, .. } = *params;
     if !is_printing_composable(filter, indexes) || !printing_compose_indexes_built(indexes) {
+        note_paging_taken(PagingTaken::NotComposable);
         return None;
     }
     let perm = indexes.sort_perms.get(sort_col, descending).filter(|p| p.len() == cards.len());
@@ -5546,6 +5587,7 @@ fn printing_compose_fastpath<'a>(
             domain as f64 * (-(printing_matches as f64) / domain as f64).exp().mul_add(-1.0, 1.0)
         };
         if est > domain as f64 * *COMPOSE_GATHER_MAX_CARD_FRACTION {
+            note_paging_taken(PagingTaken::DeclineBroad);
             return None;
         }
         // Small-total decline (mirrors the `Perm` branch's `total <= STREAM_MIN_MATCHES` below): in the
@@ -5559,6 +5601,7 @@ fn printing_compose_fastpath<'a>(
         // sparse `type:angel`/`type:goblin` card/usd (newly composable) from regressing onto this path:
         // the collection compose leaves are a printing-mode orderby-walk win, not a card-mode gather win.
         if (estimator::estimate_cardinality(filter, indexes, offsets).hi as usize) <= *STREAM_MIN_MATCHES {
+            note_paging_taken(PagingTaken::DeclineSparseEstimate);
             return None;
         }
     }
@@ -5579,13 +5622,19 @@ fn printing_compose_fastpath<'a>(
         }
     };
     if total == 0 || page_offset >= total {
+        note_paging_taken(PagingTaken::EmptyPage);
         return Some((total, Vec::new()));
     }
     let page = match perm {
         Some(perm) => {
             if total <= *STREAM_MIN_MATCHES {
+                // `Exact` to distinguish it from `DeclineSparseEstimate` above: same intent, but that
+                // one fires pre-compose off the estimator's upper bound, this one post-compose off
+                // the real total. A harness reading one label for both cannot tell which fired.
+                note_paging_taken(PagingTaken::DeclineSparseExact);
                 return None; // sparse: the general path gathers + globally sorts, ordering ties differently
             }
+            note_paging_taken(PagingTaken::Perm);
             walk_grouped_page(ctx, params, &pbits, perm)
         }
         // No permutation. #744: if the orderby has a printing-space value structure (usd/rarity,
@@ -5608,7 +5657,22 @@ fn printing_compose_fastpath<'a>(
             } else {
                 None
             };
-            walked.unwrap_or_else(|| gather_composed_page(ctx, params, &pbits))
+            match walked {
+                Some(rows) => {
+                    note_paging_taken(PagingTaken::OrderbyWalk);
+                    rows
+                }
+                None => {
+                    // Two different situations reach this gather, and `compose_paging` predicts
+                    // them differently, so they cannot share a label. `walk_col` false means no
+                    // walk was ever available and `Gather` was predicted — agreement. `walk_col`
+                    // true means a walk was available, was attempted, and declined (null-value
+                    // tail, or a page past the value structure), so `OrderbyWalk` was predicted
+                    // and this gather is the documented fallback — NOT a mispredicted branch.
+                    note_paging_taken(if walk_col { PagingTaken::GatherWalkDeclined } else { PagingTaken::Gather });
+                    gather_composed_page(ctx, params, &pbits)
+                }
+            }
         }
     };
     Some((total, page))
@@ -5659,6 +5723,29 @@ pub(crate) enum ComposePaging {
     /// No permutation and no orderby walk → the permutation-free bounded gather
     /// (`gather_composed_page`), which visits every match (offset-independent cost).
     Gather,
+}
+
+impl ComposePaging {
+    /// The string `explain` reports under `"compose_paging"`. Byte-identical to what `Debug`
+    /// produced before this existed, so the Python surface did not move.
+    ///
+    /// Spelled out rather than left as `format!("{:?}", ..)` for the same reason `PagingTaken` and
+    /// `CountSource` are, and with a sharper edge than either: a consumer compares this label
+    /// against `PagingTaken`'s. `scripts/bench_cost_model_agreement.py` counts agreement as
+    /// `cells[(predicted, taken)]` with `predicted` from here and `taken` from
+    /// `PagingTaken::label()`, so the two must SPELL the three strategies the same way. While this
+    /// side was `Debug`-derived, renaming a variant here would have silently emptied that diagonal —
+    /// every agreed run reclassified as a disagreement — and `compose_paging_prediction_matches_the_branch_taken`
+    /// would not have noticed, because it compares enums rather than strings.
+    ///
+    /// `compose_paging_and_paging_taken_agree_on_strategy_names` is the test that pins the pairing.
+    fn label(self) -> &'static str {
+        match self {
+            ComposePaging::Perm => "Perm",
+            ComposePaging::OrderbyWalk => "OrderbyWalk",
+            ComposePaging::Gather => "Gather",
+        }
+    }
 }
 
 impl PhysicalPlan {
@@ -5720,6 +5807,11 @@ impl PhysicalPlan {
 struct PreparedCandidates {
     candidate_cards: Option<Vec<u32>>,
     all_match_known: bool,
+    /// `Candidates::repr` of what the narrowing returned, before this struct flattened
+    /// it to `candidate_cards`. Diagnostic only (`explain`) — nothing in execution reads it,
+    /// and it exists because a candidate *count* in some band does not imply the query paid
+    /// a sort to get there: a plane AND'd with a range reaches the same count word-wise.
+    narrowed_repr: NarrowedRepr,
 }
 
 impl PreparedCandidates {
@@ -5739,12 +5831,17 @@ impl PreparedCandidates {
 /// any) the chosen executor reuses. One of three "count sources", picked by query
 /// structure — this is the engine's whole materialization story in one enum.
 enum Prep {
-    /// Bare printing range: features come from the range index's exact `k` (a
-    /// binary search, no scan). Nothing is materialized — `PrintingRangeScan`
-    /// walks; a materializing winner materializes for itself in dispatch. `Plane`
-    /// carries no bitmap here because `run_query_routed` owns it locally
-    /// (`plane_bits: Vec<u64>`), passed by reference into dispatch.
-    Range,
+    /// "Cheap estimate acquired, nothing materialized." Despite the name this is **not**
+    /// range-index-specific: it is shared by `CardRangePopcount` (#725), `PrintingRangeScan`
+    /// (#695) and `PrintingCompose` (#724), and a plane-composable printing-space query like
+    /// `type:merfolk` at `unique=printing` lands here via compose with no range in sight. The
+    /// payload names which acquire actually ran, so `explain` can report it instead of the
+    /// variant name — reporting "range" for a compose sent one investigation down a wrong path.
+    ///
+    /// Nothing is materialized — the fast paths walk; a materializing winner materializes for
+    /// itself in dispatch. `Plane` carries no bitmap here because `run_query_routed` owns it
+    /// locally (`plane_bits: Vec<u64>`), passed by reference into dispatch.
+    Range(CountSource),
     /// True-residual plane (card): the exact match bitmap, owned by
     /// `run_query_routed`'s local `plane_bits` and passed by reference.
     /// `PlanePopcountOrder` reads it directly; P3/P4 read it as a candidate list.
@@ -5892,6 +5989,8 @@ fn prepare_candidates(ctx: &QueryCtx, params: &QueryParams, filter: &mut FilterE
     // directly instead of paying to materialize one of them first.
     let (raw_candidates, residual_exact): (Option<Candidates>, bool) =
         narrow_candidates_exact(filter, indexes, offsets, cards);
+    // Captured before the flattening below consumes it — see PreparedCandidates::narrowed_repr.
+    let narrowed_repr = raw_candidates.as_ref().map_or(NarrowedRepr::None, Candidates::repr);
     // A present plane is always exact (that's what compile_plane guarantees),
     // so the whole original query is exact iff the residual is too — either
     // because split_planes consumed all of it (bare True) or narrow_rec
@@ -5978,7 +6077,7 @@ fn prepare_candidates(ctx: &QueryCtx, params: &QueryParams, filter: &mut FilterE
         }
     }
 
-    PreparedCandidates { candidate_cards, all_match_known }
+    PreparedCandidates { candidate_cards, all_match_known, narrowed_repr }
 }
 
 // ─── Plan executors ─────────────────────────────────────────────────────────
@@ -6287,6 +6386,344 @@ fn exec_streamed_select<'a>(
     run_query_streamed(ctx, params, filter, prep.all_match_known, perm, prep.card_ids(ctx), existential_plane)
 }
 
+/// Per-query execution counters and coarse phase timings, for checking the cost model against what
+/// the executors actually do rather than against a fitted curve.
+///
+/// Two distinct questions, and the model can fail either:
+/// - are the FEATURE COUNTS right? `cards_visited` / `printings_scanned` / `matches_pushed` are the
+///   real counts behind `eval_domain` / `scan_units` / `matches`. If a feature disagrees with its
+///   counter, no rate constant can rescue the term.
+/// - is the WORK WHERE THE MODEL SAYS? `ns_setup` + `ns_loop` + `ns_finish` should account for the
+///   whole executor. Whatever is left over is work no term describes, and re-fitting cannot find it.
+///
+/// Counters are plain locals in the hot loop and only published here at the end, so the loop pays
+/// nothing. The three phases are contiguous, so each boundary instant ends one and starts the next:
+/// four `Instant::now()` calls bound three phases, which is the same four clock reads the two
+/// phases cost before `ns_setup` was split out. Per query, not per card.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct PhaseStats {
+    pub(crate) cards_visited: u64,
+    pub(crate) printings_scanned: u64,
+    pub(crate) matches_pushed: u64,
+    /// Per-query scratch setup, before the match loop starts. Split out because it is neither
+    /// prepare nor match and it is NOT negligible: `run_query_streamed` zeroes an `n_cards`-long
+    /// counts buffer here (~126 kB on the real corpus) no matter how few candidates it is about to
+    /// visit, so on a selective query this can be most of the run. It used to fall outside every
+    /// timer and land silently in the unaccounted remainder.
+    ///
+    /// It is also the one phase here with an obvious cost term waiting for it: the dominant part
+    /// scales with `n_cards`, which `PlanFeatures` already carries.
+    pub(crate) ns_setup: u64,
+    pub(crate) ns_loop: u64,
+    pub(crate) ns_finish: u64,
+    /// Wall time of the whole `run_query_with_plan` round these phases came from. Recorded so the
+    /// accounting compares like with like: `trials_ns` reports the MINIMUM across rounds, and
+    /// dividing phases from one round by the minimum of another silently reads as unmodelled work.
+    pub(crate) ns_round_total: u64,
+    /// Wall time of `prepare_candidates` for the two materializing plans, measured here rather than
+    /// inferred. No cost term describes it, and on range-acquired queries it is where a third of the
+    /// runtime was landing unaccounted.
+    pub(crate) ns_prepare: u64,
+    /// The result total this run returned. `explain_analyze` had no ground truth at all before: a
+    /// harness wanting the true cardinality made a SECOND `query()` call, which is a different
+    /// execution, so agreement with the analyzed run was assumed rather than observed.
+    pub(crate) result_total: u64,
+    /// Which exit the printing-space fastpath that ran ACTUALLY took. For
+    /// `printing_compose_fastpath` that is a paging branch, checkable against the `compose_paging`
+    /// the cost model predicted; for `printing_range_fastpath` it is one of the `Range*` gates,
+    /// which predict nothing and exist to size the declines. The rest of this note is about the
+    /// compose half, which is the half with a prediction to falsify.
+    ///
+    /// `acquire_plan_features`' `PrintingCompose` branch sets `feats.compose_paging` by
+    /// reimplementing a decision the fastpath makes independently -- it recomputes the permutation
+    /// lookup and the `orderby_walk_available` test on its own -- and nothing checked that the two
+    /// agree. That is the same shape as the Python cost mirror which silently drifted from `cost.rs`
+    /// for two revisions. Reporting the real branch turns the assumption into something a harness
+    /// can assert, which `compose_paging_prediction_matches_the_branch_taken` now does (and
+    /// `scripts/bench_cost_model_agreement.py` observes over the real corpus).
+    ///
+    /// The two *availability* tests are identical by construction (`walk_col` against the
+    /// prediction's `matches!(mode, Mode::Printing) && orderby_walk_available(sort_col)`), so they
+    /// cannot disagree. What the prediction cannot see is one step further on: acquire never
+    /// composes, so it cannot know whether the walk it predicts will SUCCEED. The walk returns an
+    /// `Option` and declines at run time on the null-value tail or a page past the value structure,
+    /// falling into the gather. `compose_paging` is therefore an **upper bound** on `OrderbyWalk`,
+    /// exact in every other cell -- one-directional by construction, not drift between two
+    /// implementations. `GatherWalkDeclined` exists so that case is self-identifying rather than
+    /// arriving as a bare `Gather` indistinguishable from a genuine misprediction.
+    ///
+    /// The prediction is 3-way and this is 10-way, so they are not compared blindly — see
+    /// `PagingTaken` for what each variant licenses.
+    ///
+    /// Reported here but NOT stored here: the live value lives in the `PAGING_TAKEN` thread-local
+    /// and `take_phase_stats` merges it in. It is the one field written by something other than an
+    /// executor, so sharing a slot with the counters meant every publisher had to remember not to
+    /// clobber it — see `PAGING_TAKEN`.
+    pub(crate) paging_taken: PagingTaken,
+}
+
+/// Which exit a printing-space fastpath took: `printing_compose_fastpath` against the 3-way
+/// `ComposePaging` the cost model predicted, and `printing_range_fastpath` against nothing (the
+/// model predicts no strategy for it — see the `Range*` block). Every exit of both records itself,
+/// which is what lets `NotEntered` mean exactly one thing.
+///
+/// The name is compose-era and now undersells the type: only `Perm`/`OrderbyWalk`/`Gather` are
+/// about paging at all, and the rest name gates. Left alone deliberately — `paging_taken` is the
+/// wire key `scripts/bench_cost_model_agreement.py` and any later harness read, and renaming it
+/// would churn the compose narrative throughout this file for no diagnostic gain.
+///
+/// An enum rather than a `&'static str` because the valid set is load-bearing in four places — the
+/// fastpaths' record sites, `compose_paging_prediction_matches_the_branch_taken`'s legal-label
+/// tables, `scripts/bench_cost_model_agreement.py`'s strategy constants, and this doc. As strings
+/// those four drift silently; as variants the compiler settles three of them and a typo stops
+/// being expressible.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum PagingTaken {
+    /// Neither fastpath was entered at all — every other plan, and a compose or range plan that
+    /// `run_query_with_plan` rejected before calling it. A fastpath that DID enter and declined
+    /// always names the gate instead, so this never means "declined".
+    ///
+    /// `#[default]` so a cleared `PAGING_TAKEN` reads as "nothing recorded", which is what
+    /// `take_phase_stats` leaves behind and what an uninstrumented plan reports.
+    #[default]
+    NotEntered,
+    /// A strategy ran, and it must be the predicted one. These three are the only variants
+    /// comparable against `compose_paging` as an equality.
+    Perm,
+    OrderbyWalk,
+    Gather,
+    /// A walk WAS available and was attempted, declined, and fell back to the gather. Legal under a
+    /// predicted `OrderbyWalk` and only under one; a bare `Gather` in that cell would mean the
+    /// availability tests really had drifted.
+    GatherWalkDeclined,
+    /// The total was 0 or the offset was past it, so the fastpath returned an empty page before any
+    /// strategy ran. Shared by both fastpaths — a compose that composed to nothing and a range whose
+    /// `k` the offset overran are the same observation, and neither exercises a prediction.
+    EmptyPage,
+    /// The structural check failed (not a composable expr, or the compose indexes are not built). A
+    /// TRIPWIRE, not an expected outcome, for the same reason `RangeNotBare` is:
+    /// `PhysicalPlan::PrintingCompose.applicable` IS `printing_compose_applicable`, which already
+    /// requires both halves of this test, and every caller of `printing_compose_fastpath` gates on
+    /// it first. So a plan `explain` ranked can only reach this if those two structural tests have
+    /// drifted apart.
+    NotComposable,
+    /// The `COMPOSE_GATHER_MAX_CARD_FRACTION` breadth gate.
+    DeclineBroad,
+    /// The two sparse declines: pre-compose off the estimator's upper bound, and post-compose off
+    /// the real total, respectively.
+    DeclineSparseEstimate,
+    DeclineSparseExact,
+
+    // ── printing_range_fastpath ─────────────────────────────────────────────
+    // Every exit of the range fastpath, for the same reason the compose ones exist: before these,
+    // a declining `PrintingRangeScan` reached `explain_analyze` with a non-empty `declined_ns` and
+    // a `NotEntered` label, i.e. "it cost something and we cannot say what for". Unlike compose
+    // there is nothing to check them AGAINST -- `PlanFeatures` carries no range-strategy prediction
+    // -- so these size the declines rather than falsify a prediction.
+    /// Ordered by the range field itself (a price predicate under a `usd` orderby), so the index IS
+    /// the sort permutation and the page is windowed straight out of it. One of the fastpath's two
+    /// success exits.
+    RangeAligned,
+    /// The general case: walked the card sort permutation, emitting per-card-contiguous runs. The
+    /// other success exit.
+    RangeWalk,
+    /// No bare range bounds — not a range predicate, or no index for its field. A TRIPWIRE, not an
+    /// expected outcome: `PhysicalPlan::PrintingRangeScan.applicable` already requires
+    /// `bare_range_bounds(..).is_some()`, so a plan `explain` ranked can only reach this if those
+    /// two structural tests have drifted apart.
+    RangeNotBare,
+    /// `range_too_broad_to_narrow` said no: the range is selective enough that the ordinary
+    /// narrowing beats the walk. The expected decline in production, and the cheapest — two binary
+    /// searches and a ratio.
+    RangeSelective,
+    /// A `usd` orderby whose predicate is not a price leaf, so the index is not the sort
+    /// permutation and there is no aligned mapping to window. Distinct from `RangeNoPermutation`
+    /// because the orderby DOES have an aligned representation in general — this query just cannot
+    /// use it — and a harness reading one label for both could not tell a missing permutation from
+    /// a mismatched one.
+    RangeUnalignedPrice,
+    /// `k <= STREAM_MIN_MATCHES`. The range analogue of `DeclineSparseExact`, and exact for the
+    /// same reason: `k` is the index's own count, not an estimate. Cheap either way — this gates
+    /// before the walk, where compose's namesake gates after a full compose.
+    RangeSparse,
+    /// No sort permutation for this (column, direction) pair, so there is nothing to walk.
+    RangeNoPermutation,
+    /// A permutation exists but its length disagrees with the corpus. Its own label rather than
+    /// folded into `RangeNoPermutation` because the two mean different things: that one is a query
+    /// the fastpath does not serve, this one is an index built against a different store. It should
+    /// never fire, and a non-zero count in the decline table is the finding.
+    RangePermutationStale,
+}
+
+/// Which acquire branch produced a query's cost features — the `count_source` `explain` reports.
+/// An enum for the same reason as `PagingTaken`: the three `Prep::Range` payloads are not
+/// interchangeable (reporting "range" for a compose once sent an investigation down a wrong path),
+/// and as strings nothing stopped a fourth from being invented at a call site.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CountSource {
+    CardRangePopcount,
+    PrintingRangeScan,
+    PrintingCompose,
+    Plane,
+    Candidates,
+}
+
+impl CountSource {
+    /// Byte-identical to the strings this reported before it became an enum. Snake case, unlike
+    /// `PagingTaken`'s PascalCase — which is exactly why these are spelled out rather than derived
+    /// from `Debug`: the two label sets have different conventions and both are a wire format.
+    fn label(self) -> &'static str {
+        match self {
+            CountSource::CardRangePopcount => "card_range_popcount",
+            CountSource::PrintingRangeScan => "printing_range_scan",
+            CountSource::PrintingCompose => "printing_compose",
+            CountSource::Plane => "plane",
+            CountSource::Candidates => "candidates",
+        }
+    }
+}
+
+/// What the residual narrowing produced, before `PreparedCandidates` flattened it to
+/// `candidate_cards`. `Cards`/`Printings` mean a sorted vec was built (some site ran a `collect` +
+/// `sort_unstable`); the `Bits` pair mean it stayed word-wise and never sorted; `None` means the
+/// narrowing produced nothing at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NarrowedRepr {
+    None,
+    Cards,
+    Printings,
+    CardBits,
+    PrintingBits,
+}
+
+impl NarrowedRepr {
+    /// Byte-identical to the strings this reported before it became an enum.
+    fn label(self) -> &'static str {
+        match self {
+            NarrowedRepr::None => "none",
+            NarrowedRepr::Cards => "cards",
+            NarrowedRepr::Printings => "printings",
+            NarrowedRepr::CardBits => "card_bits",
+            NarrowedRepr::PrintingBits => "printing_bits",
+        }
+    }
+}
+
+impl PagingTaken {
+    /// The string `explain_analyze` reports under `"paging_taken"`. Byte-identical to the labels
+    /// this reported before it became an enum, so the Python surface did not move — `NotEntered`
+    /// is still the empty string a consumer tests for.
+    fn label(self) -> &'static str {
+        match self {
+            PagingTaken::NotEntered => "",
+            PagingTaken::Perm => "Perm",
+            PagingTaken::OrderbyWalk => "OrderbyWalk",
+            PagingTaken::Gather => "Gather",
+            PagingTaken::GatherWalkDeclined => "GatherWalkDeclined",
+            PagingTaken::EmptyPage => "EmptyPage",
+            PagingTaken::NotComposable => "NotComposable",
+            PagingTaken::DeclineBroad => "DeclineBroad",
+            PagingTaken::DeclineSparseEstimate => "DeclineSparseEstimate",
+            PagingTaken::DeclineSparseExact => "DeclineSparseExact",
+            PagingTaken::RangeAligned => "RangeAligned",
+            PagingTaken::RangeWalk => "RangeWalk",
+            PagingTaken::RangeNotBare => "RangeNotBare",
+            PagingTaken::RangeSelective => "RangeSelective",
+            PagingTaken::RangeUnalignedPrice => "RangeUnalignedPrice",
+            PagingTaken::RangeSparse => "RangeSparse",
+            PagingTaken::RangeNoPermutation => "RangeNoPermutation",
+            PagingTaken::RangePermutationStale => "RangePermutationStale",
+        }
+    }
+}
+
+thread_local! {
+    /// Scratch slot the instrumented executors publish into. **Only meaningful between a
+    /// `take_phase_stats()` and the next publish** — that window is the whole contract, and
+    /// `explain_analyze` is the only caller that establishes it.
+    ///
+    /// Nothing clears this on the production path, deliberately: a `Cell` write per query to reset
+    /// state no production reader consults would be cost for nobody. So a reader added outside
+    /// `explain_analyze` gets an arbitrary earlier query's numbers, not zeros and not the current
+    /// query's. Take first, then run, then read.
+    ///
+    /// Every publisher writes this slot WHOLE. That is what keeps the staleness above bounded to
+    /// "the last query on this thread" instead of compounding: an earlier draft had the publishers
+    /// write 8 of 10 fields and inherit the rest through `..c.get()`, which silently widened "this
+    /// run" to "this thread, ever" and was measured leaking a compose-only `paging_taken` into
+    /// `GatheredScan` on 49 of 600 queries. The two fields that made `..c.get()` necessary are now
+    /// owned elsewhere: `paging_taken` by `PAGING_TAKEN` below, `ns_round_total`/`result_total` by
+    /// `explain_analyze`, which fills them after the take.
+    static PHASE_STATS: std::cell::Cell<PhaseStats> = const { std::cell::Cell::new(PhaseStats {
+        cards_visited: 0, printings_scanned: 0, matches_pushed: 0, ns_setup: 0, ns_loop: 0, ns_finish: 0, ns_round_total: 0,
+        ns_prepare: 0, result_total: 0, paging_taken: PagingTaken::NotEntered,
+    }) };
+
+    /// The compose fastpath's branch label, stored apart from `PHASE_STATS` because it is the one
+    /// field written by something that is not an executor, and on a path that runs in production.
+    ///
+    /// Two things fall out of the split, both of which the shared slot got wrong:
+    /// - a materializing publish can no longer wipe it, so the routed path's "compose declines,
+    ///   records its gate, falls through to a materializing plan" sequence is preserved by
+    ///   construction rather than by every publisher remembering to write `..c.get()`;
+    /// - `note_paging_taken` is a one-byte store instead of a read-modify-write of the whole
+    ///   ~80-byte `PhaseStats`, which matters because it is on the production compose path.
+    ///
+    /// `take_phase_stats` reassembles the two into one `PhaseStats`, so consumers see no seam.
+    static PAGING_TAKEN: std::cell::Cell<PagingTaken> = const { std::cell::Cell::new(PagingTaken::NotEntered) };
+
+    /// `prepare_candidates`' time for the run in progress, handed to the executor that follows it —
+    /// the two are separate calls in `run_query_with_plan`, and only the executor publishes stats.
+    ///
+    /// Unlike the two slots above this one is never cleared by `take_phase_stats`, because it is
+    /// not a stat: it is a value in flight between two calls, and the receiving executor consumes
+    /// it with `replace(0)`. That handoff is what keeps it from leaking, and it is an invariant
+    /// spanning three functions rather than anything the type system enforces — every
+    /// `timed_prepare_candidates` must be followed by an executor that publishes. The
+    /// `debug_assert` below pins it, because the failure is silent: an unconsumed value is read by
+    /// the NEXT participant and reported as its `ns_prepare`, which looks entirely plausible.
+    static PENDING_PREPARE_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// `prepare_candidates`, timed. Only `run_query_with_plan`'s materializing arms use this; the routed
+/// path calls `prepare_candidates` directly, since its cost already shows up in `acquire_ns`.
+fn timed_prepare_candidates(
+    ctx: &QueryCtx,
+    params: &QueryParams,
+    filter: &mut FilterExpr,
+    plane: Option<&PlaneExpr>,
+) -> PreparedCandidates {
+    // Nothing may be in flight here: the previous timed prepare's executor must already have
+    // consumed it. See PENDING_PREPARE_NS for why an unconsumed value is worse than a missing one.
+    debug_assert_eq!(
+        PENDING_PREPARE_NS.with(std::cell::Cell::get),
+        0,
+        "a previous timed_prepare_candidates was not consumed by an executor; its time would be reported as this run's",
+    );
+    let t = std::time::Instant::now();
+    let prep = prepare_candidates(ctx, params, filter, plane);
+    PENDING_PREPARE_NS.with(|c| c.set(t.elapsed().as_nanos() as u64));
+    prep
+}
+
+/// Record which paging branch the compose fastpath took. Reporting only -- see
+/// `PhaseStats::paging_taken` for why the predicted branch is not enough.
+fn note_paging_taken(which: PagingTaken) {
+    PAGING_TAKEN.with(|c| c.set(which));
+}
+
+/// Last executor run's phase stats, and clear them. `explain_analyze` reads this immediately after a
+/// timed run, having cleared beforehand — see `PHASE_STATS` for why that order is the contract and
+/// why an unpaired read does NOT see zeros.
+///
+/// Both slots are taken together, so a caller cannot clear one and leave the other to leak into the
+/// next participant — which is the whole failure `plan_stats_never_leak_between_participants` pins.
+fn take_phase_stats() -> PhaseStats {
+    let mut stats = PHASE_STATS.with(|c| c.replace(PhaseStats::default()));
+    stats.paging_taken = PAGING_TAKEN.with(|c| c.replace(PagingTaken::NotEntered));
+    stats
+}
+
 /// P4 executor: the universal gathered per-card loop + `select_page`. Runs any
 /// query (printing-keyed orderbys, stores without permutations, or anything the
 /// other plans decline). Caller has run `prepare_candidates`.
@@ -6297,6 +6734,8 @@ fn exec_gathered_scan<'a>(
     prep: &PreparedCandidates,
     plane: Option<&PlaneExpr>,
 ) -> (usize, Vec<(&'a AOracleCard, &'a APrinting)>) {
+    // First of the three phase boundaries — everything down to the match loop is `ns_setup`.
+    let t_start = std::time::Instant::now();
     let QueryCtx { cards, printings, offsets, strings, indexes } = *ctx;
     let QueryParams { mode, prefer, sort_col, descending, limit, page_offset } = *params;
     let all_match_known = prep.all_match_known;
@@ -6317,7 +6756,13 @@ fn exec_gathered_scan<'a>(
     // the current card (reused buffer; see FilterExpr::card_pass).
     let mut residual: Vec<&FilterExpr> = Vec::new();
     let mut residual_is_or = false;
+    // Counters for the three features this plan's cost arm keys on, so they can be checked against
+    // what the loop really does. Plain locals — no atomics, no branch — published once at the end.
+    let (mut n_cards_visited, mut n_printings_scanned, mut n_matches_pushed) = (0u64, 0u64, 0u64);
+    // Ends `ns_setup` and starts `ns_loop` — one read, two phases.
+    let t_loop = std::time::Instant::now();
     for cid in card_ids {
+        n_cards_visited += 1;
         let card = &cards[cid as usize];
         // #634 Step 1: all_match_known means the narrowing already proved
         // every candidate matches — card_pass would just re-derive Tri::True
@@ -6331,18 +6776,40 @@ fn exec_gathered_scan<'a>(
         let start = u32::from(offsets[cid as usize]) as usize;
         let end   = u32::from(offsets[cid as usize + 1]) as usize;
         let before = sel.buf().len();
+        n_printings_scanned += (end - start) as u64;
         push_card_matches(
             card, cid, printings, &indexes.artwork_group_col, start, end, all_match, &residual, residual_is_or, mode, prefer,
             sort_col, descending, strings, existential_plane, sel.buf(), &mut group_best, &mut touched,
         );
+        n_matches_pushed += (sel.buf().len() - before) as u64;
         sel.absorb(before);
     }
-
+    // Ends `ns_loop` and starts `ns_finish`.
+    let t_finish = std::time::Instant::now();
     let (total, page_ids) = sel.finish(page_offset, limit);
     let page = page_ids
         .into_iter()
         .map(|(cid, pid)| (&cards[cid as usize], &printings[pid as usize]))
         .collect();
+    let t_end = std::time::Instant::now();
+    let prep_ns = PENDING_PREPARE_NS.with(|c| c.replace(0));
+    PHASE_STATS.with(|c| {
+        // A WHOLE-struct set, deliberately: nothing here is inherited, so this executor cannot
+        // report a field an earlier query wrote. The compose fastpath's `paging_taken` survives
+        // regardless — it lives in `PAGING_TAKEN`, which this does not touch.
+        c.set(PhaseStats {
+            cards_visited: n_cards_visited,
+            printings_scanned: n_printings_scanned,
+            matches_pushed: n_matches_pushed,
+            ns_setup: (t_loop - t_start).as_nanos() as u64,
+            ns_loop: (t_finish - t_loop).as_nanos() as u64,
+            ns_finish: (t_end - t_finish).as_nanos() as u64,
+            ns_round_total: 0, // filled by explain_analyze, which owns the round timer
+            ns_prepare: prep_ns,
+            result_total: 0,   // likewise: explain_analyze fills it from the value actually returned
+            paging_taken: PagingTaken::NotEntered, // owned by PAGING_TAKEN; take_phase_stats merges it in
+        });
+    });
     (total, page)
 }
 
@@ -6495,7 +6962,7 @@ fn acquire_plan_features(
         // `project` pass — so the fused op wins the argmin and a bare range doesn't mis-route to compose.
         feats.scatter_printings = k;
         feats.project_printings = k;
-        (feats, Prep::Range)
+        (feats, Prep::Range(CountSource::CardRangePopcount))
     } else if PhysicalPlan::PrintingRangeScan.applicable(ctx, params, filter, plane) {
         // Bare range: exact k from the index (no scan). P3/P4 estimated unnarrowed
         // (their broad regime — a narrow range makes P1 lose, and dispatch materializes).
@@ -6503,7 +6970,7 @@ fn acquire_plan_features(
         let k = (idx.partition_point(|p| u32::from(p.0) < hi) - idx.partition_point(|p| u32::from(p.0) < lo)) as u32;
         let mut feats = mk_plan_feats(ctx, params, k, n_cards, n_printings, verify_cost_tier(filter));
         feats.scatter_printings = k; // for costing a competing PrintingCompose (which would scatter k); P1 itself walks, so its own cost ignores this
-        (feats, Prep::Range)
+        (feats, Prep::Range(CountSource::PrintingRangeScan))
     } else if PhysicalPlan::PrintingCompose.applicable(ctx, params, filter, plane) {
         // Composable printing-space expr, any distinct-on. Estimate the counts cheaply — the fast path
         // composes once, only if this plan wins (never in acquire; a legality broadcast paid here and
@@ -6543,7 +7010,7 @@ fn acquire_plan_features(
         } else {
             ComposePaging::Gather
         };
-        (feats, Prep::Range)
+        (feats, Prep::Range(CountSource::PrintingCompose))
     } else {
         let prep = prepare_candidates(ctx, params, filter, plane);
         let feats = candidate_feats(ctx, params, &prep, filter);
@@ -6608,7 +7075,11 @@ fn run_query_routed<'a>(
         // prepare_candidates yields for a True-residual plane query.
         (p, Prep::Plane) => exec_from_candidates(
             p, ctx, params, filter,
-            &PreparedCandidates { candidate_cards: Some(bitmap_card_ids(&plane_bits)), all_match_known: true },
+            // `None`, matching what `Prep::narrowed_repr` reports for a plane acquire: the field
+            // means "what the residual NARROWING produced", and no narrowing ran here — the list
+            // came from the plane bitmap. Diagnostic-only and unread on this path, but `CardBits`
+            // here would be the one value that contradicts `explain`'s contract if it ever were.
+            &PreparedCandidates { candidate_cards: Some(bitmap_card_ids(&plane_bits)), all_match_known: true, narrowed_repr: NarrowedRepr::None },
             plane,
         ),
         (p, Prep::Candidates(prep)) => exec_from_candidates(p, ctx, params, filter, prep, plane),
@@ -6618,13 +7089,13 @@ fn run_query_routed<'a>(
         //   - CardRangePopcount builds its card bitmap from the (re-derived, ~free) range bounds now.
         //   - the printing-space fast paths walk (or, if they decline — sparse total — materialize).
         //   - a materializing plan (StreamedSelect/GatheredScan) that beat them narrows + runs.
-        (PhysicalPlan::CardRangePopcount, Prep::Range) => {
+        (PhysicalPlan::CardRangePopcount, Prep::Range(_)) => {
             let (idx, lo, hi) = bare_range_bounds(filter, ctx.indexes).expect("applicable ⇒ bare range");
             let (card_bits, range_pbits) =
                 build_card_range_bits(idx, lo, hi, ctx.indexes, ctx.cards.len(), ctx.printings.len());
             exec_card_range_popcount(ctx, params, &card_bits, &range_pbits)
         }
-        (plan, Prep::Range) => {
+        (plan, Prep::Range(_)) => {
             let fast_page = match plan {
                 PhysicalPlan::PrintingRangeScan => printing_range_fastpath(ctx, params, filter),
                 PhysicalPlan::PrintingCompose => printing_compose_fastpath(ctx, params, filter),
@@ -6696,12 +7167,12 @@ fn run_query_with_plan<'a>(
             if !streamed_select_applicable(cards, sort_col, descending, indexes) {
                 return None;
             }
-            let prep = prepare_candidates(ctx, params, filter, plane);
+            let prep = timed_prepare_candidates(ctx, params, filter, plane);
             Some(exec_streamed_select(ctx, params, filter, &prep, plane))
         }
         PhysicalPlan::GatheredScan => {
             debug_assert!(gathered_scan_applicable());
-            let prep = prepare_candidates(ctx, params, filter, plane);
+            let prep = timed_prepare_candidates(ctx, params, filter, plane);
             Some(exec_gathered_scan(ctx, params, filter, &prep, plane))
         }
     }
@@ -6714,6 +7185,116 @@ fn run_query_with_plan<'a>(
 pub(crate) struct PlanEstimate {
     pub(crate) plan: PhysicalPlan,
     pub(crate) predicted_ns: f64,
+    /// `cost::materialize_cost` for this plan: the modelled `collect` + `sort_unstable` cost of the
+    /// candidate list it consumes — the candidate-production term `plan_cost` omits. Reported but
+    /// deliberately NOT added to `predicted_ns`; `0.0` for plans that build no candidate list. See
+    /// `cost.rs`'s "Candidate materialization" section for why it stays out of the routing decision.
+    ///
+    /// Charged on `eval_domain`, which is the candidate count only under a `Candidates` acquire.
+    /// Under `Prep::Range` the two materializing plans are estimated UNNARROWED
+    /// (`eval_domain = n_cards`), so this figure has no referent there -- do not pool range-acquired
+    /// rows with candidate-acquired ones when reading it.
+    pub(crate) materialize_ns: f64,
+    /// Whether this is the plan `run_query_routed` would run: the cheapest `predicted_ns`, which
+    /// after the ascending sort is index 0. Reported explicitly so a caller never has to
+    /// reconstruct the argmin — doing that over only the plans that *ran* (dropping runtime
+    /// decliners) silently diverges from what the router picks.
+    ///
+    /// One documented exception it cannot capture: for a `Prep::Range` acquire the router may
+    /// re-materialize and re-choose at dispatch, so the executed plan can still differ. See the
+    /// free `explain` fn's doc.
+    pub(crate) picked: bool,
+}
+
+/// What the acquire step itself did, which is per-QUERY rather than per-plan: every
+/// plan in the same `explain` call shares one of these. `plan_cost` prices only what
+/// happens *after* acquire — `eval_domain` and `matches` are its inputs, not its
+/// outputs — so a change to how candidates get materialized moves `acquire_ns` and
+/// leaves every `predicted_ns` untouched. That divergence is the point: it isolates
+/// the one term the cost model does not carry.
+pub(crate) struct AcquireFacts {
+    /// The full feature vector `cost::plan_cost` consumed for this query. Reported so a calibration
+    /// sweep can regress measured time on *exactly* the terms the model uses; fitting against
+    /// re-derived proxies instead means a feature error hides as a coefficient that will not settle.
+    pub(crate) feats: cost::PlanFeatures,
+    /// Which of `Prep`'s three count sources this query's structure selected. Only
+    /// `"candidates"` materializes a candidate list at all, so it is the first thing
+    /// to check before treating a query as a test case for materialization work.
+    pub(crate) count_source: CountSource,
+    /// `Candidates::repr` of what the narrowing produced — `cards`/`printings` mean a
+    /// sorted vec was built (some site ran a `collect` + `sort_unstable`), `card_bits`/
+    /// `printing_bits` mean it stayed word-wise. `none` means the residual narrowing produced
+    /// nothing: either no candidate list at all (`range`/`plane` acquire), or a candidate
+    /// acquire whose list came from the plane bitmap alone. Both are "no sort happened".
+    ///
+    /// Needed because a candidate *count* in a given band does not imply a sort was paid to
+    /// reach it: a plane AND'd with a range lands at the same count without sorting anything.
+    ///
+    /// A top-of-narrowing proxy, not a per-site census — see `Candidates::repr`.
+    pub(crate) narrowed_repr: NarrowedRepr,
+    /// Raw per-sample wall time of the acquire step — narrowing and any
+    /// materialization included. Not pre-reduced, same rationale as
+    /// `PlanTrial::trials_ns`. `explain` reports a single sample; `explain_analyze`
+    /// reports one per round.
+    ///
+    /// Every sample deliberately pays the one-time `memoize_text_predicates`
+    /// rewrite, because each is taken from a pristine filter clone (see
+    /// `explain_analyze`'s doc for why that fairness discipline matters). So for a
+    /// text-predicate query this OVERSTATES what a warm repeated query spends in
+    /// acquire, by that one-time cost — it is a fair number to compare across
+    /// queries, not an end-to-end latency component.
+    ///
+    /// Do NOT subtract this from a materializing plan's `trials_ns` to isolate that plan's
+    /// execution from the narrowing. `PhaseStats::ns_prepare` does that job properly: it times
+    /// `prepare_candidates` INSIDE the plan's own run, so `ns_round_total - ns_prepare` is two
+    /// numbers from one execution, with no cross-run cache-state assumption to be wrong about.
+    /// Subtraction here would also be measuring the wrong quantity — `acquire_plan_features` is
+    /// `prepare_candidates` PLUS cost-feature construction (`mk_plan_feats`,
+    /// `compose_printing_estimate`, `verify_cost_tier`), and on a range or compose acquire it skips
+    /// `prepare_candidates` entirely.
+    ///
+    /// What it is good for is the thing nothing else measures: the router's own pre-dispatch
+    /// overhead. `run_query_with_plan` forces a plan and never runs the argmin, so no `trials_ns`
+    /// contains any of it.
+    pub(crate) acquire_ns: Vec<u64>,
+    /// Raw per-round wall time of `run_query_routed` — the whole real path: acquire, choose,
+    /// dispatch, *and* the lazy re-materialize-and-re-choose a `Prep::Range` query can do at
+    /// dispatch. Empty from `explain`, which runs nothing.
+    ///
+    /// This is the row that decides whether a ranking error is a live defect. `explain_analyze`'s
+    /// per-plan `trials_ns` come from `run_query_with_plan`, which forces a plan and therefore
+    /// bypasses that re-choose; so "the picked plan is slower than the best plan" does not by
+    /// itself mean the engine runs the slow one. Compare against this: routed ≈ best means the
+    /// re-choose rescued it, routed ≈ picked means it did not.
+    ///
+    /// That comparison is inherently cross-execution — there is no in-run equivalent, because a
+    /// forced-plan run skips the argmin by construction — so it is the one row that genuinely needs
+    /// to be measured on the same terms as `trials_ns`, and it is: same pristine clone per round,
+    /// same warmup discard, and drawn from the same shuffled participant pool rather than pinned
+    /// ahead of the plan loop. That last part is load-bearing rather than tidiness: this dispatches
+    /// into the picked plan's executor, so a fixed position ahead of the plans would pre-warm
+    /// exactly the plan whose selection the comparison is meant to question.
+    pub(crate) routed_ns: Vec<u64>,
+}
+
+impl Prep {
+    /// The `count_source` label `AcquireFacts` reports.
+    fn count_source(&self) -> CountSource {
+        match self {
+            Prep::Range(acquire) => *acquire,
+            Prep::Plane => CountSource::Plane,
+            Prep::Candidates(_) => CountSource::Candidates,
+        }
+    }
+
+    /// The `narrowed_repr` label `AcquireFacts` reports. `Range` and `Plane` materialize no
+    /// candidate list at all, so they have no narrowing representation to report.
+    fn narrowed_repr(&self) -> NarrowedRepr {
+        match self {
+            Prep::Candidates(p) => p.narrowed_repr,
+            Prep::Range(_) | Prep::Plane => NarrowedRepr::None,
+        }
+    }
 }
 
 /// #745 primitive 1: every applicable plan's predicted cost for this query, ranked
@@ -6727,15 +7308,34 @@ pub(crate) struct PlanEstimate {
 /// dispatch would compute if that plan actually won and got lazily re-costed
 /// against a materialized candidate list (see `acquire_plan_features`'s
 /// `PrintingRangeScan`/`PrintingCompose` branches).
-fn explain(ctx: &QueryCtx, params: &QueryParams, filter: &mut FilterExpr, plane: Option<&PlaneExpr>) -> Vec<PlanEstimate> {
-    let (feats, _prep, _plane_bits) = acquire_plan_features(ctx, params, filter, plane);
+fn explain(ctx: &QueryCtx, params: &QueryParams, filter: &mut FilterExpr, plane: Option<&PlaneExpr>) -> (AcquireFacts, Vec<PlanEstimate>) {
+    let t0 = std::time::Instant::now();
+    let (feats, prep, _plane_bits) = acquire_plan_features(ctx, params, filter, plane);
+    let acquire_ns = t0.elapsed().as_nanos() as u64;
+    let facts = AcquireFacts {
+        count_source: prep.count_source(),
+        narrowed_repr: prep.narrowed_repr(),
+        feats, // moved: `eval_domain`/`n_cards`/`matches` live here and nowhere else
+        acquire_ns: vec![acquire_ns],
+        routed_ns: Vec::new(), // explain runs nothing
+    };
     let mut estimates: Vec<PlanEstimate> = PhysicalPlan::ALL
         .into_iter()
         .filter(|p| p.applicable(ctx, params, filter, plane))
-        .map(|plan| PlanEstimate { plan, predicted_ns: cost::plan_cost(plan, &feats) })
+        .map(|plan| PlanEstimate {
+            plan,
+            predicted_ns: cost::plan_cost(plan, &facts.feats),
+            materialize_ns: cost::materialize_cost(plan, &facts.feats),
+            picked: false, // set below, once the ranking is known
+        })
         .collect();
     estimates.sort_by(|a, b| a.predicted_ns.partial_cmp(&b.predicted_ns).expect("plan_cost is finite"));
-    estimates
+    // The router's argmin is index 0 after the sort. Marked here rather than left for the caller
+    // to re-derive, which is where a caller filtering out runtime decliners gets it wrong.
+    if let Some(first) = estimates.first_mut() {
+        first.picked = true;
+    }
+    (facts, estimates)
 }
 
 /// One applicable plan's `explain_analyze` (#745) result: the same predicted cost
@@ -6746,8 +7346,88 @@ fn explain(ctx: &QueryCtx, params: &QueryParams, filter: &mut FilterExpr, plane:
 pub(crate) struct PlanTrial {
     pub(crate) plan: PhysicalPlan,
     pub(crate) predicted_ns: f64,
+    /// Both carried through from `PlanEstimate` unchanged — see its fields. `picked` in particular
+    /// is the router's choice, which is NOT necessarily the fastest `trials_ns`: that difference is
+    /// the whole point of docs/issues/local-engine-plan-misselection.md.
+    pub(crate) materialize_ns: f64,
+    pub(crate) picked: bool,
     pub(crate) trials_ns: Vec<u64>,
+    /// Raw per-round wall time of the rounds where this plan ENTERED and then declined, producing
+    /// no page. Mutually exclusive with `trials_ns` in practice — a decline is deterministic for a
+    /// given query and store — so exactly one of the two is non-empty for a plan that participated.
+    ///
+    /// Separate from `trials_ns` rather than folded into it because the two answer different
+    /// questions and every consumer reduces `trials_ns` with `min` as "what this plan costs to run".
+    /// A decline is not a run: it produced nothing, and averaging it in would make a plan that bails
+    /// early look fast.
+    ///
+    /// Only the two printing-space fast paths can land here. `PhysicalPlan::applicable` is at least
+    /// as strong as the guard `run_query_with_plan` re-checks, so a plan `explain` ranked never
+    /// fails that guard — `None` from it is always a runtime decline, never a missed applicability
+    /// test. The other four either always produce a page or are not in the list.
+    ///
+    /// This is the cost of the decline itself, and it is not free: `PagingTaken::DeclineSparseExact`
+    /// fires AFTER `printing_compose_fastpath` has composed the printing bitmap, so those rounds pay
+    /// a full compose and throw it away before the general path runs the query again. The three
+    /// other declines gate before the compose and are cheap. `phases.paging_taken` is what tells the
+    /// two apart, which is why it is recorded for a declining plan even though nothing else is.
+    pub(crate) declined_ns: Vec<u64>,
+    /// Execution counters and coarse phase timings from this plan's FASTEST recorded round — the
+    /// same round `min(trials_ns)` names, so a phase share read against that total describes one
+    /// execution rather than two. See `PhaseStats`: the counters check whether the cost arm's
+    /// FEATURES match what the loop did, and the phase timings check whether its TERMS account for
+    /// the whole executor.
+    ///
+    /// (The counters are round-invariant — the same query visits the same cards every time — so
+    /// only the timings depend on which round is kept.)
+    ///
+    /// The three phases are contiguous and disjoint, so `ns_setup + ns_loop + ns_finish` can only
+    /// be <= `ns_round_total`. The shortfall is real unmodelled work — `run_query_with_plan`'s own
+    /// dispatch and applicability checks sit outside all three — so treat it as a residual to size,
+    /// not as an invariant that should reach zero.
+    ///
+    /// Populated for the two materializing plans — `GatheredScan` (`exec_gathered_scan`) and
+    /// `StreamedSelect` (`run_query_streamed`, which publishes from all three of its return paths).
+    /// The four fast paths — `PrintingRangeScan`, `PrintingCompose`, `PlanePopcountOrder`,
+    /// `CardRangePopcount` — are NOT instrumented and report zeros, except `paging_taken`, which
+    /// the two printing-space fastpaths set on their own. `PlanePopcountOrder` and
+    /// `CardRangePopcount` write nothing at all and are the only plans for which a `NotEntered`
+    /// label is expected on a successful run.
+    ///
+    /// A consumer must not read all-zero counters as "this plan did no work": `explain_analyze`
+    /// fills `ns_round_total` for every round it records, so `ns_round_total > 0 && ns_loop == 0` is
+    /// the uninstrumented case, and `ns_round_total == 0` means the plan completed no round.
+    ///
+    /// `ns_round_total == 0` has two sub-cases, and `declined_ns` is what separates them:
+    ///
+    /// - `declined_ns` empty — the plan never produced a page and never entered a fastpath either.
+    /// - `declined_ns` non-empty — the plan entered and declined. Everything here is zero EXCEPT
+    ///   `paging_taken`, which names the gate that fired. That is the whole point of recording
+    ///   stats for a plan that produced nothing: without it a declining `PrintingCompose` is
+    ///   indistinguishable from one that was never tried, and the decline labels — compose's
+    ///   `NotComposable`/`DeclineBroad`/`DeclineSparseEstimate`/`DeclineSparseExact` and the range
+    ///   fastpath's `RangeSelective`/`RangeSparse`/`RangeUnalignedPrice`/`RangeNoPermutation` (plus
+    ///   the two tripwires `RangeNotBare`/`RangePermutationStale`) — would be reachable only from
+    ///   Rust. The counters and phase timings stay zero because no executor ran — a decline is a
+    ///   gate, not a loop.
+    pub(crate) phases: PhaseStats,
 }
+
+/// One timed unit inside an `explain_analyze` round. The acquire step and the routed path are
+/// participants rather than fixed preludes so the round's shuffle covers them too — see
+/// `explain_analyze`'s doc for why a pinned position biases the plans they pre-warm.
+#[derive(Clone, Copy)]
+enum Participant {
+    /// Index into `estimates` / `trials_ns` / `phases`.
+    Plan(usize),
+    Acquire,
+    Routed,
+}
+
+/// Fixed so a given query shuffles identically on every run. An A/B against another build has to
+/// compare the same execution order or the ordering drift swamps what is being measured — the same
+/// reason `bench_candidate_materialize` seeds its own generator rather than sampling entropy.
+const PARTICIPANT_SHUFFLE_SEED: u64 = 745_002;
 
 /// #745 primitive 2: actually run every applicable plan via `run_query_with_plan`,
 /// `num_warmups` discarded rounds then `num_trials` recorded rounds, returning the
@@ -6769,9 +7449,34 @@ pub(crate) struct PlanTrial {
 /// `plan_cost_model_matches_gold` already use (tests.rs), just via `Clone` instead
 /// of re-deriving from a `FuzzSpec`, since a real caller only has the bound tree.
 ///
-/// Rotates which plan runs first/last each round (`(i + round) % n`) rather than a
-/// fixed order, so no plan systematically benefits from whatever accumulates
-/// round-over-round (allocator state, cache residency).
+/// Each round runs `n + 2` participants in a freshly shuffled order: every applicable plan, plus
+/// the acquire step and the routed path. Shuffled rather than cyclically rotated, because a
+/// rotation only moves the cut point — the cyclic adjacency is fixed, so every participant keeps
+/// the same immediate predecessor round after round, and rotation balances only which one goes
+/// first.
+///
+/// That distinction matters here because two participants warm work the others then reuse, and each
+/// warms a *subset* of the plans it is meant to be compared against:
+/// - `run_query_routed` dispatches into the picked plan's executor, so pinning it ahead of the plan
+///   loop pre-warms exactly the plan whose selection `PlanTrial::picked` exists to question.
+/// - on a candidate acquire, `acquire_plan_features` calls the very `prepare_candidates` that
+///   `StreamedSelect` and `GatheredScan` are about to call, and that the four fast paths never do.
+///   (On a range or compose acquire it takes the cheap estimate branch and does not, so the bias is
+///   present for one acquire class and absent for another — it does not even wash out as a constant
+///   offset across a table keyed by acquire branch.)
+///
+/// The shuffle is seeded from a fixed constant, so ordering stays reproducible for the same query
+/// while still decorrelating which participant follows which.
+///
+/// What the shuffle gives up, and why `num_trials` has to carry it: rotation was *position-balanced*
+/// — over `n` rounds every participant occupied every slot exactly once — and an independent
+/// per-round shuffle is not. At `num_trials = 3` a participant can draw the warm tail of the round
+/// twice by chance, and since every consumer reduces `trials_ns` with `min`, that lower sample is
+/// the one that survives. The trade is still right, because the bias it removes was directional and
+/// unequal across acquire classes while this one is zero-mean and shrinks with rounds — but it
+/// shrinks only with rounds. Prefer enough trials for positions to average out
+/// (`scripts/bench_cost_model_agreement.py` uses 7); do not read a 2-3 trial run as a fair
+/// head-to-head between plans whose times are within ~10% of each other.
 ///
 /// `trials_ns` is a fair head-to-head *between plans*, not a reproduction of a real
 /// query's wall time: each `run_query_with_plan` call re-runs its own
@@ -6785,31 +7490,111 @@ fn explain_analyze(
     plane: Option<&PlaneExpr>,
     num_warmups: usize,
     num_trials: usize,
-) -> Vec<PlanTrial> {
+) -> (AcquireFacts, Vec<PlanTrial>) {
+    use rand::SeedableRng as _;
+    use rand::seq::SliceRandom as _;
+
     // explain() needs `&mut` for its own (one-time) acquire-step mutation; clone so
     // the timing loop below starts from `filter`'s untouched, pristine state.
-    let estimates = explain(ctx, params, &mut filter.clone(), plane);
+    let (mut facts, estimates) = explain(ctx, params, &mut filter.clone(), plane);
+    // explain()'s single sample was taken outside the loop below, so it sits in a
+    // different cache/allocator state than the plan trials it would be compared
+    // against. Discard it and re-sample in-loop, one per round, from the same fresh
+    // clones and the same shuffled position pool the plans draw from.
+    facts.acquire_ns.clear();
 
     let n = estimates.len();
     let mut trials_ns: Vec<Vec<u64>> = vec![Vec::with_capacity(num_trials); n];
+    // Rounds where a plan entered and declined instead of producing a page. Kept apart from
+    // `trials_ns` so `min(trials_ns)` never mixes "what running costs" with "what bailing costs" —
+    // see `PlanTrial::declined_ns`.
+    let mut declined_ns: Vec<Vec<u64>> = vec![Vec::new(); n];
+    let mut phases: Vec<PhaseStats> = vec![PhaseStats::default(); n];
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(PARTICIPANT_SHUFFLE_SEED);
+    let mut order: Vec<Participant> =
+        (0..n).map(Participant::Plan).chain([Participant::Acquire, Participant::Routed]).collect();
+    // Every participant clears both stat slots after itself, so this is only about the very first
+    // one: with `num_warmups == 0` an uninstrumented plan would otherwise report whatever an
+    // earlier query on this thread left in `PAGING_TAKEN`, which nothing on the production path
+    // resets.
+    take_phase_stats();
     for round in 0..(num_warmups + num_trials) {
-        for i in 0..n {
-            let idx = (i + round) % n;
-            let plan = estimates[idx].plan;
+        order.shuffle(&mut rng);
+        for &participant in &order {
             let mut round_filter = filter.clone();
+            // Bound rather than consumed, so the clock read below excludes every participant's own
+            // deallocation — otherwise the plans, which hold their result, would be measured on
+            // different terms from the two that discard it.
+            let (mut ran, mut acquired, mut routed) = (None, None, None);
             let t0 = std::time::Instant::now();
-            let ran = run_query_with_plan(plan, ctx, params, &mut round_filter, plane);
+            match participant {
+                Participant::Plan(i) => ran = run_query_with_plan(estimates[i].plan, ctx, params, &mut round_filter, plane),
+                Participant::Acquire => acquired = Some(acquire_plan_features(ctx, params, &mut round_filter, plane)),
+                Participant::Routed => routed = Some(run_query_routed(ctx, params, &mut round_filter, plane)),
+            }
             let dt = t0.elapsed().as_nanos() as u64;
-            // A structurally-applicable plan's fastpath can still decline at runtime
-            // (e.g. PrintingCompose on a sparse total) — deterministic for this
-            // query/data, so a decliner simply never accumulates trials.
-            if ran.is_some() && round >= num_warmups {
-                trials_ns[idx].push(dt);
+            drop((acquired, routed));
+            // Uniform, and read immediately: the next participant's run overwrites the thread-local.
+            // Routed and the plans dispatch into the same executors, so a participant that publishes
+            // nothing would otherwise read its predecessor's counters as its own. That is what the
+            // routed path needed a special-case clear for while it sat outside this loop — measured
+            // then: 49 of 600 queries had GatheredScan reporting a `paging_taken` only the compose
+            // fastpath sets.
+            let mut stats = take_phase_stats();
+            if round < num_warmups {
+                continue;
+            }
+            match participant {
+                Participant::Acquire => facts.acquire_ns.push(dt),
+                Participant::Routed => facts.routed_ns.push(dt),
+                // A structurally-applicable plan's fastpath can still decline at runtime
+                // (e.g. PrintingCompose on a sparse total) — deterministic for this
+                // query/data, so a decliner simply never accumulates trials.
+                Participant::Plan(i) => {
+                    if let Some((total, _)) = &ran {
+                        stats.ns_round_total = dt;
+                        stats.result_total = *total as u64;
+                        // Keep the FASTEST recorded round's phases, not the last one's. Every
+                        // consumer reduces `trials_ns` with `min`, so carrying the last round's
+                        // split means the phase breakdown describes a different (and by
+                        // construction slower, often contended) execution than the total it gets
+                        // read next to. Cheaper than it looks: `ns_round_total` travels inside
+                        // `stats`, so the two always agree about which round they came from.
+                        if trials_ns[i].iter().all(|&prev| dt < prev) {
+                            phases[i] = stats;
+                        }
+                        trials_ns[i].push(dt);
+                    } else {
+                        // Entered and declined. Nothing executed, so the counters and phase timings
+                        // stay at their default zeros — but the GATE is a real observation, and it
+                        // is the only place the four decline labels are visible from outside Rust.
+                        // Assigned rather than merged: everything else in `stats` is already zero
+                        // here, and leaving `ns_round_total` at 0 keeps "completed no round" true.
+                        phases[i].paging_taken = stats.paging_taken;
+                        declined_ns[i].push(dt);
+                    }
+                }
             }
         }
     }
 
-    estimates.into_iter().zip(trials_ns).map(|(e, trials_ns)| PlanTrial { plan: e.plan, predicted_ns: e.predicted_ns, trials_ns }).collect()
+    let trials =
+        estimates
+        .into_iter()
+        .zip(trials_ns)
+        .zip(declined_ns)
+        .zip(phases)
+        .map(|(((e, trials_ns), declined_ns), phases)| PlanTrial {
+            plan: e.plan,
+            predicted_ns: e.predicted_ns,
+            materialize_ns: e.materialize_ns,
+            picked: e.picked,
+            trials_ns,
+            declined_ns,
+            phases,
+        })
+        .collect();
+    (facts, trials)
 }
 
 /// #634 Step 2: popcount-skip order phase. Scoped to `unique=card` queries
@@ -6961,6 +7746,9 @@ fn run_query_streamed<'a>(
     card_ids: Box<dyn Iterator<Item = u32> + '_>,
     existential_plane: Option<(&PlaneExpr, &Archived<BitPlanes>)>,
 ) -> (usize, Vec<(&'a AOracleCard, &'a APrinting)>) {
+    // First of the three phase boundaries — everything down to the match loop is `ns_setup`, which
+    // for this executor is dominated by the `counts` zeroing below. See `PhaseStats::ns_setup`.
+    let t_start = std::time::Instant::now();
     let QueryCtx { cards, printings, offsets, strings, indexes } = *ctx;
     let QueryParams { mode, prefer, sort_col, descending, limit, page_offset } = *params;
     let artwork_groups = &indexes.artwork_groups;
@@ -6983,7 +7771,13 @@ fn run_query_streamed<'a>(
     counts.resize(cards.len(), 0);
     let have_group_counts = artwork_groups.len() == cards.len();
     let mut total: usize = 0;
+    // Same counters GatheredScan publishes, so the two plans' arms can be checked the same way.
+    // Locals in the loop; published once at the end. See PhaseStats.
+    let (mut n_cards_visited, mut n_printings_scanned, mut n_matches_pushed) = (0u64, 0u64, 0u64);
+    // Ends `ns_setup` and starts `ns_loop` — one read, two phases.
+    let t_loop = std::time::Instant::now();
     for cid in card_ids {
+        n_cards_visited += 1;
         let card = &cards[cid as usize];
         // #634 Step 1: skip the redundant card_pass re-derivation of Tri::True
         // when the narrowing already proved every candidate matches. Gated
@@ -7003,6 +7797,12 @@ fn run_query_streamed<'a>(
             };
         let start = u32::from(offsets[cid as usize]) as usize;
         let end   = u32::from(offsets[cid as usize + 1]) as usize;
+        // Counted HERE, below the `card_pass` continue above, because a card rejected there never has
+        // its printings touched. Counting at the top of the loop instead included them, so this plan
+        // and GatheredScan reported different `printings_scanned` for identical work whenever the
+        // narrowing was inexact -- and `scan_units` has one definition, so at most one could be the
+        // valid comparison.
+        n_printings_scanned += (end - start) as u64;
         // Every printing matches: card/printing counts are O(1) inside the
         // helper, and the artwork group count is a build-time constant.
         let c = if all_match && matches!(mode, Mode::Artwork) && have_group_counts {
@@ -7015,8 +7815,32 @@ fn run_query_streamed<'a>(
         };
         counts[cid as usize] = c;
         total += c as usize;
+        n_matches_pushed += c as u64;
     }
+    // Ends `ns_loop` and starts `ns_finish`.
+    let t_finish = std::time::Instant::now();
+    // Publishing helper: the walk below has several early returns, and every one of them must leave
+    // the stats behind or the accounting silently attributes this plan's work to nothing. Each takes
+    // the closing instant itself, so the emit phase is bounded without a second start marker.
+    let publish = |end: std::time::Instant| {
+        let prep_ns = PENDING_PREPARE_NS.with(|c| c.replace(0));
+        PHASE_STATS.with(|c| {
+            c.set(PhaseStats {
+                cards_visited: n_cards_visited,
+                printings_scanned: n_printings_scanned,
+                matches_pushed: n_matches_pushed,
+                ns_setup: (t_loop - t_start).as_nanos() as u64,
+                ns_loop: (t_finish - t_loop).as_nanos() as u64,
+                ns_finish: (end - t_finish).as_nanos() as u64,
+                ns_round_total: 0,
+                ns_prepare: prep_ns,
+                result_total: 0,                       // see the note at the other publisher
+                paging_taken: PagingTaken::NotEntered, // ditto: owned by PAGING_TAKEN
+            });
+        });
+    };
     if total == 0 || page_offset >= total {
+        publish(std::time::Instant::now());
         return (total, Vec::new());
     }
 
@@ -7052,6 +7876,7 @@ fn run_query_streamed<'a>(
             .into_iter()
             .map(|(cid, pid)| (&cards[cid as usize], &printings[pid as usize]))
             .collect();
+        publish(std::time::Instant::now());
         return (total, page);
     }
 
@@ -7094,6 +7919,7 @@ fn run_query_streamed<'a>(
         }
         skip = 0;
     }
+    publish(std::time::Instant::now());
     (total, page)
     }) // COUNTS.with
 }
@@ -7349,6 +8175,8 @@ fn plan_estimate_to_pydict<'py>(py: Python<'py>, e: &PlanEstimate) -> PyResult<B
     let d = PyDict::new(py);
     d.set_item("plan", format!("{:?}", e.plan))?;
     d.set_item("predicted_ns", e.predicted_ns)?;
+    d.set_item("materialize_ns", e.materialize_ns)?;
+    d.set_item("picked", e.picked)?;
     Ok(d)
 }
 
@@ -7356,7 +8184,57 @@ fn plan_trial_to_pydict<'py>(py: Python<'py>, t: &PlanTrial) -> PyResult<Bound<'
     let d = PyDict::new(py);
     d.set_item("plan", format!("{:?}", t.plan))?;
     d.set_item("predicted_ns", t.predicted_ns)?;
+    d.set_item("materialize_ns", t.materialize_ns)?;
+    d.set_item("picked", t.picked)?;
     d.set_item("trials_ns", t.trials_ns.clone())?;
+    // Non-empty only for a plan that entered a fastpath and declined; `paging_taken` below names
+    // the gate. See `PlanTrial::declined_ns` — a decline is not a cheap run, and
+    // `DeclineSparseExact` in particular pays a full compose first.
+    d.set_item("declined_ns", t.declined_ns.clone())?;
+    d.set_item("cards_visited", t.phases.cards_visited)?;
+    d.set_item("printings_scanned", t.phases.printings_scanned)?;
+    d.set_item("matches_pushed", t.phases.matches_pushed)?;
+    d.set_item("ns_setup", t.phases.ns_setup)?;
+    d.set_item("ns_loop", t.phases.ns_loop)?;
+    d.set_item("ns_finish", t.phases.ns_finish)?;
+    d.set_item("ns_round_total", t.phases.ns_round_total)?;
+    d.set_item("ns_prepare", t.phases.ns_prepare)?;
+    // Ground truth for this run, and which paging branch really ran. Both exist so a harness can
+    // check the model against what happened rather than against a second, separate execution.
+    d.set_item("result_total", t.phases.result_total)?;
+    d.set_item("paging_taken", t.phases.paging_taken.label())?;
+    Ok(d)
+}
+
+/// The acquire step's per-query facts, as both `explain` and `explain_analyze` report
+/// them under the `"acquire"` key.
+fn acquire_facts_to_pydict<'py>(py: Python<'py>, f: &AcquireFacts) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("count_source", f.count_source.label())?;
+    d.set_item("narrowed_repr", f.narrowed_repr.label())?;
+    d.set_item("acquire_ns", f.acquire_ns.clone())?;
+    d.set_item("routed_ns", f.routed_ns.clone())?;
+    // The model's own inputs, so a calibration fit regresses on the same vector `plan_cost` reads.
+    let g = &f.feats;
+    for (k, v) in [
+        ("eval_domain", g.eval_domain),
+        ("n_cards", g.n_cards),
+        ("matches", g.matches),
+        ("n_printings", g.n_printings),
+        ("scan_units", g.scan_units),
+        ("residual_tier_ns100", g.residual_tier_ns100),
+        ("limit", g.limit),
+        ("offset", g.offset),
+        ("broadcast_printings", g.broadcast_printings),
+        ("scatter_printings", g.scatter_printings),
+        ("project_printings", g.project_printings),
+        ("popcount_words", g.popcount_words),
+    ] {
+        d.set_item(k, v)?;
+    }
+    // `label()`, not `Debug` — a consumer compares this against `PagingTaken::label()`, so the two
+    // have to spell the shared strategy names identically. See `ComposePaging::label`.
+    d.set_item("compose_paging", g.compose_paging.label())?;
     Ok(d)
 }
 
@@ -7853,7 +8731,7 @@ impl QueryEngine {
         direction: &str,
         limit: usize,
         offset: usize,
-    ) -> PyResult<Bound<'py, PyList>> {
+    ) -> PyResult<Bound<'py, PyDict>> {
         let mmap = self.get_mmap()?;
         // Safety: see query()'s access_unchecked justification.
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
@@ -7872,10 +8750,13 @@ impl QueryEngine {
         // more per-card work. `explain_analyze` does take `prefer` and really runs the
         // plans, so its `trials_ns` reflect it even though its `predicted_ns` doesn't.
         let params = QueryParams::from_strs(unique, "default", orderby, direction, limit, offset);
-        let estimates = explain(&QueryCtx::from(data), &params, &mut filter_expr, plane_expr.as_ref());
+        let (facts, estimates) = explain(&QueryCtx::from(data), &params, &mut filter_expr, plane_expr.as_ref());
 
         let rows: Vec<Bound<PyDict>> = estimates.iter().map(|e| plan_estimate_to_pydict(py, e)).collect::<PyResult<Vec<_>>>()?;
-        PyList::new(py, rows)
+        let out = PyDict::new(py);
+        out.set_item("acquire", acquire_facts_to_pydict(py, &facts)?)?;
+        out.set_item("plans", PyList::new(py, rows)?)?;
+        Ok(out)
     }
 
     /// #745 primitive 2: run every applicable plan `num_warmups + num_trials`
@@ -7898,7 +8779,7 @@ impl QueryEngine {
         offset: usize,
         num_warmups: usize,
         num_trials: usize,
-    ) -> PyResult<Bound<'py, PyList>> {
+    ) -> PyResult<Bound<'py, PyDict>> {
         let mmap = self.get_mmap()?;
         // Safety: see query()'s access_unchecked justification.
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
@@ -7910,10 +8791,13 @@ impl QueryEngine {
         // conversion below stay on the GIL.
         let ctx = QueryCtx::from(data);
         let params = QueryParams::from_strs(unique, prefer, orderby, direction, limit, offset);
-        let trials = py.detach(|| explain_analyze(&ctx, &params, &filter_expr, plane_expr.as_ref(), num_warmups, num_trials));
+        let (facts, trials) = py.detach(|| explain_analyze(&ctx, &params, &filter_expr, plane_expr.as_ref(), num_warmups, num_trials));
 
         let rows: Vec<Bound<PyDict>> = trials.iter().map(|t| plan_trial_to_pydict(py, t)).collect::<PyResult<Vec<_>>>()?;
-        PyList::new(py, rows)
+        let out = PyDict::new(py);
+        out.set_item("acquire", acquire_facts_to_pydict(py, &facts)?)?;
+        out.set_item("plans", PyList::new(py, rows)?)?;
+        Ok(out)
     }
 
     fn size(&self) -> PyResult<usize> {
@@ -8047,3 +8931,5 @@ mod bench_word_dict_scan;
 mod bench_card_dedup;
 #[cfg(test)]
 mod bench_compose_paging;
+#[cfg(test)]
+mod bench_candidate_materialize;

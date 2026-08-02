@@ -1258,13 +1258,31 @@ class TestExplain:
 
     def test_explain_ranks_applicable_plans_ascending(self, engine: QueryEngine) -> None:
         filters = parse_scryfall_query("t:creature")
-        rows = engine.explain(filters=filters, unique="card", orderby="edhrec", direction="asc", limit=50, offset=0)
+        result = engine.explain(filters=filters, unique="card", orderby="edhrec", direction="asc", limit=50, offset=0)
+        rows = result["plans"]
 
         assert rows, "GatheredScan is always applicable"
         assert {"plan", "predicted_ns"} <= rows[0].keys()
         predicted_ns = [row["predicted_ns"] for row in rows]
         assert predicted_ns == sorted(predicted_ns)
         assert any(row["plan"] == "GatheredScan" for row in rows)
+
+    def test_explain_reports_the_features_the_cost_model_consumes(self, engine: QueryEngine) -> None:
+        """The acquire vector is the point of the diagnostic.
+
+        A calibration fit regresses on exactly what `cost::plan_cost` reads, rather than on a
+        reconstruction of it that can drift.
+        """
+        filters = parse_scryfall_query("t:creature")
+        acquire = engine.explain(filters=filters, unique="card", orderby="edhrec", direction="asc", limit=50, offset=0)["acquire"]
+
+        assert acquire["count_source"], "every query is acquired through some branch"
+        # The cost model's own inputs, so a mis-counted feature is visible as itself.
+        assert {"eval_domain", "scan_units", "matches", "n_cards", "n_printings", "residual_tier_ns100"} <= acquire.keys()
+        assert acquire["limit"] == 50
+        assert acquire["offset"] == 0
+        assert acquire["n_cards"] > 0
+        assert acquire["eval_domain"] <= acquire["n_cards"], "candidates cannot exceed the card universe"
 
     def test_explain_analyze_matches_explain_and_times_every_plan(self, engine: QueryEngine) -> None:
         filters = parse_scryfall_query("t:creature")
@@ -1283,12 +1301,75 @@ class TestExplain:
 
         # Same plans, same order, same predicted_ns -- explain_analyze must never
         # diverge from explain (they share the engine's acquire_plan_features step).
-        assert [row["plan"] for row in analyzed] == [row["plan"] for row in explained]
-        assert [row["predicted_ns"] for row in analyzed] == [row["predicted_ns"] for row in explained]
-        for row in analyzed:
+        assert [row["plan"] for row in analyzed["plans"]] == [row["plan"] for row in explained["plans"]]
+        assert [row["predicted_ns"] for row in analyzed["plans"]] == [row["predicted_ns"] for row in explained["plans"]]
+        # The features must agree too, not just the predictions: they are the inputs those
+        # predictions are computed from, and a harness that reads one and times the other would be
+        # silently comparing two different queries.
+        assert analyzed["acquire"]["count_source"] == explained["acquire"]["count_source"]
+        for key in ("eval_domain", "scan_units", "matches"):
+            assert analyzed["acquire"][key] == explained["acquire"][key]
+        for row in analyzed["plans"]:
             # A structurally-applicable plan's fastpath can still decline at runtime
             # (empty trials_ns); otherwise warmups are discarded and exactly
             # num_trials recorded.
             assert row["trials_ns"] == [] or len(row["trials_ns"]) == 3
             assert all(t >= 0 for t in row["trials_ns"])
-        assert any(row["plan"] == "GatheredScan" and len(row["trials_ns"]) == 3 for row in analyzed)
+            # A decline is reported as its own thing rather than as an absence: it produced no page,
+            # so it is not a trial, but it still cost wall time and named the gate that fired. The
+            # two are mutually exclusive because a decline is deterministic for one query and store.
+            assert not (row["trials_ns"] and row["declined_ns"]), f"{row['plan']} reported both trials and declines"
+            if row["declined_ns"]:
+                assert len(row["declined_ns"]) == 3
+                # Nothing executed, so a non-zero counter here would be another plan's.
+                assert (row["cards_visited"], row["matches_pushed"], row["ns_round_total"]) == (0, 0, 0)
+        assert any(row["plan"] == "GatheredScan" and len(row["trials_ns"]) == 3 for row in analyzed["plans"])
+
+    def test_explain_analyze_counters_track_the_features_that_predict_them(self, engine: QueryEngine) -> None:
+        """Each counter exists to check the feature that is supposed to predict it.
+
+        A mis-counted feature then shows up as itself rather than as a rate that will not calibrate.
+        `t:creature`/card narrows, so the plan that runs must visit candidates and push results, and
+        the phase split must account for the round it reports.
+        """
+        filters = parse_scryfall_query("t:creature")
+        result = engine.explain_analyze(
+            filters=filters,
+            unique="card",
+            # `prefer` is the PRINTING preference, not a plan selector -- `prefer_from_str` maps
+            # anything unrecognised to `Prefer::Default`. explain_analyze times every applicable plan
+            # regardless, so the plan under test is looked up by name from the results below.
+            prefer="default",
+            orderby="edhrec",
+            direction="asc",
+            limit=50,
+            offset=0,
+            num_warmups=1,
+            num_trials=2,
+        )
+        acquire = result["acquire"]
+        gathered = next(row for row in result["plans"] if row["plan"] == "GatheredScan")
+        assert gathered["trials_ns"], "GatheredScan always runs"
+
+        assert gathered["cards_visited"] > 0
+        assert gathered["matches_pushed"] > 0
+        # Card mode returns one row per matching card, so the pushes ARE the distinct-card total.
+        assert gathered["matches_pushed"] <= acquire["n_cards"]
+        # The phase split must account for the round, or a phase's cost is attributed to nothing.
+        # The phases are disjoint sub-intervals of the round, so they can only sum to less than it --
+        # the shortfall is the unmodelled remainder this instrumentation exists to size.
+        # NOT asserted individually as > 0: they are timings, and on a corpus this small
+        # `prepare_candidates` really does complete inside the clock's granularity and report 0.
+        assert gathered["ns_round_total"] >= gathered["ns_loop"]
+        phases = gathered["ns_prepare"] + gathered["ns_setup"] + gathered["ns_loop"] + gathered["ns_finish"]
+        assert phases <= gathered["ns_round_total"], "phase split exceeds the round it came from"
+
+        # `result_total` is ground truth for the analyzed run itself, which is the whole reason it
+        # exists: before it, a harness wanting the true cardinality made a SECOND `query()` call and
+        # ASSUMED the two agreed. Check the assumption once here, since every plan is supposed to
+        # return the same total for one query -- that is a correctness invariant, not a measurement.
+        expected_total, _ = _run(engine, "t:creature", unique="card", orderby="edhrec", limit=50)
+        for row in result["plans"]:
+            if not row["trials_ns"]:
+                continue  # declined at runtime, so it produced no total
+            assert row["result_total"] == expected_total, f"{row['plan']} disagrees with query()'s total"

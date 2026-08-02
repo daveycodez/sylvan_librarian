@@ -5,7 +5,8 @@ use super::{
     assign_artwork_groups, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
     cards_of_printings, count_common_keywords, count_common_types,
     build_artist_index, build_range_index, build_arith_tuple_index, is_arith_tuple_route, range_candidates, narrow_candidates, narrow_candidates_exact, rarity_candidates,
-    range_too_broad_to_narrow, run_query, run_query_with_plan, explain, explain_analyze, PlanEstimate, PlanTrial,
+    range_too_broad_to_narrow, run_query, run_query_with_plan, explain, explain_analyze, AcquireFacts, PlanEstimate, PlanTrial,
+    acquire_plan_features, take_phase_stats, PagingTaken, CountSource, NarrowedRepr,
     PhysicalPlan, ComposePaging, trigram_candidates, finalize_trigram_index, PrintingRangeIndex, NARROW_FLOOR,
     gathered_scan_applicable, streamed_select_applicable, plane_popcount_order_applicable, printing_range_scan_applicable,
     walk_printing_page, aligned_page, bare_range_bounds, probe_range_k, printing_range_fastpath, sort_key_bits, orderby_to_col, SortCol, STREAM_MIN_MATCHES,
@@ -3058,8 +3059,35 @@ fn explain_reports_ranked_applicable_plans() {
             let (pe, mut filter) = split_planes(
                 fuzz_bound_filter(spec, archived), &archived.indexes.planes, &archived.indexes.oracle_trigram.words, matches!(mode, Mode::Card),
             );
-            let estimates: Vec<PlanEstimate> = explain(
+            let (facts, estimates): (AcquireFacts, Vec<PlanEstimate>) = explain(
                 &QueryCtx::from(archived), &explain_params(mode, 60), &mut filter, pe.as_ref(),
+            );
+
+            // The acquire facts every plan in this call shares. `eval_domain` is what a
+            // caller filters on to decide whether a query exercises a given code path,
+            // so it must be a real count in range, not a placeholder.
+            //
+            // NOT asserted here any more: that `count_source` and `narrowed_repr` are drawn from
+            // their known sets. Both were `&'static str` and a "label is one of these five"
+            // `matches!` was the only thing keeping a typo'd or invented label out; as `CountSource`
+            // and `NarrowedRepr` the type says it, and the check would be a tautology.
+            assert_eq!(facts.feats.n_cards, archived.cards.len() as u32, "n_cards must be the corpus size");
+            assert!(
+                facts.feats.eval_domain <= facts.feats.n_cards,
+                "eval_domain {} exceeds n_cards {} ({mode_label}, {})",
+                facts.feats.eval_domain,
+                facts.feats.n_cards,
+                fuzz_describe(spec),
+            );
+            assert_eq!(facts.acquire_ns.len(), 1, "explain() reports exactly one acquire sample");
+            // `None` is legitimate for a candidate-acquired query — the residual narrowing can
+            // produce nothing and leave the plane bitmap as the whole candidate list, which is
+            // itself a "no sort happened" signal. What must still hold, and what no type enforces,
+            // is that the two preps which materialize no candidate list never claim otherwise.
+            assert!(
+                facts.count_source == CountSource::Candidates || facts.narrowed_repr == NarrowedRepr::None,
+                "{:?}-acquired query reported narrowed_repr {:?} ({mode_label}, {})",
+                facts.count_source, facts.narrowed_repr, fuzz_describe(spec),
             );
 
             assert!(!estimates.is_empty(), "GatheredScan is always applicable ({mode_label}, {})", fuzz_describe(spec));
@@ -3071,6 +3099,25 @@ fn explain_reports_ranked_applicable_plans() {
                 estimates.windows(2).all(|w| w[0].predicted_ns <= w[1].predicted_ns),
                 "explain() not sorted ascending ({mode_label}, {})", fuzz_describe(spec),
             );
+            // Exactly one plan is the router's pick, and it is the cheapest predicted — i.e. index
+            // 0 after the sort. A caller must never need to re-derive this.
+            assert_eq!(
+                estimates.iter().filter(|e| e.picked).count(), 1,
+                "exactly one plan must be marked picked ({mode_label}, {})", fuzz_describe(spec),
+            );
+            assert!(estimates[0].picked, "the picked plan must be index 0 ({mode_label}, {})", fuzz_describe(spec));
+            // The materialization term is REPORTED, never folded into predicted_ns — folding it in
+            // would change routing, which cost.rs's "Candidate materialization" section declines to
+            // do until the term is validated. Non-materializing plans must report exactly 0.
+            for e in &estimates {
+                assert!(e.materialize_ns >= 0.0 && e.materialize_ns.is_finite(), "bad materialize_ns for {:?}", e.plan);
+                let materializes = matches!(e.plan, PhysicalPlan::StreamedSelect | PhysicalPlan::GatheredScan);
+                assert_eq!(
+                    e.materialize_ns > 0.0, materializes,
+                    "{:?} materialize_ns {} contradicts whether it builds a candidate list",
+                    e.plan, e.materialize_ns,
+                );
+            }
             for e in &estimates {
                 assert!(e.predicted_ns.is_finite() && e.predicted_ns >= 0.0, "non-finite/negative predicted_ns for {:?}", e.plan);
             }
@@ -3102,20 +3149,36 @@ fn explain_analyze_matches_explain_and_times_every_plan() {
     let (ref_pe, mut ref_filter) = split_planes(
         bound.clone(), &archived.indexes.planes, &archived.indexes.oracle_trigram.words, true,
     );
-    let reference: Vec<PlanEstimate> = explain(
+    let (ref_facts, reference): (AcquireFacts, Vec<PlanEstimate>) = explain(
         &QueryCtx::from(archived), &explain_params(Mode::Card, 60), &mut ref_filter, ref_pe.as_ref(),
     );
 
     let (pe, filter) = split_planes(bound, &archived.indexes.planes, &archived.indexes.oracle_trigram.words, true);
-    let trials: Vec<PlanTrial> = explain_analyze(
+    let (facts, trials): (AcquireFacts, Vec<PlanTrial>) = explain_analyze(
         &QueryCtx::from(archived), &QueryParams::from_strs("card", "default", "edhrec", "asc", 60, 0),
         &filter, pe.as_ref(), NUM_WARMUPS, NUM_TRIALS,
     );
+
+    // The acquire facts describe the query, not the round, so they must agree with
+    // what explain() alone reported — except acquire_ns, which is a measurement:
+    // explain() takes one sample, explain_analyze re-samples once per recorded round.
+    assert_eq!(facts.count_source, ref_facts.count_source, "count_source must match explain()'s");
+    assert_eq!(facts.feats.eval_domain, ref_facts.feats.eval_domain, "eval_domain must match explain()'s");
+    assert_eq!(facts.feats.matches, ref_facts.feats.matches, "matches must match explain()'s");
+    assert_eq!(facts.acquire_ns.len(), NUM_TRIALS, "explain_analyze records one acquire sample per trial round");
+    // The routed row is what distinguishes a ranking error from a live defect, so it must be
+    // present for every recorded round — and absent from explain(), which executes nothing.
+    assert_eq!(facts.routed_ns.len(), NUM_TRIALS, "explain_analyze records one routed sample per trial round");
+    assert!(ref_facts.routed_ns.is_empty(), "explain() runs no query, so it reports no routed timing");
 
     assert_eq!(trials.len(), reference.len(), "explain_analyze must cover exactly the plans explain() reports");
     for (t, r) in trials.iter().zip(&reference) {
         assert_eq!(t.plan, r.plan, "plan order must match explain()'s ranking");
         assert_eq!(t.predicted_ns, r.predicted_ns, "predicted_ns must be identical to explain()'s for {:?}", t.plan);
+        // Carried through, not recomputed — a caller comparing explain against explain_analyze must
+        // see the same term and the same pick, or the two primitives are not describing one query.
+        assert_eq!(t.materialize_ns, r.materialize_ns, "materialize_ns must match explain()'s for {:?}", t.plan);
+        assert_eq!(t.picked, r.picked, "picked must match explain()'s for {:?}", t.plan);
         // A structurally-applicable plan's fastpath can legitimately decline at
         // runtime (empty trials_ns); when it doesn't decline, it must have run
         // exactly NUM_TRIALS times (warmups are discarded, never recorded).
@@ -3128,6 +3191,771 @@ fn explain_analyze_matches_explain_and_times_every_plan() {
         trials.iter().any(|t| t.plan == PhysicalPlan::GatheredScan && t.trials_ns.len() == NUM_TRIALS),
         "GatheredScan is always applicable and never declines",
     );
+}
+
+/// `feats.compose_paging` must name the branch `printing_compose_fastpath` really takes.
+///
+/// The two decisions are made independently: `acquire_plan_features` recomputes the permutation
+/// lookup, the `orderby_walk_available` test and the decline conditions on its own, and the fastpath
+/// decides again at run time. Nothing checked that they agree — the same shape as the Python cost
+/// mirror that silently drifted from `cost.rs` for two revisions. `PhaseStats::paging_taken` exists
+/// to make the agreement checkable; this is the check.
+///
+/// The prediction is 3-way (`ComposePaging`) and `paging_taken` is 10-way, because a decline or an
+/// empty page reaches no strategy at all. Only the strategy labels are comparable; the rest must
+/// still name the gate that fired, which is the other half of what this checks.
+///
+/// Equality holds in every cell but one, and the exception is structural rather than a tolerance.
+/// Acquire never composes, so it can test only that an orderby walk is AVAILABLE, never that the
+/// walk will succeed: the walk declines at run time on the null-value tail or a page past the value
+/// structure and falls into the gather. So `OrderbyWalk` may legally come back as
+/// `GatherWalkDeclined`, and nothing else may be inexact — in particular a predicted `Gather` that
+/// took a walk is still a failure, since that direction can only mean the availability tests
+/// drifted. Checking equality in all three cells would be asserting something the engine cannot
+/// promise; over the real corpus this cell fires about once in 1,700 compose runs.
+///
+/// Swept at two corpus sizes on purpose, because the two regimes are mutually exclusive and each
+/// leaves the other's assertion unexercised:
+/// - 8,000 cards reaches `Gather`, which needs a card/artwork compose on `rarity`/`usd` (the two
+///   orderbys with no permutation) to thread between the `COMPOSE_GATHER_MAX_CARD_FRACTION` breadth
+///   gate and the pre-compose sparse decline. At 2,000 that band is too narrow to land in.
+/// - 2,000 cards reaches the declines, which at 8,000 stop firing entirely.
+#[test]
+fn compose_paging_prediction_matches_the_branch_taken() {
+    use rand::SeedableRng;
+    // Both regimes, because they are mutually exclusive -- see the doc above. At 8,000 no query
+    // declines at all; at 2,000 `Gather` is unreachable. One size leaves half the test asleep.
+    const CORPUS_SIZES: [usize; 2] = [2_000, 8_000];
+
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(745_003);
+
+    // ONLY the last two specs actually reach a compose acquire, and that is not obvious from
+    // reading them: `is_printing_composable` accepts `border==`, `set:`/`watermark:` and
+    // `CollectionCmp` at `Ge`, and nothing else. The colour/type/rarity leaves above are bitmask
+    // and numeric comparisons, so every one of their combinations acquires as `plane` or
+    // `candidates` and is skipped by the `count_source` guard below. They are kept because a spec
+    // that stops composing is exactly the regression this test should notice — but adding more of
+    // that shape does NOT widen coverage here. Add composable leaves.
+    let specs = [
+        FuzzSpec::And(vec![fuzz_leaf_color(&mut rng), fuzz_leaf_type(&mut rng)]),
+        fuzz_leaf_type(&mut rng),
+        fuzz_leaf_color(&mut rng),
+        fuzz_leaf_rarity(&mut rng),
+        FuzzSpec::Leaf(FuzzLeaf::Border { value: "black".to_string() }),
+        FuzzSpec::And(vec![fuzz_leaf_type(&mut rng), fuzz_leaf_rarity(&mut rng)]),
+        // Deliberately NARROW, and the only other spec here built from leaves `is_printing_composable`
+        // accepts (`border==`, and `CollectionCmp` at `Ge`). This is what reaches
+        // `GatherWalkDeclined`: the walk declines when the matches carrying an indexed value run out
+        // before `page_offset + limit` while unvalued matches remain, so the missing ingredient was
+        // never nulls -- the store already generates 16% null prices and 15% null rarity -- it was a
+        // match set small enough for the valued ones to fall short of one page. `fateseal` is the
+        // rare tail of `FUZZ_KEYWORDS` (weight 1 of 86), and ANDing a border narrows it ~6x further.
+        FuzzSpec::And(vec![
+            FuzzSpec::Leaf(FuzzLeaf::Collection { field: CollField::Keywords, op: CmpOp::Ge, value: "fateseal".to_string() }),
+            FuzzSpec::Leaf(FuzzLeaf::Border { value: "black".to_string() }),
+        ]),
+    ];
+    // Every orderby, because which one is set is exactly what picks the branch: a card-space
+    // permutation gives `Perm`, `usd`/`rarity` in printing mode give `OrderbyWalk` (#744), and
+    // anything else falls through to `Gather`.
+    let sort_cols = [
+        ("edhrec", SortCol::EdhrecRank), ("cmc", SortCol::Cmc), ("power", SortCol::Power),
+        ("toughness", SortCol::Toughness), ("rarity", SortCol::Rarity), ("usd", SortCol::PriceUsd),
+        ("cubecobra", SortCol::Cubecobra), ("name", SortCol::Name),
+    ];
+    let modes = [("card", Mode::Card), ("printing", Mode::Printing), ("artwork", Mode::Artwork)];
+    // Both, since the strategy branch keys off `sort_perms.get(sort_col, descending)`.
+    let directions = [false, true];
+    // A deep offset as well as the first page: `EmptyPage` is only reachable past the total.
+    let offsets = [0usize, 40, 10_000];
+
+    let (mut exercised, mut declined, mut empty) = (0usize, 0usize, 0usize);
+    // Perm / OrderbyWalk / Gather / GatherWalkDeclined. The fourth is not a strategy the model
+    // predicts -- it is the one legal inexactness in the prediction, and it gets its own cell so
+    // the allowance above cannot pass by never being exercised.
+    let mut by_strategy = [0usize; 4];
+    for &n_cards in &CORPUS_SIZES {
+        let data = fuzz_store_n(&mut rng, n_cards);
+        let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+        let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+        let ctx = QueryCtx::from(archived);
+        for spec in &specs {
+            for &(mode_label, mode) in &modes {
+                for &(orderby, sort_col) in &sort_cols {
+                    for &descending in &directions {
+                        for &page_offset in &offsets {
+                            let params = kernel_params(mode, sort_col, descending, 60, page_offset);
+                            let bound = fuzz_bound_filter(spec, archived);
+                            let (pe, filter) = split_planes(
+                                bound, &archived.indexes.planes, &archived.indexes.oracle_trigram.words, matches!(mode, Mode::Card),
+                            );
+
+                            // The prediction, on its own clone -- acquire mutates the filter it reads.
+                            let mut acq_filter = filter.clone();
+                            let (feats, prep, _bits) = acquire_plan_features(&ctx, &params, &mut acq_filter, pe.as_ref());
+                            if prep.count_source() != CountSource::PrintingCompose {
+                                continue; // not a compose acquire; compose_paging has no referent
+                            }
+                            let predicted = feats.compose_paging;
+
+                            // The branch really taken, on a pristine clone. Clear first: an earlier
+                            // iteration's label survives in the cell otherwise (see PHASE_STATS).
+                            let mut run_filter = filter.clone();
+                            take_phase_stats();
+                            let ran = run_query_with_plan(PhysicalPlan::PrintingCompose, &ctx, &params, &mut run_filter, pe.as_ref());
+                            let taken = take_phase_stats().paging_taken;
+
+                            let case = format!(
+                                    "n={n_cards} {mode_label}/{orderby}/desc={descending}/offset={page_offset} ({})",
+                                fuzz_describe(spec),
+                            );
+                            // A decline reached no paging strategy, so there is nothing to compare
+                            // against `compose_paging`. But it must still say WHICH gate declined it:
+                            // `""` would mean the fastpath was never entered, and this call entered it.
+                            // That is the silent hole the labels close -- before them, three of the four
+                            // decline sites returned without recording anything.
+                            if ran.is_none() {
+                                assert!(
+                                    matches!(taken, PagingTaken::NotComposable | PagingTaken::DeclineBroad | PagingTaken::DeclineSparseEstimate | PagingTaken::DeclineSparseExact),
+                                    "compose declined without recording which gate fired (got {taken:?}): {case}",
+                                );
+                                declined += 1;
+                                continue;
+                            }
+                            if taken == PagingTaken::EmptyPage {
+                                empty += 1;
+                                continue; // returned before any paging strategy ran
+                            }
+                            // Not a blanket equality: the prediction is an upper bound on
+                            // `OrderbyWalk` and exact everywhere else -- see the doc above. Each
+                            // arm names the labels that are legal for it, so a wrong branch in the
+                            // OTHER direction (`Gather` predicted, walk taken) still fails.
+                            let legal: &[PagingTaken] = match predicted {
+                                ComposePaging::Perm => &[PagingTaken::Perm],
+                                ComposePaging::OrderbyWalk => &[PagingTaken::OrderbyWalk, PagingTaken::GatherWalkDeclined],
+                                // Bare `Gather` only. `GatherWalkDeclined` here would mean the
+                                // fastpath found a walk available where acquire predicted none,
+                                // i.e. the two availability tests really had drifted.
+                                ComposePaging::Gather => &[PagingTaken::Gather],
+                            };
+                            assert!(
+                                legal.contains(&taken),
+                                "cost model predicted {predicted:?} (legal: {legal:?}) but the fastpath took {taken:?}: {case}",
+                            );
+                            exercised += 1;
+                            match (predicted, taken) {
+                                (ComposePaging::Perm, _) => by_strategy[0] += 1,
+                                (ComposePaging::OrderbyWalk, PagingTaken::GatherWalkDeclined) => by_strategy[3] += 1,
+                                (ComposePaging::OrderbyWalk, _) => by_strategy[1] += 1,
+                                (ComposePaging::Gather, _) => by_strategy[2] += 1,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Guard against the sweep silently covering nothing -- every `continue` above is a shape
+    // that skipped the assertion, and all of them skipping would still pass.
+    println!(
+        "compose paging: {exercised} strategy runs checked \
+         ({} Perm, {} OrderbyWalk, {} Gather, {} walk-declined), {declined} declined, {empty} empty-page",
+        by_strategy[0], by_strategy[1], by_strategy[2], by_strategy[3],
+    );
+    // Every cell, not just a total: the agreement is only interesting where the two decisions could
+    // differ, and a sweep that reaches one branch 64 times checks one branch. This caught the sweep
+    // exercising `Gather` zero times at a smaller corpus size. `GatherWalkDeclined` is in the list
+    // for the same reason and one more: it is the single cell where the prediction is allowed to be
+    // inexact, so a sweep that never reaches it turns that allowance into an unchecked hole.
+    for (i, strategy) in ["Perm", "OrderbyWalk", "Gather", "GatherWalkDeclined"].iter().enumerate() {
+        assert!(by_strategy[i] > 0, "no compose query reached {strategy}; that branch is unchecked");
+    }
+    // And at least one decline, or the "every gate names itself" assertion never ran either.
+    assert!(declined > 0, "no compose query declined; the decline-label assertion is unexercised");
+}
+
+/// The two materializing plans must report identical `cards_visited` and `printings_scanned`.
+///
+/// These are ONE counter under one name: `PhaseStats` has a single set of fields and both
+/// `exec_gathered_scan` and `run_query_streamed` publish into them, so a consumer reading
+/// `printings_scanned` off a `PlanTrial` cannot tell which executor produced it. `scan_units` has
+/// one definition too, and both plans' cost arms key on it — so if the executors count differently,
+/// at most one of them is the valid comparison, and the damage surfaces as a rate constant that
+/// will not calibrate rather than as anything that looks like a bug.
+///
+/// `printings_scanned` is the load-bearing half, and the reason is a one-line placement: both
+/// executors count it BELOW the `card_pass` continue, because a card rejected there never has its
+/// printings touched. Counting at the top of the loop instead is the exact defect this pins, and it
+/// is the shape a plausible "just count once at the top" cleanup would reintroduce silently.
+///
+/// Equality therefore rests on that continue firing identically in both loops — and the two
+/// `all_match` gates are NOT identical:
+///
+///     gathered:   all_match_known || card_pass(..)
+///     streamed:  (all_match_known && !Artwork) || card_pass(..)
+///
+/// In artwork mode with `all_match_known`, gathered short-circuits and never calls `card_pass`,
+/// while streamed calls it and could hit the `continue`. The counts stay equal only if
+/// `all_match_known` is honest, so the artwork/all-match cell checks the narrowing's own claim as
+/// well as the counters — which is why it is guarded for coverage separately below.
+///
+/// `matches_pushed` is asserted two ways: plan-vs-plan like the others, and against the total each
+/// run actually returned. The second is what carries it. Plan-vs-plan alone cannot catch both
+/// executors being wrong the same way, and "it equals the total by construction" is not something
+/// this file should take on faith across two functions — `GatherSelect::absorb` accumulates the
+/// identical `len() - before` the counter does, and in artwork mode that expression sits downstream
+/// of the group dedup, so a counter moved above it would still agree plan-to-plan while both
+/// disagreed with reality.
+#[test]
+fn materializing_plans_agree_on_the_counters_they_share() {
+    use rand::SeedableRng;
+    // One size is enough here: unlike the compose sweep there are no mutually exclusive regimes,
+    // and what varies the `card_pass` continue is the predicate and the mode, not the corpus.
+    const CORPUS_SIZE: usize = 4_000;
+
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(745_004);
+    // Both narrowing kinds, and the second group is the load-bearing one. The plane/index leaves
+    // above it narrow EXACTLY -- every candidate they return passes `card_pass`, so the continue
+    // never fires and the two loops trivially agree. Only an inexact narrowing (an oracle-text
+    // trigram superset, an arithmetic comparison across a card and a printing field) hands the
+    // executors candidates that `card_pass` then rejects, which is the only condition under which
+    // `printings_scanned` can diverge at all. Verified: without the second group `saw_continue` is
+    // 0 across the whole sweep and both assertions pass without exercising anything.
+    let specs = [
+        fuzz_leaf_type(&mut rng),
+        fuzz_leaf_color(&mut rng),
+        fuzz_leaf_rarity(&mut rng),
+        FuzzSpec::And(vec![fuzz_leaf_color(&mut rng), fuzz_leaf_type(&mut rng)]),
+        FuzzSpec::And(vec![fuzz_leaf_type(&mut rng), fuzz_leaf_rarity(&mut rng)]),
+        FuzzSpec::Leaf(FuzzLeaf::Border { value: "black".to_string() }),
+        fuzz_leaf_text_contains(&mut rng, TextSearchField::OracleTextLower),
+        fuzz_leaf_text_contains(&mut rng, TextSearchField::NameLower),
+        fuzz_leaf_arith(&mut rng),
+        FuzzSpec::And(vec![fuzz_leaf_type(&mut rng), fuzz_leaf_text_contains(&mut rng, TextSearchField::OracleTextLower)]),
+    ];
+    // `usd`/`rarity` have no sort permutation, so StreamedSelect declines on them and the pair is
+    // skipped. Left in deliberately: which orderbys have permutations is not this test's business
+    // to encode, and `ran.is_none()` filters them without a second source of truth to drift.
+    let sort_cols = [
+        ("edhrec", SortCol::EdhrecRank), ("cmc", SortCol::Cmc), ("power", SortCol::Power),
+        ("toughness", SortCol::Toughness), ("name", SortCol::Name), ("cubecobra", SortCol::Cubecobra),
+        ("rarity", SortCol::Rarity), ("usd", SortCol::PriceUsd),
+    ];
+    let modes = [("card", Mode::Card), ("printing", Mode::Printing), ("artwork", Mode::Artwork)];
+
+    let data = fuzz_store_n(&mut rng, CORPUS_SIZE);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let ctx = QueryCtx::from(archived);
+
+    let (mut checked, mut artwork_all_match, mut saw_continue) = (0usize, 0usize, 0usize);
+    for spec in &specs {
+        for &(mode_label, mode) in &modes {
+            for &(orderby, sort_col) in &sort_cols {
+                let params = kernel_params(mode, sort_col, false, 60, 0);
+                let bound = fuzz_bound_filter(spec, archived);
+                let (pe, filter) = split_planes(
+                    bound, &archived.indexes.planes, &archived.indexes.oracle_trigram.words, matches!(mode, Mode::Card),
+                );
+
+                // Each run gets a pristine clone -- `prepare_candidates` mutates the filter it is
+                // handed (`memoize_text_predicates`), and a shared one would let the second plan
+                // narrow a tree the first already rewrote.
+                let mut streamed_filter = filter.clone();
+                take_phase_stats();
+                let streamed_ran =
+                    run_query_with_plan(PhysicalPlan::StreamedSelect, &ctx, &params, &mut streamed_filter, pe.as_ref());
+                let streamed = take_phase_stats();
+                if streamed_ran.is_none() {
+                    continue; // no sort permutation for this orderby; nothing to compare against
+                }
+
+                let mut gathered_filter = filter.clone();
+                take_phase_stats();
+                let gathered_ran =
+                    run_query_with_plan(PhysicalPlan::GatheredScan, &ctx, &params, &mut gathered_filter, pe.as_ref());
+                let gathered = take_phase_stats();
+                assert!(gathered_ran.is_some(), "GatheredScan is always applicable");
+
+                let case = format!("{mode_label}/{orderby} ({})", fuzz_describe(spec));
+                assert_eq!(
+                    streamed.cards_visited, gathered.cards_visited,
+                    "cards_visited disagrees (streamed {} vs gathered {}): {case}",
+                    streamed.cards_visited, gathered.cards_visited,
+                );
+                assert_eq!(
+                    streamed.printings_scanned, gathered.printings_scanned,
+                    "printings_scanned disagrees (streamed {} vs gathered {}): {case}",
+                    streamed.printings_scanned, gathered.printings_scanned,
+                );
+                assert_eq!(
+                    streamed.matches_pushed, gathered.matches_pushed,
+                    "matches_pushed disagrees (streamed {} vs gathered {}): {case}",
+                    streamed.matches_pushed, gathered.matches_pushed,
+                );
+                // And anchored to the value the run really returned, in BOTH executors. The two
+                // above are plan-vs-plan only, which cannot catch the two of them being wrong the
+                // same way; this is the one counter with an independent ground truth available for
+                // free, since `run_query_with_plan` already hands back the total.
+                //
+                // It is also what makes the `matches_pushed` parity above more than a restatement:
+                // the counter and `GatherSelect::total` accumulate the identical `len() - before`,
+                // and in artwork mode that expression is downstream of the group dedup, so a
+                // counter placed outside it would diverge here rather than in some later re-fit.
+                assert_eq!(
+                    streamed.matches_pushed, streamed_ran.as_ref().expect("checked above").0 as u64,
+                    "StreamedSelect's matches_pushed must equal the total it returned: {case}",
+                );
+                assert_eq!(
+                    gathered.matches_pushed, gathered_ran.as_ref().expect("asserted above").0 as u64,
+                    "GatheredScan's matches_pushed must equal the total it returned: {case}",
+                );
+                checked += 1;
+
+                // Coverage bookkeeping, so the assertions above cannot pass by never meeting the
+                // cases that could break them. `all_match_known` is read from a third narrowing
+                // rather than inferred: nothing in `PhaseStats` reports it.
+                let mut prep_filter = filter.clone();
+                let prep = prepare_candidates(&ctx, &params, &mut prep_filter, pe.as_ref());
+                if prep.all_match_known && matches!(mode, Mode::Artwork) {
+                    artwork_all_match += 1;
+                }
+                // Did the `card_pass` continue actually fire? Only then do the two loops take
+                // different numbers of trips past the counter, which is the only way
+                // `printings_scanned` can come apart at all. Measured as "fewer printings scanned
+                // than the candidate set holds", not guessed from the counters alone.
+                let scannable: u64 = prep
+                    .card_ids(&ctx)
+                    .map(|cid| {
+                        let (s, e) = (ctx.offsets[cid as usize], ctx.offsets[cid as usize + 1]);
+                        u64::from(u32::from(e) - u32::from(s))
+                    })
+                    .sum();
+                if gathered.printings_scanned < scannable {
+                    saw_continue += 1;
+                }
+            }
+        }
+    }
+
+    println!(
+        "counter parity: {checked} query/plan pairs checked, {artwork_all_match} artwork+all_match_known, \
+         {saw_continue} with card_pass rejecting at least one candidate"
+    );
+    assert!(checked > 0, "no query ran both materializing plans; the parity assertions are unexercised");
+    // The one cell where the two `all_match` gates actually differ. Without it the sweep only ever
+    // compares two loops taking the identical branch, which is not a test of anything.
+    assert!(
+        artwork_all_match > 0,
+        "no artwork query had all_match_known; the one cell where the two all_match gates diverge is unchecked",
+    );
+    // And the continue must actually fire somewhere, or `printings_scanned` equality is trivial:
+    // with every candidate passing, both loops scan every printing and cannot disagree. This is
+    // what the inexact-narrowing specs are in the list for -- drop them and this drops to 0.
+    assert!(
+        saw_continue > 0,
+        "card_pass never rejected a candidate; printings_scanned agreed only because nothing was skipped",
+    );
+}
+
+/// No plan may report stats it did not write. Driven through `explain_analyze` on purpose — the
+/// invariant at risk lives in *its* loop, not in any executor.
+///
+/// `PHASE_STATS` is one thread-local slot every participant in a round publishes into, and
+/// `explain_analyze` separates them with a single `take_phase_stats()` after each. Nothing else
+/// enforces that separation, so deleting it corrupts the counters silently: the numbers stay
+/// plausible, every other test stays green, and the damage only appears later as a feature that
+/// disagrees with its counter for reasons no re-fit can find. This is the assertion that fails.
+///
+/// Two distinct leaks, and the second is the one actually observed:
+///
+/// 1. A participant that publishes NOTHING reads its predecessor's state. `PrintingRangeScan`,
+///    `PlanePopcountOrder` and `CardRangePopcount` write no counters at all (they are bitmap/index
+///    operations with no per-card match loop), so without the clear they report whichever
+///    materializing plan ran before them.
+///
+/// 2. `paging_taken` crossing from the plan that recorded it to a later one. Only
+///    `printing_compose_fastpath` writes it, and it must survive a materializing publish within one
+///    run — the routed path's "compose declines, records its gate, falls through to a materializing
+///    plan" sequence depends on that. So its lifetime is deliberately wider than any single
+///    publisher, and the per-participant clear is the only thing bounding it to one run instead of
+///    "this thread, ever". Measured when that clear was absent: 49 of 600 queries had
+///    `GatheredScan` reporting a `paging_taken` only the compose fastpath sets.
+///
+/// So a fully-instrumented, looping plan was the contaminated one — which is why asserting only
+/// that the silent fast paths report zeros would miss the real defect.
+///
+/// The two leaks now fail in different ways, and both still need pinning. Leak 1 needs
+/// `take_phase_stats` to clear `PHASE_STATS`; leak 2 needs it to clear `PAGING_TAKEN`, which is a
+/// separate thread-local precisely so a publisher cannot clobber it — dropping either half of that
+/// take reproduces the corresponding leak. (An earlier draft stored both in one slot and had the
+/// executors preserve the label through `..c.get()`; that made every publisher responsible for not
+/// wiping a field it does not own, which is the arrangement leak 2 came out of.)
+///
+/// `result_total` is not checked: `explain_analyze` overwrites it after the take, so it has no
+/// exposure. `paging_taken` is the whole of it.
+#[test]
+fn plan_stats_never_leak_between_participants() {
+    use rand::SeedableRng;
+    const CORPUS_SIZE: usize = 3_000;
+    const NUM_WARMUPS: usize = 1;
+    const NUM_TRIALS: usize = 3;
+    /// Publish no counters whatsoever — see the doc's leak 1.
+    const SILENT_PLANS: [PhysicalPlan; 3] =
+        [PhysicalPlan::PrintingRangeScan, PhysicalPlan::PlanePopcountOrder, PhysicalPlan::CardRangePopcount];
+    /// The subset of `SILENT_PLANS` that writes NO field at all, `paging_taken` included, so
+    /// `NotEntered` there is still proof no label leaked in. `PrintingRangeScan` is silent for the
+    /// counters and phase timings but labels its own exits, so it is checked separately below —
+    /// against its own labels, which is a stronger statement than "inherited nothing".
+    const UNLABELLED_PLANS: [PhysicalPlan; 2] = [PhysicalPlan::PlanePopcountOrder, PhysicalPlan::CardRangePopcount];
+    /// What a `PrintingRangeScan` that produced a page must report. Both are success exits; every
+    /// other `Range*` variant means it declined, and a declining plan has empty `trials_ns` and is
+    /// skipped above.
+    const RANGE_SUCCESS: [PagingTaken; 2] = [PagingTaken::RangeAligned, PagingTaken::RangeWalk];
+
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(745_005);
+    // Chosen for plan COVERAGE, not for query realism: the bare ranges are what make
+    // `PrintingRangeScan`/`CardRangePopcount` applicable, the plane leaves reach
+    // `PlanePopcountOrder` in card mode, and the border leaf is the one that composes -- and a
+    // compose is what puts a real `paging_taken` in the cell for leak 2 to inherit.
+    let specs = [
+        fuzz_leaf_price(&mut rng),
+        fuzz_leaf_year(&mut rng),
+        fuzz_leaf_collector_number(&mut rng),
+        fuzz_leaf_type(&mut rng),
+        fuzz_leaf_color(&mut rng),
+        FuzzSpec::Leaf(FuzzLeaf::Border { value: "black".to_string() }),
+    ];
+    let modes = [("card", Mode::Card), ("printing", Mode::Printing), ("artwork", Mode::Artwork)];
+    let sort_cols = [("edhrec", SortCol::EdhrecRank), ("usd", SortCol::PriceUsd), ("name", SortCol::Name)];
+
+    let data = fuzz_store_n(&mut rng, CORPUS_SIZE);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let ctx = QueryCtx::from(archived);
+
+    let (mut silent_checked, mut materializing_checked, mut compose_labelled) = (0usize, 0usize, 0usize);
+    // Counted apart from `silent_checked` so the range fastpath's own success labels cannot go
+    // unexercised behind the two plans that legitimately report nothing.
+    let mut range_labelled = 0usize;
+    for spec in &specs {
+        for &(mode_label, mode) in &modes {
+            for &(orderby, sort_col) in &sort_cols {
+                let params = kernel_params(mode, sort_col, false, 60, 0);
+                let bound = fuzz_bound_filter(spec, archived);
+                let (pe, filter) = split_planes(
+                    bound, &archived.indexes.planes, &archived.indexes.oracle_trigram.words, matches!(mode, Mode::Card),
+                );
+                let (_facts, trials) = explain_analyze(&ctx, &params, &filter, pe.as_ref(), NUM_WARMUPS, NUM_TRIALS);
+
+                for t in &trials {
+                    if t.trials_ns.is_empty() {
+                        continue; // declined at runtime, so nothing was recorded for it
+                    }
+                    let case = format!("{:?} {mode_label}/{orderby} ({})", t.plan, fuzz_describe(spec));
+                    let p = &t.phases;
+                    if SILENT_PLANS.contains(&t.plan) {
+                        // Leak 1. `ns_round_total` and `result_total` are excluded: `explain_analyze`
+                        // fills both itself after the take, so they are non-zero by design here.
+                        assert_eq!(
+                            (p.cards_visited, p.printings_scanned, p.matches_pushed), (0, 0, 0),
+                            "uninstrumented plan reported counters it never wrote: {case}",
+                        );
+                        assert_eq!(
+                            (p.ns_setup, p.ns_loop, p.ns_finish, p.ns_prepare), (0, 0, 0, 0),
+                            "uninstrumented plan reported phase timings it never wrote: {case}",
+                        );
+                        // The label half splits: only the two plans that write nothing can be
+                        // checked as "still NotEntered". `PrintingRangeScan` labels its own exits,
+                        // so for it the equivalent — and stronger — statement is that the label is
+                        // one of ITS OWN success variants, not merely absent. A leaked compose
+                        // label would fail that just as surely.
+                        if UNLABELLED_PLANS.contains(&t.plan) {
+                            assert_eq!(
+                                p.paging_taken, PagingTaken::NotEntered,
+                                "uninstrumented plan inherited a paging label: {case}",
+                            );
+                        } else {
+                            assert!(
+                                RANGE_SUCCESS.contains(&p.paging_taken),
+                                "PrintingRangeScan produced a page but reported {:?}, not one of its success exits: {case}",
+                                p.paging_taken,
+                            );
+                            range_labelled += 1;
+                        }
+                        silent_checked += 1;
+                    } else if matches!(t.plan, PhysicalPlan::StreamedSelect | PhysicalPlan::GatheredScan) {
+                        // Leak 2: the field neither executor writes. Only the two printing-space
+                        // fastpaths set it, and neither is on either of their paths.
+                        assert_eq!(
+                            p.paging_taken, PagingTaken::NotEntered,
+                            "materializing plan inherited a paging label only a printing fastpath sets: {case}",
+                        );
+                        materializing_checked += 1;
+                    } else if t.plan == PhysicalPlan::PrintingCompose {
+                        // The source of the label leak 2 would propagate. Asserting it is REAL is what
+                        // makes the check above meaningful: if compose never recorded anything, there
+                        // would be nothing for a broken clear to spread.
+                        assert_ne!(
+                            p.paging_taken, PagingTaken::NotEntered,
+                            "compose ran but recorded no paging branch, so leak 2 has no source: {case}",
+                        );
+                        compose_labelled += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    println!(
+        "stat isolation: {silent_checked} uninstrumented-plan runs ({range_labelled} range-labelled), \
+         {materializing_checked} materializing runs, {compose_labelled} compose runs carrying a real paging label"
+    );
+    // Each guard covers a leak that would otherwise go unasserted, and the third is what supplies
+    // the contaminant: without a labelled compose in the mix, leak 2 cannot be reproduced even with
+    // the clear deleted.
+    assert!(silent_checked > 0, "no uninstrumented plan ran; leak 1 is unchecked");
+    assert!(materializing_checked > 0, "no materializing plan ran; leak 2 is unchecked");
+    assert!(compose_labelled > 0, "no compose recorded a paging label; leak 2 has no contaminant to detect");
+    // The range fastpath is a second contaminant source AND the only plan here whose success is
+    // asserted against its own labels rather than against their absence. A sweep that never runs it
+    // successfully leaves both unexercised.
+    assert!(range_labelled > 0, "no PrintingRangeScan produced a page; its success labels are unchecked");
+}
+
+/// The predicted strategy and the taken strategy must SPELL themselves the same way.
+///
+/// These are two enums — `ComposePaging` (what the cost model predicted) and `PagingTaken` (what the
+/// fastpath did) — and Rust compares them nowhere: `compose_paging_prediction_matches_the_branch_taken`
+/// maps one to the other through an explicit table, so a rename on either side is invisible to it.
+///
+/// The comparison that DOES happen is in Python, on the strings.
+/// `scripts/bench_cost_model_agreement.py` counts agreement as `cells[(predicted, taken)]`, drawing
+/// `predicted` from `acquire["compose_paging"]` and `taken` from `plans[i]["paging_taken"]`. If the
+/// two labels drift apart, every agreed run is reclassified as a disagreement and the whole
+/// diagonal empties — a table full of alarming off-diagonal counts, with nothing wrong but a name.
+///
+/// This was a live hole until `ComposePaging::label()` existed: that side was `format!("{:?}", ..)`,
+/// so it followed a variant rename automatically while `PagingTaken::label()` did not.
+#[test]
+fn compose_paging_and_paging_taken_agree_on_strategy_names() {
+    // The three strategies that exist on BOTH sides, which is exactly the set the Python table
+    // compares. `PagingTaken`'s other variants are gates and outcomes with no predicted counterpart,
+    // and `GatherWalkDeclined` is deliberately spelled differently — it is the one cell where the
+    // prediction is allowed to be inexact, so it must NOT collide with `Gather`.
+    let paired = [
+        (ComposePaging::Perm, PagingTaken::Perm),
+        (ComposePaging::OrderbyWalk, PagingTaken::OrderbyWalk),
+        (ComposePaging::Gather, PagingTaken::Gather),
+    ];
+    for (predicted, taken) in paired {
+        assert_eq!(
+            predicted.label(), taken.label(),
+            "{predicted:?} and {taken:?} are the same strategy but spell it differently; \
+             bench_cost_model_agreement.py compares them as strings and its diagonal would empty",
+        );
+    }
+    // The fallback must stay distinguishable from the strategy it falls back to, or the walk-declined
+    // rate folds into the agreed count and the under-costing it measures disappears.
+    assert_ne!(
+        PagingTaken::GatherWalkDeclined.label(), PagingTaken::Gather.label(),
+        "a declined walk must not be reported as a plain gather",
+    );
+}
+
+/// A plan that enters a fastpath and declines must say so through `explain_analyze`, not just
+/// through `run_query_with_plan`.
+///
+/// `compose_paging_prediction_matches_the_branch_taken` checks the decline labels by driving
+/// `run_query_with_plan` and reading the thread-local directly, which only Rust can do. Everything
+/// outside the crate — `scripts/bench_cost_model_agreement.py`, any future calibration harness —
+/// sees `explain_analyze`, and that used to drop the stats of any plan whose round returned `None`.
+/// So `NotComposable`, `DeclineBroad`, `DeclineSparseEstimate` and `DeclineSparseExact` were
+/// recorded, asserted in-crate, and then discarded before anyone outside could count them.
+///
+/// The distinction is worth a wire field rather than an inference because the four declines do not
+/// cost the same thing. Three gate BEFORE `printing_compose_fastpath` composes. `DeclineSparseExact`
+/// gates AFTER, off the real total, so it pays a full printing compose and throws it away before
+/// the general path answers the query again. `declined_ns` is what sizes that; `paging_taken` is
+/// what says which of the two happened.
+///
+/// Asserted here, in order: a declining plan reports EMPTY `trials_ns` (it produced nothing), a
+/// NON-EMPTY `declined_ns` (it still cost something), zero counters and zero phase timings (no
+/// executor ran, so anything else would be a leak), and a label naming the gate rather than the
+/// `NotEntered` default that would mean it was never tried.
+///
+/// That last one now covers BOTH printing-space fastpaths. `PrintingRangeScan` used to decline as
+/// `NotEntered` — indistinguishable from never having been tried, and rendered as a blank gate
+/// column in `scripts/bench_cost_model_agreement.py`'s decline table. Its gates carry no prediction
+/// to falsify, unlike compose's, so the assertion is only that one fired; what they are for is
+/// sizing the declines and surfacing the two that should never fire at all.
+#[test]
+fn declining_plans_report_their_gate_through_explain_analyze() {
+    use rand::SeedableRng;
+    const CORPUS_SIZE: usize = 2_000;
+    const NUM_WARMUPS: usize = 1;
+    const NUM_TRIALS: usize = 2;
+    /// Gates that mean "entered the compose fastpath and turned back". `NotEntered` is excluded on
+    /// purpose: it is the value this test exists to prove a decline never reports.
+    ///
+    /// `NotComposable` is IN the list but should never be seen, exactly like the range fastpath's
+    /// two tripwires below: `PhysicalPlan::PrintingCompose.applicable` IS `printing_compose_applicable`,
+    /// the same structural test the fastpath re-checks. Admitted here rather than asserted against
+    /// for the same reason as those — this test's job is "a gate was named", and `by_gate` below
+    /// prints the distribution so its showing up is visible.
+    const DECLINE_GATES: [PagingTaken; 4] = [
+        PagingTaken::NotComposable,
+        PagingTaken::DeclineBroad,
+        PagingTaken::DeclineSparseEstimate,
+        PagingTaken::DeclineSparseExact,
+    ];
+    /// The same for the range fastpath. `RangeAligned`/`RangeWalk` are excluded because they are
+    /// its success exits — reaching one of those with an empty `trials_ns` would mean the fastpath
+    /// returned a page and `explain_analyze` recorded a decline anyway.
+    ///
+    /// `RangeNotBare` and `RangePermutationStale` are IN the list but should never be seen:
+    /// `PhysicalPlan::PrintingRangeScan.applicable` already requires bare range bounds, and a
+    /// permutation whose length disagrees with the corpus is a corrupt index. They are admitted
+    /// here rather than asserted against because this test's job is "a gate was named", and
+    /// `range_gate_counts` below prints the distribution so either one showing up is visible.
+    const RANGE_DECLINE_GATES: [PagingTaken; 6] = [
+        PagingTaken::RangeSelective,
+        PagingTaken::RangeSparse,
+        PagingTaken::RangeUnalignedPrice,
+        PagingTaken::RangeNoPermutation,
+        PagingTaken::RangeNotBare,
+        PagingTaken::RangePermutationStale,
+    ];
+
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(745_006);
+    // The narrow keyword/border AND is the one that reliably declines -- same reasoning as the
+    // compose sweep's last spec, where a small match set is what drives the sparse gates. The
+    // broader leaves are here so the sweep also covers plans that decline for other reasons.
+    let specs = [
+        FuzzSpec::Leaf(FuzzLeaf::Border { value: "black".to_string() }),
+        fuzz_leaf_type(&mut rng),
+        fuzz_leaf_price(&mut rng),
+        // The range fastpath's declines, which the sampled price leaf above does not reach: with
+        // this seed it draws a threshold that is broad enough to walk under every orderby in the
+        // list, so the sweep only ever saw the fastpath SUCCEED. Both of these are bare ranges, so
+        // `PrintingRangeScan` is applicable for all three of them and only the gate differs.
+        //
+        // Broad: passes `range_too_broad_to_narrow` and reaches the strategy choice, so it succeeds
+        // where a permutation exists and declines `RangeNoPermutation` where one does not.
+        FuzzSpec::Leaf(FuzzLeaf::Price { op: CmpOp::Lt, val: 100_000.0 }),
+        // Matches nothing, so the breadth gate turns it back first — `RangeSelective`, NOT
+        // `EmptyPage`: the broadness test runs before the `k == 0` check, which is why an empty
+        // range reads as "the narrowing wins" rather than as an empty page.
+        FuzzSpec::Leaf(FuzzLeaf::Price { op: CmpOp::Gt, val: 100_000.0 }),
+        // A broad range that is NOT a price leaf, so under the `usd` orderby in `sort_cols` the
+        // index is not the sort permutation and there is no aligned mapping — `RangeUnalignedPrice`,
+        // the one gate that needs the predicate and the orderby to disagree.
+        FuzzSpec::Leaf(FuzzLeaf::Year { op: CmpOp::Gt, year: 1900 }),
+        FuzzSpec::And(vec![
+            FuzzSpec::Leaf(FuzzLeaf::Collection { field: CollField::Keywords, op: CmpOp::Ge, value: "fateseal".to_string() }),
+            FuzzSpec::Leaf(FuzzLeaf::Border { value: "black".to_string() }),
+        ]),
+    ];
+    let modes = [("card", Mode::Card), ("printing", Mode::Printing), ("artwork", Mode::Artwork)];
+    let sort_cols = [("edhrec", SortCol::EdhrecRank), ("usd", SortCol::PriceUsd), ("rarity", SortCol::Rarity)];
+
+    let data = fuzz_store_n(&mut rng, CORPUS_SIZE);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let ctx = QueryCtx::from(archived);
+
+    let (mut declines_seen, mut compose_gates_seen, mut range_gates_seen) = (0usize, 0usize, 0usize);
+    // Decline rounds that measured above zero. Counted rather than asserted per round — see the
+    // note at the accumulation site for why a zero is legitimate for the cheapest gates.
+    let mut nonzero_declines = 0usize;
+    let mut by_gate = std::collections::BTreeMap::<String, usize>::new();
+    for spec in &specs {
+        for &(mode_label, mode) in &modes {
+            for &(orderby, sort_col) in &sort_cols {
+                let params = kernel_params(mode, sort_col, false, 60, 0);
+                let bound = fuzz_bound_filter(spec, archived);
+                let (pe, filter) = split_planes(
+                    bound, &archived.indexes.planes, &archived.indexes.oracle_trigram.words, matches!(mode, Mode::Card),
+                );
+                let (_facts, trials) = explain_analyze(&ctx, &params, &filter, pe.as_ref(), NUM_WARMUPS, NUM_TRIALS);
+
+                for t in &trials {
+                    if t.declined_ns.is_empty() {
+                        continue;
+                    }
+                    let case = format!("{:?} {mode_label}/{orderby} ({})", t.plan, fuzz_describe(spec));
+                    // Mutually exclusive: a decline is deterministic for one query and store, so a
+                    // plan cannot both produce a page and bail across rounds of the same sweep.
+                    assert!(t.trials_ns.is_empty(), "a plan reported both trials and declines: {case}");
+                    assert_eq!(t.declined_ns.len(), NUM_TRIALS, "one decline sample per recorded round: {case}");
+                    // NOT asserted per-round as `> 0`. The cheapest gates really do complete inside
+                    // the clock's granularity: `RangeSelective` on `usd>100000` is two binary
+                    // searches over an empty span, and in a release build it measures 0 ns. An
+                    // earlier draft asserted every round was non-zero and failed on exactly that
+                    // query — the assertion was wrong, not the timer. What is worth pinning is that
+                    // the timer is wired up AT ALL, which is a sweep-level claim; see
+                    // `nonzero_declines` below.
+                    nonzero_declines += t.declined_ns.iter().filter(|&&ns| ns > 0).count();
+                    // No executor ran, so anything non-zero here came from somewhere else.
+                    let p = &t.phases;
+                    assert_eq!(
+                        (p.cards_visited, p.printings_scanned, p.matches_pushed), (0, 0, 0),
+                        "a declining plan reported counters no executor wrote: {case}",
+                    );
+                    assert_eq!(
+                        (p.ns_setup, p.ns_loop, p.ns_finish, p.ns_prepare, p.ns_round_total, p.result_total), (0, 0, 0, 0, 0, 0),
+                        "a declining plan reported timings or a total it never produced: {case}",
+                    );
+                    declines_seen += 1;
+                    // Both printing-space fastpaths label their gates, against their own legal
+                    // sets — a compose gate arriving on a range decline (or vice versa) is a leak,
+                    // and a shared "is not NotEntered" check would pass straight through it.
+                    // No other plan has a fastpath, so no other plan can reach here labelled.
+                    match t.plan {
+                        PhysicalPlan::PrintingCompose => {
+                            assert!(
+                                DECLINE_GATES.contains(&p.paging_taken),
+                                "a declining compose reported {:?}, which does not name a compose gate: {case}",
+                                p.paging_taken,
+                            );
+                            *by_gate.entry(format!("{:?}", p.paging_taken)).or_default() += 1;
+                            compose_gates_seen += 1;
+                        }
+                        PhysicalPlan::PrintingRangeScan => {
+                            assert!(
+                                RANGE_DECLINE_GATES.contains(&p.paging_taken),
+                                "a declining range scan reported {:?}, which does not name a range gate: {case}",
+                                p.paging_taken,
+                            );
+                            *by_gate.entry(format!("{:?}", p.paging_taken)).or_default() += 1;
+                            range_gates_seen += 1;
+                        }
+                        _ => assert_eq!(
+                            p.paging_taken, PagingTaken::NotEntered,
+                            "a plan with no fastpath declined carrying a label: {case}",
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    let gates: Vec<String> = by_gate.iter().map(|(g, n)| format!("{g} x{n}")).collect();
+    println!(
+        "declines through explain_analyze: {declines_seen} total, {compose_gates_seen} compose, \
+         {range_gates_seen} range ({})",
+        gates.join(", "),
+    );
+    // Each guard matters: the first says the wire field is reachable at all, the other two say the
+    // labels ride along with it. Before `declined_ns` existed every one of these rows was dropped,
+    // and before the `Range*` labels the third was reachable but blank.
+    assert!(declines_seen > 0, "no plan declined; the whole assertion block above is unexercised");
+    assert!(compose_gates_seen > 0, "no compose declined; the gate labels are still unreachable from outside Rust");
+    assert!(range_gates_seen > 0, "no range scan declined; its gate labels are still unreachable from outside Rust");
+    // `declined_ns` must be a real measurement somewhere, or it is a vector of zeros nothing would
+    // notice. Sweep-level because a single cheap gate legitimately reads 0 — the claim is that the
+    // timer runs, not that every gate is expensive enough to see.
+    assert!(nonzero_declines > 0, "every decline measured 0 ns; declined_ns is not timing anything");
 }
 
 /// #702 PR1 estimator accuracy report (NOT an assertion — a reporting tool).

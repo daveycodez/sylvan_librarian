@@ -179,6 +179,71 @@ pub(crate) const RANGE_SCATTER_PER_PRINTING_NS: f64 = 0.36;
 /// compose's scatter but a cheaper op, which is exactly why a bare range routes here, not to compose.
 pub(crate) const CARD_RANGE_BUILD_PER_PRINTING_NS: f64 = 1.22;
 
+// ─── Candidate materialization ──────────────────────────────────────────────
+// `plan_cost` prices only what happens AFTER the acquire step: `eval_domain` and `matches` are its
+// inputs, not its outputs. The acquire step is therefore unpriced, and it is where the model's error
+// lives — over 40 sampled queries the median `(measured - predicted) / acquire_ns` is 1.09, so
+// adding the MEASURED acquire time roughly closes the gap.
+//
+// `materialize_cost` below is NOT that term, and does not close that gap. It prices one component of
+// acquire — the candidate `collect` + `sort_unstable` — which measurement puts at a median 5% of
+// acquire (quartiles 2%–40%, n=167 candidate-acquired queries): the rest is index walks, the
+// narrowing recursion, `memoize_text_predicates` and feature building. Adding it to `predicted_ns`
+// measurably makes absolute accuracy slightly WORSE (73.1% -> 74.9% mean error), because it is a
+// small piece of a large omission and does not change which plans compare equal.
+//
+// So it is REPORTED BY `explain`, NOT ADDED TO `plan_cost`, for three reasons: it is validated as
+// too small to help; it is identical for the plans that actually compete (`StreamedSelect` and
+// `GatheredScan` call the same `prepare_candidates`), so it cannot change an argmin; and its real
+// purpose is to price the bitmap-versus-sort question in
+// docs/issues/local-engine-candidate-materialize.md, which is what it does measure exactly.
+
+/// `Vec::with_capacity` plus the run walk, before any comparison work
+/// (`bench_candidate_materialize`, axis A).
+pub(crate) const MATERIALIZE_SORT_FIXED_NS: f64 = 143.0;
+/// pdqsort on `u32`, per candidate — treated as **linear**, not `c·log2 c`. `sort_unstable` is a full
+/// pdqsort so it is asymptotically `n log n`, and the log factor is faintly visible over this range,
+/// but far too weak to model: per-element cost grows only 1.17x across a 31x size increase, where an
+/// `n log n` fit demands 1.49x.
+///
+/// Axis H, minimum of 10 runs (`bench_candidate_materialize_sort_shape`):
+///
+///     cands     1,024   4,096   8,192  16,384  31,508
+///     ns/elem    4.35    4.39    4.49    4.75    5.08
+///     n log n    4.35    4.83    5.11    5.40    6.50
+///
+/// Re-fit rather than extrapolating past ~3M cards, where the log factor does start to matter.
+///
+/// MEASUREMENT NOTE: take the MINIMUM across repeated runs, not a single run. Contention here is
+/// one-sided — across those 10 runs min and median agree to within 0.06 ns/elem at every point while
+/// the max reaches 5.73 — so one contaminated run reads as flat ~5.0 at every size and hides the
+/// trend completely. That artifact is what made an earlier draft of this doc quote figures that
+/// disagreed with the bench, and it is the reason to distrust any single-run number here.
+pub(crate) const MATERIALIZE_SORT_PER_CAND_NS: f64 = 4.95;
+
+/// Modelled cost of producing the candidate list a materializing plan consumes, in ns. `0.0` for
+/// plans that never build one — those walk or read a plane bitmap directly, and charging them this
+/// would invert exactly the comparison the term is meant to inform.
+///
+/// Prices today's behavior: a `collect` + `sort_unstable`. It does **not** model the bitmap
+/// alternative that doc proposes; if that ships, this needs the domain term as well.
+///
+/// The match below is deliberately NOT `PhysicalPlan::materializing()`, which means something
+/// else — "runnable off a materialized prep", and so includes `PlanePopcountOrder`, which reads
+/// the plane bitmap directly and builds no candidate list. Charging it here would invert exactly
+/// the plane-against-materializing comparison this term exists to inform.
+pub(crate) fn materialize_cost(plan: PhysicalPlan, f: &PlanFeatures) -> f64 {
+    match plan {
+        PhysicalPlan::StreamedSelect | PhysicalPlan::GatheredScan => {
+            MATERIALIZE_SORT_FIXED_NS + MATERIALIZE_SORT_PER_CAND_NS * f64::from(f.eval_domain)
+        }
+        PhysicalPlan::PrintingRangeScan
+        | PhysicalPlan::PrintingCompose
+        | PhysicalPlan::PlanePopcountOrder
+        | PhysicalPlan::CardRangePopcount => 0.0,
+    }
+}
+
 // ─── P3: StreamedSelect ─────────────────────────────────────────────────────
 // Match phase walks eval_domain cards computing per-card counts, then either
 // walks the sort permutation to the page (broad) OR — when total <=
