@@ -29,8 +29,9 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from api.parsing import parse_scryfall_query  # noqa: E402
-from client.query_runner import random_query  # noqa: E402
-from scripts.bench_bitplanes import load_engine  # noqa: E402
+from scripts import costbench  # noqa: E402
+from scripts.costbench import load_engine  # noqa: E402
+from scripts.query_sampler import QuerySampler  # noqa: E402
 
 if TYPE_CHECKING:
     import card_engine
@@ -50,14 +51,15 @@ ORDERBY_VALUES = frozenset(
     {"edhrec", "cubecobra", "cmc", "power", "toughness", "rarity", "name", "released", "set", "color", "usd", "artist", "review"}
 )
 DEFAULT_ORDERBY = "edhrec"
-RANDOM_UNIQUE_WEIGHTS = {"card": 75, "printing": 20, "artwork": 5}
-# Enough rounds that a bimodal plan shows both modes (00648's measurement-traps section) while
-# keeping a 200-query sweep to a couple of minutes.
+# Overridable so the harness runs from a git worktree, which has no benchmarks/ tree of its own.
+WILD_CORPUS = REPO_ROOT / "benchmarks/wild-queries/wild-corpus.jsonl"
+# Above the shared costbench default, with a reason: enough rounds that a bimodal plan shows both
+# modes (00648's measurement-traps section) while keeping a 200-query sweep to a couple of minutes.
 NUM_WARMUPS = 3
 NUM_TRIALS = 15
 # Regret below this is inside run-to-run noise at these sizes; counted but reported separately
 # so a "miss" that costs nothing does not inflate the headline rate.
-NOISE_FLOOR_US = 1.0
+NOISE_FLOOR_US = costbench.NOISE_FLOOR_US
 # Fewer plans than this and there is no choice to get wrong.
 MIN_PLANS_TO_CHOOSE = 2
 # statistics.quantiles needs more than this many samples to say anything.
@@ -67,16 +69,28 @@ MIN_FOR_QUARTILES = 4
 LIVE_DEFECT_FLOOR_US = 5.0
 
 
-def load_queries(source: str, sample: int, seed: int) -> list[tuple[str, str, str]]:
-    """(query, unique, orderby) triples from the requested source, sampled deterministically."""
+def load_queries(
+    source: str, sample: int, seed: int, corpus: pathlib.Path, wild_corpus: pathlib.Path
+) -> list[tuple[str, str, str]]:
+    """(query, unique, orderby) triples from the requested source, sampled deterministically.
+
+    `wild-operators` is the default and stays the wild corpus: real Scryfall traffic is the right
+    universe for a REGRET number, because regret is what users actually lose.
+
+    `random` used `client.query_runner.random_query`, which is a load generator — it picks values
+    off hardcoded lists (`year:2019`..`year:2024` on a corpus spanning 1993-2026, a dozen fixed
+    prices) and so clusters selectivity at a handful of arbitrary points. Routing is decided by
+    selectivity, so that source could barely produce a mis-selection to measure. It draws from
+    `QuerySampler` now: same synthetic role, but corpus-derived values, quantile-placed thresholds,
+    and a real spread of distinct-on and orderby instead of a fixed `edhrec`.
+    """
     rng = random.Random(seed)
     if source == "random":
-        uniques = list(RANDOM_UNIQUE_WEIGHTS)
-        weights = [RANDOM_UNIQUE_WEIGHTS[u] for u in uniques]
-        return [(random_query(), rng.choices(uniques, weights=weights)[0], DEFAULT_ORDERBY) for _ in range(sample)]
+        sampler = QuerySampler(corpus, "uniform")
+        return [(sampler.query(rng), sampler.unique(rng), sampler.orderby(rng)) for _ in range(sample)]
 
     rows = []
-    for line in (REPO_ROOT / "benchmarks/wild-queries/wild-corpus.jsonl").open():
+    for line in wild_corpus.open():
         row = json.loads(line)
         unique = UNIQUE_FROM_SCRYFALL.get(row.get("unique", "card"))
         if unique is None or not OP_RE.search(row["q"]):
@@ -119,18 +133,23 @@ def calibration(engine: card_engine.QueryEngine, queries: list[tuple[str, str, s
         except Exception:  # noqa: BLE001, S112 - a query bind rejects is a sample skip, not an error
             continue
         for p in res["plans"]:
-            if not p["trials_ns"] or p["predicted_ns"] <= 0:
+            predicted = costbench.predicted_ns(p)
+            if not p["trials_ns"] or predicted is None:
                 continue
             # A plan can measure 0 ns when it is faster than the clock's resolution; clamp so the
             # log-scale ordering below stays defined without dropping the sample.
             meas = max(min(p["trials_ns"]), 1)
-            r = meas / p["predicted_ns"]
+            r = meas / predicted
             ratios[p["plan"]].append(r)
-            # A plan that materializes pays acquire inside its trial; net it out. Clamped at a
-            # nanosecond so a plan whose whole cost was acquire cannot divide by zero.
-            net = max(meas - min(res["acquire"]["acquire_ns"]), 1.0) if p["materialize_ns"] > 0 else float(meas)
-            nets[p["plan"]].append(net / p["predicted_ns"])
-            by_source[p["plan"], res["acquire"]["count_source"]].append(net / p["predicted_ns"])
+            # `costbench.plan_self_ns` is the toolkit's one definition of a plan's own cost. This
+            # harness previously netted `acquire_ns`, which times a DIFFERENT participant, so its
+            # `net` column was not comparable to the same column in the percentile and pairwise
+            # harnesses. It nets `ns_prepare` now, and drops the row when the subtraction overshoots.
+            self_ns = costbench.plan_self_ns(p, res["acquire"])
+            if self_ns is None:
+                continue
+            nets[p["plan"]].append(self_ns / predicted)
+            by_source[p["plan"], res["acquire"]["count_source"]].append(self_ns / predicted)
             # Track the furthest from 1 in log terms, either direction.
             if abs(math.log(r)) > abs(math.log(worst[p["plan"]][0])):
                 worst[p["plan"]] = (r, f"{q} [{unique}]")
@@ -167,11 +186,14 @@ def main() -> None:
     parser.add_argument("--trials", type=int, default=NUM_TRIALS, help="timed rounds per plan; lower for large sweeps")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--corpus", type=pathlib.Path, default=REPO_ROOT / "benchmarks/bitplanes/corpus.jsonl")
+    parser.add_argument(
+        "--wild-corpus", type=pathlib.Path, default=WILD_CORPUS, help="real-traffic corpus for --source wild-operators"
+    )
     parser.add_argument("--shm-path", type=pathlib.Path, default=None)
     args = parser.parse_args()
 
     engine = load_engine(args.corpus, args.shm_path or args.corpus.with_suffix(".misselect.store"))
-    queries = load_queries(args.source, args.sample, args.seed)
+    queries = load_queries(args.source, args.sample, args.seed, args.corpus, args.wild_corpus)
     if args.calibration:
         calibration(engine, queries, args.trials)
         return

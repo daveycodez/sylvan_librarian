@@ -38,6 +38,7 @@ could not see, concentrated entirely in bounded ranges at artwork granularity.
 from __future__ import annotations
 
 import collections
+import dataclasses
 import datetime as dt
 import json
 import re
@@ -49,13 +50,21 @@ if TYPE_CHECKING:
 
 MODES = ("realistic", "uniform")
 
-# Range fields mapped to the corpus column each draws its thresholds from.
+# Range fields mapped to the corpus column each draws its thresholds from. `eur`/`tix` are sparser
+# than `usd` (not every printing is priced in every currency), which is the point: they exercise a
+# different density of the same index, and there is live work on exactly that
+# (local-engine-eur-tix-range-index.md). Rows missing a column are skipped when the corpus is read,
+# so a sparse column still yields quantiles over the values that exist.
 RANGE_COLUMNS: dict[str, str] = {
     "usd": "price_usd",
+    "eur": "price_eur",
+    "tix": "price_tix",
     "cn": "collector_number_int",
     "year": "released_at",
     "date": "released_at",
 }
+# Rendered to two decimal places; everything else in RANGE_COLUMNS is an integer or a date.
+PRICE_FIELDS = frozenset({"usd", "eur", "tix"})
 RANGE_OPS = ("<", "<=", ">", ">=", ":")
 
 # Predicate families and their relative weight in `realistic`; `uniform` uses all-ones.
@@ -88,6 +97,9 @@ REALISTIC_ORDERBY_WEIGHTS: dict[str, float] = {
 # How many predicates a query gets. Deeper conjunctions narrow to nothing and stop exercising plan
 # choice at all, which is the thing being measured.
 PREDICATE_COUNT_WEIGHTS = ((1, 45), (2, 40), (3, 15))
+# Attempts per requested predicate before `query()` gives up trying to land another distinct family.
+# Only reachable under a `Shape` whose family pool is small relative to the requested count.
+MAX_FAMILY_DRAWS = 8
 
 # Closed vocabularies: small fixed sets where the corpus adds nothing.
 STATIC_VALUES: dict[str, list[str]] = {
@@ -124,6 +136,52 @@ NAME_PREFIX_FRACTION = 0.5
 WORD_RE = re.compile(r"[a-z]{4,}")
 
 
+@dataclasses.dataclass(frozen=True)
+class Shape:
+    """A constraint on what `query()` / `unique()` / `orderby()` may draw.
+
+    Targeted benchmarks exist because they need ONE query shape — a bare range under
+    `unique=printing`, a compose leaf, a two-sided bound — and before this they each hand-rolled a
+    generator to get it. Those generators picked values off hardcoded lists, which is precisely what
+    this module's header argues against: a cost model is a function of selectivity, and a benchmark
+    that samples six values of it cannot say whether the model is right. A shape narrows WHICH
+    predicates appear without giving up corpus-derived values or quantile-placed thresholds.
+
+    Every field is a restriction on the default weighted draw; `None` means "no restriction", and
+    the mode's weights still apply across whatever survives.
+
+    Note what this deliberately cannot express: matched algebraic pairs (`-usd<c usd<d` against its
+    direct equivalent), controls chosen by knowing what a diff touches, negation, or a value picked
+    because it has a known posting count. Those are human judgements and belong in a curated list.
+
+        Shape(families={"range"}, predicates=1, unique={"printing"})  # bare printing-space range
+    """
+
+    families: frozenset[str] | None = None
+    predicates: int | None = None
+    unique: frozenset[str] | None = None
+    orderby: frozenset[str] | None = None
+
+    def __post_init__(self) -> None:
+        """Reject a shape that can never produce a query, rather than looping forever later."""
+        for field, known in (
+            ("families", set(REALISTIC_FAMILY_WEIGHTS)),
+            ("unique", set(REALISTIC_UNIQUE_WEIGHTS)),
+            ("orderby", set(REALISTIC_ORDERBY_WEIGHTS)),
+        ):
+            value = getattr(self, field)
+            if value is not None and (unknown := set(value) - known):
+                msg = f"Shape.{field} has unknown {sorted(unknown)}; known are {sorted(known)}"
+                raise ValueError(msg)
+        if self.predicates is not None and self.predicates < 1:
+            msg = f"Shape.predicates must be >= 1, got {self.predicates}"
+            raise ValueError(msg)
+
+
+#: No restriction — what every caller got before `Shape` existed.
+ANY_SHAPE = Shape()
+
+
 class QuerySampler:
     """The corpus-derived query universe, sampled under one of the two `MODES`."""
 
@@ -135,6 +193,13 @@ class QuerySampler:
         self.mode = mode
         self.realistic = mode == "realistic"
         self._read_corpus(corpus)
+        # Only range fields whose column actually carried values in this corpus. `eur`/`tix` are
+        # sparse and an export can omit them entirely; sampling a field with no quantiles to draw
+        # from would raise deep inside `range_predicate` instead of simply not being offered.
+        self.range_fields = [f for f, col in RANGE_COLUMNS.items() if col in self.sorted]
+        if not self.range_fields:
+            msg = f"corpus {corpus} has no usable range column; need one of {sorted(set(RANGE_COLUMNS.values()))}"
+            raise ValueError(msg)
         self.families = self._weights(REALISTIC_FAMILY_WEIGHTS)
         self.uniques = self._weights(REALISTIC_UNIQUE_WEIGHTS)
         self.orderbys = self._weights(REALISTIC_ORDERBY_WEIGHTS)
@@ -213,7 +278,7 @@ class QuerySampler:
 
     def _render(self, field: str, raw: float) -> str:
         """A sampled column value back into query syntax for `field`."""
-        if field == "usd":
+        if field in PRICE_FIELDS:
             return f"{raw:.2f}"
         if field == "cn":
             return str(int(raw))
@@ -223,13 +288,13 @@ class QuerySampler:
 
     def range_predicate(self, rng: random.Random) -> str:
         """One-sided range whose threshold sits at a uniformly-drawn quantile of its column."""
-        field = rng.choice(list(RANGE_COLUMNS))
+        field = rng.choice(self.range_fields)
         value = self._render(field, self.quantile(RANGE_COLUMNS[field], rng.random()))
         return f"{field}{rng.choice(RANGE_OPS)}{value}"
 
     def bounded_predicate(self, rng: random.Random) -> str:
         """A two-sided range (`usd>=a usd<=b`), the shape one-sided sampling never produces."""
-        field = rng.choice([f for f in RANGE_COLUMNS if f != "year"])
+        field = rng.choice([f for f in self.range_fields if f != "year"])
         column = RANGE_COLUMNS[field]
         lo_p, hi_p = sorted((rng.random(), rng.random()))
         lo = self._render(field, self.quantile(column, lo_p))
@@ -257,12 +322,33 @@ class QuerySampler:
         prefix = {"oracle": "o", "flavor": "ft", "artist": "a", "set": "set", "type": "t"}[family]
         return f"{prefix}:{self._pick(family, rng)}"
 
-    def query(self, rng: random.Random) -> str:
-        """One query: a few predicates from distinct families, weighted by this sampler's mode."""
-        counts, count_weights = zip(*PREDICATE_COUNT_WEIGHTS, strict=True)
-        keys, weights = self.families
+    @staticmethod
+    def _restrict(table: tuple[list[str], list[float]], allowed: frozenset[str] | None) -> tuple[list[str], list[float]]:
+        """Drop keys a shape excludes, keeping the mode's relative weights over what is left."""
+        keys, weights = table
+        if allowed is None:
+            return keys, weights
+        kept = [(k, w) for k, w in zip(keys, weights, strict=True) if k in allowed]
+        return [k for k, _ in kept], [w for _, w in kept]
+
+    def query(self, rng: random.Random, shape: Shape = ANY_SHAPE) -> str:
+        """One query: a few predicates from distinct families, weighted by this sampler's mode.
+
+        A `shape` narrows the family pool and can pin the predicate count. Because families are
+        drawn without replacement, a pinned count larger than the pool yields the pool.
+        """
+        keys, weights = self._restrict(self.families, shape.families)
+        if shape.predicates is None:
+            counts, count_weights = zip(*PREDICATE_COUNT_WEIGHTS, strict=True)
+            n = rng.choices(counts, weights=count_weights)[0]
+        else:
+            n = shape.predicates
         parts, used = [], set()
-        for _ in range(rng.choices(counts, weights=count_weights)[0]):
+        # Sample until `n` DISTINCT families land, rather than skipping duplicates as the unshaped
+        # path does -- with a narrow pool a skip would silently return fewer predicates than asked.
+        for _ in range(n * MAX_FAMILY_DRAWS):
+            if len(parts) == n or len(used) == len(keys):
+                break
             family = rng.choices(keys, weights=weights)[0]
             if family in used:
                 continue
@@ -270,12 +356,12 @@ class QuerySampler:
             parts.append(self.predicate(family, rng))
         return " ".join(parts) or self.predicate("type", rng)
 
-    def unique(self, rng: random.Random) -> str:
-        """A distinct-on, weighted by mode."""
-        keys, weights = self.uniques
+    def unique(self, rng: random.Random, shape: Shape = ANY_SHAPE) -> str:
+        """A distinct-on, weighted by mode and narrowed by `shape`."""
+        keys, weights = self._restrict(self.uniques, shape.unique)
         return rng.choices(keys, weights=weights)[0]
 
-    def orderby(self, rng: random.Random) -> str:
+    def orderby(self, rng: random.Random, shape: Shape = ANY_SHAPE) -> str:
         """An orderby, weighted by mode. Which one gates StreamedSelect/PlanePopcountOrder."""
-        keys, weights = self.orderbys
+        keys, weights = self._restrict(self.orderbys, shape.orderby)
         return rng.choices(keys, weights=weights)[0]
