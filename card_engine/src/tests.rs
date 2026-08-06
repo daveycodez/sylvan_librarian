@@ -11,7 +11,7 @@ use super::{
     PhysicalPlan, ComposePaging, trigram_candidates, finalize_trigram_index, PrintingRangeIndex, NARROW_FLOOR,
     gathered_scan_applicable, streamed_select_applicable, plane_popcount_order_applicable, printing_range_scan_applicable,
     walk_printing_page, aligned_page, bare_range_bounds, probe_range_k, printing_range_fastpath, sort_key_bits, orderby_to_col, SortCol, STREAM_MIN_MATCHES,
-    prepare_candidates, verify_cost_tier, scan_units, sort_col_bound, Mode, QueryCtx, QueryParams, Prefer, SortBound,
+    prepare_candidates, verify_cost_tier, scan_units, sort_col_bound, divergent_formats_of, Mode, QueryCtx, QueryParams, Prefer, SortBound,
     GatherSelect, select_page, GATHER_PRUNE_CHUNK, Match,
     archive_header, archive_payload, ARCHIVE_HEADER_LEN, Mmap,
     bitmap_contains, bitmap_card_ids, compile_plane, eval_planes, split_planes,
@@ -1358,11 +1358,33 @@ fn plane_expr_is_existential_identifies_legality_only() {
     let bounds = &archived.indexes.planes;
     let words = &archived.indexes.oracle_trigram.words;
 
+    // This fixture's card2 has two printings disagreeing at shifts 0 and 4, and nothing disagrees at
+    // shift 2 -- so it carries both regimes, and the mask says which is which. Asserted rather than
+    // assumed, because every expectation below depends on it.
+    let divergent = u64::from(bounds.divergent_formats);
+    assert_eq!(divergent & 0b11, 0b01, "shift 0 diverges: card2 is legal in one printing, not the other");
+    assert_eq!(divergent >> 2 & 0b11, 0b00, "shift 2 is card-invariant across this fixture");
+    assert_ne!(divergent >> 4 & 0b11, 0b00, "shift 4 diverges: banned in one printing, legal in the other");
+
     let legality_pe = compile_plane(&FilterExpr::Legality { shift: Some(0), expected: 0b01 }, bounds, words).unwrap();
-    assert!(super::plane_expr_is_existential(&legality_pe));
+    assert!(super::plane_expr_is_existential(&legality_pe, divergent), "a DIVERGENT format needs per-printing truth");
+
+    // The new half: a legality plane for a format whose printings never disagree is card-invariant, so it
+    // is not existential and the #667 carveout does not apply to it. This is what makes `f:modern` behave
+    // like `t:creature` -- in the production corpus every format but `oldschool` is in this case.
+    let invariant_pe = compile_plane(&FilterExpr::Legality { shift: Some(2), expected: 0b01 }, bounds, words).unwrap();
+    assert!(
+        !super::plane_expr_is_existential(&invariant_pe, divergent),
+        "a format no card diverges in is card-invariant, so its plane needs no per-printing verification",
+    );
+    // ...and the conservative mask still says yes, which is what a pre-mask store supplies.
+    assert!(
+        super::plane_expr_is_existential(&invariant_pe, u64::MAX),
+        "u64::MAX must reproduce the pre-mask behaviour for every format",
+    );
 
     let creature_pe = compile_plane(&FilterExpr::TypeCmp { mask: TYPE_CREATURE, op: CmpOp::Ge }, bounds, words).unwrap();
-    assert!(!super::plane_expr_is_existential(&creature_pe));
+    assert!(!super::plane_expr_is_existential(&creature_pe, divergent));
 
     let mixed = compile_plane(
         &FilterExpr::And(vec![
@@ -1373,7 +1395,7 @@ fn plane_expr_is_existential_identifies_legality_only() {
         words,
     )
     .unwrap();
-    assert!(super::plane_expr_is_existential(&mixed), "one existential leaf must taint the whole And");
+    assert!(super::plane_expr_is_existential(&mixed, divergent), "one existential leaf must taint the whole And");
 }
 
 /// Regression for the mode-aware all_match bug found while building this
@@ -1620,6 +1642,13 @@ const FUZZ_OPS: [CmpOp; 6] = [CmpOp::Eq, CmpOp::Ne, CmpOp::Lt, CmpOp::Le, CmpOp:
 // banned(0b11); NOT_LEGAL(0b00) is never a query leaf (the parser negates instead).
 const FUZZ_SHIFTS: [u8; 3] = [0, 2, 4];
 const FUZZ_STATUSES: [u64; 3] = [0b01, 0b10, 0b11];
+// Shifts a divergent card is allowed to disagree at. Deliberately NOT all of `FUZZ_SHIFTS`: production
+// has exactly one divergent format (`oldschool`, all 556 of the corpus's divergent cards) and the rest
+// are card-invariant, so a corpus where every format can diverge would only ever exercise the
+// conservative existential path. Queries still draw leaves from all three shifts, so both regimes get
+// hit -- and `FUZZ_SHIFT_INVARIANT` is the one whose per-printing verification is provably redundant.
+const FUZZ_SHIFTS_DIVERGENT: [u8; 2] = [0, 2];
+const FUZZ_SHIFT_INVARIANT: u8 = 4;
 
 fn fuzz_op(rng: &mut rand::rngs::SmallRng) -> CmpOp {
     FUZZ_OPS[rng.random_range(0..FUZZ_OPS.len())]
@@ -2266,26 +2295,29 @@ fn fuzz_store_n(rng: &mut rand::rngs::SmallRng, ncards: usize) -> CardData {
         };
         counts.push(npr);
 
-        let mut words: Vec<u64> = (0..npr).map(|_| rand_word(rng)).collect();
+        // One base word shared by every printing, then divergence introduced at ONE format. Drawing a
+        // fresh `rand_word` per printing (as this did) made every format differ between the printings of
+        // a divergent card, so the whole corpus was divergent in all three and `FUZZ_SHIFT_INVARIANT`
+        // could not exist -- caught by `fuzz_corpus_has_both_divergent_and_invariant_formats`, which read
+        // a mask of 0x3f. Production diverges in exactly one format, so this is also the more faithful
+        // shape.
+        let base = rand_word(rng);
+        let mut words: Vec<u64> = vec![base; npr];
         if divergent {
-            // Force a real disagreement at one format between printings 0 and 1,
-            // so the "divergent flag but printings happen to agree" degenerate
-            // case is not all this branch produces.
-            let ds = FUZZ_SHIFTS[rng.random_range(0..FUZZ_SHIFTS.len())];
+            // Force a real disagreement at one DIVERGENT-ELIGIBLE format between printings 0 and 1, so
+            // the "divergent flag but printings happen to agree" degenerate case is not all this branch
+            // produces, and so the invariant shift stays invariant.
+            let ds = FUZZ_SHIFTS_DIVERGENT[rng.random_range(0..FUZZ_SHIFTS_DIVERGENT.len())];
             let s0 = rng.random_range(0..4u64);
             let s1 = { let c = rng.random_range(0..4u64); if c == s0 { (s0 + 1) & 0b11 } else { c } };
-            words[0] = (words[0] & !(0b11 << ds)) | (s0 << ds);
-            words[1] = (words[1] & !(0b11 << ds)) | (s1 << ds);
+            words[0] = (base & !(0b11 << ds)) | (s0 << ds);
+            words[1] = (base & !(0b11 << ds)) | (s1 << ds);
             // Card-level word is unused for divergent cards (eval reads per-printing).
             card.card_legalities = words[0];
         } else {
             // Non-divergent: every printing shares the card-level word (the
             // real-data invariant the exact card-level plane relies on).
-            let w = words[0];
-            for x in words.iter_mut() {
-                *x = w;
-            }
-            card.card_legalities = w;
+            card.card_legalities = base;
         }
 
         for &word in &words {
@@ -2810,6 +2842,40 @@ fn gather_select_matches_reference() {
     }
 }
 
+/// The fuzz corpus must contain BOTH regimes of legality, or every differential test that touches it
+/// verifies only the conservative one.
+///
+/// Production has exactly one divergent format (`oldschool`: all 556 of the corpus's divergent cards) and
+/// the rest are card-invariant, which is what makes skipping per-printing legality verification safe for
+/// them. A fuzz store where every format could diverge would exercise the carveout and never the
+/// shortcut; one where none could would do the opposite. This pins both, on the mask `reload` itself
+/// computes, so the two cannot drift apart silently.
+#[test]
+fn fuzz_corpus_has_both_divergent_and_invariant_formats() {
+    use rand::SeedableRng;
+    // Enough cards that the ~10% divergent branch fires on every shift it is allowed to use.
+    const CORPUS_CARDS: usize = 4_000;
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(828_003);
+    let data = fuzz_store_n(&mut rng, CORPUS_CARDS);
+    let mask = divergent_formats_of(&data.printings, &data.offsets);
+
+    for shift in FUZZ_SHIFTS_DIVERGENT {
+        assert_ne!(
+            mask >> shift & 0b11,
+            0,
+            "shift {shift} is in FUZZ_SHIFTS_DIVERGENT but no card diverged there, so the existential \
+             legality path is unexercised for it (mask {mask:#x})",
+        );
+    }
+    assert_eq!(
+        mask >> FUZZ_SHIFT_INVARIANT & 0b11,
+        0,
+        "shift {FUZZ_SHIFT_INVARIANT} must be card-invariant across every card -- it is the format whose \
+         per-printing verification is provably redundant, and the only reason a test can assert a \
+         shortcut is safe (mask {mask:#x})",
+    );
+}
+
 /// #702 step 2 (force-plan seam): every physical plan that is *applicable* to a
 /// query must return rows identical to `GatheredScan`, the universal fallback /
 /// reference. This is the correctness guard for the extraction — it proves the
@@ -3047,7 +3113,7 @@ fn force_plan_differential_agreement() {
                 let (ref_total, ref_page) = run_query_with_plan(
                     PhysicalPlan::GatheredScan, &QueryCtx::from(archived),
                     &QueryParams::from_strs(mode, prefer, orderby, direction, full_limit, 0).with_sort_bound(sort_bound),
-                    &mut ref_res, ref_pe.as_ref(),
+                    &mut ref_res, None, ref_pe.as_ref(),
                 )
                 .expect("GatheredScan is always applicable");
                 ran[plan_idx(PhysicalPlan::GatheredScan)] += 1;
@@ -3071,7 +3137,7 @@ fn force_plan_differential_agreement() {
                     let out = run_query_with_plan(
                         plan, &QueryCtx::from(archived),
                         &QueryParams::from_strs(mode, prefer, orderby, direction, full_limit, 0).with_sort_bound(sort_bound),
-                        &mut res, pe.as_ref(),
+                        &mut res, None, pe.as_ref(),
                     );
                     let Some((total, page)) = out else { continue };
                     ran[plan_idx(plan)] += 1;
@@ -3217,7 +3283,7 @@ fn explain_reports_ranked_applicable_plans() {
                 fuzz_bound_filter(spec, archived), &archived.indexes.planes, &archived.indexes.oracle_trigram.words, matches!(mode, Mode::Card),
             );
             let (facts, estimates): (AcquireFacts, Vec<PlanEstimate>) = explain(
-                &QueryCtx::from(archived), &explain_params(mode, 60), &mut filter, pe.as_ref(),
+                &QueryCtx::from(archived), &explain_params(mode, 60), &mut filter, None, pe.as_ref(),
             );
 
             // The acquire facts every plan in this call shares. `eval_domain` is what a
@@ -3322,13 +3388,13 @@ fn explain_analyze_matches_explain_and_times_every_plan() {
         bound.clone(), &archived.indexes.planes, &archived.indexes.oracle_trigram.words, true,
     );
     let (ref_facts, reference): (AcquireFacts, Vec<PlanEstimate>) = explain(
-        &QueryCtx::from(archived), &explain_params(Mode::Card, 60), &mut ref_filter, ref_pe.as_ref(),
+        &QueryCtx::from(archived), &explain_params(Mode::Card, 60), &mut ref_filter, None, ref_pe.as_ref(),
     );
 
     let (pe, filter) = split_planes(bound, &archived.indexes.planes, &archived.indexes.oracle_trigram.words, true);
     let (facts, trials): (AcquireFacts, Vec<PlanTrial>) = explain_analyze(
         &QueryCtx::from(archived), &QueryParams::from_strs("card", "default", "edhrec", "asc", 60, 0),
-        &filter, pe.as_ref(), NUM_WARMUPS, NUM_TRIALS,
+        &filter, None, pe.as_ref(), NUM_WARMUPS, NUM_TRIALS,
     );
 
     // The acquire facts describe the query, not the round, so they must agree with
@@ -3469,7 +3535,7 @@ fn compose_paging_prediction_matches_the_branch_taken() {
 
                             // The prediction, on its own clone -- acquire mutates the filter it reads.
                             let mut acq_filter = filter.clone();
-                            let (feats, prep, _bits) = acquire_plan_features(&ctx, &params, &mut acq_filter, pe.as_ref());
+                            let (feats, prep, _bits) = acquire_plan_features(&ctx, &params, &mut acq_filter, None, pe.as_ref());
                             if prep.count_source() != CountSource::PrintingCompose {
                                 continue; // not a compose acquire; compose_paging has no referent
                             }
@@ -3479,7 +3545,7 @@ fn compose_paging_prediction_matches_the_branch_taken() {
                             // iteration's label survives in the cell otherwise (see PHASE_STATS).
                             let mut run_filter = filter.clone();
                             take_phase_stats();
-                            let ran = run_query_with_plan(PhysicalPlan::PrintingCompose, &ctx, &params, &mut run_filter, pe.as_ref());
+                            let ran = run_query_with_plan(PhysicalPlan::PrintingCompose, &ctx, &params, &mut run_filter, None, pe.as_ref());
                             let taken = take_phase_stats().paging_taken;
 
                             let case = format!(
@@ -3654,7 +3720,7 @@ fn materializing_plans_agree_on_the_counters_they_share() {
                 let mut streamed_filter = filter.clone();
                 take_phase_stats();
                 let streamed_ran =
-                    run_query_with_plan(PhysicalPlan::StreamedSelect, &ctx, &params, &mut streamed_filter, pe.as_ref());
+                    run_query_with_plan(PhysicalPlan::StreamedSelect, &ctx, &params, &mut streamed_filter, None, pe.as_ref());
                 let streamed = take_phase_stats();
                 if streamed_ran.is_none() {
                     continue; // no sort permutation for this orderby; nothing to compare against
@@ -3663,7 +3729,7 @@ fn materializing_plans_agree_on_the_counters_they_share() {
                 let mut gathered_filter = filter.clone();
                 take_phase_stats();
                 let gathered_ran =
-                    run_query_with_plan(PhysicalPlan::GatheredScan, &ctx, &params, &mut gathered_filter, pe.as_ref());
+                    run_query_with_plan(PhysicalPlan::GatheredScan, &ctx, &params, &mut gathered_filter, None, pe.as_ref());
                 let gathered = take_phase_stats();
                 assert!(gathered_ran.is_some(), "GatheredScan is always applicable");
 
@@ -3839,7 +3905,7 @@ fn plan_stats_never_leak_between_participants() {
                 let (pe, filter) = split_planes(
                     bound, &archived.indexes.planes, &archived.indexes.oracle_trigram.words, matches!(mode, Mode::Card),
                 );
-                let (_facts, trials) = explain_analyze(&ctx, &params, &filter, pe.as_ref(), NUM_WARMUPS, NUM_TRIALS);
+                let (_facts, trials) = explain_analyze(&ctx, &params, &filter, None, pe.as_ref(), NUM_WARMUPS, NUM_TRIALS);
 
                 for t in &trials {
                     if t.trials_ns.is_empty() {
@@ -4074,7 +4140,7 @@ fn declining_plans_report_their_gate_through_explain_analyze() {
                 let (pe, filter) = split_planes(
                     bound, &archived.indexes.planes, &archived.indexes.oracle_trigram.words, matches!(mode, Mode::Card),
                 );
-                let (_facts, trials) = explain_analyze(&ctx, &params, &filter, pe.as_ref(), NUM_WARMUPS, NUM_TRIALS);
+                let (_facts, trials) = explain_analyze(&ctx, &params, &filter, None, pe.as_ref(), NUM_WARMUPS, NUM_TRIALS);
 
                 for t in &trials {
                     if t.declined_ns.is_empty() {
@@ -4377,7 +4443,7 @@ fn plan_cost_calibration() {
                         let t0 = Instant::now();
                         let out = black_box(run_query_with_plan(
                             *plan, &QueryCtx::from(archived),
-                            &QueryParams::from_strs(mode, "default", "edhrec", "asc", limit, offset), &mut res, pe.as_ref(),
+                            &QueryParams::from_strs(mode, "default", "edhrec", "asc", limit, offset), &mut res, None, pe.as_ref(),
                         ));
                         let dt = t0.elapsed().as_nanos() as u64;
                         match out {
@@ -4500,7 +4566,7 @@ fn plan_cost_model_matches_gold() {
                         let t0 = Instant::now();
                         let out = black_box(run_query_with_plan(
                             *plan, &QueryCtx::from(archived),
-                            &QueryParams::from_strs(mode, "default", "edhrec", "asc", limit, offset), &mut res, pe.as_ref(),
+                            &QueryParams::from_strs(mode, "default", "edhrec", "asc", limit, offset), &mut res, None, pe.as_ref(),
                         ));
                         let dt = t0.elapsed().as_nanos() as u64;
                         match out {
@@ -4755,7 +4821,7 @@ fn plan_cost_refit() {
                         let t0 = Instant::now();
                         let out = black_box(run_query_with_plan(
                             *plan, &QueryCtx::from(archived),
-                            &QueryParams::from_strs(mode, "default", "edhrec", "asc", limit, offset), &mut res, pe.as_ref(),
+                            &QueryParams::from_strs(mode, "default", "edhrec", "asc", limit, offset), &mut res, None, pe.as_ref(),
                         ));
                         let dt = t0.elapsed().as_nanos() as u64;
                         match out { Some((t, _)) => { total = t; applicable = true; if it >= WARMUP { best = best.min(dt); } } None => break }
@@ -4949,7 +5015,7 @@ fn printing_range_route_probe() {
                     let t0 = Instant::now();
                     let out = black_box(run_query_with_plan(
                         *plan, &QueryCtx::from(archived),
-                        &QueryParams::from_strs("printing", "default", "edhrec", "asc", LIMIT, offset), &mut res, pe.as_ref(),
+                        &QueryParams::from_strs("printing", "default", "edhrec", "asc", LIMIT, offset), &mut res, None, pe.as_ref(),
                     ));
                     let dt = t0.elapsed().as_nanos() as u64;
                     match out {
@@ -5175,7 +5241,7 @@ fn idea1_vs_idea2_probe() {
                 let t0 = Instant::now();
                 let out = black_box(run_query_with_plan(
                     PhysicalPlan::PrintingRangeScan, &QueryCtx::from(archived),
-                    &QueryParams::from_strs("printing", "default", "edhrec", "asc", LIMIT, offset), &mut res, pe.as_ref(),
+                    &QueryParams::from_strs("printing", "default", "edhrec", "asc", LIMIT, offset), &mut res, None, pe.as_ref(),
                 ));
                 let dt = t0.elapsed().as_nanos() as u64;
                 match out { Some((t, _)) => { total = t; applicable = true; if it >= WARMUP { i1 = i1.min(dt); } } None => break }
@@ -5307,7 +5373,7 @@ fn plan_regret_report() {
                     let t0 = Instant::now();
                     let out = black_box(run_query_with_plan(
                         *plan, &QueryCtx::from(archived),
-                        &QueryParams::from_strs("card", "default", "edhrec", "asc", limit, offset), &mut res, pe.as_ref(),
+                        &QueryParams::from_strs("card", "default", "edhrec", "asc", limit, offset), &mut res, None, pe.as_ref(),
                     ));
                     let dt = t0.elapsed().as_nanos() as u64;
                     match out {
@@ -5526,6 +5592,12 @@ fn legality_and_of_two_formats_declines_but_or_compiles() {
     let a = || FilterExpr::Legality { shift: Some(0), expected: 0b01 };
     let b = || FilterExpr::Legality { shift: Some(2), expected: 0b01 };
 
+    // Still unconditional: `compile_plane` deliberately asks this question with `u64::MAX` rather than the
+    // store's divergence mask, because the answer decides whether the filter consumes to a plane -- and a
+    // consumed filter takes `PrintingCompose` out of the running, which measured a 54x loss on
+    // `f:commander`/printing. The mask is used below the applicability decisions, never inside them.
+    // Once compose is applicable to plane-consumed filters, `a AND invariant` becomes composable and this
+    // assertion is the one to revisit.
     assert!(
         compile_plane(&FilterExpr::And(vec![a(), b()]), bounds, words).is_none(),
         "two distinct formats ANDed must decline (shared-witness)"
@@ -6524,11 +6596,11 @@ fn streamed_walk_bounds_itself_by_the_sort_column_predicate() {
                 // A pristine clone per plan: `prepare_candidates` rewrites the filter it is handed.
                 let mut streamed_filter = filter.clone();
                 take_phase_stats();
-                let streamed = run_query_with_plan(PhysicalPlan::StreamedSelect, &ctx, &params, &mut streamed_filter, pe.as_ref())
+                let streamed = run_query_with_plan(PhysicalPlan::StreamedSelect, &ctx, &params, &mut streamed_filter, None, pe.as_ref())
                     .expect("store_of builds the cmc permutation, so StreamedSelect is applicable");
                 let stats = take_phase_stats();
                 let mut gathered_filter = filter.clone();
-                let gathered = run_query_with_plan(PhysicalPlan::GatheredScan, &ctx, &params, &mut gathered_filter, pe.as_ref())
+                let gathered = run_query_with_plan(PhysicalPlan::GatheredScan, &ctx, &params, &mut gathered_filter, None, pe.as_ref())
                     .expect("GatheredScan is always applicable");
 
                 let case = format!("{mode_label}/{}/offset={offset}", if descending { "desc" } else { "asc" });
@@ -6561,11 +6633,11 @@ fn streamed_walk_bounds_itself_by_the_sort_column_predicate() {
             split_planes(filt(), &archived.indexes.planes, &archived.indexes.oracle_trigram.words, true);
         let mut streamed_filter = filter.clone();
         take_phase_stats();
-        let streamed = run_query_with_plan(PhysicalPlan::StreamedSelect, &ctx, &params, &mut streamed_filter, pe.as_ref())
+        let streamed = run_query_with_plan(PhysicalPlan::StreamedSelect, &ctx, &params, &mut streamed_filter, None, pe.as_ref())
             .expect("store_of builds the edhrec permutation too");
         let stats = take_phase_stats();
         let mut gathered_filter = filter.clone();
-        let gathered = run_query_with_plan(PhysicalPlan::GatheredScan, &ctx, &params, &mut gathered_filter, pe.as_ref())
+        let gathered = run_query_with_plan(PhysicalPlan::GatheredScan, &ctx, &params, &mut gathered_filter, None, pe.as_ref())
             .expect("GatheredScan is always applicable");
         assert_eq!(streamed.0, gathered.0, "unbounded total disagrees with GatheredScan: offset={offset}");
         assert_eq!(ids(&streamed.1), ids(&gathered.1), "unbounded page disagrees with GatheredScan: offset={offset}");
