@@ -1237,3 +1237,128 @@ note here claimed the counter was missing and that a grouping walk was uncounted
 Artwork's per-card surcharge was the last of it. The executor gate was removed (up to 24×), P3's surcharge is
 gated on the same signal, and P4 was measured and needs nothing. What remains in artwork mode is a level
 question inside 0.86–1.25 on both arms, which is not worth a refit against a warm-cache design.
+
+## Compose was `Eq`-only on rarity, and that cost 167×
+
+Chasing `r>=rare`/artwork (100.1 µs regret, six appearances in the top 100) found something bigger than the
+routing error. Its full dump:
+
+    r>=rare  artwork  limit=175      acquire=candidates
+      GatheredScan     pred 484.4   meas 485.9   p/m 1.00   loop 482.2   ← picked
+      StreamedSelect   pred 518.5   meas 381.6   p/m 1.36   loop 376.1
+      eval_domain 12,887 = cards_visited     scan_units 58,656 = printings_examined (BOTH plans)
+
+**The features are exact and both arms are individually respectable**, yet the order inverts: the model
+charges P3 2.9× more per printing (5.97 vs 2.06) and P4 2.9× more per card, on the *same* 58,656 printings,
+and the two errors nearly cancel into a 34 µs predicted gap the wrong way against a 100 µs real one. That is
+the `SCAN_PER_ROW` ratio a pooled fit endorses, in its cleanest form.
+
+**But routing was the small half.** Splitting the phases shows what the query actually spends:
+
+| limit | loop (count) | finish (emit) | perm_steps |
+| --: | --: | --: | --: |
+| 10 | **386.6 µs** | 0.7 µs | 3 |
+| 175 | **374.4 µs** | 4.8 µs | 97 |
+
+`query()` returns `(total, page)`, so an exact `total = 20,979` requires visiting every candidate before
+anything can be emitted. **99.8% of the query produces the count**, flat in page size, while producing the
+rows costs 0.7–4.8 µs. Choosing the better plan wins 100 µs; not scanning at all wins 375.
+
+**And a plan that does not scan already existed — for `Eq` only.** `is_printing_composable` matched rarity
+with `CmpOp::Eq` and nothing else, so `r:rare` composed and `r>=rare` fell to a full candidate scan:
+
+| query | before | after | speedup |
+| --- | --: | --: | --: |
+| `r>=rare` / printing | 349.6 µs | **2.1** | **167×** |
+| `r<=uncommon` / printing | 378.8 | **1.9** | **199×** |
+| `r>uncommon` / printing | 344.5 | **2.1** | **164×** |
+| `r>=rare` / artwork | 487.7 | **82.7** | **5.9×** |
+| `r<=uncommon` / artwork | 421.7 | **125.7** | 3.4× |
+| `r>uncommon` / artwork | 531.7 | **91.4** | 5.8× |
+
+Printing mode becomes a popcount with no scan at all; artwork still pays the printing→artwork projection,
+which is why it is 3–6× rather than 100×.
+
+`rarity_cmp_leaf_bits` enumerates the closed domain — four interior planes plus the sparse tail's postings,
+one definition shared with `walk_rarity_orderby_page` via `rarity_ints_present` — and `Or`s the values that
+satisfy the op. Two properties fall out. **NULL rarity is excluded for free**, since a rarity-less printing is
+in no plane and no posting, which is the trivalent answer for every op including `Ne`. And this is **strictly
+more capable than `compile_plane`'s** `compile_rarity_cmp`, which shares one "above mythic" plane and declines
+`BucketVerdict::Ambiguous` whenever special must be told from bonus — compose reads those two apart from their
+own postings, so it has no ambiguous case.
+
+Row identity: **1,566 cells identical** — every rarity op, negations, conjunctions, `r:special`/`r:bonus`,
+three modes × three orderbys × three pages × two prefers, hashing the returned `scryfall_id` sequence.
+Regret mean 1.45 → **1.40 µs**; the compose acquire grows 7,532 → 8,636 queries as intended, and its share
+goes 22% → 27% because more queries live there now, at a much lower absolute cost.
+
+**The generalisable point**, given compose is meant to become the universal exact evaluator (#731): an
+applicability gate that is narrower than the machinery behind it is invisible to every routing metric. The
+router never sees the plan, so no regret figure, no pairwise ordering and no feature grading can report it —
+`r>=rare` looked like a 100 µs cost-model bug and was a 375 µs missing-plan bug. Auditing
+`is_printing_composable` leaf by leaf against what `compose_printing_bits` can actually build is likely to
+find more; `printing_compose / card` is now the worst cell at mean 2.55 µs and is the place to look next.
+
+## Sparse compose gather: attempted, and the blocker is now named exactly
+
+`usd>=0.42 usd<=0.43`/artwork appeared in the top 100 at 112 µs of regret. The dump says the regret figure
+is nearly irrelevant:
+
+    acquire=printing_compose
+      PrintingCompose   pred  105.9   meas    —      PICKED, then DeclineSparseExact
+      StreamedSelect    pred  988.2   meas 1249.8    exam 97,206
+      GatheredScan      pred 1058.2   meas 1161.5    exam 97,206
+      matches (estimated) 20,411      result_total (actual) 837
+
+The router picked compose, compose built the bitmap, **discarded it**, and dispatch re-derived everything with
+a full-corpus scan — 97,206 printings examined to return 837 matches, ~1,250 µs. The 112 µs the matrix reports
+is only the P3-vs-P4 difference among the fallbacks, because **regret compares only plans that ran** and a
+declining plan accumulates no trials. Second time today that blind spot hid the larger finding, after
+`r>=rare`.
+
+[local-engine-sparse-compose-gather.md](./local-engine-sparse-compose-gather.md) had already designed the
+fix — `gather_composed_page` in place of the `return None` — and verified it byte-identical over 127,640
+queries. Its stated blocker was that `plan_cost` could not price the path, and this stack added the
+`ComposePaging::Gather` arm, so it looked unblocked.
+
+**Tried it. Two edits, not one:** the fastpath gathers, *and* `compose_paging_for` must predict `Gather`
+rather than `Decline`, since a `Decline` prediction costs infinity and keeps compose out of the argmin so the
+gather would never run. Rows verified again on this build: **2,304 cells identical** over the sparse
+two-sided ranges the change enables plus broad controls, four orderbys including the tie-heavy `usd` and
+`rarity`, deep offsets, both prefers.
+
+**And routing got worse, so it is reverted:**
+
+| | decline | gather |
+| --- | --: | --: |
+| regret mean | 1.43 µs | **1.55 (+8%)** |
+| `printing_compose` miss% | 7% | **18%** |
+| `printing_compose` mean | 1.69 | **2.43** |
+| `printing_compose` p90 | **0.00** | **7.92** |
+
+**The blocker is not the cost arm — it is that the prediction cannot tell the query is sparse.**
+`compose_paging_for` branches on `result_total`, which is the *estimate*: 20,411 against a true 837. So it
+predicts `Perm` and prices a cheap permutation walk while the executor runs a gather. The arm is fine; it is
+being handed the wrong branch. That is the same number as the original doc's p10 0.64 → 0.14.
+
+**Which makes the real prerequisite a two-sided range.** `bare_range_bounds` matches one comparison, so
+`usd>=0.42 usd<=0.43` composes as `And` of two one-sided slices — the estimate multiplies the two sides
+instead of intersecting one interval. Fusing them fixes the estimate *and* the build cost at once, and only
+then does sparse-gather become predictable. That supersedes "widen `bare_range_bounds` for multi-leaf ranges"
+as an `eval_domain` idea — it was the wrong motivation for the right change.
+
+Measured, the fusion turned out to be worth more than a prerequisite, for a reason with nothing to do with
+compose: the narrowing already handles a selective range and the `And` never reaches it, so
+`usd>=0.42 usd<=0.43` cost **1,146.8 µs** against **26.7 µs** for a one-sided range returning *more* rows.
+Both halves have now shipped — `4991759` for the narrowing (15–33× on that population) and `7374e19` for
+compose's builders, where the estimate was 38.5× off a count that was two binary searches away. Together:
+regret 1.42 → 1.30 µs, and the fusible traffic slice to 0.81× of baseline. The evidence, the noise analysis
+behind the sparsity gate, and what is left (the sparse gather, now that its prediction is correct):
+[local-engine-two-sided-range-fusion.md](./local-engine-two-sided-range-fusion.md).
+
+## A note on the test counts quoted throughout
+
+`149 debug / 148 release` is not a flake. The difference is exactly one test,
+`tests::arith_tuple_key_budget_catches_a_blown_domain`, which asserts a `debug_assert` tripwire and so is
+compiled out of a release build. That is why both profiles are run and quoted separately: CI's `rust-test`
+job is a debug build, and a release-only local run silently skips the engine's `debug_assert` guards.

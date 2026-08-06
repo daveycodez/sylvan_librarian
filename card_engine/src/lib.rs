@@ -3367,6 +3367,113 @@ fn probe_range_k(filter: &FilterExpr, indexes: &Archived<CardIndexes>) -> Option
     Some(e - s)
 }
 
+/// One entry in the And arm's work list: a child exactly as written, or a half-open interval fused
+/// from two or more same-index range children.
+///
+/// `usd>=0.42 usd<=0.43` is the shape that motivated this. Each half matches most of the corpus, so
+/// each trips `range_too_broad_to_narrow` on its own and declines; their *intersection* is 837
+/// printings. `narrow_rec` narrows children independently and intersects the results, so the
+/// interval is never discovered — measured at 1,146.8 µs, against 26.7 µs for the one-sided
+/// `usd>=200`, which returns *more* rows. Fusing before ranking puts the two-sided form on the same
+/// sparse-vec path the one-sided form already takes.
+enum AndSource<'f, 'i> {
+    Child(&'f FilterExpr),
+    /// `[lo, hi)` on `idx`, the intersection of two or more children's intervals, holding `k`
+    /// printings — already probed, so the And arm reads it as the ranking probe instead of repeating
+    /// the two binary searches. Constituents may include a `Not` (`bare_range_bounds` reduces
+    /// `-usd<c` to `usd>=c`'s bounds itself); nothing downstream needs to know, because the
+    /// broad-interval gate below means `k` is always sparse under `sparse_only` and `range_narrowed`
+    /// therefore takes its vec path without ever consulting `broad_ok` — the one thing the negated arm
+    /// cares about. The compose builders don't consult `broad_ok` at all.
+    FusedRange { idx: &'i Archived<PrintingRangeIndex>, lo: u32, hi: u32, k: usize },
+}
+
+/// Group an `And`'s children by which printing-range index they select on, fusing each group of two
+/// or more into a single interval — `lo = max(lo_i)`, `hi = min(hi_i)`.
+///
+/// Children the range dispatch doesn't recognize and single-member groups pass through untouched, so
+/// this cannot alter any query it doesn't fuse. Emission follows the written position of each group's
+/// first member, so a caller that ranks its sources sees the tie-breaking it saw before for everything
+/// unfused.
+///
+/// The fused interval is the exact conjunction of its constituents, which is what lets one source
+/// stand in for all of them — including in `narrow_rec`'s `every_child_included` tightness accounting.
+///
+/// `sparse_only` is the one thing the two callers disagree about. `narrow_rec` sets it, because a broad
+/// fused source reaches `range_narrowed` under a single `broad_ok` where two broad children each got
+/// their own, which takes a decision away from the And's per-child skip logic for no measured gain (see
+/// the gate below). The compose builders clear it: `range_leaf_bits` is an O(k) scatter at every k, so
+/// one scatter of the intersection always beats two scatters and an AND, and
+/// `compose_printing_estimate` reads the intersection's exact `k` where the unfused fold could only take
+/// the min of the two sides (measured: 33,862 against a true 879).
+fn fuse_and_range_children<'f, 'i>(
+    children: &'f [FilterExpr],
+    indexes: &'i Archived<CardIndexes>,
+    sparse_only: bool,
+) -> Vec<AndSource<'f, 'i>> {
+    // At most one group per printing-range index (price / collector-number / released-at), so a
+    // linear scan of the accumulator beats hashing a pointer.
+    struct Group<'i> {
+        first: usize,
+        idx: &'i Archived<PrintingRangeIndex>,
+        lo: u32,
+        hi: u32,
+        count: usize,
+    }
+    let mut groups: Vec<Group<'i>> = Vec::new();
+    for (pos, child) in children.iter().enumerate() {
+        let Some((idx, lo, hi)) = bare_range_bounds(child, indexes) else { continue };
+        match groups.iter_mut().find(|g| std::ptr::eq(g.idx, idx)) {
+            Some(g) => {
+                g.lo = g.lo.max(lo);
+                // An unsatisfiable fusion (`usd>=1 usd<=0.5`) gives `hi < lo`, and every consumer
+                // computes `k` as `partition_point(hi) - partition_point(lo)` — that subtraction
+                // underflows and panics. Clamping to `[lo, lo)` yields `k = 0`, which is what an
+                // empty range means and what every consumer already handles.
+                g.hi = g.hi.min(hi).max(g.lo);
+                g.count += 1;
+            }
+            None => groups.push(Group { first: pos, idx, lo, hi, count: 1 }),
+        }
+    }
+    // Under `sparse_only`, fusion exists to DISCOVER a sparse intersection hiding behind broad halves.
+    // Where the intersection is itself broad there is nothing to discover — and fusing anyway is not
+    // neutral, for the `broad_ok` reason in this function's doc.
+    //
+    // That gate is a scope decision, not a measured win: paired traffic puts fused-vs-gated at 0.88 vs
+    // 0.86 of baseline on the fusible slice, and the per-query noise floor on a slice fusion cannot
+    // touch at all is ±170 µs, so the two are indistinguishable. What the gate does buy is a bound —
+    // outside the sparse population where the win IS demonstrated (up to 1.3 ms/query), narrowing is a
+    // provable no-op. `k` survives for the survivors so the probe isn't recomputed downstream.
+    let mut fused: Vec<(&Group<'i>, usize)> = Vec::new();
+    for g in &groups {
+        if g.count < 2 {
+            continue;
+        }
+        let s = g.idx.partition_point(|p| u32::from(p.0) < g.lo);
+        let e = g.idx.partition_point(|p| u32::from(p.0) < g.hi);
+        if !sparse_only || !range_too_broad_to_narrow(e - s, g.idx.len()) {
+            fused.push((g, e - s));
+        }
+    }
+    if fused.is_empty() {
+        return children.iter().map(AndSource::Child).collect();
+    }
+    let mut out: Vec<AndSource<'f, 'i>> = Vec::with_capacity(children.len());
+    for (pos, child) in children.iter().enumerate() {
+        let group = bare_range_bounds(child, indexes).and_then(|(idx, ..)| fused.iter().find(|(g, _)| std::ptr::eq(g.idx, idx)));
+        match group {
+            Some((g, k)) => {
+                if pos == g.first {
+                    out.push(AndSource::FusedRange { idx: g.idx, lo: g.lo, hi: g.hi, k: *k });
+                }
+            }
+            None => out.push(AndSource::Child(child)),
+        }
+    }
+    out
+}
+
 /// `broad_ok` says whether a broad printing-range child may materialize its
 /// bitmap: true under Or (the union consumes it) and Not (the complement
 /// trick needs it), false where nothing would — a lone broad set at the root
@@ -3928,12 +4035,20 @@ fn narrow_rec(
             // both shrinks the driver as fast as possible and removes the old
             // sensitivity to the order same-rank children happened to be written
             // in. Non-range children (no probe) sort after the ranges in-rank.
-            let mut ranked: Vec<(u8, Option<usize>, &FilterExpr)> = children
-                .iter()
-                .map(|c| {
-                    let rank = and_child_rank(c, indexes);
-                    let probe = if rank == 1 { probe_range_k(c, indexes) } else { None };
-                    (rank, probe, c)
+            // Same-index range children fuse into one interval first (`fuse_and_range_children`),
+            // because two individually-broad halves can intersect to something sparse and this arm
+            // only ever intersects narrowing *results*, never the bounds.
+            let mut ranked: Vec<(u8, Option<usize>, AndSource)> = fuse_and_range_children(children, indexes, true)
+                .into_iter()
+                .map(|src| match src {
+                    AndSource::Child(c) => {
+                        let rank = and_child_rank(c, indexes);
+                        let probe = if rank == 1 { probe_range_k(c, indexes) } else { None };
+                        (rank, probe, AndSource::Child(c))
+                    }
+                    // A fused interval is a printing range like any other — rank 1, and its probe is
+                    // the `k` its own broad-check already computed.
+                    AndSource::FusedRange { k, .. } => (1, Some(k), src),
                 })
                 .collect();
             ranked.sort_by_key(|(r, probe, _)| (*r, probe.unwrap_or(usize::MAX)));
@@ -3948,7 +4063,7 @@ fn narrow_rec(
             // per child meant popcounting every accumulated bitmap again on every
             // iteration — O(children² × words) for a value that only ever shrinks.
             let mut best: Option<usize> = None;
-            for (rank, probe, c) in ranked {
+            for (rank, probe, src) in ranked {
                 // A driver this selective already bounds the candidate set the
                 // residual re-verifies, so a costlier (rank>0) child usually
                 // narrows nothing the driver's verification doesn't already do
@@ -3974,7 +4089,14 @@ fn narrow_rec(
                     1 => !printing_sets.is_empty(),
                     _ => broad_ok,
                 };
-                if let Some(n) = narrow_rec(c, indexes, offsets, cards, child_broad_ok) {
+                let narrowed = match src {
+                    AndSource::Child(c) => narrow_rec(c, indexes, offsets, cards, child_broad_ok),
+                    // `range_narrowed` is what every unfused range child reaches too, with the same
+                    // `exact: true` (the bounds come from the same `int_range_bounds`/
+                    // `date_range_bounds`/`year_range_bounds` derivations).
+                    AndSource::FusedRange { idx, lo, hi, .. } => range_narrowed(idx, lo, hi, n_printings, child_broad_ok, true),
+                };
+                if let Some(n) = narrowed {
                     // A child covering most of its domain barely narrows the
                     // intersection; skipping it is advisory-sound and avoids
                     // paying its projection/materialization for ~nothing.
@@ -5306,8 +5428,10 @@ fn is_printing_composable(filter: &FilterExpr, indexes: &Archived<CardIndexes>) 
         {
             true
         }
-        FilterExpr::NumericCmp { lhs: NumExpr::Field(NumField::RarityInt), op: CmpOp::Eq, rhs: NumExpr::Const(_) }
-        | FilterExpr::NumericCmp { lhs: NumExpr::Const(_), op: CmpOp::Eq, rhs: NumExpr::Field(NumField::RarityInt) } => true,
+        // Any rarity comparison, not only `== c`: the domain is closed and every present value has exact
+        // bits, so an inequality is the `Or` of the qualifying ones. See `rarity_cmp_leaf_bits`.
+        FilterExpr::NumericCmp { lhs: NumExpr::Field(NumField::RarityInt), rhs: NumExpr::Const(_), .. }
+        | FilterExpr::NumericCmp { lhs: NumExpr::Const(_), rhs: NumExpr::Field(NumField::RarityInt), .. } => true,
         // Legality via #667's card `_EXISTS` plane + a divergent repair (see `legality_leaf_bits`).
         // Only a plane-backed status (legal/banned/restricted) with a present format; an absent format
         // (`shift: None`) matches nothing and stays on the general path.
@@ -5379,6 +5503,48 @@ fn rarity_leaf_bits(c: f64, rp: &Archived<RarityPrintingPlanes>, n_printings: us
         Some(e) => scatter_bits(e.1.iter().map(|p| u32::from(*p)), n_printings),
         None => vec![0u64; wpp],
     }
+}
+
+/// The exact printing-space bitmap for **any** rarity comparison, not just `== c`.
+///
+/// Rarity's domain is closed and small: the four interior ints have laid-out planes and the sparse tail
+/// (special/bonus) has postings, so every value present in the store can be enumerated and its exact bits
+/// read. An inequality is then the `Or` of the values that satisfy it — the same enumeration
+/// `walk_rarity_orderby_page` already walks for its bucket order.
+///
+/// Two consequences worth stating. **NULL rarity is excluded for free**: a printing with no rarity appears in
+/// no plane and no posting, so it matches nothing here, which is the trivalent answer for every op including
+/// `Ne` (`-r:rare` must not match a rarity-less printing). And this is **strictly more capable than
+/// `compile_plane`'s** `compile_rarity_cmp`, which shares one "above mythic" plane and so declines
+/// (`BucketVerdict::Ambiguous`) whenever special must be told from bonus — `r:special`, `r>=bonus` and friends.
+/// Compose reads the two apart from their own postings, so it has no ambiguous case at all.
+///
+/// Was `Eq`-only, and the cost of that was not subtle: `r>=rare`/artwork fell off the compose path entirely
+/// and took **487.7 µs** through a full candidate scan, against **59.2 µs** for `r:rare` on the same corpus —
+/// 8× for a predicate that is just `rare ∨ mythic ∨ special ∨ bonus`.
+fn rarity_cmp_leaf_bits(op: CmpOp, threshold: f64, rp: &Archived<RarityPrintingPlanes>, n_printings: usize) -> Vec<u64> {
+    let wpp = words_per_plane(n_printings);
+    let mut out = vec![0u64; wpp];
+    for int in rarity_ints_present(rp) {
+        if !planes::matches_op(op, f64::from(int), threshold) {
+            continue;
+        }
+        for (dst, src) in out.iter_mut().zip(rarity_leaf_bits(f64::from(int), rp, n_printings)) {
+            *dst |= src;
+        }
+    }
+    out
+}
+
+/// Every rarity int the store actually holds: the four interior values (planes, always laid out) plus
+/// whatever the sparse tail carries. One definition, shared by the compose leaf above and
+/// `walk_rarity_orderby_page`'s bucket walk, so the two cannot disagree about the domain.
+fn rarity_ints_present(rp: &Archived<RarityPrintingPlanes>) -> Vec<u8> {
+    let mut values: Vec<u8> = RARITY_PRINTING_PLANE_INTS.to_vec();
+    values.extend(rp.postings.iter().map(|e| e.0));
+    values.sort_unstable();
+    values.dedup();
+    values
 }
 
 /// #746: the exact printing-space bitmap for a bare tag-postings leaf (`set:VALUE`/`watermark:VALUE`)
@@ -5659,10 +5825,18 @@ fn compose_printing_bits(
     match filter {
         FilterExpr::True => all_printing_bits(n_printings),
         FilterExpr::And(v) => {
-            // empty And is vacuously true; start all-ones (tail masked) and intersect each child.
+            // empty And is vacuously true; start all-ones (tail masked) and intersect each source.
+            // Same-index range children fuse into one interval first, so `usd>=0.42 usd<=0.43` scatters
+            // the 879-printing intersection once instead of scattering 33,862 and 48,559 and ANDing
+            // them. Unconditional (`sparse_only: false`): `range_leaf_bits` is an O(k) scatter at every
+            // k, so one scatter of a subset can never lose to two of its supersets.
             let mut acc = all_printing_bits(n_printings);
-            for child in v.iter() {
-                and_bits_into(&mut acc, &compose_printing_bits(child, indexes, offsets, printings, n_printings));
+            for src in fuse_and_range_children(v, indexes, false) {
+                let bits = match src {
+                    AndSource::Child(c) => compose_printing_bits(c, indexes, offsets, printings, n_printings),
+                    AndSource::FusedRange { idx, lo, hi, .. } => range_leaf_bits(idx, lo, hi, n_printings),
+                };
+                and_bits_into(&mut acc, &bits);
             }
             acc
         }
@@ -5710,9 +5884,12 @@ fn compose_printing_bits(
             let (idx, card_space) = collection_compose_index(indexes, *field).expect("guarded by the matches!");
             collection_negated_leaf_bits(idx, value.as_str(), card_space, offsets, n_printings)
         }
-        FilterExpr::NumericCmp { lhs: NumExpr::Field(NumField::RarityInt), op: CmpOp::Eq, rhs: NumExpr::Const(c) }
-        | FilterExpr::NumericCmp { lhs: NumExpr::Const(c), op: CmpOp::Eq, rhs: NumExpr::Field(NumField::RarityInt) } => {
-            rarity_leaf_bits(*c, &indexes.rarity_printing, n_printings)
+        // `flip_op` on the const-first form so `2<=rarity` and `rarity>=2` build the same bitmap.
+        FilterExpr::NumericCmp { lhs: NumExpr::Field(NumField::RarityInt), op, rhs: NumExpr::Const(c) } => {
+            rarity_cmp_leaf_bits(*op, *c, &indexes.rarity_printing, n_printings)
+        }
+        FilterExpr::NumericCmp { lhs: NumExpr::Const(c), op, rhs: NumExpr::Field(NumField::RarityInt) } => {
+            rarity_cmp_leaf_bits(flip_op(*op), *c, &indexes.rarity_printing, n_printings)
         }
         FilterExpr::Legality { shift: Some(shift), expected } => {
             legality_leaf_bits(*shift, *expected, indexes, offsets, printings, n_printings)
@@ -5745,9 +5922,17 @@ fn compose_printing_estimate(
     let popcount = |bits: &[u64]| bits.iter().map(|w| w.count_ones() as usize).sum::<usize>();
     match filter {
         FilterExpr::True => (n_printings, 0, 0),
-        FilterExpr::And(v) => v
-            .iter()
-            .map(|c| compose_printing_estimate(c, indexes, offsets, n_printings))
+        // The min-of-children fold is an intersection UPPER BOUND, and on a two-sided range it is a bad
+        // one: `usd>=0.42 usd<=0.43` folded to min(33,862, 48,559) against a true 879, and the summed
+        // scatter to 82,421 for an 879-row answer. Fusing same-index children first replaces both with
+        // the interval's exact `k` — the same two `partition_point` calls the one-sided arm below
+        // already makes, which is why a one-sided range estimates at 1.0x and this did not.
+        FilterExpr::And(v) => fuse_and_range_children(v, indexes, false)
+            .into_iter()
+            .map(|src| match src {
+                AndSource::Child(c) => compose_printing_estimate(c, indexes, offsets, n_printings),
+                AndSource::FusedRange { k, .. } => (k, 0, k),
+            })
             .fold((n_printings, 0, 0), |(m, bc, sc), (cm, cbc, csc)| (m.min(cm), bc + cbc, sc + csc)),
         FilterExpr::Or(v) => {
             let (m, bc, sc) = v
@@ -5805,9 +5990,11 @@ fn compose_printing_estimate(
             let k = collection_leaf_printing_count(idx, value.as_str(), card_space, offsets);
             (n_printings.saturating_sub(k), 0, k)
         }
-        FilterExpr::NumericCmp { lhs: NumExpr::Field(NumField::RarityInt), op: CmpOp::Eq, rhs: NumExpr::Const(c) }
-        | FilterExpr::NumericCmp { lhs: NumExpr::Const(c), op: CmpOp::Eq, rhs: NumExpr::Field(NumField::RarityInt) } => {
-            (popcount(&rarity_leaf_bits(*c, &indexes.rarity_printing, n_printings)), 0, 0)
+        FilterExpr::NumericCmp { lhs: NumExpr::Field(NumField::RarityInt), op, rhs: NumExpr::Const(c) } => {
+            (popcount(&rarity_cmp_leaf_bits(*op, *c, &indexes.rarity_printing, n_printings)), 0, 0)
+        }
+        FilterExpr::NumericCmp { lhs: NumExpr::Const(c), op, rhs: NumExpr::Field(NumField::RarityInt) } => {
+            (popcount(&rarity_cmp_leaf_bits(flip_op(*op), *c, &indexes.rarity_printing, n_printings)), 0, 0)
         }
         // Legality: matches ≈ the legal-∃ cards' printings (existence-scaled from the cheap card
         // ∃-plane popcount). The build cost rides the *sparser* side (#744): a majority-legal format
@@ -6251,11 +6438,30 @@ fn printing_compose_fastpath<'a>(
     let (page, mut work) = match perm {
         Some(perm) => {
             if total <= *STREAM_MIN_MATCHES {
+                // Sparse: hand the query back to the general path rather than paging it here.
+                //
+                // NOT for the reason this comment used to give ("the general path gathers + globally
+                // sorts, ordering ties differently"). That died with #815, which made row order total
+                // and filter-independent on (key1, key2, cid, pid), replacing the key-3 `prefer_score`
+                // that genuinely differed between the permutation (first STORED printing's score) and
+                // the gathered paths (first MATCHING one). Measured 2026-08-04 by toggling this decline
+                // off: 576 real invocations of the walk over 1,512 tie-heavy cells, 0 row differences,
+                // plus 14 inside `force_plan_differential_agreement`, which asserts full row order
+                // against GatheredScan. Either executor is correct here now.
+                //
+                // What keeps the decline is cost, not correctness. `gather_composed_page` is genuinely
+                // 1.3-2.7x faster than the plan that otherwise wins on this population, but `plan_cost`
+                // reads 0.27-0.53 of its real time, and the resulting mispicks cancel the wins exactly:
+                // regret 1.30 -> 1.51 us, compose miss% 7% -> 18%, compose-acquire wall time 1.00 over
+                // 2,341 paired queries. Neutral in time and worse in routing is not a trade worth the
+                // complexity. docs/issues/local-engine-sparse-compose-gather.md carries the four
+                // acceptance criteria this has to clear.
+                //
                 // `Exact` to distinguish it from `DeclineSparseEstimate` above: same intent, but that
                 // one fires pre-compose off the estimator's upper bound, this one post-compose off
                 // the real total. A harness reading one label for both cannot tell which fired.
                 note_paging_taken(PagingTaken::DeclineSparseExact);
-                return None; // sparse: the general path gathers + globally sorts, ordering ties differently
+                return None;
             }
             note_paging_taken(PagingTaken::Perm);
             walk_grouped_page(ctx, params, &pbits, perm)
