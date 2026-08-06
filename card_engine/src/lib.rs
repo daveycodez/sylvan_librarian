@@ -2328,6 +2328,156 @@ fn build_printing_to_card(offsets: &[u32]) -> Vec<u32> {
     out
 }
 
+/// Exact result totals in all three `unique=` spaces for one value of a low-cardinality dimension.
+///
+/// 12 bytes. Every space is stored rather than derived because none derives from the others: printings
+/// is not cards times a reprint rate, and artworks sits between them at a ratio that varies per value
+/// (0.63-0.95 measured across `frame:` values alone, which is exactly why estimating it failed).
+#[derive(Archive, Serialize, Deserialize, Clone, Copy, Default, Debug, PartialEq, Eq)]
+struct SpaceTotals {
+    printings: u32,
+    cards: u32,
+    artworks: u32,
+}
+
+impl ArchivedSpaceTotals {
+    fn get(&self, mode: Mode) -> usize {
+        match mode {
+            Mode::Printing => u32::from(self.printings) as usize,
+            Mode::Card => u32::from(self.cards) as usize,
+            Mode::Artwork => u32::from(self.artworks) as usize,
+        }
+    }
+}
+
+/// Exact 3-space totals per value, for the dimensions whose predicate tests ONE value.
+///
+/// The whole table is ~2 KB on the production corpus, because every dimension here has under 30 values.
+/// At that size there is no threshold to tune and no sparse tail to special-case: store all of them.
+/// This is the counterpart to `RangeCardCounts`, which covers the dimensions whose predicates are
+/// ranges and therefore need prefix/suffix aggregates instead of per-value ones.
+///
+/// What it does NOT replace: where a query already reads a card-space plane, that plane's popcount is
+/// the exact card total for nothing (how legality got exact card counts before this table existed). The
+/// table's value is the two spaces a card-space plane cannot give — a card bit does not say WHICH
+/// printing matched, so it cannot count printings or artworks.
+#[derive(Archive, Serialize, Deserialize, Default)]
+struct ValueTotals {
+    /// `border:` — printing-space, 5 values. Keyed by the interned border string, which is what
+    /// `TextExact` compares against byte-for-byte.
+    border: HashMap<String, SpaceTotals>,
+    /// `layout:` and the `is:flip`/`is:split`/… family — card-space, 14 values.
+    layout: HashMap<String, SpaceTotals>,
+    /// `frame:` and `is:new`/`is:old` — printing-space, 29 values. Keyed by the `coll_vocab` string.
+    frame_data: HashMap<String, SpaceTotals>,
+    /// `f:X` / `banned:X` / `restricted:X`, keyed `(shift << 2) | status`.
+    ///
+    /// One entry per (format, status) pair rather than per format, because `FilterExpr::Legality`
+    /// carries a single 2-bit `expected` status and tests `(word >> shift) & 0b11 == expected`. Statuses
+    /// PARTITION each space — a printing has exactly one status per format — so a per-status entry is
+    /// both exact on its own and safely summable if a future predicate ever accepts a set.
+    ///
+    /// Counted per PRINTING, not per card, so `legality_divergent` cards (30A, Collectors' Edition,
+    /// gold border) contribute their printings' own words. Reading the card word for those would
+    /// mis-count exactly the cards the divergence flag exists to flag.
+    legality: HashMap<u16, SpaceTotals>,
+}
+
+/// The key `ValueTotals::legality` uses. `shift` is even and < 64, so this cannot collide.
+fn legality_totals_key(shift: u8, expected: u64) -> u16 {
+    (u16::from(shift) << 2) | (expected as u16 & 0b11)
+}
+
+/// Exact 3-space totals per value, in one pass over printings.
+///
+/// `keys_of` yields every value the printing belongs to — one for a scalar dimension like border,
+/// several for a collection like `frame_data`, one per format for legality. Distinct cards and
+/// artworks are deduped with a per-value stamp rather than a bitmap: a card's printings are contiguous
+/// in pid order, so `last_card` catches card repeats, and a stamp of `cid + 1` per artwork group
+/// catches artwork repeats WITHIN a card (which need not be contiguous). Both are O(values) memory.
+fn build_value_totals<K: Eq + std::hash::Hash>(
+    cards: &[OracleCard],
+    printings: &[Printing],
+    printing_to_card: &[u32],
+    max_artwork_groups: usize,
+    keys_of: impl Fn(&OracleCard, &Printing) -> Vec<K>,
+) -> HashMap<K, SpaceTotals> {
+    struct Acc {
+        totals: SpaceTotals,
+        last_card: u32,
+        /// `stamps[group] == cid + 1` iff this card's artwork group was already counted. `cid + 1`
+        /// rather than `cid` so that 0 means "never seen", and no earlier card can leave a stamp a
+        /// later card reads as its own.
+        stamps: Vec<u32>,
+    }
+    let mut acc: HashMap<K, Acc> = HashMap::new();
+    for (pid, printing) in printings.iter().enumerate() {
+        let cid = printing_to_card[pid];
+        let card = &cards[cid as usize];
+        let group = usize::from(printing.artwork_group_id);
+        for key in keys_of(card, printing) {
+            let e = acc.entry(key).or_insert_with(|| Acc {
+                totals: SpaceTotals::default(),
+                last_card: u32::MAX,
+                stamps: vec![0; max_artwork_groups + 1],
+            });
+            e.totals.printings += 1;
+            if e.last_card != cid {
+                e.last_card = cid;
+                e.totals.cards += 1;
+            }
+            if e.stamps[group] != cid + 1 {
+                e.stamps[group] = cid + 1;
+                e.totals.artworks += 1;
+            }
+        }
+    }
+    acc.into_iter().map(|(k, a)| (k, a.totals)).collect()
+}
+
+/// Build all four `ValueTotals` maps. One call site, so the four cannot be built from different
+/// snapshots of the same printings.
+fn build_all_value_totals(
+    cards: &[OracleCard],
+    printings: &[Printing],
+    printing_to_card: &[u32],
+    strings: &[String],
+    coll_vocab: &[String],
+    max_artwork_groups: usize,
+) -> ValueTotals {
+    // A macro rather than a closure alias: each `keys_of` is a distinct closure type returning a
+    // distinct key type, so one generic-over-both helper binding cannot serve all four.
+    macro_rules! totals {
+        ($keys_of:expr) => {
+            build_value_totals(cards, printings, printing_to_card, max_artwork_groups, $keys_of)
+        };
+    }
+    // ALL 32 format slots, not just the ones this archive assigned. Restricting to the registry
+    // snapshot leaves the table silently under-populated wherever the snapshot is empty (the fuzz store
+    // is), and absence from this table is read as an exact zero — so a missing key is a WRONG total, not
+    // a missing one. Covering every slot costs 32 x 4 statuses x 12 bytes = 1.5 KB and cannot be
+    // under-populated. The entries for unassigned slots are correct rather than merely harmless: an
+    // unassigned format reads as `not_legal` for every card, which is what those entries say.
+    let shifts: Vec<u8> = (0..MAX_FORMATS as u8).map(|i| i * 2).collect();
+    ValueTotals {
+        border: totals!(|_card: &OracleCard, p: &Printing| match p.card_border_id {
+            NONE_STR => Vec::new(),
+            id => vec![strings[id as usize].clone()],
+        }),
+        layout: totals!(|card: &OracleCard, _p: &Printing| match card.card_layout_id {
+            NONE_STR => Vec::new(),
+            id => vec![strings[id as usize].clone()],
+        }),
+        frame_data: totals!(|_card: &OracleCard, p: &Printing| {
+            p.card_frame_data.iter().map(|v| coll_vocab[*v as usize].clone()).collect()
+        }),
+        legality: totals!(|card: &OracleCard, p: &Printing| {
+            let word = if card.legality_divergent { p.card_legalities } else { card.card_legalities };
+            shifts.iter().map(|&shift| legality_totals_key(shift, (word >> shift) & 0b11)).collect()
+        }),
+    }
+}
+
 // ─── Printing-space value-major indexes ──────────────────────────────────────
 // One layout for every printing-space ordering: released_at / price_usd /
 // collector_number (range filters, plus the `usd` orderby walk) and
@@ -2447,6 +2597,19 @@ struct RangeCardCounts {
     /// Distinct cards among printings with value == `values[i]`. Serves `Eq`, which cannot be had by
     /// subtracting neighbouring `below` entries.
     at: Vec<u32>,
+    /// The same three aggregates over distinct ARTWORKS.
+    ///
+    /// The third space, added because it was the only one estimated for every range: printings come
+    /// free as `k = e - s` and cards from the triple above, while artwork totals went through
+    /// `printing_bits_to_artwork_bits` and were read as 0.80-0.87 of the truth. Filled in the SAME pass
+    /// as the card triple, over a parallel artwork-seen bitmap, so the two cannot drift.
+    ///
+    /// Costs a measured **156.6 KB** of archive across the five range dimensions (12 bytes per distinct
+    /// value, ~13,400 values), or 0.22% — the honest price of the exactness, and more than the 133 KB
+    /// `frame_data`'s hybrid gave back.
+    below_artworks: Vec<u32>,
+    at_or_above_artworks: Vec<u32>,
+    at_artworks: Vec<u32>,
 }
 
 impl ArchivedRangeCardCounts {
@@ -2458,7 +2621,26 @@ impl ArchivedRangeCardCounts {
     /// several values (only `year:Y`, which covers a whole calendar year of release dates) returns
     /// `None`; distinct counts do not subtract, so the neighbouring entries cannot be combined.
     fn distinct_cards(&self, lo: u32, hi: u32) -> Option<u32> {
-        if self.values.is_empty() || hi <= lo {
+        self.lookup(lo, hi, &self.below, &self.at_or_above, &self.at)
+    }
+
+    /// Exact distinct ARTWORKS for `[lo, hi)`, on the same answerable shapes as `distinct_cards`.
+    fn distinct_artworks(&self, lo: u32, hi: u32) -> Option<u32> {
+        self.lookup(lo, hi, &self.below_artworks, &self.at_or_above_artworks, &self.at_artworks)
+    }
+
+    /// The shape both spaces share: which of the three aggregates a `[lo, hi)` reduces to, or `None`
+    /// where distinct counts cannot be combined. Written once so the two spaces cannot answer
+    /// differently-shaped questions.
+    fn lookup(
+        &self,
+        lo: u32,
+        hi: u32,
+        below: &Archived<Vec<u32>>,
+        at_or_above: &Archived<Vec<u32>>,
+        at: &Archived<Vec<u32>>,
+    ) -> Option<u32> {
+        if self.values.is_empty() || hi <= lo || below.is_empty() {
             return None;
         }
         let pos = |v: u32| self.values.partition_point(|x| u32::from(*x) < v);
@@ -2469,11 +2651,11 @@ impl ArchivedRangeCardCounts {
         let first = u32::from(self.values[0]);
         let last_covers_end = j == self.values.len();
         match (lo <= first, last_covers_end) {
-            (true, true) => Some(u32::from(self.at_or_above[0])), // whole index
-            (true, false) => Some(u32::from(self.below[j])),      // `<` / `<=`
-            (false, true) => Some(u32::from(self.at_or_above[i])), // `>` / `>=`
+            (true, true) => Some(u32::from(at_or_above[0])), // whole index
+            (true, false) => Some(u32::from(below[j])),      // `<` / `<=`
+            (false, true) => Some(u32::from(at_or_above[i])), // `>` / `>=`
             // Interior range: exact only when it holds a single distinct value, which is `Eq`.
-            (false, false) if j == i + 1 => Some(u32::from(self.at[i])),
+            (false, false) if j == i + 1 => Some(u32::from(at[i])),
             _ => None,
         }
     }
@@ -2482,59 +2664,93 @@ impl ArchivedRangeCardCounts {
 /// Build the three count vectors for one range index. O(n) over the index plus one card-seen bitmap
 /// per direction, so two passes; the index is value-major, so the value blocks are already delimited
 /// by `starts` and no boundary scan is needed.
-fn build_range_card_counts(idx: &PrintingValueIndex, printing_to_card: &[u32], n_cards: usize) -> RangeCardCounts {
+fn build_range_card_counts(
+    idx: &PrintingValueIndex,
+    printing_to_card: &[u32],
+    n_cards: usize,
+    // pid -> the printing's artwork group within its card, and card -> its first global artwork id.
+    // Together these give a printing's GLOBAL artwork id, the same derivation
+    // `printing_bits_to_artwork_bits` uses.
+    printings: &[Printing],
+    artwork_base: &[u32],
+) -> RangeCardCounts {
     let mut out = RangeCardCounts::default();
     if idx.pids.is_empty() {
         return out;
     }
     let n_values = idx.keys.len();
+    let n_artworks = artwork_base.last().copied().unwrap_or(0) as usize;
     let run = |b: usize| idx.starts[b] as usize..idx.starts[b + 1] as usize;
     out.values = idx.keys.clone();
+    // (card id, global artwork id) for a printing. One closure so the two spaces are derived from the
+    // same pid in the same place.
+    let ids = |pid: u32| {
+        let cid = printing_to_card[pid as usize] as usize;
+        let aid = artwork_base[cid] as usize + printings[pid as usize].artwork_group_id as usize;
+        (cid, aid)
+    };
 
-    let words = n_cards.div_ceil(64);
-    let mut seen = vec![0u64; words];
-    let mut distinct = 0u32;
+    // Two spaces, two domains, one pass over the index. A set-bit test per space per printing is
+    // cheaper than walking the index twice, and it keeps the card and artwork columns in lockstep.
+    let mut seen_c = vec![0u64; n_cards.div_ceil(64)];
+    let mut seen_a = vec![0u64; n_artworks.div_ceil(64)];
+    let (mut nc, mut na) = (0u32, 0u32);
+    let bump = |seen: &mut [u64], n: &mut u32, id: usize| {
+        let (w, bit) = (id >> 6, 1u64 << (id & 63));
+        if seen[w] & bit == 0 {
+            seen[w] |= bit;
+            *n += 1;
+        }
+    };
     // Forward: `below[i]` is the running distinct count before this value's block begins.
     for b in 0..n_values {
-        out.below.push(distinct);
+        out.below.push(nc);
+        out.below_artworks.push(na);
         for &pid in &idx.pids[run(b)] {
-            let cid = printing_to_card[pid as usize] as usize;
-            let (w, bit) = (cid >> 6, 1u64 << (cid & 63));
-            if seen[w] & bit == 0 {
-                seen[w] |= bit;
-                distinct += 1;
-            }
+            let (cid, aid) = ids(pid);
+            bump(&mut seen_c, &mut nc, cid);
+            bump(&mut seen_a, &mut na, aid);
         }
     }
-    // Backward for `at_or_above`, and per-block for `at` — both need their own fresh bitmap, since a
-    // card counted in one block must still count in another.
-    seen.fill(0);
-    distinct = 0;
+    // Backward for `at_or_above`, and per-block for `at` — both need their own fresh bitmap, since an
+    // id counted in one block must still count in another.
+    seen_c.fill(0);
+    seen_a.fill(0);
+    nc = 0;
+    na = 0;
     out.at_or_above = vec![0; n_values];
     out.at = vec![0; n_values];
-    // One scratch bitmap reused across blocks, cleared by walking back over the cards this block
-    // actually touched — a `fill(0)` per block would be O(n_cards) each, and there are as many
-    // blocks as distinct values.
-    let mut block = vec![0u64; words];
-    let mut touched: Vec<usize> = Vec::new();
+    out.at_or_above_artworks = vec![0; n_values];
+    out.at_artworks = vec![0; n_values];
+    // Scratch bitmaps reused across blocks, cleared by walking back over the ids this block actually
+    // touched — a `fill(0)` per block would be O(domain) each, and there are as many blocks as
+    // distinct values.
+    let mut block_c = vec![0u64; n_cards.div_ceil(64)];
+    let mut block_a = vec![0u64; n_artworks.div_ceil(64)];
+    let (mut touched_c, mut touched_a): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
     for b in (0..n_values).rev() {
-        touched.clear();
+        touched_c.clear();
+        touched_a.clear();
         for &pid in &idx.pids[run(b)] {
-            let cid = printing_to_card[pid as usize] as usize;
-            let (w, bit) = (cid >> 6, 1u64 << (cid & 63));
-            if seen[w] & bit == 0 {
-                seen[w] |= bit;
-                distinct += 1;
-            }
-            if block[w] & bit == 0 {
-                block[w] |= bit;
-                touched.push(cid);
+            let (cid, aid) = ids(pid);
+            bump(&mut seen_c, &mut nc, cid);
+            bump(&mut seen_a, &mut na, aid);
+            for (blk, touched, id) in [(&mut block_c, &mut touched_c, cid), (&mut block_a, &mut touched_a, aid)] {
+                let (w, bit) = (id >> 6, 1u64 << (id & 63));
+                if blk[w] & bit == 0 {
+                    blk[w] |= bit;
+                    touched.push(id);
+                }
             }
         }
-        out.at_or_above[b] = distinct;
-        out.at[b] = touched.len() as u32;
-        for &cid in &touched {
-            block[cid >> 6] &= !(1u64 << (cid & 63));
+        out.at_or_above[b] = nc;
+        out.at[b] = touched_c.len() as u32;
+        out.at_or_above_artworks[b] = na;
+        out.at_artworks[b] = touched_a.len() as u32;
+        for (blk, touched) in [(&mut block_c, &touched_c), (&mut block_a, &touched_a)] {
+            for &id in touched.iter() {
+                blk[id >> 6] &= !(1u64 << (id & 63));
+            }
         }
     }
     out
@@ -2926,6 +3142,18 @@ struct CardIndexes {
     price_eur_cards:        RangeCardCounts,
     price_tix_cards:        RangeCardCounts,
     collector_number_cards: RangeCardCounts,
+    /// The sixth, over `rarity_printing_ordered`. Rarity is NOT a `bare_range_bounds` member -- that
+    /// would make rarity queries eligible for `PrintingRangeScan`/`CardRangePopcount`, a routing change
+    /// worth its own measurement -- so this serves `exact_result_total`'s dedicated rarity arm only.
+    /// 6 distinct values, so it is ~144 bytes.
+    ///
+    /// Per-value counts would NOT have worked here: a card can be printed at several rarities, so
+    /// distinct cards for `r<=rare` is not the sum of the at-rarity counts. Prefix/suffix/at is the
+    /// shape the question needs, and it is the shape this struct already is.
+    rarity_cards:           RangeCardCounts,
+    /// Exact 3-space totals for the low-cardinality dimensions whose predicate tests one value:
+    /// border, layout, frame, and (format, status). ~2 KB.
+    value_totals:   ValueTotals,
     sort_perms:     SortPermutations,          // card space (streamed selection)
     artwork_groups: Vec<u16>,                  // card space: distinct illustration groups
     // card space, n_cards+1 entries: prefix sum of artwork_groups, so card c's artworks are the
@@ -5232,6 +5460,15 @@ static RESIDUAL_PASS_RATE_ARTWORK: LazyLock<f64> = LazyLock::new(|| guard_env("C
 /// sizes with branch differences under the ~5% noise floor throughout that
 /// band; 1,024 sits at the spread's upper (gather/simple) edge, and past it
 /// streaming's win grows fast (~1.8× by 8k), so the trigger stays put.
+/// Whether `exact_result_total` may answer from the per-value `ValueTotals` table and the rarity range
+/// table, and whether printing mode's `result_total` may take the exact value instead of
+/// `compose_printing_estimate`'s. On by default; 0 falls every one of those back to the estimator.
+///
+/// Kept as a permanent handle, not scaffolding: these arms change ROUTING (a total feeds the argmin),
+/// so the only honest way to price them is an interleaved A/B in which both arms read a byte-identical
+/// archive. The table is archived either way, so flipping this cannot move a field offset.
+static EXACT_VALUE_TOTALS: LazyLock<bool> = LazyLock::new(|| guard_env("CARD_ENGINE_EXACT_VALUE_TOTALS", 1u8) != 0);
+
 static STREAM_MIN_MATCHES: LazyLock<usize> = LazyLock::new(|| guard_env("CARD_ENGINE_STREAM_MIN_MATCHES", 1_024));
 
 /// Kill-switch for narrowing the streamed walk to the filter's bound on the sort column
@@ -5334,6 +5571,32 @@ fn range_card_counts_for<'i>(
 /// — `narrow_rec`'s own range narrowing, `is_printing_composable`, `compose_printing_estimate`,
 /// `compose_printing_bits` — gets the negated shape for free; none of them special-case `Not`
 /// themselves (docs/issues/local-engine-negated-range-narrowing.md).
+/// The `[lo, hi)` rarity-int window a bare rarity comparison covers, or `None` when the filter is not
+/// one. Deliberately narrow: `NumericCmp` on `RarityInt` against a constant, optionally negated, which
+/// is every spelling of `r:`/`rarity:` the parser produces.
+///
+/// Separate from `bare_range_bounds` on purpose -- see `exact_result_total`'s rarity arm.
+fn bare_rarity_bounds(filter: &FilterExpr) -> Option<(u32, u32)> {
+    fn leaf(filter: &FilterExpr, map_op: impl Fn(CmpOp) -> CmpOp) -> Option<(u32, u32)> {
+        let (op, value) = match filter {
+            FilterExpr::NumericCmp { lhs: NumExpr::Field(NumField::RarityInt), op, rhs: NumExpr::Const(v) } => (map_op(*op), *v),
+            FilterExpr::NumericCmp { lhs: NumExpr::Const(v), op, rhs: NumExpr::Field(NumField::RarityInt) } => {
+                (flip_op(map_op(*op)), *v)
+            }
+            _ => return None,
+        };
+        // `Some(None)` is an empty window, which is an exact total of zero rather than no answer.
+        match int_range_bounds(op, value)? {
+            None => Some((0, 0)),
+            Some((lo, hi)) => Some((lo, hi)),
+        }
+    }
+    match filter {
+        FilterExpr::Not(inner) => leaf(inner.as_ref(), negate_op),
+        _ => leaf(filter, |op| op),
+    }
+}
+
 fn bare_range_bounds<'i>(
     filter: &FilterExpr,
     indexes: &'i Archived<CardIndexes>,
@@ -6624,13 +6887,83 @@ fn walk_value_orderby_page<'a>(
 /// No new stored table: both counts are already on the query path. A per-format count table would work
 /// too (there are at most 32 formats x 4 statuses, so ~1 KB) but it would store what a popcount of a
 /// plane the query already reads gives for nothing.
-fn exact_card_total(composed: &FilterExpr, indexes: &Archived<CardIndexes>, n_cards: usize) -> Option<usize> {
+fn exact_result_total(composed: &FilterExpr, indexes: &Archived<CardIndexes>, mode: Mode) -> Option<usize> {
     if let Some((idx, lo, hi)) = bare_range_bounds(composed, indexes) {
-        return range_card_counts_for(indexes, idx).and_then(|counts| counts.distinct_cards(lo, hi)).map(|n| n as usize);
+        // Printings come free from the index's own partition points; the other two spaces come from the
+        // prefix/suffix tables, which now carry an artwork column as well as a card one.
+        let (s, e) = idx.range(lo, hi);
+        return match mode {
+            Mode::Printing => Some(e - s),
+            Mode::Card => range_card_counts_for(indexes, idx).and_then(|c| c.distinct_cards(lo, hi)).map(|n| n as usize),
+            Mode::Artwork => range_card_counts_for(indexes, idx).and_then(|c| c.distinct_artworks(lo, hi)).map(|n| n as usize),
+        };
     }
-    if let FilterExpr::Legality { shift: Some(shift), expected } = composed {
-        return legality_candidate_bits(indexes, n_cards, *shift, *expected, false)
-            .map(|b| b.iter().map(|w| w.count_ones() as usize).sum());
+    // Rarity is the same question one index over, and it gets its own arm rather than joining
+    // `bare_range_bounds`: that predicate gates `PrintingRangeScan`/`CardRangePopcount` applicability in
+    // a dozen places, so admitting rarity there is a ROUTING change (plausibly a good one -- `r:rare` is
+    // 55 us today) and belongs in its own measured commit, not in a counting one.
+    if let Some((lo, hi)) = bare_rarity_bounds(composed).filter(|_| *EXACT_VALUE_TOTALS) {
+        if hi <= lo {
+            return Some(0); // an empty window is an exact zero in every space, not a declined shape
+        }
+        let idx = &indexes.rarity_printing_ordered;
+        let (s, e) = idx.range(lo, hi);
+        return match mode {
+            Mode::Printing => Some(e - s),
+            Mode::Card => indexes.rarity_cards.distinct_cards(lo, hi).map(|n| n as usize),
+            Mode::Artwork => indexes.rarity_cards.distinct_artworks(lo, hi).map(|n| n as usize),
+        };
+    }
+    // The per-value table, which covers the dimensions whose predicate tests ONE value, in all three
+    // spaces. Absence from a COMPLETE table is an exact zero, not a declined shape -- every one of
+    // these maps holds every value present in the corpus, so a miss means nothing matches.
+    let vt = &indexes.value_totals;
+    match composed {
+        // `Eq` only. The ordering ops on an interned string compare lexicographically, which is not a
+        // per-value question and has no entry here.
+        FilterExpr::TextExact { field: TextField::Border, op: CmpOp::Eq, value } => {
+            return Some(vt.border.get(value.as_str()).map_or(0, |t| t.get(mode)));
+        }
+        FilterExpr::TextExact { field: TextField::Layout, op: CmpOp::Eq, value } => {
+            return Some(vt.layout.get(value.as_str()).map_or(0, |t| t.get(mode)));
+        }
+        // `Ge` on a collection is containment. `Eq`/`Gt` add a collection-LENGTH condition these
+        // postings do not prove, so their count is an upper bound rather than a total -- the same
+        // distinction the card-space arm below draws.
+        FilterExpr::CollectionCmp { field: CollField::FrameData, op: CmpOp::Ge, value, .. } => {
+            return Some(vt.frame_data.get(value.as_str()).map_or(0, |t| t.get(mode)));
+        }
+        FilterExpr::Legality { shift: Some(shift), expected } => {
+            return Some(vt.legality.get(&legality_totals_key(*shift, *expected).into()).map_or(0, |t| t.get(mode)));
+        }
+        // A format absent from all loaded data matches nothing, in every space.
+        FilterExpr::Legality { shift: None, .. } => return Some(0),
+        _ => {}
+    }
+    // The remaining shapes are exact in CARD space only, so any other mode falls back to the estimator.
+    if !matches!(mode, Mode::Card) {
+        return None;
+    }
+    // A CARD-space containment leaf (`t:`/`keyword:`/`otag:`) posts card ids, so its postings length IS
+    // the exact distinct-card count -- the same "the answer was already computed and then discarded"
+    // shape the legality arm above fixes. The acquire was projecting the leaf's PRINTING count through
+    // balls-into-bins instead, which reads 1.27x on `t:human` (5,411 estimated against 4,249 exact) and
+    // up to 2.24x on `t:angel`.
+    //
+    // `Ge` only. `Eq`/`Gt` share these postings as a loose superset -- they prove containment but not the
+    // collection-length condition -- so their count is an upper bound, not a total.
+    if let FilterExpr::CollectionCmp { field, op: CmpOp::Ge, value, .. } = composed {
+        let card_space_idx = match field {
+            CollField::Subtypes => Some(&indexes.subtypes),
+            CollField::Keywords => Some(&indexes.keywords),
+            CollField::OracleTags => Some(&indexes.oracle_tags),
+            // Printing-space: postings are printing ids, so their length is not a card count. These want
+            // an import-time count table (the artwork side needs one for every family, including the
+            // ranges and formats that are already exact in card space).
+            CollField::ArtTags | CollField::IsTags | CollField::FrameData => None,
+        };
+        // Absent from a complete index is an exact ZERO, not "no answer".
+        return card_space_idx.map(|idx| idx.get(value.as_str()).map_or(0, |v| v.len()));
     }
     None
 }
@@ -8942,7 +9275,16 @@ fn acquire_plan_features(
         // projection -- and those are the bulk of what reaches here, since `bare_range_bounds`
         // matches one comparison, not an And of two. One-sided ranges DO land here in quantity:
         // every artwork-mode one, plus card-mode ones whose orderby has no permutation.
-        let exact_cards = exact_card_total(composed, indexes, n_cards as usize);
+        // Two quantities, deliberately separate. `exact_cards` is CARD space no matter the query's
+        // mode, because `eval_domain`, `scan_all` and the artwork capacity all consume a card count.
+        // `exact_total` is the answer in the query's OWN mode, and is what `result_total` wants.
+        // Conflating them puts an artwork count where cards are expected in artwork mode.
+        let exact_cards = exact_result_total(composed, indexes, Mode::Card);
+        let exact_total = if matches!(mode, Mode::Card) {
+            exact_cards
+        } else {
+            exact_result_total(composed, indexes, mode)
+        };
         let est_cards =
             exact_cards.unwrap_or_else(|| calibrated_balls_into_bins(printing_matches, n_cards as usize));
         // What the MATERIALIZING alternatives scan if compose loses. Every mode narrows -- a
@@ -8966,7 +9308,17 @@ fn acquire_plan_features(
         let scan_all =
             |cards: usize| (((cards as f64) * printings_per_card * COMPOSE_CANDIDATE_SPAN_BIAS) as usize).min(n_printings as usize);
         let (result_total, project, popcount_words, eval_domain, scan_units) = match mode {
-            Mode::Printing => (printing_matches, 0, (n_printings as usize).div_ceil(64), est_cards, scan_all(est_cards)),
+            Mode::Printing => {
+                // `exact_total` for the RESULT, `printing_matches` for everything else. They are not the
+                // same quantity: `printing_matches` proxies the size of the bitmap compose BUILDS, which
+                // for a legality leaf is every printing of every existentially-legal card -- a superset
+                // that the residual then filters. The cost features are calibrated against that superset
+                // (`printings_examined`, `printing_span`), so substituting the true match count there
+                // would under-charge the scan on exactly the divergent-legality cards the superset exists
+                // for. `f:modern` reads 68,687 against a true 73,783; `banned:modern` 160 against 399.
+                let total = if *EXACT_VALUE_TOTALS { exact_total.unwrap_or(printing_matches) } else { printing_matches };
+                (total, 0, (n_printings as usize).div_ceil(64), est_cards, scan_all(est_cards))
+            }
             Mode::Card => {
                 // Card mode's result total IS the distinct-card count, which is precisely what
                 // `est_cards` already holds. The estimated fallback used to be the saturating
@@ -8993,7 +9345,10 @@ fn acquire_plan_features(
                 // over-picked in artwork specifically: that slice carries 21% of ALL routing regret at
                 // p99 205us against 40us for printing and 36us for card.
                 let capacity_cards = exact_cards.unwrap_or_else(|| balls_into_bins(printing_matches, n_cards as usize));
-                let rt = artwork_estimate(printing_matches, capacity_cards, n_cards as usize, n_artworks);
+                // The two-stage estimate is only reached when nothing exact is available. A bare
+                // one-sided range now answers artwork exactly from the range table's artwork column,
+                // which is the one space every such query used to estimate (0.80-0.87 measured).
+                let rt = exact_total.unwrap_or_else(|| artwork_estimate(printing_matches, capacity_cards, n_cards as usize, n_artworks));
                 // The bitmap `printing_bits_to_artwork_bits` popcounts is n_artworks bits wide, not
                 // n_printings -- 46,112 against 97,206 here, so this was 2.1x over as well.
                 (rt, printing_matches, n_artworks.div_ceil(64), est_cards, scan_all(est_cards))
@@ -10267,12 +10622,12 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 /// catch (e.g. reordering same-size fields, changing an index type) — and on
 /// any FLAVOR_FP_FEATURES change: archived fingerprints are built with that
 /// table, so a new table reading old fingerprints breaks the superset test.
-// Stack layer 08: `frame_data` becomes a `HybridTagIndex` -- a printing bitmap for the dense values,
-// postings for the sparse tail -- which is an archived-layout change, so a store built against the
-// previous layer must fail the header check and be rebuilt rather than be read as garbage.
-// Numbered by stack patch; the header check is EQUALITY, so the invariant is only that a value is
-// never reused for a different layout.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026080508;
+// Stack layer 09: `RangeCardCounts` gains an artwork column, a sixth table is added for rarity, and
+// `ValueTotals` arrives for border/layout/frame/(format,status). All archived-layout changes, so a
+// store built against the previous layer must fail the header check and be rebuilt rather than be
+// read as garbage. Numbered by stack patch; the check is EQUALITY, so the invariant is only that a
+// value is never reused for a different layout.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026080509;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -10800,11 +11155,23 @@ impl QueryEngine {
         let price_eur_idx = build_printing_value_index(&printings, &cards, &offsets, |p| p.price_eur);
         let price_tix_idx = build_printing_value_index(&printings, &cards, &offsets, |p| p.price_tix);
         let collector_number_idx = build_printing_value_index(&printings, &cards, &offsets, |p| p.collector_number_int.map(u32::from));
-        let released_at_cards = build_range_card_counts(&released_at_idx, &printing_to_card, cards.len());
-        let price_usd_cards = build_range_card_counts(&price_usd_idx, &printing_to_card, cards.len());
-        let price_eur_cards = build_range_card_counts(&price_eur_idx, &printing_to_card, cards.len());
-        let price_tix_cards = build_range_card_counts(&price_tix_idx, &printing_to_card, cards.len());
-        let collector_number_cards = build_range_card_counts(&collector_number_idx, &printing_to_card, cards.len());
+        let released_at_cards = build_range_card_counts(&released_at_idx, &printing_to_card, cards.len(), &printings, &artwork_base);
+        let price_usd_cards = build_range_card_counts(&price_usd_idx, &printing_to_card, cards.len(), &printings, &artwork_base);
+        let price_eur_cards = build_range_card_counts(&price_eur_idx, &printing_to_card, cards.len(), &printings, &artwork_base);
+        let price_tix_cards = build_range_card_counts(&price_tix_idx, &printing_to_card, cards.len(), &printings, &artwork_base);
+        let collector_number_cards = build_range_card_counts(&collector_number_idx, &printing_to_card, cards.len(), &printings, &artwork_base);
+        let rarity_idx = build_printing_value_index(&printings, &cards, &offsets, |p| p.card_rarity_int.map(u32::from));
+        let rarity_cards = build_range_card_counts(&rarity_idx, &printing_to_card, cards.len(), &printings, &artwork_base);
+        // Out here for the same reason as the count tables: it reads `printing_to_card`, which the
+        // struct literal below moves.
+        let value_totals = build_all_value_totals(
+            &cards,
+            &printings,
+            &printing_to_card,
+            &strings,
+            &coll_vocab,
+            usize::from(artwork_group_counts.iter().copied().max().unwrap_or(0)),
+        );
         let indexes = CardIndexes {
             name_trigram:   build_trigram_index(&cards, |c| c.card_name_folded.as_str()),
             oracle_trigram: build_oracle_text_index(&cards, &strings),
@@ -10864,7 +11231,9 @@ impl QueryEngine {
             planes:         build_bit_planes(&cards, &printings, &offsets, &strings),
             border_printing: build_border_printing_planes(&printings, &strings),
             rarity_printing: build_rarity_printing_planes(&printings),
-            rarity_printing_ordered: build_printing_value_index(&printings, &cards, &offsets, |p| p.card_rarity_int.map(u32::from)),
+            rarity_printing_ordered: rarity_idx,
+            rarity_cards,
+            value_totals,
             name_bigrams:   build_name_bigram_index(&cards),
             legal_divergent: build_divergent_ids(&cards),
             arith_tuple:    build_arith_tuple_index(&cards),
@@ -10876,6 +11245,7 @@ impl QueryEngine {
         // Snapshot the registry card_from_pydict just populated so reader
         // processes can adopt the same format→shift assignments.
         let format_shifts_snapshot = format_shifts().read().map(|m| m.clone()).unwrap_or_default();
+
         let card_data = CardData {
             cards,
             printings,
