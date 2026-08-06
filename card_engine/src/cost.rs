@@ -332,7 +332,18 @@ pub(crate) fn materialize_cost(plan: PhysicalPlan, f: &PlanFeatures) -> f64 {
 /// 9,867 distinct shapes. P3 had been under-costed ~1.6x, which biases the router toward picking it.
 /// P4 and compose were re-fit in the same run and NOT changed: P4's fitted values reproduce these
 /// within 8% with no agreement gain, and compose's fit makes its median worse (0.95 -> 0.86).
-const STREAM_CARD_PASS_NS: f64 = 5.05;
+/// **Split 2026-08-03**, and the level below is now the CALL only. `bench_streamed_loop` measures P3's
+/// loop at 2.58 ns/card on the `all_match` path and 5.08 with a residual, on the same cells at the same
+/// corpus size — so ~2.5 of the shipped 5.05 was the `card_pass` call, charged to every candidate whether
+/// the call happened or not. The sum is preserved (2.58 + 2.47 = 5.05), so a residual-bearing query is
+/// costed exactly as before and only the `all_match` path gets cheaper.
+const STREAM_CARD_PASS_NS: f64 = 2.47;
+/// P3's loop body per candidate card, paid whether or not a residual exists: the `counts` write, the
+/// offsets arithmetic, and the match-count call that answers from the span alone under `all_match`.
+/// 2.58 ns/card measured by `bench_streamed_loop`, and the one rate in either loop that is FLAT across a
+/// 13× corpus (2.58 / 2.54 / 2.55) — it reads the card record and nothing else, so it has no misses to
+/// gain. That flatness is why it is the half worth stating as a constant.
+const STREAM_LOOP_PER_CARD_NS: f64 = 2.58;
 
 /// P3's per-scanned-row cost, charged ONLY when a residual is present.
 ///
@@ -421,7 +432,37 @@ const STREAM_ARTWORK_SEEN_PER_CARD_NS: f64 = 1.21;
 /// ~52µs = 31508 × 1.65. Only added when `matches <= STREAM_MIN_MATCHES`, the
 /// exact condition that routes P3 into that gather branch. The 1.65 above was fit on three hand
 /// picked narrow queries; across the sampled space the floor measures ~31µs, not 52µs.
+///
+/// CONFIRMED 2026-08-03 by `bench_streamed_loop`, which needed 600-card cells to reach this branch at
+/// all -- every earlier cell had more than `STREAM_MIN_MATCHES` matches and took the permutation walk
+/// instead, so this constant had never been measured against the branch it prices. It now reads
+/// 1.075-1.250 ns per card scanned against the 1.02 shipped, on a 33.9 us finish phase. Left alone.
 const STREAM_SMALL_TOTAL_FLOOR_PER_CARD_NS: f64 = 1.02;
+/// ns per permutation entry stepped in the streaming walk, the branch taken when
+/// `total > STREAM_MIN_MATCHES`.
+///
+/// The walk covers its sort-column segment until the page fills, so it visits about
+/// `page_span * n_cards / matches` entries -- inversely proportional to selectivity, and the one
+/// quantity in P3's finish phase that no other feature is proportional to. Nothing charged for it
+/// before: the arm had `matches * EMIT + FIXED`, which is flat in `n_cards`, so at a fixed 1,500
+/// matches it predicted ~397 ns while `bench_streamed_loop` measured 1,333 / 3,791 / 10,458 ns at
+/// 31.5k / 126k / 410k cards. Under by 3.4x at the production corpus and 26x at 410k, which is why
+/// that phase graded mean |log| 2.06 while carrying 12% of all measured nanoseconds.
+///
+/// Measured 0.958-1.256 ns/entry on the cells where the walk is long (1,500 matches, ~1,260 estimated
+/// steps): 1.0 is the middle of that. Cells whose walk is SHORT read 2.0-4.2 ns/entry, but those are a
+/// ~167-step estimate against a few hundred ns, where a fixed cost dominates and a per-step rate
+/// overstates -- the long-walk regime is the one worth fitting, being where the term is large enough to
+/// change a routing decision.
+///
+/// The estimate is graded against the realized `perm_steps` counter rather than trusted, the same way
+/// `scan_units` is graded against `printings_examined`. **The rate survived the walk being bounded to
+/// its sort-column segment**, which is the useful thing that grade has said so far: traffic fit 1.17
+/// before and 1.19 after, on the same seed and sample length, while realized steps at p90 fell from
+/// 6.43x the estimate to 5.31x (and to 4.26x under the unshipped realized-span variant). A change that
+/// deletes a fifth of the steps at the tail while moving the per-step rate by 2% is the signature of a
+/// rate that is a real per-unit cost rather than a sink for the count's error.
+const STREAM_PERM_STEP_NS: f64 = 1.0;
 /// Per-card cost P3 pays over the WHOLE corpus regardless of how narrow the query is, charged on
 /// `n_cards` rather than `eval_domain`. The thread-local counts buffer is resized and cleared to
 /// `cards.len()` every query — a 126 kB memset on this corpus — and the emission walk is over the
@@ -448,7 +489,20 @@ const STREAM_FIXED_COST_NS: f64 = 217.0;
 /// ridge-anchored to the previous values because several columns barely vary on this corpus and
 /// are collinear with the intercept. Fitted on ~10k distinct feature vectors, stable to <3% across
 /// independent seeds. Median measured/predicted moved 1.78 -> 1.00 (P4) and 1.69 -> 1.06 (P3).
-const GATHER_CARD_PASS_NS: f64 = 6.88;
+/// **Split 2026-08-03**, and the level below is now the CALL only. The module header's own reading of
+/// `bench_gather_loop` said this constant "BUNDLES the predicate call": ~3.2 ns/card of loop overhead
+/// plus 2.94-3.00 for the `card_pass` call itself on singletons, summing to ~6.2 against the shipped
+/// 6.88. It was therefore "about right for queries that make that call, and about 2x too high for the
+/// #634 `all_match_known` path, which skips `card_pass` entirely and is charged for it anyway — a
+/// model-shape error rather than a mis-fitted constant". This is that error, fixed where it lives.
+///
+/// The sum is preserved (3.88 + 3.00 = 6.88), so residual-bearing queries are costed as before.
+const GATHER_CARD_PASS_NS: f64 = 3.00;
+/// P4's loop body per candidate card, paid whether or not a residual exists. 3.88 = the shipped 6.88
+/// less the 3.00 call above, rather than the kernel's 3.15-3.33 directly: the kernel figure is a warm
+/// rate (see the retraction in `bench_gather_loop`'s header) and holding the SUM at the shipped value
+/// keeps this change a pure re-gating, with no level moving on the queries that were costed correctly.
+const GATHER_LOOP_PER_CARD_NS: f64 = 3.88;
 /// ns per printing scanned in the gathered loop (residual test per row). The verify `tier`
 /// does NOT ride this term; see GATHER_VERIFY_TIER_SCALE and STREAM_SCAN_PER_ROW_NS.
 const GATHER_SCAN_PER_ROW_NS: f64 = 2.06;
@@ -462,9 +516,50 @@ const GATHER_PUSH_PER_MATCH_NS: f64 = 2.24;
 /// bounded by matches: narrow deep pages (offset > matches) measured ≈ shallow
 /// (select_page returns early), so the term uses min(offset+limit, matches).
 const GATHER_SELECT_PER_PAGE_SLOT_NS: f64 = 3.51;
+/// ns per row actually collected into the page — `page_ids.into_iter().map(..)`, two random array
+/// derefs per row into `cards` and `printings`.
+///
+/// A SECOND driver for this phase, found by `bench_gather_loop`'s page sweep 2026-08-03. The phase was
+/// charged on `page_span` alone, which the sweep falsifies directly: at identical candidates,
+/// `page_span` 960 (offset 900, limit 60) costs 11,250 ns while `page_span` 600 (offset 0, limit 600)
+/// costs 16,375. A bigger span costing less is impossible under one column. The quickselect scales with
+/// `offset + limit`, but the collect scales with the PAGE, and the two rows separate them because one
+/// pairs a large span with a small page.
+///
+/// Traffic cannot separate them -- span and page are correlated across the sampled query mix, which is
+/// why an earlier non-negative fit put this at exactly 0.00. Four designed rows do it. Same lesson as
+/// the loop's three collinear counters: shape from a built design, level from traffic.
+///
+/// The count is what `select_page` returns, `clamp(matches - offset, 0, limit)`, not `limit`: a page
+/// past the end of the matches collects fewer rows than asked for, and charging `limit` there would
+/// bill a deep page on a narrow query for rows that do not exist.
+/// Level from traffic, not from the sweep. The page sweep put this near 15 ns/row, but a traffic fit
+/// with the column present reads 9.79, and traffic is what the routing surface is calibrated against --
+/// kernel LEVELS have not transferred in this branch (first warm cache, then an unexplained 1.6x on
+/// P3's per-card rate), while kernel SHAPE has been reliable. Adding the column did not disturb
+/// `GATHER_SELECT_PER_PAGE_SLOT_NS`, which refits 3.44 against a shipped 3.51 -- so the two are
+/// additive in the sampled mix rather than trading off, and only this one moves.
+const GATHER_COLLECT_PER_PAGE_ROW_NS: f64 = 9.79;
 /// Fixed P4 setup. Fit from the narrowest query (cmc>=15 card shallow 208ns at
 /// eval_domain=5: 208 − 5×(GATHER_VISIT_PER_CARD_NS+GATHER_PUSH_PER_MATCH_NS) −
 /// 5×GATHER_SELECT_PER_PAGE_SLOT_NS ≈ 170).
+///
+/// NOT refit 2026-08-03, deliberately. A whole-arm traffic fit puts this at 85, half the shipped value,
+/// on a model whose every other term sits at 0.85-1.22 -- and an intercept that far out on an otherwise
+/// agreeing model is a symptom, not a measurement. `fit_cost_model.py` fits ONE equation per query
+/// against total dispatch, so its intercept absorbs whatever the other columns cannot express; it read
+/// 84 and then 85 while `GATHER_COLLECT_PER_PAGE_ROW_NS` moved 15.0 -> 9.79 underneath it.
+///
+/// Measuring the intercept directly says the same thing more sharply. `bench_gather_loop` solves it from
+/// cells differing ONLY in card count, where nothing else can hide, and gets card -1,084 ns and printing
+/// -845 ns. A negative fixed cost is impossible, so the linear-in-cards shape is wrong: the loop is
+/// CONVEX in card count (12.40 ns/card across 400-4,500 against 6.31-7.67 over 1,500-4,500), which is the
+/// same working-set effect the corpus sweep measured as rates growing 2.4x over 13x cards. A straight
+/// line through a convex curve drives its intercept negative.
+///
+/// So 85 is compensation for curvature, not a fixed cost, and pasting it would fit today's query-size mix
+/// and drift as either query sizes or the corpus change. The fix is a term for the curvature -- see the
+/// corpus-size note in `bench_gather_loop` -- not a smaller constant.
 const GATHER_FIXED_COST_NS: f64 = 169.6;
 
 // --- PrintingCompose's own rates -------------------------------------------------------------
@@ -639,26 +734,76 @@ pub(crate) fn plan_cost(plan: PhysicalPlan, f: &PlanFeatures) -> f64 {
                 && f.matches > 0
                 && u64::from(f.offset) < u64::from(f.matches);
             let floor = if runs_small_gather { n_cards * STREAM_SMALL_TOTAL_FLOOR_PER_CARD_NS } else { 0.0 };
+            // The other branch: when the small-total gather does NOT run and there is a page to emit,
+            // the walk steps the permutation until it fills. Same guards as the gather -- a query with
+            // no matches, or a page past the end, returns before the walk too.
+            let walks_permutation = !runs_small_gather && f.matches > 0 && u64::from(f.offset) < u64::from(f.matches);
+            let perm_steps = if walks_permutation {
+                // Entries visited to accumulate `page_span` matches, when matches are spread uniformly
+                // through the permutation: one match per `n_cards / matches` entries. Bounded by the
+                // corpus, since the walk cannot step past the end of the permutation.
+                //
+                // The executor now starts and ends the walk at the segment its filter's bound on the
+                // SORT COLUMN admits (`walk_bounds`), which this cannot see -- no `PlanFeatures` field
+                // carries the filter's shape. The uniform-spread assumption absorbs it: the expected gap
+                // before the first match is one `n_cards / matches` stride, negligible against
+                // `page_span` of them. What the regrade showed is that the assumption's remaining error
+                // is a DIFFERENT shape. Realized/estimated over ~12.5k walking rows, same seed and
+                // sample length:
+                //
+                //     unbounded walk                 p10 0.13   median 1.00   p90 6.43
+                //     sort-column bound              p10 0.11   median 0.96   p90 5.31
+                //     realized inv_perm min/max      p10 0.08   median 0.90   p90 4.26
+                //
+                // The third row is not shipped -- it cost 0.51 ns per matching card -- but it bounds how
+                // much of the tail a start position can reach at all, and the gap between rows two and
+                // three is real: a realized minimum catches clustering from ANY source, while a bound
+                // catches only what the predicate names. What is left in BOTH is non-matching entries
+                // INTERIOR to the walked segment, which no start position reaches by construction. That
+                // is the popcount-skip mechanism's territory.
+                (page_span * n_cards / f64::from(f.matches)).min(n_cards)
+            } else {
+                0.0
+            };
             // card_pass — and the verify tier that prices it — is per candidate CARD: the loop
             // calls `filter.card_pass` once per `cid`, and only the cheaper printing-dependent
             // residual is re-checked per row inside `push_card_matches`. Charging `tier_ns` per
             // scanned ROW instead is invisible in card mode (scan_units ≈ eval_domain) and
             // overcharges printing/artwork by the whole printings-per-card ratio.
-            eval_domain * (STREAM_CARD_PASS_NS + if tier_ns > 0.0 { tier_ns.max(STREAM_RESIDUAL_FLOOR_NS) } else { 0.0 })
+            //
+            // The per-card term is TWO terms, gated apart on the same `tier_ns > 0` signal this arm
+            // already uses for its scan: the loop body runs for every candidate, but the `card_pass`
+            // CALL only happens when there is a residual to check. `all_match_known` skips it outright
+            // (#634 step 1), and `tier_ns == 0` is exactly that condition. Charging the call anyway made
+            // the arm's card-mode body read p50 1.90 over-costed.
+            eval_domain
+                * (STREAM_LOOP_PER_CARD_NS
+                    + if tier_ns > 0.0 { STREAM_CARD_PASS_NS + tier_ns.max(STREAM_RESIDUAL_FLOOR_NS) } else { 0.0 })
                 // Only with a residual does P3 walk printings; see STREAM_SCAN_PER_ROW_NS.
                 + if tier_ns > 0.0 { scan_units * STREAM_SCAN_PER_ROW_NS } else { 0.0 }
                 + matches * STREAM_EMIT_PER_MATCH_NS
+                + perm_steps * STREAM_PERM_STEP_NS
                 + f64::from(f.artwork_seen_cards) * STREAM_ARTWORK_SEEN_PER_CARD_NS
                 + floor
                 + n_cards * STREAM_CORPUS_PASS_PER_CARD_NS
                 + STREAM_FIXED_COST_NS
         }
         PhysicalPlan::GatheredScan => {
+    // Rows the collect actually walks: `select_page` yields `clamp(matches - offset, 0, limit)`, so a
+    // page past the end of the matches collects fewer rows than `limit` asked for.
+    let page_rows = f64::from(f.matches.saturating_sub(f.offset).min(f.limit));
             // Per-CARD verify tier, for the reason spelled out in the StreamedSelect arm above.
-            eval_domain * (GATHER_CARD_PASS_NS + if tier_ns > 0.0 { tier_ns.max(GATHER_RESIDUAL_FLOOR_NS) } else { 0.0 })
+            // Split and gated exactly as in the StreamedSelect arm above, and deliberately in the same
+            // change: this lowers both plans' cost on `all_match` queries, and the one asymmetric
+            // adjustment tried before (P3's residual floor moved while P4's stayed) sent
+            // `StreamedSelect -> GatheredScan` from 407 lost-time queries to 653.
+            eval_domain
+                * (GATHER_LOOP_PER_CARD_NS
+                    + if tier_ns > 0.0 { GATHER_CARD_PASS_NS + tier_ns.max(GATHER_RESIDUAL_FLOOR_NS) } else { 0.0 })
                 + scan_units * GATHER_SCAN_PER_ROW_NS
                 + matches * GATHER_PUSH_PER_MATCH_NS
                 + page_span * GATHER_SELECT_PER_PAGE_SLOT_NS
+                + page_rows * GATHER_COLLECT_PER_PAGE_ROW_NS
                 + GATHER_FIXED_COST_NS
         }
     }

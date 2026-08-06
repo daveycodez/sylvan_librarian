@@ -88,12 +88,24 @@ RIDGE_STRENGTH = 0.01
 # and the baseline each fitted rate is reported against.
 CURRENT: dict[str, list[float]] = {
     # eval_domain, scan_units, tier scale, matches, page_span, fixed
-    "GatheredScan": [6.88, 2.06, 18.89, 2.24, 3.51, 169.6],
+    # ..., page_span, page_rows, fixed -- page_rows new 2026-08-03. The phase has two drivers: the
+    # quickselect scales with offset+limit, the collect with the page actually returned. A designed page
+    # sweep separates them where traffic cannot, since the two are correlated in the sampled query mix.
+    # 2026-08-03: the first column is now the UNCONDITIONAL loop rate and the third carries the
+    # `card_pass` call (3.00) on top of the floor (18.89), because the arm gates the call on
+    # `tier_ns > 0` -- `all_match_known` skips it. The design matrix already had these as two
+    # columns; only the arm and these labels changed.
+    "GatheredScan": [3.88, 2.06, 21.89, 2.24, 3.51, 9.79, 169.6],
     # eval_domain, scan_units, residual floor, matches, artwork_seen_cards, n_cards floor, corpus pass, fixed
     # Refit once `printings_examined` existed: this plan's fit was vetoed for as long as the only
     # available counter was the printing SPAN, which its all_match rows disagree with by ~3x over a
     # term the arm multiplies by zero. Median agreement 0.63 -> 0.92, within-25% 19% -> 58%.
-    "StreamedSelect": [5.05, 5.97, 6.58, 0.12, 1.21, 1.02, 0.02, 217.0],
+    # ..., perm_steps, ... -- the permutation walk's length, new 2026-08-03. It is the one quantity in
+    # P3's finish phase no other feature is proportional to: the walk steps until the page fills, so it
+    # visits ~page_span * n_cards / matches entries, inversely proportional to selectivity.
+    # Same split as GatheredScan above: 2.58 unconditional, and the call (2.47) folded into the
+    # residual-gated column alongside the 6.58 floor.
+    "StreamedSelect": [2.58, 5.97, 9.05, 0.12, 1.0, 1.21, 1.02, 0.02, 217.0],
     # broadcast, scatter, project, popcount, walk step, walk emit, gather card pass, gather bittest,
     # gather push, fixed. Several of these are SHARED with other arms in cost.rs (LINEAR_PASS,
     # RANGE_SCATTER, GATHER_CARD_PASS, GATHER_PUSH_PER_MATCH, ...), so a fitted value that disagrees
@@ -184,6 +196,9 @@ def nnls(rows: list[list[float]], targets: list[float]) -> list[float]:
 # A consequence worth stating: the fitted floor is not directly pasteable, because the offset it was
 # fitted against assumed the OLD floor. Applying it and re-fitting is a fixed-point iteration, and
 # each run is only self-consistent with whatever is shipped at the time.
+# The residual-gated column now prices the `card_pass` call as well as the floor, but the OFFSET
+# below is still about the floor alone: it captures `eval_domain * max(tier_ns - FLOOR, 0)`, the
+# excess where an expensive residual beats the floor, and the call is not part of that maximum.
 SHIPPED_RESIDUAL_FLOOR = {"GatheredScan": 18.89, "StreamedSelect": 6.58}
 
 
@@ -204,17 +219,32 @@ def design_row(plan: str, acq: dict, limit: int, offset: int) -> tuple[list[floa
     n_cards = float(acq["n_cards"])
     tier_ns = acq["residual_tier_ns100"] / 100.0
     page_span = float(min(offset + limit, acq["matches"]))
+    # Mirrors cost.rs: `select_page` returns clamp(matches - offset, 0, limit), so a page past the end of
+    # the matches collects fewer rows than requested.
+    page_rows = float(min(max(acq["matches"] - offset, 0), limit))
     residual_on = 1.0 if tier_ns > 0.0 else 0.0
     floor = SHIPPED_RESIDUAL_FLOOR.get(plan, 0.0)
     excess = eval_domain * max(tier_ns - floor, 0.0) if tier_ns > 0.0 else 0.0
 
     if plan == "GatheredScan":
         return (
-            [eval_domain, scan_units, eval_domain * residual_on, matches, page_span, 1.0],
-            ["CARD_PASS", "SCAN_PER_ROW", "RESIDUAL_FLOOR", "PUSH_PER_MATCH", "SELECT_PER_PAGE_SLOT", "FIXED"],
+            [eval_domain, scan_units, eval_domain * residual_on, matches, page_span, page_rows, 1.0],
+            [
+                "LOOP_PER_CARD",
+                "SCAN_PER_ROW",
+                "CARD_PASS+FLOOR",
+                "PUSH_PER_MATCH",
+                "SELECT_PER_PAGE_SLOT",
+                "COLLECT_PER_PAGE_ROW",
+                "FIXED",
+            ],
             excess,
         )
     if plan == "StreamedSelect":
+        # Mirrors the arm's guards: an empty result or a page past the end returns before BOTH branches,
+        # so neither the gather floor nor the walk is charged there.
+        walks_perm = matches > STREAM_MIN_MATCHES and matches > 0 and offset < matches
+        perm_steps = min(page_span * n_cards / matches, n_cards) if walks_perm else 0.0
         # Mirrors run_query_streamed's early return: zero matches, or a page past the total, never
         # reaches the small-total gather. See STREAM_SMALL_TOTAL_FLOOR_PER_CARD_NS in cost.rs.
         runs_small_gather = 0 < matches <= STREAM_MIN_MATCHES and offset < matches
@@ -229,16 +259,18 @@ def design_row(plan: str, acq: dict, limit: int, offset: int) -> tuple[list[floa
                 scan_units * residual_on,
                 eval_domain * residual_on,
                 matches,
+                perm_steps,
                 float(acq["artwork_seen_cards"]),
                 small_total,
                 n_cards,
                 1.0,
             ],
             [
-                "CARD_PASS",
+                "LOOP_PER_CARD",
                 "SCAN_PER_ROW",
-                "RESIDUAL_FLOOR",
+                "CARD_PASS+FLOOR",
                 "EMIT_PER_MATCH",
+                "PERM_STEP",
                 "ARTWORK_SEEN_PER_CARD",
                 "SMALL_TOTAL_FLOOR_PER_CARD",
                 "CORPUS_PASS_PER_CARD",
@@ -291,6 +323,45 @@ def design_row(plan: str, acq: dict, limit: int, offset: int) -> tuple[list[floa
             0.0,  # no residual-floor term in this arm, so nothing comes off the target
         )
     return None
+
+
+def perm_step_check(samples: list[dict]) -> tuple[int, float, float, float] | None:
+    """Realized `perm_steps` against the estimate cost.rs derives. The ratio should be 1.00.
+
+    Separate from `counter_check` because this feature is not published by acquire -- the arm computes
+    it from `page_span`, `n_cards` and `matches`. The rate was fitted and cross-validated (kernel
+    0.958-1.256 ns/entry, traffic 1.15), but a rate can look right while the quantity it multiplies is
+    wrong, so the ESTIMATE needs its own grade.
+
+    What is being tested is the uniform-spread assumption: the walk is modelled as finding one match
+    every `n_cards / matches` entries, which holds if matches are scattered evenly through the sort
+    permutation and fails if they cluster. Clustering is not far-fetched -- the permutation is ordered
+    by a sort column, and predicates correlate with sort columns (`year>=2020` under `order=released`
+    is the extreme case), so a real skew here would be a genuine model defect and not noise.
+
+    Read the SPREAD, not just the median. The executor bounds its walk to the realized match span, so
+    the ends of a cluster no longer cost anything and this ratio can only be inflated by non-matching
+    entries INTERIOR to the span. Bounding those ends took p90 from 6.43 to 4.26 (p10 0.13 -> 0.08,
+    median 1.00 -> 0.90) on one seed and sample length: a third of the tail was the leading prefix, and
+    what is left is a different mechanism's to fix.
+
+    Returns (rows, p10, median, p90) of realized/estimated, or None if no row walked.
+    """
+    ratios = []
+    for s in samples:
+        if s["plan"] != "StreamedSelect" or not s.get("perm_steps"):
+            continue
+        acq, matches = s["acq"], float(s["acq"]["matches"])
+        if matches <= 0:
+            continue
+        page_span = float(min(s["offset"] + s["limit"], matches))
+        estimate = min(page_span * float(acq["n_cards"]) / matches, float(acq["n_cards"]))
+        if estimate > 0:
+            ratios.append(float(s["perm_steps"]) / estimate)
+    if not ratios:
+        return None
+    ratios.sort()
+    return (len(ratios), ratios[len(ratios) // 10], ratios[len(ratios) // 2], ratios[(9 * len(ratios)) // 10])
 
 
 def counter_check(samples: list[dict]) -> dict[str, list[tuple[str, float]]]:
@@ -394,6 +465,7 @@ def collect(engine: object, rng: random.Random, seconds: float, sampler: QuerySa
                     "paging_taken": p.get("paging_taken"),
                     "printings_examined": p["printings_examined"],
                     "matches_pushed": p["matches_pushed"],
+                    "perm_steps": p.get("perm_steps", 0),
                 }
             )
     return samples
@@ -554,6 +626,13 @@ def main() -> None:
                 suspect.add(plan)
             print(f"{plan:<20}{label:<40}{ratio:>9.2f}{flag}")
     print("  a ratio far from 1.00 is a miscounted feature; no rate can absorb it.")
+    perm = perm_step_check(samples)
+    if perm is not None:
+        rows, p10, med, p90 = perm
+        print(f"\nStreamedSelect perm_steps realized/estimated over {rows:,} walking rows:")
+        print(f"  p10 {p10:.2f}   median {med:.2f}   p90 {p90:.2f}")
+        print("  tests the uniform-spread assumption behind `page_span * n_cards / matches`; skew would")
+        print("  show as a median away from 1.00, and clustering as a wide p10-p90 spread.")
 
     by_plan: dict[str, list[dict]] = collections.defaultdict(list)
     for s in samples:

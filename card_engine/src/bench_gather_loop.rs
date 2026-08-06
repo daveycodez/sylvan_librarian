@@ -177,15 +177,29 @@ const ITERS: usize = 200;
 /// group-size table this prints shows only 1,910 cards reach 8 printings, which is too few to fill
 /// the larger cells. 4 keeps the leverage worth having and the wide group ~4× bigger.
 const WIDE_MIN_PRINTINGS: usize = 4;
-/// Card counts each cell runs at. Two sizes so linearity in the card term is measured, not assumed;
-/// bounded above by the wide group, which is the scarce one. The single-printing cell runs 6.31 →
-/// 7.67 ns/card between the two, so this is not a formality — the card term is mildly superlinear
-/// and a one-size design would bake whichever size it used into the constant.
-const CARD_COUNTS: [usize; 2] = [1_500, 4_500];
+/// Card counts each cell runs at. Four sizes, geometric, because two things are being measured on this
+/// axis and they need opposite ends of it:
+///
+/// - **Linearity in the card term**, which the large end shows: the single-printing card cell measured
+///   8.33 / 8.53 / 10.11 ns/card at 400 / 1,500 / 4,500, so the per-card rate RISES with card count and
+///   a one-size design would bake whichever size it used into the constant.
+/// - **The intercept**, i.e. the per-query fixed cost, which only exists as the y-intercept of cells
+///   that vary in size — and which the SMALL end pins, because `intercept = t(n) - slope * n` multiplies
+///   any slope error by `n`. At a 400-card floor a 1 ns/card slope error is 400 ns of intercept error,
+///   against a shipped `GATHER_FIXED_COST_NS` of 169.6: unmeasurable. 100 shortens that lever 4x.
+///
+/// Bounded above by the wide group, which is the scarce one (see `WIDE_MIN_PRINTINGS`).
+const CARD_COUNTS: [usize; 4] = [100, 400, 1_500, 4_500];
 /// Page requested. Small and fixed: `sel.absorb()` runs INSIDE the loop and prunes toward
 /// `offset + limit`, so this is part of what the per-match rate has to cover — keeping it constant
 /// keeps that contribution proportional to matches rather than to the page.
 const LIMIT: usize = 60;
+/// (offset, limit) pairs for the finish-phase sweep. `GATHER_SELECT_PER_PAGE_SLOT_NS` is charged against
+/// `page_span = min(offset + limit, matches)`, and every cell above holds the page FIXED, so that term
+/// has never been varied here -- the loop rates were measured while the one term keyed on the page was
+/// held constant. These four move `page_span` ~40x at constant counters, which is what separates a
+/// per-slot rate from a fixed cost the phase pays regardless.
+const PAGE_SPECS: [(usize, usize); 4] = [(0, 15), (0, 60), (0, 600), (900, 60)];
 
 /// Default store. `BENCH_LOOP_STORE` overrides it, which is how the corpus-size sweep runs: build
 /// upscaled stores with `scripts/upscale_corpus.py` and point this at each in turn. The real corpus is
@@ -597,6 +611,58 @@ fn bench_gather_loop() {
     // What artwork mode costs ON TOP of the three fitted rates. cost.rs has no artwork term for P4,
     // so today this sits inside the shared rates, which is why measuring them without artwork in the
     // design and then lowering them under-costs artwork queries.
+    // Finish-phase sweep. Runs the SAME candidate set at four pages, so the loop's work is identical
+    // across rows and every difference in `ns_finish` is the select-and-collect. Chunk-rotated like
+    // everything else, and the median is reported.
+    //
+    // `page_span` is `min(offset + limit, matches)`, so the (900, 60) row is capped by matches rather
+    // than by the page: with 4,500 matches it asks for span 960, where (0, 600) asks for 600. That is
+    // the row that separates a genuine per-slot rate from `offset` merely being large.
+    if singleton.len() >= CARD_COUNTS[1] {
+        println!("\nfinish phase vs page_span (same cards, four pages -- the loop is identical across rows):");
+        println!("  {:>7}{:>8}{:>12}{:>12}{:>14}", "offset", "limit", "page_span", "ns_finish", "ns per slot");
+        let mut rows: Vec<(f64, f64)> = Vec::new();
+        for (offset, limit) in PAGE_SPECS {
+            let params = QueryParams::from_strs("card", "default", "name", "asc", limit, offset);
+            let mut samples: Vec<f64> = Vec::with_capacity(ITERS);
+            let mut span = 0.0f64;
+            let chunks = (singleton.len() / CARD_COUNTS[1]).max(1);
+            for iter in 0..ITERS {
+                let start = (iter % chunks) * CARD_COUNTS[1];
+                let end = (start + CARD_COUNTS[1]).min(singleton.len());
+                let prep = PreparedCandidates {
+                    candidate_cards: Some(singleton[start..end].to_vec()),
+                    all_match_known: true,
+                    narrowed_repr: NarrowedRepr::Cards,
+                };
+                black_box(exec_gathered_scan(&ctx, &params, &filter, &prep, None));
+                let st = take_phase_stats();
+                span = (offset + limit).min(st.matches_pushed as usize) as f64;
+                samples.push(st.ns_finish as f64);
+            }
+            samples.sort_by(f64::total_cmp);
+            let ns = samples[samples.len() / 2];
+            println!("  {offset:>7}{limit:>8}{span:>12.0}{ns:>12.0}{:>14.2}", ns / span.max(1.0));
+            rows.push((span, ns));
+        }
+        // Two-point solve across the widest span gap, which is the cheapest way to see whether the phase
+        // has a fixed component. Through the origin the slope has to absorb any constant, which inflates
+        // it on the small-page rows -- the same error that made `GATHER_SELECT_PER_PAGE_SLOT_NS` look 5x
+        // wrong earlier in this branch.
+        if let (Some(lo), Some(hi)) = (rows.first(), rows.iter().max_by(|a, b| a.0.total_cmp(&b.0)))
+            && hi.0 > lo.0
+        {
+            {
+                let slope = (hi.1 - lo.1) / (hi.0 - lo.0);
+                println!(
+                    "  two-point: {:.2} ns/slot + {:.0} ns fixed   (shipped GATHER_SELECT_PER_PAGE_SLOT_NS 3.51, no fixed term)",
+                    slope,
+                    lo.1 - slope * lo.0
+                );
+            }
+        }
+    }
+
     // The warm/cold gap, per cell. `cost.rs`'s constants are fitted on production traffic, which pays
     // this; every rate this harness reports is a min-of-200 and does not.
     println!("\nfirst pass vs warm minimum (min-of-{ITERS} hides whatever the cold walk costs):");
@@ -627,6 +693,80 @@ fn bench_gather_loop() {
             (c.ns_loop - base) / c.printings,
             (c.ns_loop - base) / c.cards
         );
+    }
+
+    // A per-query FIXED cost, measured as the intercept of the loop phase rather than taken from a
+    // whole-arm traffic fit. `fit_cost_model.py` fits one equation per query against total dispatch, so
+    // its intercept absorbs every mis-specification the other columns cannot express -- it read 84 and
+    // then 85 while COLLECT_PER_PAGE_ROW moved 15.0 -> 9.79 beneath it, which is exactly that. Here the
+    // intercept is identified by cells that differ ONLY in size, so nothing else can hide in it.
+    //
+    // Grouped by CELL LABEL, and least-squares over that label's three sizes. Both matter, and the
+    // first is a correction: this used to filter to a shape and two-point solve on the smallest and
+    // largest cells matching it, which crossed cell boundaries whenever two labels shared a shape --
+    // it paired `A` at 400 cards with `A'` (the same shape on a different chunk stagger) at 4,500 and
+    // reported -1,305 ns, where `A` against itself gives -780. The sign was right either way, but half
+    // the magnitude was stagger noise, and the magnitude is what a refit decision needs. One label
+    // across sizes holds the chunk stagger fixed, so only the size varies; printing per label rather
+    // than per mode then shows the spread instead of hiding it inside one number.
+    {
+        println!("\nloop-phase fixed cost and curvature per cell, single-printing shapes:");
+        println!(
+            "  {:<26}{:>10}{:>12}{:>10}{:>10}{:>9}{:>12}",
+            "cell", "ns/card", "intercept", "small", "large", "curve", "fixed"
+        );
+        // First occurrence of each label, in design order. `dedup()` would not do: cells are emitted
+        // size-major, so every label recurs once per size and only CONSECUTIVE repeats would collapse.
+        let mut labels: Vec<&str> = Vec::new();
+        for c in &cells {
+            if !labels.contains(&c.label) {
+                labels.push(c.label);
+            }
+        }
+        for label in labels {
+            // Single-printing shapes only. A fit on `cards` alone is interpretable only where printings
+            // track cards: a wide cell's cost is mostly per-PRINTING, so its slope reads 22-26 ns/card
+            // instead of ~11 and its intercept collects whatever that mis-attribution leaves over
+            // (`D wide print/default` read +6,498 ns). Same filter the per-mode version used, kept.
+            let same: Vec<&Cell> =
+                cells.iter().filter(|c| c.label == label && !c.ran_card_pass && (c.printings / c.cards) < 1.5).collect();
+            // Least squares on `ns_loop = intercept + slope * cards`, over every size this label ran.
+            let n = same.len() as f64;
+            if n < 2.0 {
+                continue;
+            }
+            let (sx, sy) = (same.iter().map(|c| c.cards).sum::<f64>(), same.iter().map(|c| c.ns_loop).sum::<f64>());
+            let sxx = same.iter().map(|c| c.cards * c.cards).sum::<f64>();
+            let sxy = same.iter().map(|c| c.cards * c.ns_loop).sum::<f64>();
+            let denom = n * sxx - sx * sx;
+            if denom.abs() < f64::EPSILON {
+                continue;
+            }
+            let slope = (n * sxy - sx * sy) / denom;
+            let intercept = (sy - slope * sx) / n;
+            // The whole-range line is reported for continuity with earlier runs, but it is NOT the
+            // number to read: the two smallest and two largest sizes are dominated by different effects,
+            // and a single line through them lands between the two with a negative intercept. Solve them
+            // apart. The small pair is where a per-query fixed cost is visible at all (at 4,500 cards a
+            // 170 ns constant is 0.04 ns/card, far under the cell-to-cell spread); the large pair is
+            // where the per-card rate has grown, which is the curvature.
+            let mut by_size: Vec<&&Cell> = same.iter().collect();
+            by_size.sort_by(|a, b| a.cards.total_cmp(&b.cards));
+            let secant = |lo: &Cell, hi: &Cell| (hi.ns_loop - lo.ns_loop) / (hi.cards - lo.cards);
+            let (small, large) = match (by_size.first(), by_size.get(1), by_size.iter().rev().nth(1), by_size.last()) {
+                (Some(a), Some(b), Some(c), Some(d)) => (secant(a, b), secant(c, d)),
+                _ => (f64::NAN, f64::NAN),
+            };
+            let small_intercept = by_size.first().map_or(f64::NAN, |c| c.ns_loop - small * c.cards);
+            println!(
+                "  {:<26}{:>10.2}{:>12.0}{:>10.2}{:>10.2}{:>9.2}{:>12.0}",
+                label, slope, intercept, small, large, large / small, small_intercept
+            );
+        }
+        println!("  shipped GATHER_FIXED_COST_NS 169.6; a whole-arm traffic fit puts it at 85.");
+        println!("  Read the last two columns, not the first two. `large/small` is the CURVATURE the arm has");
+        println!("  no term for; `fixed` is what the small pair says a per-query cost is, and the whole-range");
+        println!("  intercept goes NEGATIVE only because one line cannot hold both ends at once.");
     }
 
     // The reparameterised fit: each mode fitted in the two-parameter space it can actually support,

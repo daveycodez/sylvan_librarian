@@ -1942,6 +1942,29 @@ impl ArchivedSortPermutations {
         };
         Some(&pair[descending as usize])
     }
+
+    /// Both directions of one streamable column, length-checked against the card count, or `None` if
+    /// the column has no permutation. The single answer to "can a plan stream this orderby": every
+    /// plan that walks a permutation also indexes its inverse, so all three applicability predicates
+    /// and all three executors want the pair or neither.
+    fn order(&self, col: SortCol, descending: bool, n_cards: usize) -> Option<SortOrder<'_>> {
+        let perm = self.get(col, descending)?;
+        let inv = self.get_inv(col, descending)?;
+        (perm.len() == n_cards && inv.len() == n_cards).then_some(SortOrder { perm, inv })
+    }
+}
+
+/// One streamable column's card ordering and its inverse, which every permutation-walking plan needs
+/// together: the walk reads `perm`, and finding where in that order a card sits reads `inv`.
+///
+/// Paired in one value, obtained from one length-checked lookup (`ArchivedSortPermutations::order`),
+/// because the two were previously fetched by five call sites with two `expect`s each and applicability
+/// predicates that checked the forward array's length but not the inverse's — a store whose two arrays
+/// disagreed would have reached an indexing panic inside an executor rather than a decline.
+#[derive(Copy, Clone)]
+struct SortOrder<'a> {
+    perm: &'a Archived<Vec<u32>>,
+    inv:  &'a Archived<Vec<u32>>,
 }
 
 /// Dense byte-order rank of card_name_lower onto each card (equal names share
@@ -1972,6 +1995,172 @@ fn invert_perm(perm: &[u32]) -> Vec<u32> {
     inv
 }
 
+/// An inclusive value interval on the sort column that every match must satisfy, or `UNBOUNDED` when
+/// the filter says nothing about it. Extracted from the filter BEFORE `split_planes` consumes it (see
+/// `sort_col_bound`) and carried on `QueryParams`, because that is the only point at which the tree is
+/// still readable: `cmc>=6` compiles to mask algebra over bitplanes, and the residual left behind is
+/// `FilterExpr::True`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SortBound {
+    lo: Option<f64>,
+    hi: Option<f64>,
+}
+
+impl SortBound {
+    /// No constraint: the walk covers the whole permutation, exactly as it did before this existed.
+    /// Also the safe default — every path that does not extract a bound gets this one, so a caller that
+    /// forgets to loses performance and not correctness.
+    const UNBOUNDED: SortBound = SortBound { lo: None, hi: None };
+
+    fn is_unbounded(self) -> bool {
+        self.lo.is_none() && self.hi.is_none()
+    }
+
+    /// Tighten with another interval — `And`'s rule, and the only way bounds combine.
+    fn intersect(self, other: SortBound) -> SortBound {
+        let tighter = |a: Option<f64>, b: Option<f64>, pick: fn(f64, f64) -> f64| match (a, b) {
+            (Some(x), Some(y)) => Some(pick(x, y)),
+            (v, None) | (None, v) => v,
+        };
+        SortBound { lo: tighter(self.lo, other.lo, f64::max), hi: tighter(self.hi, other.hi, f64::min) }
+    }
+}
+
+/// The inclusive interval on `sort_col` that every match of `filter` must satisfy.
+///
+/// Deliberately conservative in every direction, because the cost of being too wide is a longer walk
+/// and the cost of being too narrow is a wrong page:
+///
+/// - **`And` only.** An `Or` child can match outside any bound its sibling implies, and `Not` inverts
+///   into a union of two intervals that this cannot express. Both yield `UNBOUNDED` for that subtree,
+///   which an enclosing `And` then simply ignores.
+/// - **Strict comparisons are widened to inclusive.** `cmc>6` reports `lo = 6`, so the walk may start
+///   at the head of the `cmc == 6` tie block and step over it. One block of wasted steps against having
+///   to reason about float adjacency.
+/// - **Card-level columns only**, and only the three with numeric predicates. Everything else has no
+///   `NumericCmp` that can constrain it (there is no `edhrec>` in the query language), and `Rarity` /
+///   `PriceUsd` have no permutation to search.
+fn sort_col_bound(filter: &FilterExpr, sort_col: SortCol) -> SortBound {
+    let field = match sort_col {
+        SortCol::Cmc => NumField::Cmc,
+        SortCol::Power => NumField::Power,
+        SortCol::Toughness => NumField::Toughness,
+        _ => return SortBound::UNBOUNDED,
+    };
+    match filter {
+        FilterExpr::And(children) => {
+            children.iter().fold(SortBound::UNBOUNDED, |acc, c| acc.intersect(sort_col_bound(c, sort_col)))
+        }
+        // `op` reads left-to-right, so a constant on the left flips it: `6 <= cmc` bounds cmc BELOW.
+        FilterExpr::NumericCmp { lhs: NumExpr::Field(f), op, rhs: NumExpr::Const(v) } if *f == field => {
+            bound_from_cmp(*op, *v)
+        }
+        FilterExpr::NumericCmp { lhs: NumExpr::Const(v), op, rhs: NumExpr::Field(f) } if *f == field => {
+            bound_from_cmp(flip_op(*op), *v)
+        }
+        _ => SortBound::UNBOUNDED,
+    }
+}
+
+/// One comparison's inclusive interval. `Ne` constrains nothing (it excludes a point from the middle,
+/// which is not an interval), and the strict operators widen to their inclusive neighbours.
+fn bound_from_cmp(op: CmpOp, v: f64) -> SortBound {
+    match op {
+        CmpOp::Ge | CmpOp::Gt => SortBound { lo: Some(v), hi: None },
+        CmpOp::Le | CmpOp::Lt => SortBound { lo: None, hi: Some(v) },
+        CmpOp::Eq => SortBound { lo: Some(v), hi: Some(v) },
+        CmpOp::Ne => SortBound::UNBOUNDED,
+    }
+}
+
+/// The permutation's PRIMARY key: the sort column's value, direction folded in by negation, absent
+/// sorting last. One function because two places must agree on it exactly — `build_sort_permutations`
+/// orders by it, and `walk_bounds` binary-searches for it to find where a value interval starts and
+/// ends in that order. A divergence between those two would not be a slow walk, it would be a walk
+/// that starts past real matches and silently returns the wrong page.
+///
+/// `u32::MAX` for absent is what makes a numeric bound safe to search for: a card with no value in the
+/// column sorts past every finite key in BOTH directions, and `numeric_cmp_tri` answers `Tri::Null` for
+/// it, so it can never be a match of a comparison against that column either.
+fn perm_primary_key(value: Option<f32>, descending: bool) -> u32 {
+    value.map_or(u32::MAX, |v| f32_sort_bits(if descending { -v } else { v }))
+}
+
+/// The sort column's value for one archived card, in the same units `build_sort_permutations` sorted
+/// on. Card-level columns only: `Rarity`/`PriceUsd` have no permutation (they depend on the
+/// prefer-chosen printing), which is why `ArchivedSortPermutations::get` returns `None` for them.
+fn sort_col_card_value(card: &AOracleCard, sort_col: SortCol) -> Option<f32> {
+    match sort_col {
+        SortCol::EdhrecRank => card.edhrec_rank.as_ref().map(|v| u32::from(*v) as f32),
+        SortCol::Cubecobra  => card.cubecobra_score.as_ref().map(|v| f32::from(*v)),
+        // Single bytes, so archived and native are the same type — no `u8::from` to unwrap.
+        SortCol::Cmc        => card.cmc.as_ref().map(|v| f32::from(*v)),
+        SortCol::Power      => card.creature_power.as_ref().map(|v| f32::from(*v)),
+        SortCol::Toughness  => card.creature_toughness.as_ref().map(|v| f32::from(*v)),
+        SortCol::Name       => Some(u32::from(card.name_rank) as f32),
+        SortCol::Rarity | SortCol::PriceUsd => None,
+    }
+}
+
+/// The segment of `perm` that can contain a match, from the filter's interval on the sort column.
+///
+/// The permutation is a sorted array on `perm_primary_key`, so an interval on the sort column's VALUE
+/// is a contiguous range of POSITIONS, found by two binary searches — O(log n_cards) probes once per
+/// query, against the alternative of reading `inv_perm` once per matching card. Which end of the walked
+/// order each side of the interval lands on depends on the direction, because the key negates: under
+/// `asc` the low bound starts the segment, under `desc` the high bound does.
+///
+/// Returns the whole permutation when the filter constrains nothing, which is also what every caller
+/// gets that does not extract a bound.
+fn walk_bounds<'p>(
+    perm: &'p Archived<Vec<u32>>,
+    cards: &[AOracleCard],
+    sort_col: SortCol,
+    descending: bool,
+    bound: SortBound,
+) -> &'p [Archived<u32>] {
+    let all = &perm[..];
+    if bound.is_unbounded() || perm.len() != cards.len() || *WALK_SORT_BOUND == 0 {
+        return all;
+    }
+    // Values are read through the same encoder the permutation was built with, so this comparison and
+    // that ordering cannot disagree.
+    let key_at = |pos: usize| {
+        let cid = u32::from(all[pos]) as usize;
+        perm_primary_key(sort_col_card_value(&cards[cid], sort_col), descending)
+    };
+    // Under `desc` the key is negated, so the interval's ends swap roles: the largest VALUE has the
+    // smallest key and therefore comes first.
+    let (first_v, last_v) = if descending { (bound.hi, bound.lo) } else { (bound.lo, bound.hi) };
+    let key_of = |v: f64| perm_primary_key(Some(v as f32), descending);
+    // `partition_point` over positions: the first position whose key reaches the interval, and the
+    // first position past it. Both sides are inclusive in value, so `start` excludes keys strictly
+    // before the interval and `end` includes the whole tie block at its far edge.
+    let start = first_v.map_or(0, |v| {
+        let k = key_of(v);
+        partition_point(all.len(), |pos| key_at(pos) < k)
+    });
+    let end = last_v.map_or(all.len(), |v| {
+        let k = key_of(v);
+        partition_point(all.len(), |pos| key_at(pos) <= k)
+    });
+    // An empty or inverted range means the interval falls between two stored values (`cmc>=6 cmc<=5`),
+    // so nothing can match; the walk then steps nothing rather than being handed a reversed slice.
+    if start >= end { &all[..0] } else { &all[start..end] }
+}
+
+/// `partition_point` over an index range: the first `i` in `0..len` where `pred(i)` is false, with
+/// `pred` monotone. `slice::partition_point` cannot be used directly because the predicate needs the
+/// POSITION (to read the card behind it), not the element.
+fn partition_point(len: usize, pred: impl Fn(usize) -> bool) -> usize {
+    let (mut lo, mut hi) = (0usize, len);
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if pred(mid) { lo = mid + 1 } else { hi = mid }
+    }
+    lo
+}
+
 fn build_sort_permutations(cards: &[OracleCard]) -> SortPermutations {
     // Purely card-space now: the printings/offsets arguments existed only to read the first stored
     // printing's prefer_score, which is no longer a sort key (see the closure below).
@@ -1979,7 +2168,7 @@ fn build_sort_permutations(cards: &[OracleCard]) -> SortPermutations {
         let mut ids: Vec<u32> = (0..cards.len() as u32).collect();
         ids.sort_unstable_by_key(|&i| {
             let c = &cards[i as usize];
-            let pk = get(c).map_or(u32::MAX, |v| f32_sort_bits(if descending { -v } else { v }));
+            let pk = perm_primary_key(get(c), descending);
             let e = c.edhrec_rank.unwrap_or(u32::MAX);
             // Canonical secondary: the first (store-preferred) printing's
             // default prefer score, matching sort_key_bits' third component
@@ -4210,6 +4399,14 @@ struct QueryParams {
     descending: bool,
     limit: usize,
     page_offset: usize,
+    /// What the filter says about the SORT COLUMN, which `StreamedSelect` turns into the segment of the
+    /// permutation its walk has to cover. Not a user parameter — it is derived from the filter — but it
+    /// travels here because it is only meaningful next to `sort_col`/`descending`, and because the point
+    /// where it can be extracted (before `split_planes`) is nowhere near the executor that uses it.
+    ///
+    /// Defaults to `UNBOUNDED` in `from_strs`, and every constructor that does not opt in gets that: a
+    /// missing bound costs a longer walk, never a wrong page. `with_sort_bound` is the opt-in.
+    sort_bound: SortBound,
 }
 
 impl QueryParams {
@@ -4228,7 +4425,15 @@ impl QueryParams {
             descending: direction == "desc",
             limit,
             page_offset,
+            sort_bound: SortBound::UNBOUNDED,
         }
+    }
+
+    /// Attach the filter's interval on the sort column. Called at the PyO3 boundary, next to
+    /// `bind_and_split_filter`, since that is the last place the unsplit filter exists.
+    fn with_sort_bound(mut self, sort_bound: SortBound) -> Self {
+        self.sort_bound = sort_bound;
+        self
     }
 }
 
@@ -4635,6 +4840,17 @@ static RESIDUAL_PASS_RATE_ARTWORK: LazyLock<f64> = LazyLock::new(|| guard_env("C
 /// band; 1,024 sits at the spread's upper (gather/simple) edge, and past it
 /// streaming's win grows fast (~1.8× by 8k), so the trigger stays put.
 static STREAM_MIN_MATCHES: LazyLock<usize> = LazyLock::new(|| guard_env("CARD_ENGINE_STREAM_MIN_MATCHES", 1_024));
+
+/// Kill-switch for narrowing the streamed walk to the filter's bound on the sort column
+/// (`walk_bounds`). Default on; 0 walks the whole permutation as the executor did before the bound
+/// existed. A binary switch, not a calibrated threshold — the bound costs O(log n_cards) probes once
+/// per query and nothing per card, so there is no crossover to find, and its predecessor (a per-card
+/// `inv_perm` min/max, gated on candidate count) was replaced precisely because it did have one.
+///
+/// Exists because `scripts/bench_walk_span.py` needs both behaviours in ONE binary: the effect is
+/// smaller than the run-to-run spread of `ns_loop` across builds, so a cross-build A/B of it reports
+/// the wrong sign.
+static WALK_SORT_BOUND: LazyLock<usize> = LazyLock::new(|| guard_env("CARD_ENGINE_WALK_SORT_BOUND", 1));
 
 /// Whether run_query reorders And/Or children cheapest-verification-first
 /// before the evaluation walk (see FilterExpr::order_children_by_verify_cost).
@@ -6224,7 +6440,11 @@ impl PreparedCandidates {
     /// every card. Boxed because the two arms are different iterator types and
     /// both P3 and P4 want the same either-or — previously spelled out
     /// identically at the head of each.
-    fn card_ids<'s>(&'s self, ctx: &QueryCtx) -> Box<dyn Iterator<Item = u32> + 's> {
+    ///
+    /// `ExactSizeIterator` rather than `Iterator`: both arms know their length (a `Vec` and a `Range`),
+    /// so an executor that wants the candidate count before its loop can ask for it instead of being
+    /// handed the count alongside the iterator and trusting the two to agree.
+    fn card_ids<'s>(&'s self, ctx: &QueryCtx) -> Box<dyn ExactSizeIterator<Item = u32> + 's> {
         match &self.candidate_cards {
             Some(v) => Box::new(v.iter().copied()),
             None => Box::new(0..ctx.n_cards()),
@@ -6286,13 +6506,16 @@ fn gathered_scan_applicable() -> bool {
 /// descending)` whose length matches the card count, over a non-empty store.
 /// `maybe_broad` is deliberately excluded — that is a routing/perf choice, not a
 /// correctness constraint; StreamedSelect returns correct rows at any breadth.
+///
+/// The INVERSE is required on the same terms, because the emission walk bounds itself to the match
+/// span through it — hence `order`, which yields the pair or nothing.
 fn streamed_select_applicable(
     cards: &[AOracleCard],
     sort_col: SortCol,
     descending: bool,
     indexes: &Archived<CardIndexes>,
 ) -> bool {
-    !cards.is_empty() && indexes.sort_perms.get(sort_col, descending).is_some_and(|p| p.len() == cards.len())
+    !cards.is_empty() && indexes.sort_perms.order(sort_col, descending, cards.len()).is_some()
 }
 
 /// `PlanePopcountOrder` needs the filter fully consumed to `True`, `Mode::Card`,
@@ -6311,8 +6534,7 @@ fn plane_popcount_order_applicable(
         && matches!(mode, Mode::Card)
         && !cards.is_empty()
         && plane.is_some()
-        && indexes.sort_perms.get(sort_col, descending).is_some_and(|p| p.len() == cards.len())
-        && indexes.sort_perms.get_inv(sort_col, descending).is_some()
+        && indexes.sort_perms.order(sort_col, descending, cards.len()).is_some()
 }
 
 /// `PrintingRangeScan` structural eligibility only — whether it actually runs is
@@ -6370,8 +6592,7 @@ fn card_range_popcount_applicable(
         && !cards.is_empty()
         && plane.is_none()
         && bare_range_bounds(filter, indexes).is_some()
-        && indexes.sort_perms.get(sort_col, descending).is_some_and(|p| p.len() == cards.len())
-        && indexes.sort_perms.get_inv(sort_col, descending).is_some()
+        && indexes.sort_perms.order(sort_col, descending, cards.len()).is_some()
 }
 
 // ─── Shared P3/P4 candidate preparation ─────────────────────────────────────
@@ -6531,13 +6752,14 @@ fn exec_plane_popcount_order_with_bitmap<'a>(
 ) -> (usize, Vec<(&'a AOracleCard, &'a APrinting)>) {
     let indexes = ctx.indexes;
     let QueryParams { sort_col, descending, .. } = *params;
-    let perm = indexes.sort_perms.get(sort_col, descending).expect("PlanePopcountOrder applicability guarantees a permutation");
-    let inv_perm =
-        indexes.sort_perms.get_inv(sort_col, descending).expect("PlanePopcountOrder applicability guarantees an inverse permutation");
+    let order = indexes
+        .sort_perms
+        .order(sort_col, descending, ctx.cards.len())
+        .expect("PlanePopcountOrder applicability guarantees a sort order");
     // `run_query_streamed_popcount` publishes the phases and consumes the pending plane build; see
     // `publish_popcount_phases`. Counters stay zero: this plan popcounts a bitmap and visits no
     // cards, so it has nothing to report there.
-    run_query_streamed_popcount(ctx, params, perm, inv_perm, bitmap, Some(plane_expr), None)
+    run_query_streamed_popcount(ctx, params, order, bitmap, Some(plane_expr), None)
 }
 
 /// `CardRangePopcount` executor: the same popcount-skip order phase as P2, but its match bitmap is a
@@ -6553,10 +6775,11 @@ fn exec_card_range_popcount<'a>(
 ) -> (usize, Vec<(&'a AOracleCard, &'a APrinting)>) {
     let indexes = ctx.indexes;
     let QueryParams { sort_col, descending, .. } = *params;
-    let perm = indexes.sort_perms.get(sort_col, descending).expect("CardRangePopcount applicability guarantees a permutation");
-    let inv_perm =
-        indexes.sort_perms.get_inv(sort_col, descending).expect("CardRangePopcount applicability guarantees an inverse permutation");
-    run_query_streamed_popcount(ctx, params, perm, inv_perm, card_bits, None, Some(range_pbits))
+    let order = indexes
+        .sort_perms
+        .order(sort_col, descending, ctx.cards.len())
+        .expect("CardRangePopcount applicability guarantees a sort order");
+    run_query_streamed_popcount(ctx, params, order, card_bits, None, Some(range_pbits))
 }
 
 /// Prefix-sum the per-card distinct-artwork counts (`artwork_groups`) into artwork-space offsets: a
@@ -6620,7 +6843,7 @@ fn walk_grouped_page<'a>(
     perm: &Archived<Vec<u32>>,
 ) -> (Vec<(&'a AOracleCard, &'a APrinting)>, ComposePageWork) {
     let QueryCtx { cards, printings, offsets, indexes, .. } = *ctx;
-    let QueryParams { mode, prefer, sort_col, descending, limit, page_offset } = *params;
+    let QueryParams { mode, prefer, sort_col, descending, limit, page_offset, .. } = *params;
     let max_artwork_groups = u16::from(indexes.max_artwork_groups);
     let is_set = |pid: usize| pbits[pid >> 6] & (1u64 << (pid & 63)) != 0;
     let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit);
@@ -6725,7 +6948,7 @@ fn gather_composed_page<'a>(
     card_bits: Option<&[u64]>,
 ) -> (Vec<(&'a AOracleCard, &'a APrinting)>, ComposePageWork) {
     let QueryCtx { cards, printings, offsets, indexes, .. } = *ctx;
-    let QueryParams { mode, prefer, sort_col, descending, limit, page_offset } = *params;
+    let QueryParams { mode, prefer, sort_col, descending, limit, page_offset, .. } = *params;
     let max_artwork_groups = u16::from(indexes.max_artwork_groups);
     let is_set = |pid: usize| pbits[pid >> 6] & (1u64 << (pid & 63)) != 0;
     // `card_bits` is `pbits` already projected into card space. `Mode::Card` computes that
@@ -6845,8 +7068,12 @@ fn exec_streamed_select<'a>(
         .sort_perms
         .get(params.sort_col, params.descending)
         .expect("StreamedSelect applicability guarantees a permutation");
+    // The walk's segment, decided here rather than inside the executor because it is a property of the
+    // QUERY (its filter's interval on the sort column) and not of the emission loop. Two binary searches
+    // when the filter constrains the sort column, the whole permutation otherwise.
+    let walk = walk_bounds(perm, ctx.cards, params.sort_col, params.descending, params.sort_bound);
     let existential_plane = existential_plane_for(params.mode, plane, indexes);
-    run_query_streamed(ctx, params, filter, prep.all_match_known, perm, prep.card_ids(ctx), existential_plane)
+    run_query_streamed(ctx, params, filter, prep.all_match_known, walk, prep.card_ids(ctx), existential_plane)
 }
 
 /// Per-query execution counters and coarse phase timings, for checking the cost model against what
@@ -6882,6 +7109,16 @@ pub(crate) struct PhaseStats {
     /// span arithmetic alone, and the stored artwork group count answers without a printing either.
     pub(crate) printings_examined: u64,
     pub(crate) matches_pushed: u64,
+    /// Permutation entries `run_query_streamed`'s walk stepped over. Zero for every other executor and
+    /// for P3's other two exits (the empty/past-the-end return and the small-total gather).
+    ///
+    /// The walk steps the permutation until the page fills, so its length is
+    /// `page x n_cards / matches` -- inversely proportional to selectivity, and the one quantity in P3's
+    /// finish phase that no existing feature is proportional to. Measured against a fixed 1,500 matches
+    /// it runs 1,333 / 3,791 / 10,458 ns at 31.5k / 126k / 410k cards while the arm charged
+    /// `matches x EMIT + FIXED` ~ 397 ns throughout: under by 3.4x at the production corpus and 26x at
+    /// 410k. Published so the estimate can be GRADED rather than assumed, like the other three counters.
+    pub(crate) perm_steps: u64,
     /// Per-query scratch setup, before the match loop starts. Split out because it is neither
     /// prepare nor match and it is NOT negligible: `run_query_streamed` zeroes an `n_cards`-long
     /// counts buffer here (~126 kB on the real corpus) no matter how few candidates it is about to
@@ -7132,8 +7369,8 @@ thread_local! {
     /// owned elsewhere: `paging_taken` by `PAGING_TAKEN` below, `ns_round_total`/`result_total` by
     /// `explain_analyze`, which fills them after the take.
     static PHASE_STATS: std::cell::Cell<PhaseStats> = const { std::cell::Cell::new(PhaseStats {
-        cards_visited: 0, printing_span: 0, printings_examined: 0, matches_pushed: 0, ns_setup: 0, ns_loop: 0, ns_finish: 0, ns_round_total: 0,
-        ns_prepare: 0, result_total: 0, paging_taken: PagingTaken::NotEntered,
+        cards_visited: 0, printing_span: 0, printings_examined: 0, matches_pushed: 0, perm_steps: 0, ns_setup: 0, ns_loop: 0,
+        ns_finish: 0, ns_round_total: 0, ns_prepare: 0, result_total: 0, paging_taken: PagingTaken::NotEntered,
     }) };
 
     /// The compose fastpath's branch label, stored apart from `PHASE_STATS` because it is the one
@@ -7279,7 +7516,7 @@ fn exec_gathered_scan<'a>(
     // First of the three phase boundaries — everything down to the match loop is `ns_setup`.
     let t_start = std::time::Instant::now();
     let QueryCtx { cards, printings, offsets, strings, indexes } = *ctx;
-    let QueryParams { mode, prefer, sort_col, descending, limit, page_offset } = *params;
+    let QueryParams { mode, prefer, sort_col, descending, limit, page_offset, .. } = *params;
     let all_match_known = prep.all_match_known;
     let existential_plane = existential_plane_for(mode, plane, indexes);
     let card_ids = prep.card_ids(ctx);
@@ -7348,6 +7585,7 @@ fn exec_gathered_scan<'a>(
             printing_span: n_printing_span,
             printings_examined: n_printings_examined,
             matches_pushed: n_matches_pushed,
+            perm_steps: 0, // GatheredScan never walks the permutation
             ns_setup: (t_loop - t_start).as_nanos() as u64,
             ns_loop: (t_finish - t_loop).as_nanos() as u64,
             ns_finish: (t_end - t_finish).as_nanos() as u64,
@@ -7360,7 +7598,13 @@ fn exec_gathered_scan<'a>(
     (total, page)
 }
 
-#[allow(clippy::too_many_arguments)] // the PyO3 string surface, adapted in one place; the core takes two structs
+/// The six-string convenience form of `run_query_routed`, for tests that state a query the way the
+/// HTTP surface does. `QueryParams::from_strs` is still the single string→enum interpretation — the
+/// PyO3 methods call it directly, because they also have a `SortBound` to attach and this wrapper has
+/// no filter tree left to extract one from (see `bind_and_split_filter`). A query routed through here
+/// therefore walks the whole permutation, which is the correct-but-slower default.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)] // the string surface, adapted in one place; the core takes two structs
 fn run_query<'a>(
     ctx: &QueryCtx<'a>,
     filter: &mut FilterExpr,
@@ -7373,8 +7617,7 @@ fn run_query<'a>(
     page_offset: usize,
 ) -> (usize, Vec<(&'a AOracleCard, &'a APrinting)>) {
     // #702: plan selection is one cost-based routing layer (`run_query_routed`,
-    // `argmin cost::plan_cost` over the applicable plans), not a hand-tuned decision
-    // tree. `run_query` is the thin string→enum adapter; the core takes enums.
+    // `argmin cost::plan_cost` over the applicable plans), not a hand-tuned decision tree.
     let params = QueryParams::from_strs(unique, prefer, orderby, direction, limit, page_offset);
     run_query_routed(ctx, &params, filter, plane)
 }
@@ -8653,8 +8896,7 @@ fn explain_analyze(
 fn run_query_streamed_popcount<'a>(
     ctx: &QueryCtx<'a>,
     params: &QueryParams,
-    perm: &Archived<Vec<u32>>,
-    inv_perm: &Archived<Vec<u32>>,
+    order: SortOrder<'_>,
     bitmap: &[u64],
     plane: Option<&PlaneExpr>,
     range_bits: Option<&[u64]>,
@@ -8666,6 +8908,7 @@ fn run_query_streamed_popcount<'a>(
     let t_start = std::time::Instant::now();
     let QueryCtx { cards, printings, offsets, strings, indexes } = *ctx;
     let QueryParams { prefer, limit, page_offset, .. } = *params;
+    let SortOrder { perm, inv: inv_perm } = order;
     let planes = &indexes.planes;
     let n_cards = cards.len();
     let total: usize = bitmap.iter().map(|w| w.count_ones() as usize).sum();
@@ -8810,15 +9053,15 @@ fn run_query_streamed<'a>(
     params: &QueryParams,
     filter: &FilterExpr,
     all_match_known: bool,
-    perm: &Archived<Vec<u32>>,
-    card_ids: Box<dyn Iterator<Item = u32> + '_>,
+    walk: &[Archived<u32>],
+    card_ids: Box<dyn ExactSizeIterator<Item = u32> + '_>,
     existential_plane: Option<(&PlaneExpr, &Archived<BitPlanes>)>,
 ) -> (usize, Vec<(&'a AOracleCard, &'a APrinting)>) {
     // First of the three phase boundaries — everything down to the match loop is `ns_setup`, which
     // for this executor is dominated by the `counts` zeroing below. See `PhaseStats::ns_setup`.
     let t_start = std::time::Instant::now();
     let QueryCtx { cards, printings, offsets, strings, indexes } = *ctx;
-    let QueryParams { mode, prefer, sort_col, descending, limit, page_offset } = *params;
+    let QueryParams { mode, prefer, sort_col, descending, limit, page_offset, .. } = *params;
     let artwork_groups = &indexes.artwork_groups;
     let artwork_group_col = &indexes.artwork_group_col;
     let max_artwork_groups = u16::from(indexes.max_artwork_groups);
@@ -8899,7 +9142,7 @@ fn run_query_streamed<'a>(
     // Publishing helper: the walk below has several early returns, and every one of them must leave
     // the stats behind or the accounting silently attributes this plan's work to nothing. Each takes
     // the closing instant itself, so the emit phase is bounded without a second start marker.
-    let publish = |end: std::time::Instant| {
+    let publish = |end: std::time::Instant, perm_steps: u64| {
         let prep_ns = PENDING_PREPARE_NS.with(|c| c.replace(0));
         PHASE_STATS.with(|c| {
             c.set(PhaseStats {
@@ -8907,6 +9150,7 @@ fn run_query_streamed<'a>(
                 printing_span: n_printing_span,
                 printings_examined: n_printings_examined,
                 matches_pushed: n_matches_pushed,
+                perm_steps,
                 ns_setup: (t_loop - t_start).as_nanos() as u64,
                 ns_loop: (t_finish - t_loop).as_nanos() as u64,
                 ns_finish: (end - t_finish).as_nanos() as u64,
@@ -8918,7 +9162,7 @@ fn run_query_streamed<'a>(
         });
     };
     if total == 0 || page_offset >= total {
-        publish(std::time::Instant::now());
+        publish(std::time::Instant::now(), 0);
         return (total, Vec::new());
     }
 
@@ -8953,18 +9197,30 @@ fn run_query_streamed<'a>(
             .into_iter()
             .map(|(cid, pid)| (&cards[cid as usize], &printings[pid as usize]))
             .collect();
-        publish(std::time::Instant::now());
+        publish(std::time::Instant::now(), 0);
         return (total, page);
     }
 
-    // Stream: walk the permutation, consume page_offset from the counts, emit
-    // page cards only. Within a card, items order by (sort key, pid) — the
-    // same comparator select_page uses; across cards the permutation supplies
-    // the order.
+    // Stream: walk the segment `walk_bounds` handed over, consume page_offset
+    // from the counts, emit page cards only. Within a card, items order by
+    // (sort key, pid) — the same comparator select_page uses; across cards the
+    // permutation supplies the order.
+    //
+    // The segment is the whole permutation unless the filter bounded the sort column, in which case
+    // every position outside it belongs to a card whose value cannot satisfy that bound and therefore
+    // has `counts[cid] == 0`. The walk's only effect on a zero-count entry is to `continue`, so
+    // narrowing the segment cannot change which rows come back — only how many entries are stepped to
+    // find them.
     let mut skip = page_offset;
     let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit);
     let mut scratch: Vec<Match> = Vec::new();
-    'walk: for cid in perm.iter().map(|x| u32::from(*x)) {
+    // Counted for every entry the walk touches, including the ones skipped on a zero count -- that
+    // skip IS the walk's cost, and it is what grows as matches thin out in a larger corpus. Entries
+    // outside the segment are NOT counted: they are never stepped, and the counter's job is to grade
+    // the cost model against work actually done. A plain local, published once, like the others.
+    let mut n_perm_steps = 0u64;
+    'walk: for cid in walk.iter().map(|x| u32::from(*x)) {
+        n_perm_steps += 1;
         let c = counts[cid as usize] as usize;
         if c == 0 {
             continue;
@@ -8996,7 +9252,7 @@ fn run_query_streamed<'a>(
         }
         skip = 0;
     }
-    publish(std::time::Instant::now());
+    publish(std::time::Instant::now(), n_perm_steps);
     (total, page)
     }) // COUNTS.with
 }
@@ -9223,7 +9479,20 @@ pub(crate) fn count_common_keywords(data: &Archived<CardData>) -> HashMap<String
 /// No `#[inline]`: this shares a crate with its only hot-path caller (`query`), so
 /// the compiler already inlines at its discretion, and the body is dominated by
 /// Python FFI (`to_json`, `orjson.dumps`) — a call boundary here is unmeasurable.
-fn bind_and_split_filter(py: Python<'_>, filters: &Bound<PyAny>, unique: &str, data: &Archived<CardData>) -> PyResult<(Option<PlaneExpr>, FilterExpr)> {
+/// Binds the Python filter, extracts what it says about `sort_col`, and splits it into plane + residual.
+///
+/// The `SortBound` comes out of here rather than out of the executor because this is the last moment the
+/// whole filter exists: `split_planes` compiles `cmc>=6` into mask algebra over bitplanes and leaves
+/// `FilterExpr::True` behind, so by the time a plan runs there is nothing left to read the bound from.
+/// Every caller that does not want it can ignore it and get `UNBOUNDED` behaviour — a longer walk, never
+/// a different page.
+fn bind_and_split_filter(
+    py: Python<'_>,
+    filters: &Bound<PyAny>,
+    unique: &str,
+    data: &Archived<CardData>,
+    sort_col: SortCol,
+) -> PyResult<(Option<PlaneExpr>, FilterExpr, SortBound)> {
     let to_json = filters.call_method0("to_json")?;
     let json_bytes: Vec<u8> = py
         .import("orjson")?
@@ -9241,11 +9510,14 @@ fn bind_and_split_filter(py: Python<'_>, filters: &Bound<PyAny>, unique: &str, d
         .map_err(|e| QueryError::new_err(format!("build_filter: {e}")))?;
     filter_expr.bind(&data.coll_vocab, &data.coll_vocab_sorted, &data.artist_vocab, &data.mana_vocab, &data.indexes.flavor, &data.strings);
 
-    Ok(if u32::from(data.indexes.planes.n_cards) as usize == data.cards.len() && !data.cards.is_empty() {
+    // Read before the split consumes the tree.
+    let sort_bound = sort_col_bound(&filter_expr, sort_col);
+    let (plane, residual) = if u32::from(data.indexes.planes.n_cards) as usize == data.cards.len() && !data.cards.is_empty() {
         split_planes(filter_expr, &data.indexes.planes, &data.indexes.oracle_trigram.words, !matches!(unique, "artwork" | "printing"))
     } else {
         (None, filter_expr)
-    })
+    };
+    Ok((plane, residual, sort_bound))
 }
 
 fn plan_estimate_to_pydict<'py>(py: Python<'py>, e: &PlanEstimate) -> PyResult<Bound<'py, PyDict>> {
@@ -9272,6 +9544,7 @@ fn plan_trial_to_pydict<'py>(py: Python<'py>, t: &PlanTrial) -> PyResult<Bound<'
     d.set_item("printing_span", t.phases.printing_span)?;
     d.set_item("printings_examined", t.phases.printings_examined)?;
     d.set_item("matches_pushed", t.phases.matches_pushed)?;
+    d.set_item("perm_steps", t.phases.perm_steps)?;
     d.set_item("ns_setup", t.phases.ns_setup)?;
     d.set_item("ns_loop", t.phases.ns_loop)?;
     d.set_item("ns_finish", t.phases.ns_finish)?;
@@ -9803,10 +10076,13 @@ impl QueryEngine {
         // run_query evaluates in a few hundred word ops instead of per-card
         // dispatch. Shared verbatim with explain()/explain_analyze() — see
         // bind_and_split_filter.
-        let (plane_expr, mut filter_expr) = bind_and_split_filter(py, filters, unique, data)?;
+        let params = QueryParams::from_strs(unique, prefer, orderby, direction, limit, offset);
+        let (plane_expr, mut filter_expr, sort_bound) = bind_and_split_filter(py, filters, unique, data, params.sort_col)?;
 
         let ctx = QueryCtx::from(data);
-        let (total, page) = run_query(&ctx, &mut filter_expr, plane_expr.as_ref(), unique, prefer, orderby, direction, limit, offset);
+        // `run_query`'s string→enum adaptation, done here so the filter's sort-column bound can ride on
+        // the params: `from_strs` is still the single interpretation of the four strings.
+        let (total, page) = run_query_routed(&ctx, &params.with_sort_bound(sort_bound), &mut filter_expr, plane_expr.as_ref());
 
         let matches: Vec<Bound<PyDict>> = page
             .iter()
@@ -9843,7 +10119,8 @@ impl QueryEngine {
         let mmap = self.get_mmap()?;
         // Safety: see query()'s access_unchecked justification.
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
-        let (plane_expr, mut filter_expr) = bind_and_split_filter(py, filters, unique, data)?;
+        let params = QueryParams::from_strs(unique, prefer, orderby, direction, limit, offset);
+        let (plane_expr, mut filter_expr, sort_bound) = bind_and_split_filter(py, filters, unique, data, params.sort_col)?;
 
         // `prefer` is accepted and passed through, but note what it does NOT yet change:
         // `cost::plan_cost`/`PlanFeatures` still don't read it, so the argmin and every
@@ -9857,8 +10134,8 @@ impl QueryEngine {
         // feature value cannot be right for both. Taking the parameter is what lets a
         // prefer-aware feature be graded here at all; until one exists, an `explain` for a
         // non-default `prefer` still predicts the default's numbers.
-        let params = QueryParams::from_strs(unique, prefer, orderby, direction, limit, offset);
-        let (facts, estimates) = explain(&QueryCtx::from(data), &params, &mut filter_expr, plane_expr.as_ref());
+        let (facts, estimates) =
+            explain(&QueryCtx::from(data), &params.with_sort_bound(sort_bound), &mut filter_expr, plane_expr.as_ref());
 
         let rows: Vec<Bound<PyDict>> = estimates.iter().map(|e| plan_estimate_to_pydict(py, e)).collect::<PyResult<Vec<_>>>()?;
         let out = PyDict::new(py);
@@ -9891,14 +10168,15 @@ impl QueryEngine {
         let mmap = self.get_mmap()?;
         // Safety: see query()'s access_unchecked justification.
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
-        let (plane_expr, filter_expr) = bind_and_split_filter(py, filters, unique, data)?;
+        let params = QueryParams::from_strs(unique, prefer, orderby, direction, limit, offset);
+        let (plane_expr, filter_expr, sort_bound) = bind_and_split_filter(py, filters, unique, data, params.sort_col)?;
 
         // Release the GIL for the timing loop: it's pure Rust (no Python calls) and
         // runs plans × (warmups + trials) executions, so a long explain_analyze
         // shouldn't block other Python threads. The bind above and the PyDict
         // conversion below stay on the GIL.
         let ctx = QueryCtx::from(data);
-        let params = QueryParams::from_strs(unique, prefer, orderby, direction, limit, offset);
+        let params = params.with_sort_bound(sort_bound);
         let (facts, trials) = py.detach(|| explain_analyze(&ctx, &params, &filter_expr, plane_expr.as_ref(), num_warmups, num_trials));
 
         let rows: Vec<Bound<PyDict>> = trials.iter().map(|t| plan_trial_to_pydict(py, t)).collect::<PyResult<Vec<_>>>()?;
