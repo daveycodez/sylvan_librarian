@@ -1486,7 +1486,9 @@ fn negate_op(op: CmpOp) -> CmpOp {
 /// for the printing-space indexes): candidates are bounded by the ~3× smaller
 /// card count, so even a slice covering the whole index measures at worst
 /// break-even against the per-printing scan it would replace.
-fn numeric_candidates(idx: &Archived<NumericIndex>, op: CmpOp, val: f64) -> Option<Vec<u32>> {
+/// `n_cards` is the id DOMAIN, which is not `idx.len()`: the numeric indexes are nullable (a card with
+/// no power has no entry), so ids run past the index's length and a bitmap sized from it would panic.
+fn numeric_candidates(idx: &Archived<NumericIndex>, op: CmpOp, val: f64, n_cards: usize) -> Option<Vec<u32>> {
     let (start, end) = match op {
         CmpOp::Ne => return None,
         CmpOp::Eq => {
@@ -1500,9 +1502,9 @@ fn numeric_candidates(idx: &Archived<NumericIndex>, op: CmpOp, val: f64) -> Opti
         CmpOp::Gt => (idx.partition_point(|p| (i16::from(p.0) as f64) <= val), idx.len()),
         CmpOp::Ge => (idx.partition_point(|p| (i16::from(p.0) as f64) < val), idx.len()),
     };
-    let mut result: Vec<u32> = idx[start..end].iter().map(|p| u32::from(p.1)).collect();
-    result.sort_unstable();
-    Some(result)
+    // Card space, so the domain is `n_cards` -- `MATERIALIZE_BITMAP_RATIO` reads the domain rather than
+    // assuming printing space, which is the whole reason it is a ratio.
+    Some(sorted_ids(idx[start..end].iter().map(|p| u32::from(p.1)), end - start, n_cards))
 }
 
 // ─── Arith-expression tuple postings (#743) ──────────────────────────────────
@@ -1645,10 +1647,10 @@ fn arith_tuple_narrow(filter: &FilterExpr, idx: &Archived<ArithTupleIndex>, n_ca
     if count > *BITS_PROMOTE {
         return Narrowed::tight(Candidates::CardBits(scatter_bits(post_ids(), n_cards)));
     }
-    let mut result: Vec<u32> = Vec::with_capacity(count);
-    result.extend(post_ids());
-    result.sort_unstable();
-    Narrowed::tight(Candidates::Cards(result))
+    // The case that prompted docs/issues/local-engine-candidate-materialize.md: up to 564 posting rows
+    // concatenated, each sorted, the whole never so. Only reachable below `BITS_PROMOTE`, since the arm
+    // above already hands back a bitmap past it.
+    Narrowed::tight(Candidates::Cards(sorted_ids(post_ids(), count, n_cards)))
 }
 
 // ─── Tag index ───────────────────────────────────────────────────────────────
@@ -3163,14 +3165,99 @@ fn range_candidates(idx: &Archived<PrintingValueIndex>, lo: u32, hi: u32) -> Opt
 /// widened one position for f32/f64 rounding (see price_bounds) and therefore
 /// produce supersets that must never be marked tight — a Not would complement
 /// away the boundary printings, which are exactly the negation's matches.
+/// Where a bitmap scatter-then-extract becomes cheaper than `collect` + `sort_unstable` for producing
+/// an ascending id vector, as a DOMAIN:COUNT ratio rather than a count.
+///
+/// A count constant is only right at one domain: the bitmap pays `domain/64` words whatever the answer
+/// size is, so its fixed cost triples between card space (493 words) and printing space (1,519). The
+/// crossover collapses cleanly to a ratio instead -- `bench_candidate_materialize`'s fine sweep, 12%
+/// steps with 2 confirmations:
+///
+///        domain     words   crossover     ratio
+///        31,508       493          90     350:1
+///        97,206     1,519         194     501:1
+///       300,000     4,688         667     450:1
+///     1,000,000    15,625       2,064     484:1
+///     3,000,000    46,875       6,401     469:1
+///
+/// So `k * 490 > domain`, which puts printing space at k > 198. Same shape as
+/// `bitmap_beats_postings`'s `k * 32 > n`, but that one is a STORAGE crossover in bytes and this is a
+/// materialization-time one; the two are unrelated and their constants should not be conflated.
+///
+/// What it is worth where it matters: at 2,048 ids the bitmap is 3.6x, at 16,384 it is 5.8x, at 31,508
+/// 6.3x. A mid-band price range materializes 13,000-24,000.
+const MATERIALIZE_BITMAP_RATIO: usize = 490;
+
+/// An ascending id vector, by whichever route is cheaper at this size and domain. `ids` may arrive in
+/// any order -- `range_pids` yields key-major, which is the tiebreak order, not pid order.
+///
+/// **Precondition: `ids` must be duplicate-free.** This is the one way the two routes differ, and it is
+/// silent: a bitmap DEDUPS and a sort does not, so a caller emitting an id twice gets a shorter vec from
+/// one route than the other. Every current caller satisfies it by construction -- a `PrintingValueIndex`
+/// holds one entry per printing with a value, `build_numeric_index` one per card, and a card lives in
+/// exactly one `arith_tuple` posting row -- and the debug build checks it on every call rather than
+/// trusting that list to stay true.
+///
+/// Ids must also be `< domain`; `scatter_bits` would panic otherwise, which is the loud failure.
+///
+/// Same output either way given that, so this is a pure cost choice with no consumer effect. See
+/// `MATERIALIZE_BITMAP_RATIO`, and docs/issues/local-engine-candidate-materialize.md for the k-way merge
+/// that lost to both by 3-30x.
+fn sorted_ids(ids: impl Iterator<Item = u32>, k: usize, domain: usize) -> Vec<u32> {
+    let bitmap = *RANGE_MATERIALIZE_BITMAP && k.saturating_mul(MATERIALIZE_BITMAP_RATIO) > domain;
+    // Debug builds run BOTH and compare, so every call site the fuzz suite reaches is a live check of
+    // the precondition above -- not a claim in a doc comment that drifts. Release picks one.
+    #[cfg(debug_assertions)]
+    {
+        let collected: Vec<u32> = ids.collect();
+        let by_sort = {
+            let mut v = collected.clone();
+            v.sort_unstable();
+            v
+        };
+        let by_bitmap = bitmap_card_ids(&scatter_bits(collected.iter().copied(), domain));
+        debug_assert_eq!(
+            by_sort, by_bitmap,
+            "sorted_ids routes disagree over {} ids in a domain of {domain} -- the caller emitted a \
+             duplicate, which the bitmap collapses and the sort keeps",
+            collected.len(),
+        );
+        if bitmap { by_bitmap } else { by_sort }
+    }
+    #[cfg(not(debug_assertions))]
+    if bitmap {
+        bitmap_card_ids(&scatter_bits(ids, domain))
+    } else {
+        let mut v: Vec<u32> = ids.collect();
+        v.sort_unstable();
+        v
+    }
+}
+
 fn range_narrowed(idx: &Archived<PrintingValueIndex>, lo: u32, hi: u32, n_printings: usize, broad_ok: bool, exact: bool) -> Option<Narrowed> {
     let (s, e) = idx.range(lo, hi);
     let k = e - s;
-    if !range_too_broad_to_narrow(k, idx.len()) {
-        // Still a sort: the run order is the sort-key tiebreak, not pid, and `Candidates::Printings`
-        // is contractually pid-ascending. Cheaper than before if anything — no stride over a tuple.
-        let mut result: Vec<u32> = idx.range_pids(lo, hi).collect();
-        result.sort_unstable();
+    // Breadth against the WALK's domain, not the index's own length. A printing-value index omits
+    // null-valued printings, so `idx.len()` is the priced subset -- 54,896 of 97,206 for tix -- and
+    // measuring against it overstates breadth by exactly the null rate (1.77x for tix, 1.19x for
+    // usd/eur, 1.00x for the always-present date and collector-number indexes).
+    //
+    // The guard asks "is this set too big a fraction of what we would otherwise scan to be worth
+    // materializing", and what we would otherwise scan is the corpus. `tix>=0.03 tix<=0.03` is 16,664
+    // printings: 30.4% of the tix index and 17.1% of the corpus. Judged the first way it is broad, so it
+    // declines under `broad_ok: false` and narrows NOTHING -- which is why
+    // `eur>0.15 tix>=0.03 tix<=0.03` runs 39 us alone but 1,405 us with any plane-consumed partner, the
+    // plane having taken the only leaf that could have supplied a printing-space set.
+    //
+    // The collection and frame arms already use `n_printings` for the same guard; the range arms were
+    // the inconsistent ones.
+    let domain = if *RANGE_BREADTH_VS_CORPUS { n_printings } else { idx.len() };
+    if !range_too_broad_to_narrow(k, domain) {
+        // The run order is the sort-key tiebreak, not pid, and `Candidates::Printings` is contractually
+        // pid-ascending -- so the ids have to be ordered somehow. `sorted_ids` picks the cheaper of the
+        // two ways: at this call site `k` reaches 20,000+ on a mid-band price range, where the sort cost
+        // 157 us of a 166 us query while the scatter costs ~25.
+        let result = sorted_ids(idx.range_pids(lo, hi), k, n_printings);
         return Some(Narrowed { set: Candidates::Printings(result), tight: exact, proven: 0 });
     }
     if !broad_ok {
@@ -4130,13 +4217,26 @@ fn fuse_and_range_children<'f, 'i>(
     // touch at all is ±170 µs, so the two are indistinguishable. What the gate does buy is a bound —
     // outside the sparse population where the win IS demonstrated (up to 1.3 ms/query), narrowing is a
     // provable no-op. `k` survives for the survivors so the probe isn't recomputed downstream.
+    // Every printing has a card, so this CSR is corpus-length -- unlike the value indexes, which omit nulls.
+    let corpus_printings = indexes.printing_to_card.len();
     let mut fused: Vec<(&Group<'i>, usize)> = Vec::new();
     for g in &groups {
         if g.count < 2 {
             continue;
         }
         let (s, e) = g.idx.range(g.lo, g.hi);
-        if !sparse_only || !range_too_broad_to_narrow(e - s, g.idx.len()) {
+        // Same denominator argument as `range_narrowed`'s: the index omits null-valued printings, so
+        // `g.idx.len()` is the priced subset and judging breadth against it overstates it by the null
+        // rate. `tix>=0.03 tix<=0.03` fuses to 16,664 printings -- 30.4% of the tix index but 17.1% of
+        // the corpus -- so this gate refused to fuse it, the two halves stayed separate and individually
+        // broad, and BOTH declined under `broad_ok: false`. The result was a query that narrowed nothing:
+        // `eur>0.15 tix>=0.03 tix<=0.03 id:bgruw` at 1,405 us against 39 us for the same query without
+        // the plane-consumed partner.
+        //
+        // This gate, not `range_narrowed`'s, is the one that fires first -- changing only the latter
+        // moved nothing, because unfused halves never reach it as an interval.
+        let domain = if *RANGE_BREADTH_VS_CORPUS { corpus_printings } else { g.idx.len() };
+        if !sparse_only || !range_too_broad_to_narrow(e - s, domain) {
             fused.push((g, e - s));
         }
     }
@@ -4413,7 +4513,7 @@ fn narrow_rec(
             // loose in the sense that matters for Not: a posted card can have
             // other printings that do NOT satisfy the comparison, so the
             // complement would wrongly exclude cards `-rarity:x` matches.
-            let numeric = |idx, op, v: &f64| numeric_candidates(idx, op, *v).and_then(|c| Narrowed::tight(Candidates::Cards(c)));
+            let numeric = |idx, op, v: &f64| numeric_candidates(idx, op, *v, n_cards).and_then(|c| Narrowed::tight(Candidates::Cards(c)));
             let rarity = |op, v: &f64| narrow_rarity(indexes, n_cards, op, *v);
             // Same shape as `cn` below now that price is integer cents, not lossy f32 dollars --
             // the only price-specific step is snapping the *PRICE_CENTS_PER_DOLLAR conversion
@@ -5753,6 +5853,13 @@ static RESIDUAL_PASS_RATE_ARTWORK: LazyLock<f64> = LazyLock::new(|| guard_env("C
 /// Whether a dense `frame_data` value is gated on being genuinely BROAD (1/4) rather than merely dense
 /// (1/32). 0 restores the conflated gate, for the A/B that priced the distinction.
 static DENSE_FRAME_BROAD_GATE: LazyLock<bool> = LazyLock::new(|| guard_env("CARD_ENGINE_DENSE_FRAME_BROAD_GATE", 1u8) != 0);
+
+/// Whether `sorted_ids` may take the bitmap route. 0 forces `collect` + `sort_unstable`, for the A/B.
+static RANGE_MATERIALIZE_BITMAP: LazyLock<bool> = LazyLock::new(|| guard_env("CARD_ENGINE_RANGE_MATERIALIZE_BITMAP", 1u8) != 0);
+
+/// Whether range breadth is judged against the corpus (`n_printings`) or the index's own length. The
+/// index omits nulls, so the latter overstates breadth by the null rate. 0 restores it, for the A/B.
+static RANGE_BREADTH_VS_CORPUS: LazyLock<bool> = LazyLock::new(|| guard_env("CARD_ENGINE_RANGE_BREADTH_VS_CORPUS", 1u8) != 0);
 
 /// Whether the PAIR table answers a two-leaf `And` exactly and tightens the `And` fold's bound. 0 falls
 /// both back to `min` over single leaves.
@@ -9138,9 +9245,10 @@ fn exec_from_candidates<'a>(
 /// fallback it replaces on the model's own terms. Both paths are correct for any query either is
 /// applicable to — `force_plan_differential_agreement` holds every plan to identical results — so
 /// this changes only which correct plan runs.
-// Eight: the declined plan, the three shared query artifacts, the two split-filter pieces a sibling
-// needs to re-derive its own applicability, and the router's `choose`. A wrapper struct would only be
-// unpacked again at the two call sites.
+// Eight parameters: the declined plan, the three shared query artifacts (`ctx`, `params`, `filter`),
+// the two split-filter pieces a sibling needs to re-derive its own applicability (`unsplit`, `plane`),
+// and the router's `choose`. Bundling them would mean a struct whose only purpose is this call, and
+// whose fields the two call sites would immediately destructure again.
 #[allow(clippy::too_many_arguments, reason = "shared query artifacts plus the router's choose; a wrapper struct would only be unpacked again")]
 fn declined_sibling_fastpath<'a>(
     declined: PhysicalPlan,
