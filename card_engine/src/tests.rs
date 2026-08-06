@@ -3531,6 +3531,16 @@ fn compose_paging_prediction_matches_the_branch_taken() {
         fuzz_leaf_rarity(&mut rng),
         FuzzSpec::Leaf(FuzzLeaf::Border { value: "black".to_string() }),
         FuzzSpec::And(vec![fuzz_leaf_type(&mut rng), fuzz_leaf_rarity(&mut rng)]),
+        // The one composable leaf whose build needs a card-plane BROADCAST, and therefore the only
+        // shape that now reaches `Gather` under a grouped mode on a walkable orderby -- every other
+        // composable leaf walks there (see `orderby_walk_beats_gather`). Without this spec
+        // `ComposePaging::Gather` is unreachable in this sweep, which is how the walk's extension to
+        // card/artwork was caught removing the branch entirely.
+        FuzzSpec::Leaf(FuzzLeaf::Legality { shift: Some(0), expected: 0b01 }),
+        FuzzSpec::And(vec![
+            FuzzSpec::Leaf(FuzzLeaf::Legality { shift: Some(0), expected: 0b01 }),
+            FuzzSpec::Leaf(FuzzLeaf::Border { value: "black".to_string() }),
+        ]),
         // Deliberately NARROW, and the only other spec here built from leaves `is_printing_composable`
         // accepts (`border==`, and `CollectionCmp` at `Ge`). This is what reaches
         // `GatherWalkDeclined`: the walk declines when the matches carrying an indexed value run out
@@ -7638,39 +7648,59 @@ fn orderby_walk_matches_gather_composed() {
         page.iter().map(|(_, p)| u128::from(p.scryfall_id)).collect()
     };
 
-    let mut walked_any = false;
+    // Every distinct-on, both prefers that matter, both directions. Mode is the axis this test exists
+    // for now: card/artwork rows are GROUPS, and the walk places a group at its representative rather
+    // than at whichever printing it met first, so a wrong representative shows up here as a row
+    // difference and nowhere else. `prefer` is swept because it DECIDES the representative --
+    // `Prefer::Default` lets the walk stop at the first match in store order while `UsdHigh` forces it
+    // to score the whole group, and only the latter can catch a walk that assumed store order.
+    let mut walked = 0usize;
+    let mut grouped_walked = 0usize;
     for (name, filter) in &filters {
         assert!(super::is_printing_composable(filter, &archived.indexes), "{name} must be composable");
         let pbits = super::compose_printing_bits(filter, &archived.indexes, &archived.offsets, &archived.printings, n_printings);
-        let total: usize = pbits.iter().map(|w| w.count_ones() as usize).sum();
-        for orderby in ["usd", "rarity"] {
-            let sort_col = orderby_to_col(orderby);
-            for &descending in &[false, true] {
-                for &offset in &[0usize, 50, 200] {
-                    let limit = 100usize;
-                    let (gather, _) = super::gather_composed_page(
-                        &QueryCtx::from(archived), &kernel_params(Mode::Printing, sort_col, descending, limit, offset), &pbits, None,
-                    );
+        for (mode_name, mode) in [("printing", Mode::Printing), ("card", Mode::Card), ("artwork", Mode::Artwork)] {
+            // `total` is the count in the query's RESULT space, which is what the walk's null-tail
+            // decline compares against; taking the printing popcount for every mode would make the
+            // grouped modes think they had more rows to find than exist and decline where they should not.
+            let card_bits = matches!(mode, Mode::Card)
+                .then(|| super::printing_bits_to_card_bits(&pbits, &archived.offsets, archived.cards.len()));
+            let total = super::compose_total_for_mode(&pbits, mode, &archived.indexes, &archived.printings, card_bits.as_deref());
+            for (prefer_name, prefer) in [("default", Prefer::Default), ("usd_high", Prefer::UsdHigh)] {
+                for orderby in ["usd", "rarity"] {
+                    let sort_col = orderby_to_col(orderby);
                     let idx = match sort_col {
                         SortCol::PriceUsd => &archived.indexes.price_usd,
                         _ => &archived.indexes.rarity_printing_ordered,
                     };
-                    let walk = super::walk_value_orderby_page(
-                        idx, &pbits, &archived.cards, &archived.printings,
-                        &archived.indexes.printing_to_card, descending, total, limit, offset,
-                    );
-                    if let Some((walk, _)) = walk {
-                        walked_any = true;
-                        assert_eq!(
-                            ids(&walk), ids(&gather),
-                            "walk vs gather_composed_page page differs ({name}, orderby={orderby}, desc={descending}, offset={offset})"
-                        );
+                    for &descending in &[false, true] {
+                        for &offset in &[0usize, 50, 200] {
+                            let limit = 100usize;
+                            let mut params = kernel_params(mode, sort_col, descending, limit, offset);
+                            params.prefer = prefer;
+                            let (gather, _) = super::gather_composed_page(
+                                &QueryCtx::from(archived), &params, &pbits, card_bits.as_deref(),
+                            );
+                            let walk = super::walk_value_orderby_page(&QueryCtx::from(archived), &params, idx, &pbits, total);
+                            if let Some((walk, _)) = walk {
+                                walked += 1;
+                                grouped_walked += usize::from(!matches!(mode, Mode::Printing));
+                                assert_eq!(
+                                    ids(&walk), ids(&gather),
+                                    "walk vs gather_composed_page differs ({name}, unique={mode_name}, \
+                                     prefer={prefer_name}, orderby={orderby}, desc={descending}, offset={offset})"
+                                );
+                            }
+                        }
                     }
                 }
             }
         }
     }
-    assert!(walked_any, "the orderby walk never fired on this fixture — the differential would be vacuous");
+    assert!(walked > 0, "the orderby walk never fired on this fixture — the differential would be vacuous");
+    // The grouped modes are the new coverage; a fixture where only printing mode ever walks would pass
+    // the assert above while testing none of the representative logic.
+    assert!(grouped_walked > 0, "the walk never fired in card/artwork mode — the group path is untested");
 }
 
 // ─── Bitplanes (#630) ─────────────────────────────────────────────────────────

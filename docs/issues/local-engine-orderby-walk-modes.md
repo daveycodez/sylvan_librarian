@@ -1,15 +1,55 @@
-# The orderby walk is printing-mode only, and that costs 33x on artwork mode
+# The orderby walk is printing-mode only, and card mode pays 18x for it
 
-`border:black` ordered by rarity takes **25.5 µs** under `unique=printing` and **853.8 µs** under
-`unique=artwork`. Same filter, same orderby, same corpus. The walk that makes the first one fast
-requires `Mode::Printing`:
+**Shipped** (`b0618f0`) — one walk for all three distinct-ons, via the group representative. What the
+work actually turned on was not the walk but an EXACTNESS fix in the router's card estimate; see
+[Outcome](#outcome). Two routing attempts failed first and both are recorded, because each failed in a
+way worth not repeating.
+
+`border:black` ordered by rarity takes **25 µs** under `unique=printing`, **451 µs** under
+`unique=card`, and **836 µs** under `unique=artwork`. Same filter, same orderby, same corpus. The walk
+that makes the first one fast requires `Mode::Printing`:
 
 ```rust
 let walk_col = perm.is_none() && matches!(mode, Mode::Printing) && orderby_walk_available(sort_col);
 ```
 
-Everything else falls to `gather_composed_page`, which visits every candidate — so a broad predicate
-costs a whole-corpus gather instead of a 60-row walk.
+Everything else falls to a gather over every candidate CARD — so a broad predicate costs a whole-corpus
+pass instead of a 60-row walk.
+
+**The target is card mode, not artwork**, and an earlier revision of this doc had that backwards
+because it ranked by the 200 slowest queries rather than by traffic. Artwork is the slowest per query
+but 5% of `REALISTIC_UNIQUE_WEIGHTS`; card is 75%. Weighted by realistic traffic:
+
+| shape | share of realistic traffic |
+| --- | --: |
+| artwork x (`usd`\|`rarity`) | 0.90% |
+| **card x (`usd`\|`rarity`)** | **13.50%** |
+
+`usd` (10%) and `rarity` (8%) are 18% of `REALISTIC_ORDERBY_WEIGHTS`. So ~13.5% of real traffic runs at
+451-882 µs where the identical shape in printing mode runs at 25 µs. Artwork dominated the 200-slowest
+list only because `uniform` sampling weights the three modes equally.
+
+## Why card mode is 2x cheaper than artwork, and why that is fragile
+
+Not a structural advantage — one store-order trick, and it is worth measuring because it is also the
+cheapest available evidence that the fix below is cheap.
+
+| unique | prefer | `printings_examined` | per card | µs |
+| --- | --- | --: | --: | --: |
+| card | default | 31,453 | **1.01** | **451** |
+| card | usd_high | 96,790 | 3.11 | 882 |
+| artwork | default | 96,790 | 3.11 | 836 |
+| artwork | usd_high | 96,790 | 3.11 | 993 |
+| printing | either | **60** | — | **25** |
+
+Printings are stored prefer-desc within a card, so under `Prefer::Default` the first MATCHING printing
+is the representative and the gather early-breaks after 1.01 printings per card instead of 3.11. Any
+other prefer must score the whole card to find the max, and the break is gone — 451 → 882 µs, landing
+where artwork already is. 15% of realistic `prefer` draws are non-default. Artwork can never have the
+break: it must see every matching printing to discover the card's other artwork groups.
+
+But `cards_visited` is 31,169 — the whole card corpus — in every card-mode row. The early break makes
+each card cheaper, not the pass shorter, which is why card mode is still 18x off printing mode.
 
 ## This is the dominant slow shape in sampled traffic
 
@@ -102,15 +142,22 @@ That is correct, and each card is emitted exactly once at its true key position:
   Emitting on first encounter would order the group by whichever printing arrived first, which is the
   min-over-group semantics the measurement above rules out.
 
-Cost is one representative resolution per encountered matching printing, and it is cheap: under
-`Prefer::Default` printings are stored prefer-desc within a card, so `rep(c)` is the first `pbits` hit
-in `offsets[cid]..offsets[cid+1]` — ~1-3 bit tests, 3.08 printings per card on average. A 60-row page
-over a broad filter resolves on the order of 60-200 spans, against `gather_composed_page`'s whole-corpus
-visit. No buffer, no permutation, no archive change.
+Cost is one representative resolution per encountered matching printing, and the card-mode early break
+above is the measurement: it resolves a representative in **1.01 `pbits` tests per card** in
+production, on the same store order, for the same reason. That is not an estimate — it is the operation
+this walk needs, already running at scale. Non-default prefers cost the card's full span instead (3.11
+printings). No buffer, no permutation, no archive change.
 
-The prize is bounded by what the equivalent permutation walk already achieves in artwork mode:
-`border:black`/artwork/edhrec runs `Perm` at 172 µs, so ~5x on the 853 µs cell rather than the 33x that
-printing mode gets — artwork mode has real per-card work the walk cannot remove.
+The prize, bounded by what the equivalent permutation walk already achieves in the same modes
+(`border:black`/edhrec, which HAS a permutation): 172 µs artwork, and card mode's own `Perm` figures.
+So expect card mode ~451 → tens of µs and artwork ~836 → ~172 µs — a large win on 13.5% of realistic
+traffic and a smaller one on 0.9%.
+
+One gate interacts: card mode currently DECLINES compose on broad filters
+(`COMPOSE_GATHER_MAX_CARD_FRACTION`, correctly for the gather) and runs `GatheredScan`. A walk inverts
+that premise exactly as it already does for printing mode — "broad ⇒ not worth composing" is backwards
+for a branch whose best case is a dense predicate — so the gate must not apply to it, the same carve-out
+`walk_col` already has.
 
 Row identity is the gate, not regret: this changes which ROW represents a group if the `p == rep(c)`
 test is wrong, and `force_plan_differential_agreement` asserts full row order against `GatheredScan`.
@@ -131,10 +178,11 @@ meaningful slice of `REALISTIC_ORDERBY_WEIGHTS`, so unlike
 [the layout question](./local-engine-layout-postings.md) this shape is genuinely sampled by realistic
 traffic — it just needs the realistic-mode number measured before the work is priced.
 
-Card mode is a separate case and mostly NOT this problem: compose declines there
-(`COMPOSE_GATHER_MAX_CARD_FRACTION`, correctly — `border:black` is 98.9% of cards, past the calibrated
-~93% where the gather stops winning) and `GatheredScan` runs at 353-626 µs. That decline is right; the
-cost is real.
+Card mode was described here as "a separate case and mostly NOT this problem". That was wrong: it is
+the SAME problem and the largest instance of it. Compose does decline there
+(`COMPOSE_GATHER_MAX_CARD_FRACTION` — `border:black` is 98.9% of cards, past the calibrated ~93% where
+the gather stops winning) and that decline is correct **for the gather**; it is not correct for a walk,
+which is the point.
 
 ## Status
 
@@ -145,3 +193,79 @@ queries.
 Related: [cost-based OrderbyWalk vs Gather](./local-engine-compose-paging-cost-based.md) is about
 choosing between the two branches where BOTH are available; this is about the branch not being
 available at all.
+
+## Outcome
+
+The walk itself was the easy half. `group_representative` reproduces `walk_grouped_page`'s selection
+byte for byte and takes the same early break (printings are stored prefer-desc, so under
+`Prefer::Default` the first match wins) — without that break the walk paid **42 probes per resolution**,
+because heavily reprinted cards sort early under `edhrec_rank`; with it, 2.1.
+
+| query | unique | prefer | before | after |
+| --- | --- | --- | --: | --: |
+| `border:black`/rarity | card | default | 451 µs | **165 µs** |
+| `border:black`/rarity | card | usd_high | 882 µs | **287 µs** |
+| `r<=mythic`/rarity | card | default | 626 µs | **233 µs** |
+| `r<=mythic`/rarity | artwork | default | 822 µs | **219 µs** |
+
+### Two routing attempts that failed, and why
+
+1. **Gate the grouped walk on `compose_gather_declines`' broad verdict.** The router then predicted
+   `OrderbyWalk` where the executor gathered, so compose won the argmin at a walk's price and paid a
+   gather's: **1.8–2.6× regressions on every mid-range legality filter** (`f:penny` 176 → 465 µs). It
+   also left `ComposePaging::Gather` unreachable — every other sort column has a permutation — which
+   `compose_paging_prediction_matches_the_branch_taken` caught immediately.
+2. **Compare result-space totals at `COMPOSE_GATHER_MAX_CARD_FRACTION` (0.85).** Killed the regressions
+   and the wins together: the router's card estimate tops out near 0.82 of the domain, so it never
+   cleared a bar the executor's exact total did. `cn<645` was the lone survivor, and that is the clue —
+   it is a one-sided range, so `RangeCardCounts::distinct_cards` answers it EXACTLY and the two sides
+   agreed.
+
+### What made it work: legality already had an exact count
+
+`legality_candidate_bits` reads the status's card-space `_EXISTS` plane, and existence-for-some-printing
+**is** the fact `unique=card` counts — so its popcount is the exact distinct-card total.
+`compose_printing_estimate` was computing it, scaling it into printing space, and the caller then ran
+balls-into-bins over that to recover an *estimate* of the number it had started with:
+
+| format | exact cards | estimated | ratio |
+| --- | --: | --: | --: |
+| `f:future` | 4,672 | 7,141 | 1.53× |
+| `f:pauper` | 10,703 | 14,021 | 1.31× |
+| `f:penny` | 15,060 | 17,747 | 1.18× |
+| `f:duel` | 31,386 | 25,903 | 0.83× |
+
+Now exact — 1.00 on all eight formats checked — via `exact_card_total`, alongside the one-sided range
+case. **No stored table needed**: a per-format count table would work (32 formats × 4 statuses ≈ 1 KB)
+but a popcount of a plane the query already reads gives the same answer for nothing.
+
+Note the direction reverses: over by up to 1.53× when sparse, **under** at 0.83× when near-total,
+because the formula saturates against the domain while the truth approaches it. That is why no single
+bias constant fixed it, and why the 0.85 gate — sitting exactly where the error changes sign — behaved
+so badly.
+
+### What it is worth
+
+Paired wall time, 2,000 realistic queries, per-query minimum over two runs on each side:
+
+| subset | n | base | final | ratio |
+| --- | --: | --: | --: | --: |
+| card/artwork × (usd\|rarity) TARGET | 279 | 35.3 ms | 35.0 ms | 0.992 |
+| printing × (usd\|rarity) | 76 | 10.0 ms | 10.1 ms | 1.008 |
+| everything else CONTROL | 1,645 | 140.6 ms | 141.8 ms | 1.008 |
+| whole mix | 2,000 | 186.0 ms | 187.0 ms | 1.005 |
+
+**The aggregate is inside the noise floor and the honest claim is "no regression", not "a win"** — the
+target shapes are 279 queries and the wins total ~500 µs. What is reproducible per query is
+`border:black` 449 → 230, `cn<645` 551 → 319, `f:duel` 450 → 345, `f:oathbreaker` 378 → 303 µs, and
+p99 635 → 620 µs.
+
+### Known limitation, named rather than tuned around
+
+`cn>=74 cn<=413` went 849 → 224 µs under attempt 1 and is back at 827 µs. It is a two-sided INTERIOR
+range, where `distinct_cards` declines because distinct counts do not subtract, so the router is on the
+estimate and disagrees with the executor. Fixing it means an exact interior-range card count — the
+binned start×end triangle table in
+[local-engine-range-cardinality-estimate.md](./local-engine-range-cardinality-estimate.md) — or
+threading the router's decision to the executor instead of re-deriving it, which is the durable fix for
+the whole class and would also retire `GROUPED_WALK_MIN_FRACTION`'s fitted 0.75.
