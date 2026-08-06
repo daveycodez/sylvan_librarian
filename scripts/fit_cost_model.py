@@ -55,13 +55,12 @@ MIN_ROWS_FOR_FIT = 200
 STREAM_MIN_MATCHES = 1024
 # Mirrors cost.rs MATCH_RATE_FLOOR, the density floor under the page-fill walk length.
 MATCH_RATE_FLOOR = 1.0 / 1_000_000.0
+# Mirrors cost.rs WALK_LENGTH_BIAS: matches clump along the sort order, so a walk runs ~1.45x longer
+# than uniform spacing predicts. Measured 0.69 against `printings_examined` before this existed.
+WALK_LENGTH_BIAS = 1.45
 # A realized counter this far from the feature meant to predict it is a FEATURE bug; refitting rates
 # on top of it just relocates the error.
 COUNTER_TOL = 0.15
-# Netting prepare_candidates out can overshoot (different round than the min trial). Keep a row only
-# if what remains is at least this fraction of the raw time; below that the residual is noise.
-# Now enforced inside `costbench.plan_self_ns`, which every harness shares.
-MIN_NETTED_FRACTION = costbench.NETTING_RESIDUAL_FLOOR
 # The mirror check's tolerance. This is a reimplementation of cost.rs in Python, so it can drift --
 # and did: the arms moved to `max(tier, floor)` and gained a residual-gated per-row term while
 # `design_row` still modelled the tier as a multiplier, which silently invalidated every coefficient
@@ -91,12 +90,18 @@ CURRENT: dict[str, list[float]] = {
     # eval_domain, scan_units, tier scale, matches, page_span, fixed
     "GatheredScan": [6.88, 2.06, 18.89, 2.24, 3.51, 169.6],
     # eval_domain, scan_units, residual floor, matches, artwork_seen_cards, n_cards floor, corpus pass, fixed
-    "StreamedSelect": [6.46, 5.53, 8.18, 0.13, 1.36, 1.64, 0.02, 217.5],
+    # Refit once `printings_examined` existed: this plan's fit was vetoed for as long as the only
+    # available counter was the printing SPAN, which its all_match rows disagree with by ~3x over a
+    # term the arm multiplies by zero. Median agreement 0.63 -> 0.92, within-25% 19% -> 58%.
+    "StreamedSelect": [5.05, 5.97, 6.58, 0.12, 1.21, 1.02, 0.02, 217.0],
     # broadcast, scatter, project, popcount, walk step, walk emit, gather card pass, gather bittest,
     # gather push, fixed. Several of these are SHARED with other arms in cost.rs (LINEAR_PASS,
     # RANGE_SCATTER, GATHER_CARD_PASS, GATHER_PUSH_PER_MATCH, ...), so a fitted value that disagrees
     # with the other arm's is information about the shared constant, not a number to paste blindly.
-    "PrintingCompose": [1.93, 0.48, 1.93, 1.07, 0.58, 2.19, 9.81, 0.38, 3.39, 163.56],
+    # GATHER_GROUP_PER_PRINTING sits between the bit-test and push columns, matching design_row.
+    # Added when the artwork tail was traced to the grouping arm's work being charged at the bit-test
+    # rate; its 1.5 start is a physical guess (a struct read plus prefer_score), meant to be fitted.
+    "PrintingCompose": [1.93, 0.48, 1.93, 1.07, 0.58, 2.19, 13.22, 0.38, 1.5, 3.39, 163.56],
 }
 
 
@@ -167,10 +172,19 @@ def nnls(rows: list[list[float]], targets: list[float]) -> list[float]:
     return coeffs
 
 
-# The residual floors the shipped arms use inside `max(tier_ns, floor)`. They are NOT fitted here --
-# see design_row for why the max cannot be a plain linear column -- and were derived independently by
-# regressing per-card match-loop time on printings-per-card, split by tier class.
-SHIPPED_RESIDUAL_FLOOR = {"GatheredScan": 18.89, "StreamedSelect": 8.18}
+# The residual floors the shipped arms use inside `max(tier_ns, floor)`.
+#
+# These MUST equal the `*_RESIDUAL_FLOOR_NS` constants in cost.rs, and equal the third entry of the
+# matching `CURRENT` vector. All three are the same number: `design_row` makes the floor the
+# coefficient of the `eval_domain * residual_on` column AND uses it to compute the `excess` offset for
+# rows where the tier beats it. Change one without the others and `mirror_matches_engine` drops below
+# its 99% bar -- which is exactly how the 2026-08-02 refit was caught pasting a fitted floor of 6.58
+# into cost.rs while the offset here still assumed 8.18 (7.4% of rows disagreed).
+#
+# A consequence worth stating: the fitted floor is not directly pasteable, because the offset it was
+# fitted against assumed the OLD floor. Applying it and re-fitting is a fixed-point iteration, and
+# each run is only self-consistent with whatever is shipped at the time.
+SHIPPED_RESIDUAL_FLOOR = {"GatheredScan": 18.89, "StreamedSelect": 6.58}
 
 
 def design_row(plan: str, acq: dict, limit: int, offset: int) -> tuple[list[float], list[str], float] | None:
@@ -244,7 +258,9 @@ def design_row(plan: str, acq: dict, limit: int, offset: int) -> tuple[list[floa
         # Recomputed rather than read from the exposed u32, which is truncated for display. The
         # mirror has to match cost.rs bit for bit or its self-check fails on small walks.
         match_rate = max(matches / max(float(acq["n_printings"]), 1.0), MATCH_RATE_FLOOR)
-        walk = (page_span / match_rate) if not gather else 0.0
+        # Mirrors `cost::printings_walked`: the closed form times WALK_LENGTH_BIAS, then floored by
+        # `orderby_walk_scan` for the plane-bucket orderby walk (0 for Perm and for the usd walk).
+        walk = max(page_span / match_rate * WALK_LENGTH_BIAS, float(acq.get("orderby_walk_scan", 0))) if not gather else 0.0
         return (
             [
                 float(acq["broadcast_printings"]),
@@ -255,6 +271,7 @@ def design_row(plan: str, acq: dict, limit: int, offset: int) -> tuple[list[floa
                 limit if not gather else 0.0,
                 eval_domain if gather else 0.0,
                 float(acq["compose_scan_printings"]) if gather else 0.0,
+                float(acq.get("gather_group_printings", 0)) if gather else 0.0,
                 matches if gather else 0.0,
                 1.0,
             ],
@@ -267,6 +284,7 @@ def design_row(plan: str, acq: dict, limit: int, offset: int) -> tuple[list[floa
                 "WALK_EMIT_PER_ROW",
                 "GATHER_CARD_PASS",
                 "GATHER_BITTEST_PER_PRINTING",
+                "GATHER_GROUP_PER_PRINTING",
                 "GATHER_PUSH_PER_MATCH",
                 "FIXED",
             ],
@@ -277,12 +295,15 @@ def design_row(plan: str, acq: dict, limit: int, offset: int) -> tuple[list[floa
 
 def counter_check(samples: list[dict]) -> dict[str, list[tuple[str, float]]]:
     """Realized counter vs the feature that should predict it, per plan. Ratios should be 1.00."""
-    pairs = (("cards_visited", "eval_domain"), ("printings_scanned", "scan_units"), ("matches_pushed", "matches"))
+    # `scan_units` pairs with `printings_examined`, not the `printing_span` this used to read: the span
+    # is computed by the caller before the match kernel runs, so in card mode -- where every kernel
+    # stops at the first qualifying printing -- it reports work that never happened.
+    pairs = (("cards_visited", "eval_domain"), ("printings_examined", "scan_units"), ("matches_pushed", "matches"))
 
     def feature_for(plan: str, counter: str, row: dict) -> str:
         """Compose reads its own scan field, and which one depends on the paging branch that runs."""
-        if counter != "printings_scanned" or plan != "PrintingCompose":
-            return {"cards_visited": "eval_domain", "printings_scanned": "scan_units", "matches_pushed": "matches"}[counter]
+        if counter != "printings_examined" or plan != "PrintingCompose":
+            return {"cards_visited": "eval_domain", "printings_examined": "scan_units", "matches_pushed": "matches"}[counter]
         return "compose_scan_printings" if row["acq"].get("compose_paging") == "Gather" else "printings_walked"
 
     out: dict[str, list[tuple[str, float]]] = {}
@@ -295,8 +316,26 @@ def counter_check(samples: list[dict]) -> dict[str, list[tuple[str, float]]]:
             continue  # only the two scan plans carry counters; absent is not the same as wrong
         checks = []
         for counter, _default in pairs:
-            got = [r[counter] / max(r["acq"][feature_for(plan, counter, r)], 1) for r in instrumented]
-            feature = feature_for(plan, counter, instrumented[0])
+            # Only grade rows whose arm actually multiplies the feature by a rate. StreamedSelect's
+            # scan term is `if tier_ns > 0.0 { scan_units * ... } else { 0.0 }`, so on an all_match
+            # query (tier 0) `scan_units` is a number the model never reads -- and grading it anyway
+            # read 0.65 here and vetoed the whole plan's fit over a term that contributes zero.
+            graded = instrumented
+            if counter == "printings_examined" and plan == "StreamedSelect":
+                graded = [r for r in instrumented if r["acq"]["residual_tier_ns100"] > 0]
+            # Compose's three paging branches charge different features, so grading a row against a
+            # feature its branch never multiplies by a rate manufactures a defect. Its Gather branch
+            # charges eval_domain/compose_scan_printings/matches; Perm and OrderbyWalk charge only
+            # printings_walked and stop at page_offset+limit, so their `cards_visited` is 0 (the
+            # orderby walk steps a value structure, not cards) and their `matches_pushed` is a page,
+            # not a total. Ungated, those read 0.02 and 0.01 and vetoed the plan's whole fit.
+            if plan == "PrintingCompose":
+                gather_only = counter in ("cards_visited", "matches_pushed")
+                graded = [r for r in graded if (r.get("paging_taken") in ("Gather", "GatherWalkDeclined")) == gather_only]
+            if not graded:
+                continue
+            got = [r[counter] / max(r["acq"][feature_for(plan, counter, r)], 1) for r in graded]
+            feature = feature_for(plan, counter, graded[0])
             if got:
                 checks.append((f"{counter}/{feature}", statistics.median(got)))
         if checks:
@@ -351,7 +390,9 @@ def collect(engine: object, rng: random.Random, seconds: float, sampler: QuerySa
                     "ns_setup": p["ns_setup"],
                     "ns_loop": p["ns_loop"],
                     "ns_finish": p["ns_finish"],
-                    "printings_scanned": p["printings_scanned"],
+                    "printing_span": p["printing_span"],
+                    "paging_taken": p.get("paging_taken"),
+                    "printings_examined": p["printings_examined"],
                     "matches_pushed": p["matches_pushed"],
                 }
             )
@@ -488,7 +529,10 @@ def main() -> None:
     args = parser.parse_args()
 
     engine = load_engine(args.corpus, args.shm_path or args.corpus.with_suffix(".fit.store"))
-    samples = collect(engine, random.Random(args.seed), args.seconds)
+    # Pass the sampler explicitly: `collect`'s fallback builds one off a hardcoded corpus path, so
+    # `--corpus` was loading the engine from one file and drawing queries from another (or, off the
+    # default checkout, raising FileNotFoundError). Values must come from the corpus the engine holds.
+    samples = collect(engine, random.Random(args.seed), args.seconds, QuerySampler(args.corpus, "uniform"))
     print(f"\n{len(samples):,} plan-rows collected in {args.seconds:.0f}s")
 
     agree, checked = mirror_matches_engine(samples)

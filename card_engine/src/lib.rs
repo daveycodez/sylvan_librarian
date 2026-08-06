@@ -4272,12 +4272,22 @@ enum Mode { Card, Artwork, Printing }
 /// silently under-count in production instead of failing loudly on reload.
 const ARTWORK_GROUP_WORDS: usize = 8;
 
-/// Matches this card contributes: 0/1 for Card mode (existence, short-circuit),
+/// Matches this card contributes, and how many printings it had to look at to know:
+/// `(matches, examined)`. 0/1 matches for Card mode (existence, short-circuit),
 /// passing printings for Printing mode, distinct illustrations with a passing
 /// printing for Artwork mode. `seen_words` is a reused scratch buffer: a
 /// fixed-size bitmask indexed by each printing's dense `artwork_group_id`
 /// (#629), one bit per group, `word = gid / 64` -- zeroed in full every card
 /// (cheap: ARTWORK_GROUP_WORDS is tiny), never resized.
+///
+/// `examined` is the number of times the per-printing loop body ran, which is the quantity
+/// `PlanFeatures::scan_units` claims to predict. It is NOT `end - start`: every Card-mode path here
+/// short-circuits, and the two `all_match` arms return without touching a printing at all. The
+/// `printing_span` counter used to be incremented as the full span by the CALLER, before this
+/// function ran, so it reported what a full scan would have cost rather than what happened -- and
+/// `cost.rs`'s "the `printing_span` counter shows the scan plans walk the full printing span of
+/// their candidates in CARD mode too, not one row each" was inferred from exactly that. Returning the
+/// truth from the only place that knows it is what makes the claim checkable.
 // #676 review: a legality leaf promoted into `plane` alongside a genuinely
 // printing-dependent residual (DateCmp, ArtistMatch, ...) needs *both*
 // checked against the *same* printing -- `all_match`/`residual_matches` alone
@@ -4308,7 +4318,7 @@ fn card_match_count(
     strings: &AStrings,
     existential_plane: Option<(&PlaneExpr, &Archived<BitPlanes>)>,
     seen_words: &mut [u64; ARTWORK_GROUP_WORDS],
-) -> u32 {
+) -> (u32, u32) {
     // No existential plane: identical code shape to before #676's
     // existential_plane parameter existed at all -- no closure, no extra
     // branch inside the hot loop. This is the overwhelmingly common case
@@ -4325,18 +4335,20 @@ fn card_match_count(
         return match mode {
             Mode::Card => {
                 if all_match {
-                    return u32::from(start < end);
+                    // Existence is settled by the span being non-empty; no printing is read.
+                    return (u32::from(start < end), 0);
                 }
-                for p in &printings[start..end] {
+                for (i, p) in printings[start..end].iter().enumerate() {
                     if FilterExpr::residual_matches(card, p, strings, residual, residual_is_or) {
-                        return 1;
+                        return (1, i as u32 + 1); // stopped here: i+1 printings looked at
                     }
                 }
-                0
+                (0, (end - start) as u32) // no match: the whole span was ruled out
             }
             Mode::Printing => {
                 if all_match {
-                    return (end - start) as u32;
+                    // The count is the span itself, arithmetic only -- no printing is read.
+                    return ((end - start) as u32, 0);
                 }
                 let mut n = 0u32;
                 for p in &printings[start..end] {
@@ -4344,7 +4356,7 @@ fn card_match_count(
                         n += 1;
                     }
                 }
-                n
+                (n, (end - start) as u32)
             }
             Mode::Artwork => {
                 // #737's skip-repped shortcut, which landed in the gather loop but not here. Read the
@@ -4368,7 +4380,8 @@ fn card_match_count(
                     }
                     seen_words[word] |= bit;
                 }
-                seen_words.iter().map(|w| w.count_ones()).sum()
+                // Artwork never short-circuits: a later printing can always rep an unseen group.
+                (seen_words.iter().map(|w| w.count_ones()).sum(), (end - start) as u32)
             }
         };
     };
@@ -4383,10 +4396,10 @@ fn card_match_count(
         Mode::Card => {
             for pid in start..end {
                 if satisfies(pid) {
-                    return 1;
+                    return (1, (pid - start) as u32 + 1);
                 }
             }
-            0
+            (0, (end - start) as u32)
         }
         Mode::Printing => {
             let mut n = 0u32;
@@ -4395,7 +4408,7 @@ fn card_match_count(
                     n += 1;
                 }
             }
-            n
+            (n, (end - start) as u32)
         }
         Mode::Artwork => {
             // Same skip-repped shortcut as the no-plane arm above, and it matters more here:
@@ -4409,13 +4422,20 @@ fn card_match_count(
                 }
                 seen_words[word] |= bit;
             }
-            seen_words.iter().map(|w| w.count_ones()).sum()
+            (seen_words.iter().map(|w| w.count_ones()).sum(), (end - start) as u32)
         }
     }
 }
 
 /// Emit this card's matches as (sort key, cid, pid) tuples — the per-card body
 /// of the gathered path, shared by the streamed path for page cards.
+///
+/// Returns how many printings the loop body ran on, the same `examined` quantity
+/// `card_match_count` reports and for the same reason: `scan_units` claims to predict it, and the
+/// span the caller used to add in its place is not it. Card mode with the default prefer stops at the
+/// first qualifying printing (one, not the span); a custom prefer must score every printing, so there
+/// the span IS the truth. That difference is invisible to a caller-side `end - start`, and it is
+/// exactly the difference the cost model needs to see.
 ///
 /// `existential_plane`: `Some((plane, planes))` iff `mode` is `Card` and the
 /// plane driving `all_match` touched a legality leaf
@@ -4454,7 +4474,7 @@ fn push_card_matches(
     out: &mut Vec<Match>,
     group_best: &mut [Option<(u32, f64)>],
     touched: &mut Vec<u16>,
-) {
+) -> u32 {
     match mode {
         Mode::Card => {
             // Printings are stored in descending default-prefer order, so
@@ -4471,13 +4491,19 @@ fn push_card_matches(
             // Kept as two separate closures (not one closure branching on
             // `existential_plane` every call) for the same reason
             // `card_match_count` is split this way — see its doc.
-            let chosen: Option<u32> = if let Some((pe, planes)) = existential_plane {
+            // `examined` rides alongside `chosen` rather than being counted in a separate local: on
+            // the two default-prefer paths the chosen printing IS the one the loop stopped at, so its
+            // offset from `start` is the count and no per-iteration bookkeeping is needed. The custom-
+            // prefer paths score every printing and so examine the whole span, unconditionally.
+            let span = (end - start) as u32;
+            let (chosen, examined): (Option<u32>, u32) = if let Some((pe, planes)) = existential_plane {
                 let satisfies = |pid: usize| {
                     eval_plane_expr_for_printing(pe, planes, cid, &printings[pid], strings)
                         && (all_match || FilterExpr::residual_matches(card, &printings[pid], strings, residual, residual_is_or))
                 };
                 if matches!(prefer, Prefer::Default) {
-                    (start..end).find(|&pid| satisfies(pid)).map(|pid| pid as u32)
+                    let found = (start..end).find(|&pid| satisfies(pid)).map(|pid| pid as u32);
+                    (found, found.map_or(span, |pid| pid - start as u32 + 1))
                 } else {
                     let mut chosen: Option<(u32, f64)> = None;
                     for pid in start..end {
@@ -4489,7 +4515,7 @@ fn push_card_matches(
                             chosen = Some((pid as u32, score));
                         }
                     }
-                    chosen.map(|(pid, _)| pid)
+                    (chosen.map(|(pid, _)| pid), span)
                 }
             } else if matches!(prefer, Prefer::Default) {
                 let mut found: Option<u32> = None;
@@ -4499,7 +4525,7 @@ fn push_card_matches(
                         break;
                     }
                 }
-                found
+                (found, found.map_or(span, |pid| pid - start as u32 + 1))
             } else {
                 let mut chosen: Option<(u32, f64)> = None;
                 for pid in start..end {
@@ -4512,11 +4538,12 @@ fn push_card_matches(
                         chosen = Some((pid as u32, score));
                     }
                 }
-                chosen.map(|(pid, _)| pid)
+                (chosen.map(|(pid, _)| pid), span)
             };
             if let Some(pid) = chosen {
                 out.push((sort_key_bits(card, &printings[pid as usize], sort_col, descending), cid, pid));
             }
+            examined
         }
         Mode::Printing => {
             for pid in start..end {
@@ -4524,6 +4551,8 @@ fn push_card_matches(
                 if !all_match && !FilterExpr::residual_matches(card, p, strings, residual, residual_is_or) { continue; }
                 out.push((sort_key_bits(card, p, sort_col, descending), cid, pid as u32));
             }
+            // Every printing is a candidate row: no ordering lets this stop early.
+            (end - start) as u32
         }
         Mode::Artwork => {
             // Within-range order is prefer-score-desc (not illustration), so
@@ -4581,6 +4610,8 @@ fn push_card_matches(
                 let (bp, _) = group_best[gid as usize].take().unwrap();
                 out.push((sort_key_bits(card, &printings[bp as usize], sort_col, descending), cid, bp));
             }
+            // Both grouping loops run to `end`: a later printing can always rep a group not yet seen.
+            (end - start) as u32
         }
     }
 }
@@ -4917,6 +4948,27 @@ fn aligned_page<'a>(
 /// is to size the declines, and to make `RangeNotBare`/`RangePermutationStale` visible if they ever
 /// fire, since neither should.
 fn printing_range_fastpath<'a>(
+    ctx: &QueryCtx<'a>,
+    params: &QueryParams,
+    filter: &FilterExpr,
+) -> Option<(usize, Vec<(&'a AOracleCard, &'a APrinting)>)> {
+    // Timed as one span rather than split into setup/loop/finish. The three-phase split exists where
+    // an executor HAS three phases to attribute cost between; this one has a dozen structurally
+    // different exits (three of them producing a page) and no common shape across them. What the
+    // harnesses need is that the phase sum equals the executor's own time, and one span satisfies
+    // that exactly -- `ns_loop` is the honest bucket for "the work", with the other two zero.
+    //
+    // Only a run that PRODUCED a page publishes. A decline returns `None`, records no trial, and must
+    // leave the slot as `take_phase_stats` cleared it.
+    let t = std::time::Instant::now();
+    let out = printing_range_fastpath_inner(ctx, params, filter);
+    if out.is_some() {
+        PHASE_STATS.with(|c| c.set(PhaseStats { ns_loop: t.elapsed().as_nanos() as u64, ..PhaseStats::default() }));
+    }
+    out
+}
+
+fn printing_range_fastpath_inner<'a>(
     ctx: &QueryCtx<'a>,
     params: &QueryParams,
     filter: &FilterExpr,
@@ -5579,8 +5631,145 @@ fn orderby_walk_available(sort_col: SortCol) -> bool {
 /// every match lives in the buckets (`collected` reaches `total`, no null tail), a short last page is
 /// windowed normally.
 #[allow(clippy::too_many_arguments)]
+/// The routed path's time, split into DISJOINT phases that cover all of `run_query_routed`.
+///
+/// Everything else here measures one participant at a time and cannot be added up. `acquire_ns` is
+/// timed in its own `explain_analyze` round — a standalone `acquire_plan_features` call with its own
+/// cache state — while `routed_ns` times a SEPARATE execution that does its own acquire inside. They
+/// are two independent measurements of overlapping work, not a part and a whole, which is why
+/// `acquire_ns / routed_ns` measured a nonsensical 104% at the median on candidate-acquired queries.
+///
+/// These three are read from ONE execution with four contiguous clock reads, so
+/// `ns_acquire + ns_choose + ns_dispatch` accounts for the whole call bar the reads themselves. The
+/// same shape `PhaseStats` uses for setup/loop/finish, one level up — and those three subdivide
+/// `ns_dispatch`, together with `ns_prepare`, so the two nest rather than overlap.
+///
+/// Why it is worth four clock reads on the production path: `plan_cost` prices only what happens
+/// AFTER acquire, so acquire is unpriced for every plan, and cost.rs records the model's median error
+/// as 1.09x `acquire_ns`. Acquire is the largest unmodelled component in the engine and nothing has
+/// ever measured it as a fraction of the query it belongs to.
+/// Behind the `routed-phases` cargo feature, and the reason is measured rather than cautious: the
+/// four clock reads cost +2.7us and +2.3us on a ~40us median query in a paired interleaved A/B, both
+/// intervals excluding zero. That is ~1.6% of every request to answer a question a diagnostic build
+/// can answer instead — the same trade `alloc-counter` already makes.
+///
+/// With the feature off, `RoutedPhaseTimer` is a zero-sized struct whose methods are empty, so the
+/// reads and the publish compile away entirely.
+#[derive(Default, Clone, Copy)]
+struct RoutedPhases {
+    /// `acquire_plan_features`: count source, feature build, and whatever artifact it materializes.
+    ns_acquire: u64,
+    /// The `argmin cost::plan_cost` over applicable plans. Expected to be negligible; measured so
+    /// that "expected" is not doing the work — it comes out at 41ns, 0.0% of the query.
+    ns_choose: u64,
+    /// Running the winner, including a lazy re-materialize and re-choose when a fastpath declines.
+    ns_dispatch: u64,
+}
+
+/// Marks the three phase boundaries in `run_query_routed`, or nothing at all when the
+/// `routed-phases` feature is off. See `RoutedPhases`.
+#[cfg(feature = "routed-phases")]
+struct RoutedPhaseTimer {
+    entry: std::time::Instant,
+    acquired: Option<std::time::Instant>,
+    chosen: Option<std::time::Instant>,
+}
+
+#[cfg(feature = "routed-phases")]
+impl RoutedPhaseTimer {
+    fn start() -> Self {
+        Self { entry: std::time::Instant::now(), acquired: None, chosen: None }
+    }
+    fn acquired(&mut self) {
+        self.acquired = Some(std::time::Instant::now());
+    }
+    fn chosen(&mut self) {
+        self.chosen = Some(std::time::Instant::now());
+    }
+    /// Publishes the three disjoint spans. A boundary that was never marked collapses to the entry
+    /// instant, which cannot happen on the one path that exists but keeps this total.
+    fn finish(self) {
+        let done = std::time::Instant::now();
+        let acquired = self.acquired.unwrap_or(self.entry);
+        let chosen = self.chosen.unwrap_or(acquired);
+        ROUTED_PHASES.with(|c| {
+            c.set(RoutedPhases {
+                ns_acquire: (acquired - self.entry).as_nanos() as u64,
+                ns_choose: (chosen - acquired).as_nanos() as u64,
+                ns_dispatch: (done - chosen).as_nanos() as u64,
+            });
+        });
+    }
+}
+
+#[cfg(not(feature = "routed-phases"))]
+struct RoutedPhaseTimer;
+
+#[cfg(not(feature = "routed-phases"))]
+impl RoutedPhaseTimer {
+    #[inline(always)]
+    fn start() -> Self {
+        Self
+    }
+    #[inline(always)]
+    fn acquired(&mut self) {}
+    #[inline(always)]
+    fn chosen(&mut self) {}
+    #[inline(always)]
+    fn finish(self) {}
+}
+
+/// The last routed execution's phase split, cleared. All zeros without the `routed-phases` feature,
+/// which is what `explain_analyze` then reports — a consumer sees three empty-looking spans rather
+/// than a missing key, so the schema does not change with the feature.
+fn take_routed_phases() -> RoutedPhases {
+    #[cfg(feature = "routed-phases")]
+    {
+        ROUTED_PHASES.with(|c| c.replace(RoutedPhases::default()))
+    }
+    #[cfg(not(feature = "routed-phases"))]
+    {
+        RoutedPhases::default()
+    }
+}
+
+/// What a compose paging branch actually did, against the three quantities its cost arm charges.
+///
+/// `PrintingCompose` published no executor counters at all until this existed, which made it the one
+/// plan `bench_feature_accuracy.py` could say nothing about -- every cell labelled with a compose
+/// ACQUIRE was really measuring how well compose's shared feature vector described GatheredScan and
+/// StreamedSelect, the plans that do report. Its own arm terms (`compose_scan_printings`,
+/// `printings_walked`) were graded against nothing, and its paging table was structurally empty at
+/// any sample size. That matters more than the gap in coverage suggests: compose carries ~75% of all
+/// routing regret (docs/issues/reference-cost-model-measurement.md).
+///
+/// The three branches do different work and each fills these differently -- see the doc on each.
+#[derive(Default, Clone, Copy)]
+struct ComposePageWork {
+    /// Cards the branch iterated: candidate cards for the gather, permutation entries consumed for
+    /// the forward walk, `0` for the orderby walk (it steps a value structure, not cards).
+    cards_visited: u64,
+    /// Printings the branch touched: `pbits` membership tests for the gather and the forward walk,
+    /// matches stepped over for the orderby walk.
+    printings_examined: u64,
+    /// Rows the branch pushed. For the gather this is every match (it visits every candidate); for
+    /// the two walks it is bounded by the page, which is the whole point of their cost shape.
+    matches_pushed: u64,
+    /// The whole fastpath's wall time, merged into `ns_loop` by `take_phase_stats`.
+    ///
+    /// One span, not three. Compose's arm is not decomposed into setup/loop/finish -- it is a build
+    /// plus one of three structurally different paging branches -- so there is nothing to attribute
+    /// between phases. What the harnesses need is that the phase sum equals the executor's own time,
+    /// and one span gives that. Carried here rather than written to `PHASE_STATS` separately so the
+    /// production compose path still pays ONE store; see this slot's doc for what that cost.
+    ns_total: u64,
+}
+
+// Nine: the bucket source, the three stores it reads through, the sort key's two halves, and the three
+// paging bounds. They are the page-fill's whole input and the one caller passes them straight through.
+#[allow(clippy::too_many_arguments, reason = "the page fill's whole input; the single caller passes them straight through")]
 fn collect_orderby_page<'a>(
-    mut next_bucket: impl FnMut() -> Option<Vec<u32>>,
+    mut next_bucket: impl FnMut() -> Option<(u64, Vec<u32>)>,
     cards: &'a [AOracleCard],
     printings: &'a [APrinting],
     printing_to_card: &AOffsets,
@@ -5589,14 +5778,21 @@ fn collect_orderby_page<'a>(
     total: usize,
     limit: usize,
     page_offset: usize,
-) -> Option<Vec<(&'a AOracleCard, &'a APrinting)>> {
+) -> Option<(Vec<(&'a AOracleCard, &'a APrinting)>, ComposePageWork)> {
     let want = page_offset + limit;
     let mut collected: Vec<u32> = Vec::new();
     let mut cum = 0usize; // matches seen (skipped + collected) so far
     let mut first_touched = 0usize; // matches before the first collected bucket (the offset skip)
     let mut started = false;
+    // The work this walk really does, which is NOT `cum`. A bucket is produced by scanning a raw
+    // structure and intersecting it with `pbits`: a rarity PLANE bucket ANDs `words_per_plane` words
+    // (~n_printings/64) however few matches come out, a postings bucket walks its list, a range
+    // bucket walks its value run. `cum` counts what SURVIVED that scan, so pricing the walk on it
+    // charges nothing for a bucket that scanned the whole corpus and matched twice.
+    let mut scanned = 0u64;
     while cum < want {
-        let Some(bucket) = next_bucket() else { break };
+        let Some((raw, bucket)) = next_bucket() else { break };
+        scanned += raw;
         let m = bucket.len();
         if m == 0 {
             continue;
@@ -5619,6 +5815,17 @@ fn collect_orderby_page<'a>(
     if cum < want && cum < total {
         return None;
     }
+    // `printings_examined` is the RAW units scanned, not `cum`: see `scanned`. `cost::printings_walked`
+    // predicts `page_span / match_rate`, a page-fill length in match units, which does not describe a
+    // bucket scan at all -- one rarity plane bucket costs the same whether it yields two matches or
+    // twenty thousand. `cards_visited` stays 0: this walk steps a value structure, never cards.
+    let work = ComposePageWork {
+        cards_visited: 0,
+        printings_examined: scanned,
+        matches_pushed: collected.len() as u64,
+        // Filled by `printing_compose_fastpath`, which owns the span; this helper only reports work.
+        ns_total: 0,
+    };
     let matches: Vec<Match> = collected
         .iter()
         .map(|&pid| {
@@ -5630,12 +5837,13 @@ fn collect_orderby_page<'a>(
     // of matches, so the `O(n log n)` sort's log factor is the dominant cost there — `select_page`
     // (same `page_cmp` comparator) is `O(collected + limit·log limit)`. `page_offset - first_touched`
     // rebases the offset onto the collected touched buckets.
-    Some(
+    Some((
         select_page(matches, page_offset - first_touched, limit)
             .into_iter()
             .map(|(cid, pid)| (&cards[cid as usize], &printings[pid as usize]))
             .collect(),
-    )
+        work,
+    ))
 }
 
 /// #744 orderby walk for a range-indexed sort column (`usd` — the only such `SortCol`; cn/date are
@@ -5655,10 +5863,10 @@ fn walk_range_orderby_page<'a>(
     total: usize,
     limit: usize,
     page_offset: usize,
-) -> Option<Vec<(&'a AOracleCard, &'a APrinting)>> {
+) -> Option<(Vec<(&'a AOracleCard, &'a APrinting)>, ComposePageWork)> {
     let is_set = |pid: usize| pbits[pid >> 6] & (1u64 << (pid & 63)) != 0;
     let (mut lo, mut hi) = (0usize, idx.len());
-    let next = move || -> Option<Vec<u32>> {
+    let next = move || -> Option<(u64, Vec<u32>)> {
         if lo >= hi {
             return None;
         }
@@ -5678,7 +5886,8 @@ fn walk_range_orderby_page<'a>(
             (lo, b)
         };
         if descending { hi = bs } else { lo = be }
-        Some((bs..be).map(|t| u32::from(idx[t].1)).filter(|&pid| is_set(pid as usize)).collect())
+        // The value run is scanned in full and bit-tested per entry; `be - bs` is that cost.
+        Some(((be - bs) as u64, (bs..be).map(|t| u32::from(idx[t].1)).filter(|&pid| is_set(pid as usize)).collect()))
     };
     collect_orderby_page(next, cards, printings, printing_to_card, sort_col, descending, total, limit, page_offset)
 }
@@ -5701,7 +5910,7 @@ fn walk_rarity_orderby_page<'a>(
     limit: usize,
     page_offset: usize,
     n_printings: usize,
-) -> Option<Vec<(&'a AOracleCard, &'a APrinting)>> {
+) -> Option<(Vec<(&'a AOracleCard, &'a APrinting)>, ComposePageWork)> {
     // Every rarity int present: interior [0..3] (planes, always laid out) + the postings' ints.
     let mut values: Vec<u8> = RARITY_PRINTING_PLANE_INTS.to_vec();
     values.extend(rp.postings.iter().map(|e| e.0));
@@ -5711,10 +5920,13 @@ fn walk_rarity_orderby_page<'a>(
     }
     let wpp = words_per_plane(n_printings);
     let mut vi = 0usize;
-    let next = move || -> Option<Vec<u32>> {
+    let next = move || -> Option<(u64, Vec<u32>)> {
         let int = *values.get(vi)?;
         vi += 1;
-        let pids: Vec<u32> = if let Some(k) = RARITY_PRINTING_PLANE_INTS.iter().position(|&v| v == int) {
+        // `raw` is what the bucket cost to produce, which the two kinds pay very differently: a plane
+        // bucket ANDs `wpp` words of the whole corpus however few matches survive, while a postings
+        // bucket walks only its own list. Counted in the same units the caller sums.
+        let (raw, pids): (u64, Vec<u32>) = if let Some(k) = RARITY_PRINTING_PLANE_INTS.iter().position(|&v| v == int) {
             let plane = &rp.words[k * wpp..(k + 1) * wpp];
             let mut out = Vec::new();
             for (wi, (pw, bw)) in plane.iter().zip(pbits.iter()).enumerate() {
@@ -5724,14 +5936,20 @@ fn walk_rarity_orderby_page<'a>(
                     w &= w - 1;
                 }
             }
-            out
+            // One word covers 64 printings, so report the printings covered rather than the word
+            // count -- that keeps this comparable to the entry-scanning buckets and to a feature
+            // measured in printings.
+            ((wpp * 64) as u64, out)
         } else {
             match rp.postings.iter().find(|e| e.0 == int) {
-                Some(e) => e.1.iter().map(|p| u32::from(*p)).filter(|&pid| pbits[pid as usize >> 6] & (1u64 << (pid & 63)) != 0).collect(),
-                None => Vec::new(),
+                Some(e) => (
+                    e.1.len() as u64,
+                    e.1.iter().map(|p| u32::from(*p)).filter(|&pid| pbits[pid as usize >> 6] & (1u64 << (pid & 63)) != 0).collect(),
+                ),
+                None => (0, Vec::new()),
             }
         };
-        Some(pids)
+        Some((raw, pids))
     };
     collect_orderby_page(next, cards, printings, printing_to_card, SortCol::Rarity, descending, total, limit, page_offset)
 }
@@ -5748,6 +5966,9 @@ fn printing_compose_fastpath<'a>(
     params: &QueryParams,
     filter: &FilterExpr,
 ) -> Option<(usize, Vec<(&'a AOracleCard, &'a APrinting)>)> {
+    // Ends at whichever exit produces a page; see `ComposePageWork::ns_total`. Declines return before
+    // any publish and so leave the slot as `take_phase_stats` cleared it.
+    let t_start = std::time::Instant::now();
     let QueryCtx { cards, printings, offsets, indexes, .. } = *ctx;
     let QueryParams { mode, sort_col, descending, limit, page_offset, .. } = *params;
     if !is_printing_composable(filter, indexes) || !printing_compose_indexes_built(indexes) {
@@ -5795,9 +6016,10 @@ fn printing_compose_fastpath<'a>(
     };
     if total == 0 || page_offset >= total {
         note_paging_taken(PagingTaken::EmptyPage);
+        publish_compose_work(ComposePageWork { ns_total: t_start.elapsed().as_nanos() as u64, ..Default::default() });
         return Some((total, Vec::new()));
     }
-    let page = match perm {
+    let (page, mut work) = match perm {
         Some(perm) => {
             if total <= *STREAM_MIN_MATCHES {
                 // `Exact` to distinguish it from `DeclineSparseEstimate` above: same intent, but that
@@ -5830,9 +6052,9 @@ fn printing_compose_fastpath<'a>(
                 None
             };
             match walked {
-                Some(rows) => {
+                Some(rows_and_work) => {
                     note_paging_taken(PagingTaken::OrderbyWalk);
-                    rows
+                    rows_and_work
                 }
                 None => {
                     // Two different situations reach this gather, and `compose_paging` predicts
@@ -5847,6 +6069,8 @@ fn printing_compose_fastpath<'a>(
             }
         }
     };
+    work.ns_total = t_start.elapsed().as_nanos() as u64;
+    publish_compose_work(work);
     Some((total, page))
 }
 
@@ -6276,7 +6500,19 @@ fn exec_plane_popcount_order<'a>(
     }
     PLANE_BITMAP_POPCOUNT.with(|cell| {
         let mut bitmap = cell.borrow_mut();
+        // Timed and published as `ns_prepare`, for the same reason `prepare_candidates` is: this is a
+        // SHARED artifact that the router builds once during acquire and hands to whichever plan wins
+        // (`Prep::Plane`), so a forced run that rebuilds it is paying something the routed path does
+        // not pay at dispatch. Netting it is what makes the two comparable — see
+        // `costbench.plan_self_ns`.
+        //
+        // Without this the plane rows read NEGATIVE regret: routed dispatch reuses `plane_bits` while
+        // the forced trial re-evaluates the plane, so the router appeared to beat the best plan by a
+        // mean of 4.21us and held -13% of share. That is the `prepare_candidates` asymmetry again, one
+        // artifact along.
+        let t = std::time::Instant::now();
         eval_planes(plane_expr, &ctx.indexes.planes, &mut bitmap);
+        note_pending_prepare_ns(t.elapsed().as_nanos() as u64);
         exec_plane_popcount_order_with_bitmap(ctx, params, plane_expr, &bitmap)
     })
 }
@@ -6298,6 +6534,9 @@ fn exec_plane_popcount_order_with_bitmap<'a>(
     let perm = indexes.sort_perms.get(sort_col, descending).expect("PlanePopcountOrder applicability guarantees a permutation");
     let inv_perm =
         indexes.sort_perms.get_inv(sort_col, descending).expect("PlanePopcountOrder applicability guarantees an inverse permutation");
+    // `run_query_streamed_popcount` publishes the phases and consumes the pending plane build; see
+    // `publish_popcount_phases`. Counters stay zero: this plan popcounts a bitmap and visits no
+    // cards, so it has nothing to report there.
     run_query_streamed_popcount(ctx, params, perm, inv_perm, bitmap, Some(plane_expr), None)
 }
 
@@ -6379,7 +6618,7 @@ fn walk_grouped_page<'a>(
     params: &QueryParams,
     pbits: &[u64],
     perm: &Archived<Vec<u32>>,
-) -> Vec<(&'a AOracleCard, &'a APrinting)> {
+) -> (Vec<(&'a AOracleCard, &'a APrinting)>, ComposePageWork) {
     let QueryCtx { cards, printings, offsets, indexes, .. } = *ctx;
     let QueryParams { mode, prefer, sort_col, descending, limit, page_offset } = *params;
     let max_artwork_groups = u16::from(indexes.max_artwork_groups);
@@ -6398,10 +6637,16 @@ fn walk_grouped_page<'a>(
     let mut touched: Vec<u16> = Vec::new();
     let mut scratch: Vec<Match> = Vec::new();
     let mut skip = page_offset;
+    // This walk pays per PERMUTATION ENTRY, not per match: it steps cards in sort order and bit-tests
+    // each one's whole printing span, stopping only when the page fills. `cost::printings_walked`
+    // models that as `page_span / match_rate`, which nothing checked before these counters.
+    let mut work = ComposePageWork::default();
     for cid in perm.iter().map(|x| u32::from(*x)) {
         let card = &cards[cid as usize];
         let start = u32::from(offsets[cid as usize]) as usize;
         let end = u32::from(offsets[cid as usize + 1]) as usize;
+        work.cards_visited += 1;
+        work.printings_examined += (end - start) as u64;
         scratch.clear();
         match mode {
             // Printing: every set printing is its own row (no grouping).
@@ -6441,6 +6686,7 @@ fn walk_grouped_page<'a>(
                 }
             }
         }
+        work.matches_pushed += scratch.len() as u64;
         if scratch.is_empty() {
             continue;
         }
@@ -6452,12 +6698,12 @@ fn walk_grouped_page<'a>(
         for m in scratch.iter().skip(skip) {
             page.push((&cards[m.1 as usize], &printings[m.2 as usize]));
             if page.len() == limit {
-                return page;
+                return (page, work);
             }
         }
         skip = 0;
     }
-    page
+    (page, work)
 }
 
 /// Permutation-free counterpart to `walk_grouped_page`, for when `orderby` has no card-space
@@ -6477,7 +6723,7 @@ fn gather_composed_page<'a>(
     params: &QueryParams,
     pbits: &[u64],
     card_bits: Option<&[u64]>,
-) -> Vec<(&'a AOracleCard, &'a APrinting)> {
+) -> (Vec<(&'a AOracleCard, &'a APrinting)>, ComposePageWork) {
     let QueryCtx { cards, printings, offsets, indexes, .. } = *ctx;
     let QueryParams { mode, prefer, sort_col, descending, limit, page_offset } = *params;
     let max_artwork_groups = u16::from(indexes.max_artwork_groups);
@@ -6503,6 +6749,15 @@ fn gather_composed_page<'a>(
     let mut group_best: Vec<Option<(u32, f64)>> = vec![None; n];
     let mut touched: Vec<u16> = Vec::new();
     let mut sel = GatherSelect::new(page_offset, limit);
+    // `compose_scan_printings` is set to the composed bitmap's POPCOUNT, on the stated grounds that
+    // compose "walks the set bits". This loop does not: except in the card/default-prefer arm it
+    // iterates `start..end` of every candidate card and bit-tests each printing, so the real count is
+    // the SPAN of the candidate cards.
+    //
+    // Only the span is accumulated. `cards_visited` is `candidate_cards.len()`, known before the loop
+    // starts, and `matches_pushed` is the total `GatherSelect` already computes and this function
+    // currently discards -- neither needs a per-iteration add.
+    let mut work = ComposePageWork { cards_visited: candidate_cards.len() as u64, ..Default::default() };
     for cid in candidate_cards {
         let card = &cards[cid as usize];
         let start = u32::from(offsets[cid as usize]) as usize;
@@ -6511,6 +6766,7 @@ fn gather_composed_page<'a>(
         match mode {
             // Printing: every set printing is its own row (no grouping).
             Mode::Printing => {
+                work.printings_examined += (end - start) as u64;
                 for pid in start..end {
                     if is_set(pid) {
                         sel.buf().push((sort_key_bits(card, &printings[pid], sort_col, descending), cid, pid as u32));
@@ -6526,12 +6782,19 @@ fn gather_composed_page<'a>(
             // cost that scales with total matches rather than `limit` is the dominant term for a broad
             // composed set.
             Mode::Card if matches!(prefer, Prefer::Default) => {
+                // The one arm that does stop early: `find` breaks at the first set printing, and a
+                // candidate card has at least one by construction, so this tests `first_set - start + 1`
+                // rather than the span.
                 if let Some(pid) = (start..end).find(|&pid| is_set(pid)) {
+                    work.printings_examined += (pid - start + 1) as u64;
                     sel.buf().push((sort_key_bits(card, &printings[pid], sort_col, descending), cid, pid as u32));
+                } else {
+                    work.printings_examined += (end - start) as u64;
                 }
             }
             // Card (non-default prefer) / Artwork: one best-prefer representative per group.
             Mode::Card | Mode::Artwork => {
+                work.printings_examined += (end - start) as u64;
                 touched.clear();
                 for pid in start..end {
                     if !is_set(pid) {
@@ -6560,8 +6823,12 @@ fn gather_composed_page<'a>(
         }
         sel.absorb(before);
     }
-    let (_total, page_ids) = sel.finish(page_offset, limit); // total already known exactly via popcount; only the page is wanted here
-    page_ids.into_iter().map(|(cid, pid)| (&cards[cid as usize], &printings[pid as usize])).collect()
+    // `total` is every match this branch pushed, which is what `matches_pushed` wants and what
+    // `GatherSelect` has been computing and this function discarding. The popcount already gave the
+    // caller the result total, hence the old `_total`.
+    let (total, page_ids) = sel.finish(page_offset, limit);
+    work.matches_pushed = total as u64;
+    (page_ids.into_iter().map(|(cid, pid)| (&cards[cid as usize], &printings[pid as usize])).collect(), work)
 }
 
 /// P3 executor: streamed selection over the sort permutation. Caller guarantees
@@ -6586,7 +6853,7 @@ fn exec_streamed_select<'a>(
 /// the executors actually do rather than against a fitted curve.
 ///
 /// Two distinct questions, and the model can fail either:
-/// - are the FEATURE COUNTS right? `cards_visited` / `printings_scanned` / `matches_pushed` are the
+/// - are the FEATURE COUNTS right? `cards_visited` / `printing_span` / `matches_pushed` are the
 ///   real counts behind `eval_domain` / `scan_units` / `matches`. If a feature disagrees with its
 ///   counter, no rate constant can rescue the term.
 /// - is the WORK WHERE THE MODEL SAYS? `ns_setup` + `ns_loop` + `ns_finish` should account for the
@@ -6599,7 +6866,21 @@ fn exec_streamed_select<'a>(
 #[derive(Default, Clone, Copy)]
 pub(crate) struct PhaseStats {
     pub(crate) cards_visited: u64,
-    pub(crate) printings_scanned: u64,
+    /// The printings under the candidate cards — what a full scan of them WOULD cost. A span,
+    /// computed as `end - start` per surviving card, kept because it is the right comparison for
+    /// `scan_units` in printing and artwork mode, where the loops really do traverse the span.
+    ///
+    /// It is the WRONG comparison in card mode, and reading it as though it were the work done is how
+    /// `cost.rs` came to assert that "the scan plans walk the full printing span of their candidates
+    /// in CARD mode too, not one row each". They do not: see `card_match_count` and
+    /// `push_card_matches`, both of which stop at the first qualifying printing under the default
+    /// prefer. Compare against `printings_examined` for what actually ran.
+    pub(crate) printing_span: u64,
+    /// The printings the per-card body actually ran on — the quantity `scan_units` claims to predict.
+    /// Reported by the two match kernels, which are the only code that knows where they stopped.
+    /// Legitimately 0 for a whole query: both `all_match` arms of `card_match_count` answer from the
+    /// span arithmetic alone, and the stored artwork group count answers without a printing either.
+    pub(crate) printings_examined: u64,
     pub(crate) matches_pushed: u64,
     /// Per-query scratch setup, before the match loop starts. Split out because it is neither
     /// prepare nor match and it is NOT negligible: `run_query_streamed` zeroes an `n_cards`-long
@@ -6851,7 +7132,7 @@ thread_local! {
     /// owned elsewhere: `paging_taken` by `PAGING_TAKEN` below, `ns_round_total`/`result_total` by
     /// `explain_analyze`, which fills them after the take.
     static PHASE_STATS: std::cell::Cell<PhaseStats> = const { std::cell::Cell::new(PhaseStats {
-        cards_visited: 0, printings_scanned: 0, matches_pushed: 0, ns_setup: 0, ns_loop: 0, ns_finish: 0, ns_round_total: 0,
+        cards_visited: 0, printing_span: 0, printings_examined: 0, matches_pushed: 0, ns_setup: 0, ns_loop: 0, ns_finish: 0, ns_round_total: 0,
         ns_prepare: 0, result_total: 0, paging_taken: PagingTaken::NotEntered,
     }) };
 
@@ -6867,6 +7148,34 @@ thread_local! {
     ///
     /// `take_phase_stats` reassembles the two into one `PhaseStats`, so consumers see no seam.
     static PAGING_TAKEN: std::cell::Cell<PagingTaken> = const { std::cell::Cell::new(PagingTaken::NotEntered) };
+
+    /// The compose fastpath's three counters, stored apart from `PHASE_STATS` for exactly the reason
+    /// `PAGING_TAKEN` is: this is the production compose path, and a whole-struct publish there is a
+    /// read-modify-write of ~80 bytes to report 24.
+    ///
+    /// Measured, because the first version did write the whole struct: a paired A/B against the same
+    /// build without it read `+1.4 µs` and `+3.1 µs` on a 129 µs mean (slower on 619 and 863 queries
+    /// of ~2,000), and neutralising every cost-model change left the regression in place — the
+    /// publish WAS the regression. The note on `PAGING_TAKEN` above had already said so.
+    ///
+    /// Safe to leave unwritten by the other executors for the same reason `PHASE_STATS` is safe:
+    /// `take_phase_stats` replaces this with the default, and `explain_analyze` takes before every
+    /// participant runs, so a plan that does not publish here reads zeros rather than the last
+    /// compose's numbers. Outside that window nothing reads it at all.
+    static COMPOSE_WORK: std::cell::Cell<ComposePageWork> = const { std::cell::Cell::new(ComposePageWork {
+        cards_visited: 0, printings_examined: 0, matches_pushed: 0, ns_total: 0,
+    }) };
+
+    /// The routed path's disjoint phase split — see `RoutedPhases`. Its own slot for the same reason
+    /// the two above have theirs: `run_query_routed` is the production entry point, and one 24-byte
+    /// store there is affordable where a read-modify-write of `PhaseStats` measurably was not.
+    ///
+    /// Written by `run_query_routed` only, so it never collides with the executors' slot; the routed
+    /// path's dispatch phase CONTAINS an executor publish into `PHASE_STATS`, and the two nest.
+    #[cfg(feature = "routed-phases")]
+    static ROUTED_PHASES: std::cell::Cell<RoutedPhases> = const { std::cell::Cell::new(RoutedPhases {
+        ns_acquire: 0, ns_choose: 0, ns_dispatch: 0,
+    }) };
 
     /// `prepare_candidates`' time for the run in progress, handed to the executor that follows it —
     /// the two are separate calls in `run_query_with_plan`, and only the executor publishes stats.
@@ -6908,6 +7217,30 @@ fn note_paging_taken(which: PagingTaken) {
     PAGING_TAKEN.with(|c| c.set(which));
 }
 
+/// Hand a shared-artifact build time to the executor that follows, the same way
+/// `timed_prepare_candidates` does. Used by the plane path, whose artifact the router builds in
+/// acquire and a forced run has to rebuild; see `exec_plane_popcount_order`.
+fn note_pending_prepare_ns(ns: u64) {
+    debug_assert_eq!(
+        PENDING_PREPARE_NS.with(std::cell::Cell::get),
+        0,
+        "a previous shared-artifact build was not consumed by an executor; its time would be reported as this run's",
+    );
+    PENDING_PREPARE_NS.with(|c| c.set(ns));
+}
+
+/// Publish what a compose paging branch did, so `PrintingCompose` reports the same three quantities
+/// the two materializing plans do.
+///
+/// A 24-byte store into `COMPOSE_WORK`, not a write of the whole `PhaseStats` — see that slot's doc
+/// for the measurement that forced the split. `take_phase_stats` merges the two, so consumers see no
+/// seam, and the phase timings stay zero: compose's arm is not decomposed into setup/loop/finish, so
+/// there is nothing to check them against, and publishing an unvalidatable number is how
+/// `printing_span` became load-bearing in the first place.
+fn publish_compose_work(work: ComposePageWork) {
+    COMPOSE_WORK.with(|c| c.set(work));
+}
+
 /// Last executor run's phase stats, and clear them. `explain_analyze` reads this immediately after a
 /// timed run, having cleared beforehand — see `PHASE_STATS` for why that order is the contract and
 /// why an unpaired read does NOT see zeros.
@@ -6917,6 +7250,19 @@ fn note_paging_taken(which: PagingTaken) {
 fn take_phase_stats() -> PhaseStats {
     let mut stats = PHASE_STATS.with(|c| c.replace(PhaseStats::default()));
     stats.paging_taken = PAGING_TAKEN.with(|c| c.replace(PagingTaken::NotEntered));
+    // Compose's counters live in their own slot; fold them in so a consumer cannot tell which
+    // executor wrote them. Only ONE of the two publishes per run -- a materializing executor writes
+    // `PHASE_STATS` and never `COMPOSE_WORK`, compose the reverse -- so this cannot double-count, and
+    // taking both together is what stops either leaking into the next participant.
+    let compose = COMPOSE_WORK.with(|c| c.replace(ComposePageWork::default()));
+    if compose.cards_visited | compose.printings_examined | compose.matches_pushed | compose.ns_total != 0 {
+        stats.cards_visited = compose.cards_visited;
+        stats.printings_examined = compose.printings_examined;
+        stats.matches_pushed = compose.matches_pushed;
+        // Compose reports one undivided span; `ns_loop` is where it belongs so the phase sum equals
+        // the executor's time. See `ComposePageWork::ns_total`.
+        stats.ns_loop = compose.ns_total;
+    }
     stats
 }
 
@@ -6954,7 +7300,11 @@ fn exec_gathered_scan<'a>(
     let mut residual_is_or = false;
     // Counters for the three features this plan's cost arm keys on, so they can be checked against
     // what the loop really does. Plain locals — no atomics, no branch — published once at the end.
-    let (mut n_cards_visited, mut n_printings_scanned, mut n_matches_pushed) = (0u64, 0u64, 0u64);
+    let (mut n_cards_visited, mut n_printing_span, mut n_matches_pushed) = (0u64, 0u64, 0u64);
+    // The printings the per-card body actually ran on, which is NOT `n_printing_span` (the span).
+    // See `push_card_matches`; the two are published side by side so the gap is readable rather than
+    // inferred.
+    let mut n_printings_examined = 0u64;
     // Ends `ns_setup` and starts `ns_loop` — one read, two phases.
     let t_loop = std::time::Instant::now();
     for cid in card_ids {
@@ -6972,11 +7322,11 @@ fn exec_gathered_scan<'a>(
         let start = u32::from(offsets[cid as usize]) as usize;
         let end   = u32::from(offsets[cid as usize + 1]) as usize;
         let before = sel.buf().len();
-        n_printings_scanned += (end - start) as u64;
-        push_card_matches(
+        n_printing_span += (end - start) as u64;
+        n_printings_examined += u64::from(push_card_matches(
             card, cid, printings, &indexes.artwork_group_col, start, end, all_match, &residual, residual_is_or, mode, prefer,
             sort_col, descending, strings, existential_plane, sel.buf(), &mut group_best, &mut touched,
-        );
+        ));
         n_matches_pushed += (sel.buf().len() - before) as u64;
         sel.absorb(before);
     }
@@ -6995,7 +7345,8 @@ fn exec_gathered_scan<'a>(
         // regardless — it lives in `PAGING_TAKEN`, which this does not touch.
         c.set(PhaseStats {
             cards_visited: n_cards_visited,
-            printings_scanned: n_printings_scanned,
+            printing_span: n_printing_span,
+            printings_examined: n_printings_examined,
             matches_pushed: n_matches_pushed,
             ns_setup: (t_loop - t_start).as_nanos() as u64,
             ns_loop: (t_finish - t_loop).as_nanos() as u64,
@@ -7037,7 +7388,7 @@ fn run_query<'a>(
 /// only paid when a candidate list exists. Called from `candidate_feats`.
 fn scan_units(mode: Mode, candidate_cards: Option<&[u32]>, offsets: &AOffsets, n_printings: u32, n_cards: u32) -> u32 {
     // Card mode used to short-circuit to `eval_domain`, on the theory that the loop breaks at the
-    // first matching printing of each card. The `printings_scanned` counter says otherwise: across
+    // first matching printing of each card. The `printing_span` counter says otherwise: across
     // every acquire branch, GatheredScan and StreamedSelect scan the FULL printing span of their
     // candidates in card mode too, and the old feature read 0.25-0.33 against it. So the QUANTITY is
     // the same in all three modes -- printings under the candidates -- and there is no mode branch in
@@ -7171,6 +7522,68 @@ fn declined_sibling_fastpath<'a>(
 /// `domain * (1 - e^(-k/domain))`. Unlike `k.min(domain)` this does not saturate -- `cn<100` (35,021
 /// printings) and `usd<50` (80,527) both cap to exactly 31,508 against true counts of 17,616 and
 /// 31,217, losing the entire signal between them.
+/// How much `balls_into_bins` over-states compose's distinct-card count, measured against
+/// `cards_visited` once `PrintingCompose` began reporting it.
+///
+/// The model assumes each matching printing lands in an independently chosen card. Compose's
+/// predicates are CLUSTERED instead -- a legality leaf broadcast down sets every printing of a
+/// matching card at once -- so the same `k` printings touch far fewer cards than independence
+/// predicts. Over 1,036 measured gather rows the raw estimator reads a median **1.73x** the truth.
+///
+/// A calibration constant and not a better model, deliberately: a size-biased estimator over the
+/// corpus's span histogram (`P(hit) = 1-(1-p)^s` per span-`s` card, which is the principled fix for
+/// treating every card as one equally likely bin) was tried and scored NO better -- log error 0.512
+/// against 0.513 -- because the failing assumption is independence, not uniform bins, and a
+/// size-biased model is still an independence model. Per-slice constants keyed on
+/// broadcast/range were also tried and added nothing once the exact rows below were separated out
+/// (test log error 0.439 against 0.438).
+///
+/// Fit on 1,036 rows, scored on a held-out 1,047: test log error 0.678 -> 0.438, median 1.73 -> 0.98,
+/// spread unchanged at 3.6. Spread is what a constant cannot fix, and it is what remains.
+///
+/// NOT applied where `range_card_counts_for` answers exactly -- those rows measure 1.000 with log
+/// error 0.056 and dividing them by anything would break them. That mixture is why the bias looked
+/// like 1.35 before the two populations were separated.
+const COMPOSE_CARD_ESTIMATE_BIAS: f64 = 1.78;
+
+/// Printings the gather BIT-TESTS per matching printing.
+///
+/// `compose_scan_printings` was the composed bitmap's popcount, on the stated grounds that compose
+/// "walks the set bits". `gather_composed_page` does not: except in its card/default-prefer arm it
+/// iterates `start..end` of every candidate card and tests each printing, so the real count is the
+/// SPAN of the candidate cards. Measured against `printings_examined`, the popcount reads a median
+/// 0.68 of the truth -- the gather tests 1.47 printings for every one that is set.
+///
+/// A single constant, unlike the card estimate's: per-slice constants keyed on broadcast/range were
+/// tried and made the held-out SPREAD worse (14.8 against 9.2) for a log-error gain of 0.005, which
+/// is overfitting four numbers to a mixture. Test log error 0.845 -> 0.700, median 0.66 -> 0.97.
+///
+/// The alternative is to make the feature true by changing the executor -- walking set bits, as the
+/// old comment claimed. Measured ceiling for that: bit tests on non-set printings are 11% of the
+/// gather's modelled page cost (`card_pass` is 60%, `push` 26%), so it is a constant-factor
+/// optimisation of one branch, not a model change. Left as a separate question.
+const COMPOSE_GATHER_SPAN_PER_MATCH: f64 = 1.47;
+
+/// How much bigger the candidate cards on a compose acquire are than an average card.
+///
+/// `scan_all` projects a card count into printings with the corpus mean (`printings_per_card`,
+/// 3.09). That is right when the candidates are a fair sample of the corpus and wrong here: a
+/// composable predicate selects cards by having a matching PRINTING, so heavily-reprinted cards are
+/// over-represented — the same size bias that makes compose's own gather test 13.2 printings per
+/// candidate card against a corpus mean of 3.09.
+///
+/// This multiplier is on `scan_units`, which costs the MATERIALIZING alternatives should compose
+/// lose, so it is a routing input even though compose never reads it. Calibrating the card estimate
+/// exposed it: `scan_units [printing_compose]` had been reading 0.75 with the two errors partly
+/// cancelling, and dividing `est_cards` by 1.78 moved it to 0.47.
+const COMPOSE_CANDIDATE_SPAN_BIAS: f64 = 2.1;
+
+/// `balls_into_bins` with its measured bias divided out. See `COMPOSE_CARD_ESTIMATE_BIAS`.
+fn calibrated_balls_into_bins(k: usize, domain: usize) -> usize {
+    let raw = balls_into_bins(k, domain) as f64;
+    ((raw / COMPOSE_CARD_ESTIMATE_BIAS).round() as usize).max(usize::from(k > 0))
+}
+
 fn balls_into_bins(k: usize, domain: usize) -> usize {
     if domain == 0 {
         return 0;
@@ -7309,6 +7722,8 @@ fn mk_plan_feats(
         // STREAM_ARTWORK_SEEN_PER_CARD_NS for the mechanism and the measurement.
         artwork_seen_cards: if matches!(params.mode, Mode::Artwork) { eval_domain } else { 0 },
         compose_scan_printings: 0, // set by every branch that costs a PrintingCompose (its own, or as a competitor)
+        gather_group_printings: 0, // only the compose branch, and only when its grouping arm runs
+        orderby_walk_scan: 0,      // only the compose branch, and only for a plane-bucket orderby walk
     }
 }
 
@@ -7375,9 +7790,13 @@ fn acquire_plan_features(
     plane: Option<&PlaneExpr>,
 ) -> (cost::PlanFeatures, Prep, Vec<u64>) {
     let QueryCtx { cards, offsets, indexes, .. } = *ctx;
-    let QueryParams { mode, sort_col, descending, .. } = *params;
+    let QueryParams { mode, prefer, sort_col, descending, .. } = *params;
     let n_cards = ctx.n_cards();
     let n_printings = ctx.n_printings();
+    // Mean printings per card, the factor between "one printing of each candidate" and "all of them".
+    // Both the plane branch and the compose branch's `scan_all` need it; `.max(1.0)` guards a corpus
+    // with more cards than printings, which cannot happen but costs nothing to exclude.
+    let printings_per_card = (f64::from(n_printings) / f64::from(n_cards)).max(1.0);
 
     // Scratch for the plane bitmap (`Prep::Plane` only). A fresh `Vec` allocates
     // just once, on the plane branch's `eval_planes`; non-plane queries leave it
@@ -7385,11 +7804,44 @@ fn acquire_plan_features(
     let mut plane_bits: Vec<u64> = Vec::new();
 
     let (feats, prep) = if PhysicalPlan::PlanePopcountOrder.applicable(ctx, params, filter, plane) {
-        // The ONE plane eval; its popcount IS the exact count. scan_units == count
-        // (Mode::Card breaks at first match); True residual ⇒ tier 0.
+        // The ONE plane eval; its popcount IS the exact count. True residual ⇒ tier 0.
         eval_planes(plane.expect("PlanePopcountOrder ⇒ plane"), &indexes.planes, &mut plane_bits);
         let count: u32 = plane_bits.iter().map(|w| w.count_ones()).sum();
-        (mk_plan_feats(ctx, params, count, count, count, 0), Prep::Plane)
+        // `scan_units` costs the MATERIALIZING alternatives to this plan (PlanePopcountOrder itself
+        // popcounts a bitmap and scans nothing), and here alone it depends on `prefer`.
+        //
+        // A True residual means `all_match`, so `push_card_matches` takes its first-match branch: under
+        // `Prefer::Default` printings are stored prefer-desc, the first printing IS the pick, and the
+        // loop breaks after one — `scan_units == count`. Under any other prefer the same loop must
+        // score every printing of the card to find the max, so it examines the full span.
+        //
+        // Measured against `printings_examined` over 4,136 plane-acquire rows: the old unconditional
+        // `count` graded 1.00 at p90-p100 (the default-prefer population) and 0.16-0.35 at p10-p50 (the
+        // other four prefers) — one value cannot be right for both, and the 3.09x between them is
+        // exactly `printings_per_card`. This is the only feature in the vector that reads `prefer`;
+        // everywhere else the span-shaped estimate already covers both regimes, because an inexact
+        // narrowing makes non-matching candidates burn their whole span regardless of prefer.
+        //
+        // The custom-prefer side takes the EXACT span rather than `count * printings_per_card`. The
+        // corpus mean puts the cell's median at 1.00 but leaves a 3.09x over-count tail (measured p90
+        // 3.05, p99 3.09) on plane sets whose cards are single-printing, and a mean cannot fix a
+        // spread. One pass over the set bits is exact and is paid only here — `Prefer::Default`, ~85%
+        // of traffic by `REALISTIC_PREFER_WEIGHTS`, returns before reaching it.
+        let scan_units = if matches!(prefer, Prefer::Default) {
+            count
+        } else {
+            let mut span = 0u64;
+            for (w, word) in plane_bits.iter().enumerate() {
+                let mut bits = *word;
+                while bits != 0 {
+                    let cid = w * 64 + bits.trailing_zeros() as usize;
+                    span += u64::from(u32::from(offsets[cid + 1]) - u32::from(offsets[cid]));
+                    bits &= bits - 1;
+                }
+            }
+            span.min(u64::from(n_printings)) as u32
+        };
+        (mk_plan_feats(ctx, params, count, count, scan_units, 0), Prep::Plane)
     } else if PhysicalPlan::CardRangePopcount.applicable(ctx, params, filter, plane) {
         // Exact in-range printing count `k` from the index partition points (two binary searches, no
         // scan, no scatter). The O(k) card-bitmap build is deferred to dispatch and paid only if this
@@ -7430,11 +7882,23 @@ fn acquire_plan_features(
         feats.compose_paging = compose_paging_for(indexes, cards.len(), mode, sort_col, descending);
         (feats, Prep::Range(CountSource::CardRangePopcount))
     } else if PhysicalPlan::PrintingRangeScan.applicable(ctx, params, filter, plane) {
-        // Bare range: exact k from the index (no scan). P3/P4 estimated unnarrowed
-        // (their broad regime — a narrow range makes P1 lose, and dispatch materializes).
+        // Bare range: exact k from the index (no scan).
         let (idx, lo, hi) = bare_range_bounds(filter, indexes).expect("applicable ⇒ bare range");
         let k = (idx.partition_point(|p| u32::from(p.0) < hi) - idx.partition_point(|p| u32::from(p.0) < lo)) as u32;
-        let mut feats = mk_plan_feats(ctx, params, k, n_cards, n_printings, verify_cost_tier(filter));
+        // What the MATERIALIZING alternatives see, by the same test the sibling `CardRangePopcount`
+        // branch already applies: `range_narrowed` hands back an enumerable printing list only while
+        // the slice stays under `MAX_NARROW_FRACTION`, and degrades to a printing-space bitmap past
+        // it, which cannot yield card ids so the scan walks the whole corpus.
+        //
+        // This branch used to assume the degraded case ALWAYS, on the grounds that a narrow range
+        // makes P1 lose and dispatch materializes anyway. The sibling's comment went further and
+        // claimed the two "agree to within 1%". They agree at the MEDIAN and nowhere else: measured
+        // against `cards_visited`, `eval_domain` here reads 1.00 at p50 but 4.23 at p70 and 41.7 at
+        // p90, because a third of these queries do narrow. (The p100 of 315 is the harness's
+        // MIN_COUNTER floor, not the real maximum -- 31,508/100.)
+        let (eval_domain, scan_units) =
+            if range_too_broad_to_narrow(k as usize, idx.len()) { (n_cards, n_printings) } else { (k.min(n_cards), k) };
+        let mut feats = mk_plan_feats(ctx, params, k, eval_domain, scan_units, verify_cost_tier(filter));
         feats.compose_scan_printings = k;
         feats.scatter_printings = k; // for costing a competing PrintingCompose (which would scatter k); P1 itself walks, so its own cost ignores this
         // Also for costing that competing compose: `eval_domain`/`scan_units` above are the
@@ -7465,7 +7929,8 @@ fn acquire_plan_features(
         // every artwork-mode one, plus card-mode ones whose orderby has no permutation.
         let exact_cards = bare_range_bounds(filter, indexes)
             .and_then(|(idx, lo, hi)| range_card_counts_for(indexes, idx).and_then(|counts| counts.distinct_cards(lo, hi)));
-        let est_cards = exact_cards.map_or_else(|| balls_into_bins(printing_matches, n_cards as usize), |n| n as usize);
+        let est_cards =
+            exact_cards.map_or_else(|| calibrated_balls_into_bins(printing_matches, n_cards as usize), |n| n as usize);
         // What the MATERIALIZING alternatives scan if compose loses. Every mode narrows -- a
         // composable filter has an index for every leaf -- so all three are the NARROWED counts.
         // Printing mode took the unnarrowed universe while card/artwork took a narrowed count; only
@@ -7473,8 +7938,7 @@ fn acquire_plan_features(
         // `eval_domain` and scanned 0.14x the claimed `scan_units`. Over-costing both plans inflates
         // the predicted GAP between them (P4 carries the larger per-row rates), which is what routing
         // reads -- measured as a GatheredScan-vs-StreamedSelect gap ratio of 0.32 on this acquire.
-        let printings_per_card = (f64::from(n_printings) / f64::from(n_cards)).max(1.0);
-        let scan_all = |cards: usize| ((cards as f64) * printings_per_card) as usize;
+        let scan_all = |cards: usize| ((cards as f64) * printings_per_card * COMPOSE_CANDIDATE_SPAN_BIAS) as usize;
         let (result_total, project, popcount_words, eval_domain, scan_units) = match mode {
             Mode::Printing => (printing_matches, 0, (n_printings as usize).div_ceil(64), est_cards, scan_all(est_cards)),
             Mode::Card => {
@@ -7491,9 +7955,19 @@ fn acquire_plan_features(
                 // pushes 34,285, not the 68,687 printings it scans. Handing over the printing count
                 // over-charged every materializing alternative by ~2x on this acquire. The printing
                 // count stays where it belongs -- `project` (the printing->artwork pass) and
-                // `scan_units` both walk printings, as `printings_scanned` confirms.
+                // `scan_units` both walk printings, as `printing_span` confirms.
                 let n_artworks = u32::from(*indexes.artwork_base.last().expect("artwork_base has n_cards+1 entries")) as usize;
-                let rt = artwork_estimate(printing_matches, est_cards, n_cards as usize, n_artworks);
+                // The UNCALIBRATED card count feeds the artwork capacity on purpose.
+                // `COMPOSE_CARD_ESTIMATE_BIAS` was measured against `cards_visited` -- distinct CARDS
+                // -- and `artwork_estimate` does not consume a card count as an answer, it uses it to
+                // size a capacity (`est_cards * n_artworks/n_cards`) that a second balls-into-bins then
+                // draws into. Feeding the calibrated value shrank both stages and moved
+                // `matches <Gather> / artwork` from 0.97 to 0.84, i.e. it made an already-good cell
+                // worse. Under-charging compose's push term is what over-picks it, and compose is
+                // over-picked in artwork specifically: that slice carries 21% of ALL routing regret at
+                // p99 205us against 40us for printing and 36us for card.
+                let capacity_cards = exact_cards.map_or_else(|| balls_into_bins(printing_matches, n_cards as usize), |n| n as usize);
+                let rt = artwork_estimate(printing_matches, capacity_cards, n_cards as usize, n_artworks);
                 // The bitmap `printing_bits_to_artwork_bits` popcounts is n_artworks bits wide, not
                 // n_printings -- 46,112 against 97,206 here, so this was 2.1x over as well.
                 (rt, printing_matches, n_artworks.div_ceil(64), est_cards, scan_all(est_cards))
@@ -7504,7 +7978,21 @@ fn acquire_plan_features(
         feats.scatter_printings = scatter as u32;
         feats.project_printings = project as u32;
         feats.popcount_words = popcount_words as u32;
-        feats.compose_scan_printings = printing_matches as u32;
+        feats.compose_scan_printings = (printing_matches as f64 * COMPOSE_GATHER_SPAN_PER_MATCH) as u32;
+        // A rarity orderby walk pays a whole one-hot plane per bucket, so its floor is the corpus
+        // however selective the filter is. `usd` walks small value runs instead and keeps the shared
+        // page-fill term. See `PlanFeatures::orderby_walk_scan`.
+        feats.orderby_walk_scan = if matches!(sort_col, SortCol::Rarity) { n_printings } else { 0 };
+        // The gather's grouping arm runs for artwork always, and for card only under a non-default
+        // prefer -- card/default takes the early-break arm and never groups. Printing mode gets 0
+        // because its push term already rides the printing count. Driven by the PRE-dedup printing
+        // matches, which is the whole point: see `PlanFeatures::gather_group_printings`.
+        let groups = match mode {
+            Mode::Artwork => true,
+            Mode::Card => !matches!(prefer, Prefer::Default),
+            Mode::Printing => false,
+        };
+        feats.gather_group_printings = if groups { printing_matches as u32 } else { 0 };
         // Which paging strategy the fastpath will actually use — decided the same way the fastpath
         // itself decides, through the same helpers, including whether it will decline. Only this
         // branch knows the estimated result total, so only it can predict the small-total bail. The
@@ -7566,14 +8054,24 @@ fn run_query_routed<'a>(
             .expect("GatheredScan is always applicable and materializing")
     };
 
+    // Marks three disjoint phases covering the whole call — see `RoutedPhases` for why acquire needed
+    // measuring from inside one execution rather than as its own `explain_analyze` participant, and
+    // why it is behind a feature. Compiles to nothing without `routed-phases`.
+    let mut phases = RoutedPhaseTimer::start();
+
     // ── acquire: pick the count source, build features, materialize its artifact ──
     let (feats, prep, plane_bits) = acquire_plan_features(ctx, params, filter, plane);
+    phases.acquired();
 
     // ── choose: cheapest applicable plan ──
     let plan = choose(filter, &feats, false);
+    phases.chosen();
 
     // ── dispatch: run the winner, reusing the acquired artifact ──
-    match (plan, &prep) {
+    // Bound, not returned directly, so the closing clock read happens before the result is handed
+    // back and the phase covers dispatch alone. The match has no early returns, so this one exit is
+    // the only place the phases can be published from.
+    let out = match (plan, &prep) {
         (PhysicalPlan::PlanePopcountOrder, Prep::Plane) => {
             exec_plane_popcount_order_with_bitmap(ctx, params, plane.expect("Prep::Plane ⇒ plane"), &plane_bits)
         }
@@ -7597,8 +8095,13 @@ fn run_query_routed<'a>(
         //   - a materializing plan (StreamedSelect/GatheredScan) that beat them narrows + runs.
         (PhysicalPlan::CardRangePopcount, Prep::Range(_)) => {
             let (idx, lo, hi) = bare_range_bounds(filter, ctx.indexes).expect("applicable ⇒ bare range");
+            // Timed and handed to the executor as `ns_prepare`: this build happens in DISPATCH on
+            // both paths, so it belongs to the plan's cost, and `card_range_popcount` being a
+            // RANGE_ACQUIRE is what tells `plan_self_ns` to add it rather than exclude it.
+            let t_build = std::time::Instant::now();
             let (card_bits, range_pbits) =
                 build_card_range_bits(idx, lo, hi, ctx.indexes, ctx.cards.len(), ctx.printings.len());
+            note_pending_prepare_ns(t_build.elapsed().as_nanos() as u64);
             exec_card_range_popcount(ctx, params, &card_bits, &range_pbits)
         }
         (plan, Prep::Range(_)) => {
@@ -7617,7 +8120,9 @@ fn run_query_routed<'a>(
                 }
             }
         }
-    }
+    };
+    phases.finish();
+    out
 }
 
 /// In-process force/dispatch entry point (#702 step 2): run `plan` for this
@@ -7666,7 +8171,11 @@ fn run_query_with_plan<'a>(
                 return None;
             }
             let (idx, lo, hi) = bare_range_bounds(filter, indexes).expect("applicability guarantees a bare range");
+            // Timed exactly as the routed path times it, so a forced trial and dispatch contain the
+            // same work; see the routed call site.
+            let t_build = std::time::Instant::now();
             let (card_bits, range_pbits) = build_card_range_bits(idx, lo, hi, indexes, cards.len(), ctx.printings.len());
+            note_pending_prepare_ns(t_build.elapsed().as_nanos() as u64);
             Some(exec_card_range_popcount(ctx, params, &card_bits, &range_pbits))
         }
         PhysicalPlan::StreamedSelect => {
@@ -7781,6 +8290,17 @@ pub(crate) struct AcquireFacts {
     /// into the picked plan's executor, so a fixed position ahead of the plans would pre-warm
     /// exactly the plan whose selection the comparison is meant to question.
     pub(crate) routed_ns: Vec<u64>,
+    /// `routed_ns` split into disjoint phases, one triple per round, from INSIDE the same execution —
+    /// see `RoutedPhases`. `routed_acquire_ns[i] + routed_choose_ns[i] + routed_dispatch_ns[i]`
+    /// accounts for `routed_ns[i]` bar the clock reads.
+    ///
+    /// Not the same quantity as `acquire_ns`, and the difference is the point. That one times a
+    /// standalone `acquire_plan_features` in its own participant round, so it can be compared across
+    /// queries but cannot be divided into `routed_ns` — measured, the ratio comes out at 104% of the
+    /// median candidate-acquired query, which is how the two got read as a part and a whole.
+    pub(crate) routed_acquire_ns: Vec<u64>,
+    pub(crate) routed_choose_ns: Vec<u64>,
+    pub(crate) routed_dispatch_ns: Vec<u64>,
 }
 
 impl Prep {
@@ -7824,6 +8344,9 @@ fn explain(ctx: &QueryCtx, params: &QueryParams, filter: &mut FilterExpr, plane:
         feats, // moved: `eval_domain`/`n_cards`/`matches` live here and nowhere else
         acquire_ns: vec![acquire_ns],
         routed_ns: Vec::new(), // explain runs nothing
+        routed_acquire_ns: Vec::new(),
+        routed_choose_ns: Vec::new(),
+        routed_dispatch_ns: Vec::new(),
     };
     let mut estimates: Vec<PlanEstimate> = PhysicalPlan::ALL
         .into_iter()
@@ -8052,7 +8575,16 @@ fn explain_analyze(
             }
             match participant {
                 Participant::Acquire => facts.acquire_ns.push(dt),
-                Participant::Routed => facts.routed_ns.push(dt),
+                Participant::Routed => {
+                    facts.routed_ns.push(dt);
+                    // Taken from the slot `run_query_routed` just wrote, in the same round, so the
+                    // three sum to `dt`. Replaced with the default so a later participant that does
+                    // not publish here cannot report this round as its own.
+                    let ph = take_routed_phases();
+                    facts.routed_acquire_ns.push(ph.ns_acquire);
+                    facts.routed_choose_ns.push(ph.ns_choose);
+                    facts.routed_dispatch_ns.push(ph.ns_dispatch);
+                }
                 // A structurally-applicable plan's fastpath can still decline at runtime
                 // (e.g. PrintingCompose on a sparse total) — deterministic for this
                 // query/data, so a decliner simply never accumulates trials.
@@ -8127,12 +8659,20 @@ fn run_query_streamed_popcount<'a>(
     plane: Option<&PlaneExpr>,
     range_bits: Option<&[u64]>,
 ) -> (usize, Vec<(&'a AOracleCard, &'a APrinting)>) {
+    // First of the three phase boundaries, same convention as `run_query_streamed`: everything to the
+    // skip scan is `ns_setup` (here the total popcount plus the permuted scatter), the skip scan is
+    // `ns_loop`, the emit walk is `ns_finish`. Shared by BOTH popcount plans, so instrumenting here
+    // covers `PlanePopcountOrder` and `CardRangePopcount` at once.
+    let t_start = std::time::Instant::now();
     let QueryCtx { cards, printings, offsets, strings, indexes } = *ctx;
     let QueryParams { prefer, limit, page_offset, .. } = *params;
     let planes = &indexes.planes;
     let n_cards = cards.len();
     let total: usize = bitmap.iter().map(|w| w.count_ones() as usize).sum();
     if total == 0 || page_offset >= total {
+        // Still publishes: an empty page is real work (the popcount) and a plan that ran must report
+        // a cost, or a consumer reading the phases as the executor's time gets zero for a real run.
+        publish_popcount_phases(t_start.elapsed().as_nanos() as u64, 0, 0);
         return (total, Vec::new());
     }
 
@@ -8156,6 +8696,9 @@ fn run_query_streamed_popcount<'a>(
                 permuted[pos / 64] |= 1u64 << (pos % 64);
             }
         }
+
+        // Ends `ns_setup` (popcount + scatter) and starts `ns_loop`.
+        let t_loop = std::time::Instant::now();
 
         // Skip: accumulate word popcounts until the boundary word containing
         // page_offset — 64 cards per word read, deep pagination is a
@@ -8185,6 +8728,8 @@ fn run_query_streamed_popcount<'a>(
         // even then: bounded by `limit` emitted cards, not the candidate set,
         // and only pays the extra check at all for legality-touching planes.
         let existential = plane.is_some_and(plane_expr_is_existential);
+        // Ends `ns_loop` (the skip scan) and starts `ns_finish` (the emit walk).
+        let t_finish = std::time::Instant::now();
         let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit);
         'walk: while word_idx < permuted.len() {
             let mut w = permuted[word_idx];
@@ -8236,8 +8781,25 @@ fn run_query_streamed_popcount<'a>(
             }
             word_idx += 1;
         }
+        publish_popcount_phases(
+            (t_loop - t_start).as_nanos() as u64,
+            (t_finish - t_loop).as_nanos() as u64,
+            t_finish.elapsed().as_nanos() as u64,
+        );
         (total, page)
     })
+}
+
+/// Publish the popcount executor's three phases, consuming whatever build its caller handed over.
+///
+/// The pending value differs per plan and the `RANGE_ACQUIRES` rule is what makes both correct:
+/// `PlanePopcountOrder`'s plane eval is built during ACQUIRE on the routed path (so a forced run's
+/// rebuild must not count toward dispatch, and `plane` is not a range acquire), while
+/// `CardRangePopcount`'s bitmap is built in DISPATCH on both paths (so it must count, and
+/// `card_range_popcount` IS a range acquire). Same handoff, opposite treatment, both from one rule.
+fn publish_popcount_phases(ns_setup: u64, ns_loop: u64, ns_finish: u64) {
+    let prep_ns = PENDING_PREPARE_NS.with(|c| c.replace(0));
+    PHASE_STATS.with(|c| c.set(PhaseStats { ns_setup, ns_loop, ns_finish, ns_prepare: prep_ns, ..PhaseStats::default() }));
 }
 
 /// Streamed selection: match phase records per-card match counts (total is
@@ -8279,7 +8841,12 @@ fn run_query_streamed<'a>(
     let mut total: usize = 0;
     // Same counters GatheredScan publishes, so the two plans' arms can be checked the same way.
     // Locals in the loop; published once at the end. See PhaseStats.
-    let (mut n_cards_visited, mut n_printings_scanned, mut n_matches_pushed) = (0u64, 0u64, 0u64);
+    let (mut n_cards_visited, mut n_printing_span, mut n_matches_pushed) = (0u64, 0u64, 0u64);
+    // See the same local in the gathered loop. This plan only COUNTS here (the page is emitted
+    // below), and counting short-circuits harder than emitting does: both `all_match` arms of
+    // `card_match_count` answer without reading a printing at all, so this can legitimately be 0
+    // where `n_printing_span` is the full corpus span.
+    let mut n_printings_examined = 0u64;
     // Ends `ns_setup` and starts `ns_loop` — one read, two phases.
     let t_loop = std::time::Instant::now();
     for cid in card_ids {
@@ -8305,20 +8872,23 @@ fn run_query_streamed<'a>(
         let end   = u32::from(offsets[cid as usize + 1]) as usize;
         // Counted HERE, below the `card_pass` continue above, because a card rejected there never has
         // its printings touched. Counting at the top of the loop instead included them, so this plan
-        // and GatheredScan reported different `printings_scanned` for identical work whenever the
+        // and GatheredScan reported different `printing_span` for identical work whenever the
         // narrowing was inexact -- and `scan_units` has one definition, so at most one could be the
         // valid comparison.
-        n_printings_scanned += (end - start) as u64;
+        n_printing_span += (end - start) as u64;
         // Every printing matches: card/printing counts are O(1) inside the
         // helper, and the artwork group count is a build-time constant.
         let c = if all_match && matches!(mode, Mode::Artwork) && have_group_counts {
+            // A stored per-card group count: answered without looking at one printing.
             u32::from(u16::from(artwork_groups[cid as usize]))
         } else {
-            card_match_count(
+            let (c, examined) = card_match_count(
                 card, cid, printings, &indexes.artwork_group_col, start, end, all_match, &residual, residual_is_or, mode, strings,
                 existential_plane,
                 &mut seen_words,
-            )
+            );
+            n_printings_examined += u64::from(examined);
+            c
         };
         counts[cid as usize] = c;
         total += c as usize;
@@ -8334,7 +8904,8 @@ fn run_query_streamed<'a>(
         PHASE_STATS.with(|c| {
             c.set(PhaseStats {
                 cards_visited: n_cards_visited,
-                printings_scanned: n_printings_scanned,
+                printing_span: n_printing_span,
+                printings_examined: n_printings_examined,
                 matches_pushed: n_matches_pushed,
                 ns_setup: (t_loop - t_start).as_nanos() as u64,
                 ns_loop: (t_finish - t_loop).as_nanos() as u64,
@@ -8698,7 +9269,8 @@ fn plan_trial_to_pydict<'py>(py: Python<'py>, t: &PlanTrial) -> PyResult<Bound<'
     // `DeclineSparseExact` in particular pays a full compose first.
     d.set_item("declined_ns", t.declined_ns.clone())?;
     d.set_item("cards_visited", t.phases.cards_visited)?;
-    d.set_item("printings_scanned", t.phases.printings_scanned)?;
+    d.set_item("printing_span", t.phases.printing_span)?;
+    d.set_item("printings_examined", t.phases.printings_examined)?;
     d.set_item("matches_pushed", t.phases.matches_pushed)?;
     d.set_item("ns_setup", t.phases.ns_setup)?;
     d.set_item("ns_loop", t.phases.ns_loop)?;
@@ -8720,6 +9292,9 @@ fn acquire_facts_to_pydict<'py>(py: Python<'py>, f: &AcquireFacts) -> PyResult<B
     d.set_item("narrowed_repr", f.narrowed_repr.label())?;
     d.set_item("acquire_ns", f.acquire_ns.clone())?;
     d.set_item("routed_ns", f.routed_ns.clone())?;
+    d.set_item("routed_acquire_ns", f.routed_acquire_ns.clone())?;
+    d.set_item("routed_choose_ns", f.routed_choose_ns.clone())?;
+    d.set_item("routed_dispatch_ns", f.routed_dispatch_ns.clone())?;
     // The model's own inputs, so a calibration fit regresses on the same vector `plan_cost` reads.
     let g = &f.feats;
     for (k, v) in [
@@ -8737,6 +9312,8 @@ fn acquire_facts_to_pydict<'py>(py: Python<'py>, f: &AcquireFacts) -> PyResult<B
         ("popcount_words", g.popcount_words),
         ("artwork_seen_cards", g.artwork_seen_cards),
         ("compose_scan_printings", g.compose_scan_printings),
+        ("gather_group_printings", g.gather_group_printings),
+        ("orderby_walk_scan", g.orderby_walk_scan),
         // Derived inside plan_cost rather than stored, and exposed because the Perm/OrderbyWalk
         // paging branches are priced entirely on it and nothing else can check them.
         ("printings_walked", cost::printings_walked(g) as u32),
@@ -9250,12 +9827,14 @@ impl QueryEngine {
     /// lazily re-materialize and re-choose on exact features at dispatch — so the
     /// executed plan can differ from `result[0]`. See the free `explain` fn's doc.
         #[allow(clippy::too_many_arguments)] // the PyO3 keyword surface; the free `explain` fn it calls takes 4
-    #[pyo3(signature = (*, filters, unique="card", orderby="edhrec", direction="asc", limit=100, offset=0))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (*, filters, unique="card", prefer="default", orderby="edhrec", direction="asc", limit=100, offset=0))]
     fn explain<'py>(
         &self,
         py: Python<'py>,
         filters: &Bound<PyAny>,
         unique: &str,
+        prefer: &str,
         orderby: &str,
         direction: &str,
         limit: usize,
@@ -9266,19 +9845,19 @@ impl QueryEngine {
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
         let (plane_expr, mut filter_expr) = bind_and_split_filter(py, filters, unique, data)?;
 
-        // This method's signature has never taken `prefer` (it predates #757), and
-        // substituting the default here is behavior-preserving *for what explain
-        // reports*: `cost::plan_cost`/`PlanFeatures` don't read `prefer` at all, so
-        // both the argmin and every `predicted_ns` are prefer-blind regardless of what
-        // is passed. That is a gap in the cost model, not a property of execution —
-        // `prefer` genuinely changes the work done (it picks each card's representative
-        // printing, and `Prefer::Default` specifically lets `gather_composed_page`
-        // early-break on the first set printing instead of scoring every printing of
-        // the card, and `run_query_streamed_popcount` likewise). So an `explain` for a
-        // non-default `prefer` predicts the same numbers while the real query would do
-        // more per-card work. `explain_analyze` does take `prefer` and really runs the
-        // plans, so its `trials_ns` reflect it even though its `predicted_ns` doesn't.
-        let params = QueryParams::from_strs(unique, "default", orderby, direction, limit, offset);
+        // `prefer` is accepted and passed through, but note what it does NOT yet change:
+        // `cost::plan_cost`/`PlanFeatures` still don't read it, so the argmin and every
+        // `predicted_ns` remain prefer-blind. That is a real gap, now measurable rather
+        // than merely asserted — `prefer` genuinely changes the work done, since it picks
+        // each card's representative printing and `Prefer::Default` alone lets the match
+        // kernels early-break on the first qualifying printing instead of scoring every
+        // printing of the card. Measured over the plane acquire (exact narrowing, so the
+        // early break is the whole per-card cost), `scan_units` grades 1.00 against
+        // `printings_examined` under `default` and 0.32 under each of the other four — one
+        // feature value cannot be right for both. Taking the parameter is what lets a
+        // prefer-aware feature be graded here at all; until one exists, an `explain` for a
+        // non-default `prefer` still predicts the default's numbers.
+        let params = QueryParams::from_strs(unique, prefer, orderby, direction, limit, offset);
         let (facts, estimates) = explain(&QueryCtx::from(data), &params, &mut filter_expr, plane_expr.as_ref());
 
         let rows: Vec<Bound<PyDict>> = estimates.iter().map(|e| plan_estimate_to_pydict(py, e)).collect::<PyResult<Vec<_>>>()?;
@@ -9470,3 +10049,7 @@ mod bench_compose_paging;
 mod bench_compose_card_projection;
 #[cfg(test)]
 mod bench_candidate_materialize;
+#[cfg(test)]
+mod bench_gather_loop;
+#[cfg(test)]
+mod bench_streamed_loop;

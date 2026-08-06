@@ -111,14 +111,12 @@ MIN_ROWS = 30
 # Below this, a per-query difference is timer jitter rather than a real change.
 NOISE_FLOOR_US = 1.0
 
-# Acquire sources whose routed path re-pays `prepare_candidates`, so a plan's `trials_ns` is NOT
-# double-counting it and must not be netted. Everywhere else the prep is shared and the plan is
-# charged for a copy it would not pay under the router.
+# Acquire sources where acquire only ESTIMATED, so DISPATCH pays the artifact build itself -- either
+# `prepare_candidates` on a lazy materialize, or `build_card_range_bits` for CardRangePopcount. On
+# these `ns_prepare` is part of the plan's cost and `plan_self_ns` ADDS it. Everywhere else the router
+# built the artifact during acquire and dispatch merely reuses it, so a forced run rebuilding it is
+# reporting work dispatch never pays.
 RANGE_ACQUIRES = frozenset({"card_range_popcount", "printing_range_scan", "printing_compose"})
-# If netting `ns_prepare` removes more than this fraction of the measured round, the subtraction has
-# overshot and the residual is noise rather than a smaller measurement. Drop the row instead of
-# reporting a number built out of two nearly-equal quantities.
-NETTING_RESIDUAL_FLOOR = 0.5
 
 BOOTSTRAP_RESAMPLES = 10_000
 BOOTSTRAP_CI = 0.95
@@ -136,7 +134,8 @@ PLAN_KEYS = frozenset(
         "trials_ns",
         "declined_ns",
         "cards_visited",
-        "printings_scanned",
+        "printing_span",
+        "printings_examined",
         "matches_pushed",
         "ns_setup",
         "ns_loop",
@@ -147,7 +146,20 @@ PLAN_KEYS = frozenset(
         "paging_taken",
     }
 )
-ACQUIRE_KEYS = frozenset({"count_source", "narrowed_repr", "acquire_ns", "routed_ns", "compose_paging"})
+# The routed phase split is asserted here too: it is a partition of `routed_ns`, so a build that
+# stops publishing it should fail loudly rather than have a consumer silently read an empty list.
+ACQUIRE_KEYS = frozenset(
+    {
+        "count_source",
+        "narrowed_repr",
+        "acquire_ns",
+        "routed_ns",
+        "routed_acquire_ns",
+        "routed_choose_ns",
+        "routed_dispatch_ns",
+        "compose_paging",
+    }
+)
 
 
 def require_schema(res: dict) -> None:
@@ -210,9 +222,20 @@ class Sample:
         return (self.q, self.kw["unique"], self.kw["orderby"], self.kw["direction"], self.kw["limit"], self.kw["offset"])
 
 
-def sample_kwargs(sampler: QuerySampler, rng: random.Random) -> dict:
-    """One query shape: distinct-on, order, direction and page, weighted by the sampler's mode."""
-    return {
+def sample_kwargs(sampler: QuerySampler, rng: random.Random, *, vary_prefer: bool = False) -> dict:
+    """One query shape: distinct-on, order, direction and page, weighted by the sampler's mode.
+
+    `vary_prefer` draws `prefer` from the sampler instead of pinning it to `"default"`, and it is
+    OFF by default for a reason that is not timidity: drawing it consumes the rng, so turning it on
+    shifts every subsequent query in the stream. Baselines on disk were taken without it, and a
+    harness comparing against one must keep the stream byte-identical.
+
+    Turn it on where `prefer` is the variable under study. It is not cosmetic -- it decides whether
+    the card-mode match kernels may stop at the first qualifying printing (`Prefer::Default`,
+    printings are stored in prefer-desc order) or must score all of them to find the max. That is a
+    ~3x difference in per-card work that no other sampled parameter reaches.
+    """
+    kwargs = {
         "filters": None,
         "unique": sampler.unique(rng),
         "orderby": sampler.orderby(rng),
@@ -220,13 +243,21 @@ def sample_kwargs(sampler: QuerySampler, rng: random.Random) -> dict:
         "limit": rng.choice(LIMITS),
         "offset": rng.choice(OFFSETS),
     }
+    if vary_prefer:
+        kwargs["prefer"] = sampler.prefer(rng)
+    return kwargs
 
 
-def iter_samples(engine: object, sampler: QuerySampler, rng: random.Random, budget: Budget) -> Iterator[Sample]:
+def iter_samples(
+    engine: object, sampler: QuerySampler, rng: random.Random, budget: Budget, *, vary_prefer: bool = False
+) -> Iterator[Sample]:
     """Yield measured queries until the budget runs out, skipping any the parser rejects.
 
     The schema is checked against the first response that comes back, so a run against a build whose
     `explain_analyze` has moved on fails immediately instead of part way through.
+
+    `vary_prefer` is forwarded to `sample_kwargs`; see there for why it defaults off. The drawn
+    `prefer` lands in `Sample.kw`, so a caller that turns it on can slice by it.
     """
     # Imported here, not at module scope, so `costbench` stays importable (and unit-testable)
     # without the `api` package on the path. The cost is one import per process.
@@ -237,12 +268,17 @@ def iter_samples(engine: object, sampler: QuerySampler, rng: random.Random, budg
     taken = 0
     while time.monotonic() < deadline and (budget.sample is None or taken < budget.sample):
         taken += 1
-        kw = sample_kwargs(sampler, rng)
+        kw = sample_kwargs(sampler, rng, vary_prefer=vary_prefer)
         q = sampler.query(rng)
         try:
             kw["filters"] = parse_scryfall_query(q)
+            # Both calls get the same `prefer`. Note what that does and does not buy: `PlanFeatures`
+            # does not carry `prefer`, so the features and every `predicted_ns` come back identical
+            # whatever is passed, while execution honours it. That asymmetry is what makes a prefer
+            # slice readable -- only the COUNTERS move, so a ratio that shifts with `prefer` is the
+            # feature failing to model a real difference in work, not two numbers drifting at once.
             acquire = engine.explain(**kw)["acquire"]
-            res = engine.explain_analyze(prefer="default", num_warmups=budget.warmups, num_trials=budget.trials, **kw)
+            res = engine.explain_analyze(num_warmups=budget.warmups, num_trials=budget.trials, **{"prefer": "default", **kw})
         except Exception:  # noqa: BLE001, S112 - a rejected query is a skipped sample
             continue
         if not checked:
@@ -270,27 +306,41 @@ def predicted_ns(plan: dict) -> float | None:
 def plan_self_ns(plan: dict, acquire: dict) -> float | None:
     """What this plan costs to RUN, in nanoseconds -- the single definition every harness uses.
 
-    `min` over the trials, because the question is what the plan costs when nothing interferes, and
-    the distribution's upper tail is machine noise rather than the plan.
+    The quantity wanted is DISPATCH: what the routed path spends after it has chosen. It is built by
+    ADDITION now, from two measured pieces, where it used to be recovered by subtracting `ns_prepare`
+    from a trial.
 
-    Materializing plans re-run `prepare_candidates` inside their own forced round, where the router
-    would have acquired the artifact once and shared it. That prep is published per plan as
-    `ns_prepare`, so it can be netted back out -- except under a range-style acquire, where the
-    routed path re-pays it too and it IS the plan's cost.
+    **The executor**, from `ns_setup + ns_loop + ns_finish`. Contiguous by construction, so the sum IS
+    the executor -- exact, with nothing to overshoot. Every plan publishes these; the two materializing
+    ones split them three ways, and the four others report one undivided span in `ns_loop` because they
+    have no three phases to attribute between. Verified against the old netted figure on 45k paired
+    rows before the switch: median ratio 0.998 (GatheredScan) and 0.997 (StreamedSelect), 0.08us of the
+    round unaccounted.
+
+    **Plus any shared artifact DISPATCH pays for**, which depends on the acquire and not on the plan:
+
+    - `candidates` / `plane` acquire -- the router built the artifact during acquire and dispatch just
+      reuses it, so dispatch is the executor alone. A forced run rebuilt it and reported the rebuild in
+      `ns_prepare`; that is exactly what must NOT be counted.
+    - `RANGE_ACQUIRES` -- acquire only estimated. Dispatch pays the build itself, whether that is
+      `prepare_candidates` on a lazy materialize or `build_card_range_bits` for `CardRangePopcount`, so
+      `ns_prepare` IS part of the plan's cost and is added.
+
+    Why this is better than the subtraction it replaces: an addition cannot overshoot, so the guard
+    that dropped rows is gone, and with it the reason `bench_regret_matrix` was skipping queries. That
+    guard cost 39% of all queries as a fraction and 1.8% as an absolute floor; it is now 0%.
 
     Returns:
-        The plan's own nanoseconds, or None if the plan produced no page (declined, or never ran) or
-        if netting overshot far enough that the residual is noise.
+        The plan's dispatch nanoseconds, or None if it produced no page (declined, or never ran).
     """
     if not plan["trials_ns"]:
         return None
-    real = float(min(plan["trials_ns"]))
-    if plan["ns_round_total"] and acquire["count_source"] not in RANGE_ACQUIRES:
-        netted = real - plan["ns_prepare"]
-        if netted < real * NETTING_RESIDUAL_FLOOR:
-            return None
-        real = netted
-    return real
+    dispatch = float(plan["ns_setup"] + plan["ns_loop"] + plan["ns_finish"])
+    if dispatch <= 0:
+        return None  # ran but published no phase: cannot be priced, and must not read as zero
+    if acquire["count_source"] in RANGE_ACQUIRES:
+        dispatch += float(plan["ns_prepare"])
+    return dispatch
 
 
 # ── statistics and tables ─────────────────────────────────────────────────────────────────────

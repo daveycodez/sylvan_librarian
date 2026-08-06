@@ -40,8 +40,7 @@
 //! the per-card `card_pass` term is driven by `eval_domain` (candidate cards) and
 //! the per-row residual scan + its verify `tier` by `scan_units` (printings under the
 //! candidate cards). One mode-agnostic formula, and `scan_units()` no longer branches
-//! on mode at all: the `printings_scanned` counter shows the scan plans walk the full
-//! printing span of their candidates in CARD mode too, not one row each. The `_CARD_PASS`/`_SCAN` split of the old lumped
+//! on mode at all. The `_CARD_PASS`/`_SCAN` split of the old lumped
 //! `VISIT` constants was fit to hold card unchanged while correcting printing (see
 //! each constant's doc). Artwork rides the printing path (same all-printings scan);
 //! its confirming validation is still pending a bench run.
@@ -54,6 +53,27 @@
 //! rare). The `_CARD_PASS`/`_SCAN`/`PUSH` split is a physical prior resolving what
 //! data alone cannot. Model sits at ~1.4× absolute (slow bucket), ordering-correct
 //! (argmin==gold 87/88) — the identifiable ceiling for this workload.
+//!
+//! ## What the span counter could and could not show (2026-08-02)
+//!
+//! The paragraph above used to justify the mode-agnostic `scan_units` by asserting that "the
+//! `printings_scanned` counter shows the scan plans walk the full printing span of their candidates in
+//! CARD mode too, not one row each". That inference does not hold, and the sentence is now deleted
+//! rather than merely qualified: the counter (since renamed `printing_span`) was computed by the
+//! CALLER as `end - start` per surviving card, before the match kernel ran, so it reported the span
+//! whatever the kernel then did. It could not distinguish the two cases it was being cited for.
+//!
+//! The kernels do stop early in card mode. `card_match_count` returns from `all_match` without reading
+//! a printing at all, and both it and `push_card_matches` return at the FIRST qualifying printing
+//! under `Prefer::Default`. `printings_examined`, reported by the kernels themselves, is the quantity
+//! `scan_units` predicts, and grading against it is what `bench_feature_accuracy.py` now does.
+//!
+//! The mode-agnostic span estimate nonetheless survives that correction, for a reason the original
+//! note did not give: under an INEXACT narrowing most candidate cards do not match, and a
+//! non-matching card is ruled out only after its whole span is walked. So the span is a good proxy in
+//! card mode generally (`scan_units [candidates] / card` grades p50 1.00 against `printings_examined`)
+//! and wrong specifically where the narrowing is EXACT — the plane acquire, where `all_match` holds
+//! and `prefer` then decides everything. That case is handled in `acquire_plan_features`.
 
 use super::*;
 
@@ -73,10 +93,17 @@ pub(crate) struct PlanFeatures {
     /// candidate count when `prepare_candidates` produced a list, else `n_cards`.
     pub eval_domain: u32,
     /// Printings under the candidate cards — the dominant P3/P4 driver, and the same
-    /// quantity in all three distinct-ons. Card mode was long assumed to break at the
-    /// first matching printing (`scan_units ≈ eval_domain`); measured against
-    /// `printings_scanned`, that read 0.25-0.33 for both GatheredScan and StreamedSelect
-    /// while `eval_domain · n_printings/n_cards` reads 0.90-1.02 in every mode.
+    /// quantity in all three distinct-ons.
+    ///
+    /// Card mode DOES break at the first matching printing, so the `0.25-0.33` this note used to cite
+    /// against `printings_scanned` was the counter's artifact, not the feature's error — see the module
+    /// header. Graded against `printings_examined` the span estimate reads p50 1.00 in card mode
+    /// anyway, because an inexact narrowing makes non-matching candidates walk their whole span.
+    ///
+    /// `prefer` is the one thing this cannot see: it decides whether the kernels may break early at
+    /// all, and `PlanFeatures` does not carry it. That is invisible under an inexact narrowing (the
+    /// non-matching cards dominate either way) and decisive under an exact one, which is why the plane
+    /// branch of `acquire_plan_features` sets this field itself rather than taking the span estimate.
     pub scan_units: u32,
     /// Per-card verify cost of the residual, ns×100 (`verify_cost_tier`); `0`
     /// when `all_match_known` (the walk skips `card_pass` entirely).
@@ -88,22 +115,13 @@ pub(crate) struct PlanFeatures {
     ///
     /// `scan_units` is every printing under a candidate card — right for GatheredScan and
     /// StreamedSelect, which must test each one. Compose walks the set bits of the composed bitmap
-    /// instead, so it touches `printing_matches`. Measured against `printings_scanned`, compose reads
+    /// instead, so it touches `printing_matches`. Measured against `printing_span`, compose reads
     /// 1.00 on `matches` in printing mode and 1.00-1.01 on `project_printings` in artwork (the same
     /// value), while `scan_units` reads 2.0-2.8 for it.
     ///
     /// Sharing one feature between the two forced a compromise that was ~2x wrong for whichever arm
     /// lost: with the value GatheredScan needs, compose over-counts 2x; with compose's, the scan plans
     /// under-count 3.3x.
-    /// Printings compose's **Gather** paging branch bit-tests, which is NOT `scan_units`.
-    ///
-    /// `scan_units` is every printing under a candidate card -- right for GatheredScan and
-    /// StreamedSelect, which must test each one. Compose walks the set bits of the bitmap it just
-    /// built, so it touches `printing_matches`. Measured against `printings_scanned`, compose reads
-    /// 1.00 on `matches` in printing mode and 1.00-1.01 on `project_printings` in artwork (the same
-    /// value), while `scan_units` reads 2.0-2.8 for it.
-    ///
-    /// Sharing one feature between the two forced a compromise ~2x wrong for whichever arm lost.
     pub compose_scan_printings: u32,
     /// Page size (`limit`).
     pub limit: u32,
@@ -128,6 +146,46 @@ pub(crate) struct PlanFeatures {
     /// that keeps the popcount term honest across distinct-ons: `n_printings/64` (printing),
     /// `n_cards/64` (card), `n_artworks/64` (artwork). Set by `PrintingCompose`; `0` elsewhere.
     pub popcount_words: u32,
+    /// Set printings `gather_composed_page`'s GROUPING arm processes, or `0` when that arm is not the
+    /// one that runs.
+    ///
+    /// The Gather arm charged three things: a per-candidate-card pass, a per-printing bit test at
+    /// 0.38ns ("a cheap bit test, not a real residual scan"), and a per-match push. That describes
+    /// the printing-mode arm, which really does just test a bit and push. It does not describe the
+    /// `Mode::Card | Mode::Artwork` arm, which for every SET printing also reads the artwork group id,
+    /// computes `prefer_score`, and compares against `group_best` — real work, none of it a bit test.
+    ///
+    /// The unit is the load-bearing part. `matches` in artwork mode is the DEDUPED artwork count, so
+    /// `COMPOSE_GATHER_PUSH_PER_MATCH_NS` charges once per surviving group, while the grouping work
+    /// scales with the PRE-dedup printing matches feeding it. A card with twelve printings across two
+    /// artworks pays twelve groupings and two pushes. That is the same class of error
+    /// `bench_feature_accuracy` was written for, mirrored: there a printing count drove a per-result
+    /// term, here a deduped count drives a term whose work is pre-dedup.
+    ///
+    /// Measured consequence before this term existed: over 129 queries where compose was picked and
+    /// lost to GatheredScan, compose's real/predicted was **3.07** — 89% of the lost time in artwork,
+    /// 94% on the Gather branch, and every one of the five worst a single bare `f:` legality leaf at
+    /// ~300us. `PrintingCompose -> GatheredScan` is 99% miss and 11% of ALL routing regret.
+    ///
+    /// `0` for printing mode (the push term already covers its per-set-printing work, since `matches`
+    /// there IS the printing count) and for card mode under `Prefer::Default`, which takes the
+    /// early-break arm instead and never groups.
+    pub gather_group_printings: u32,
+    /// Printings the #744 orderby walk's BUCKET SCAN covers before the page can fill, or `0` when the
+    /// walk is not the branch (or its buckets are cheap value runs).
+    ///
+    /// The Perm and OrderbyWalk branches shared `printings_walked` — `page_span / match_rate`, a
+    /// page-fill length in MATCH units. That describes the permutation walk and does not describe a
+    /// bucket walk at all: `walk_rarity_orderby_page`'s interior buckets are one-hot PLANES, so a
+    /// single bucket ANDs `words_per_plane` words of the whole corpus whether two matches survive or
+    /// twenty thousand. Measured against the raw units actually scanned, the shared formula reads a
+    /// median 0.25 with spread 400 — it under-charges the walk ~4x, and under-charging is what
+    /// over-picks a plan.
+    ///
+    /// `usd` needs none of this: its buckets are value runs off the range index, small and
+    /// proportional to matches, which is the shape `printings_walked` already has. So this is `0`
+    /// there and the shared term stands.
+    pub orderby_walk_scan: u32,
     /// Which of `PrintingCompose`'s three paging strategies will actually run (see `ComposePaging`),
     /// decided the same way `printing_compose_fastpath` decides. The three have different cost shapes
     /// — the permutation walk and the #744 orderby-index walk are both offset-dependent (fill the page
@@ -264,7 +322,17 @@ pub(crate) fn materialize_cost(plan: PhysicalPlan, f: &PlanFeatures) -> f64 {
 /// ridge-anchored to the previous values because several columns barely vary on this corpus and
 /// are collinear with the intercept. Fitted on ~10k distinct feature vectors, stable to <3% across
 /// independent seeds. Median measured/predicted moved 1.78 -> 1.00 (P4) and 1.69 -> 1.06 (P3).
-const STREAM_CARD_PASS_NS: f64 = 6.46;
+///
+/// Refit again 2026-08-02, and this is the first fit of P3 that was allowed to happen: every earlier
+/// run of `fit_cost_model.py` REFUSED to fit this plan, because its `counter_check` graded
+/// `scan_units` against the printing SPAN, and P3's `all_match` rows disagree with the span by ~3x
+/// over a term this arm multiplies by zero (`if tier_ns > 0.0`). With `printings_examined` reported
+/// by the match kernels and the zero-weight rows excluded, all six counter checks read 1.00 and the
+/// fit ran: median predicted/measured 0.63 -> 0.92 and within-25% 19% -> 58% over 29,084 rows /
+/// 9,867 distinct shapes. P3 had been under-costed ~1.6x, which biases the router toward picking it.
+/// P4 and compose were re-fit in the same run and NOT changed: P4's fitted values reproduce these
+/// within 8% with no agreement gain, and compose's fit makes its median worse (0.95 -> 0.86).
+const STREAM_CARD_PASS_NS: f64 = 5.05;
 
 /// P3's per-scanned-row cost, charged ONLY when a residual is present.
 ///
@@ -286,7 +354,7 @@ const STREAM_CARD_PASS_NS: f64 = 6.46;
 ///
 /// This one is NOT common-mode with P4 — P4 pays `GATHER_SCAN_PER_ROW_NS` unconditionally — so
 /// unlike the verify tier it can move the argmin between the two.
-const STREAM_SCAN_PER_ROW_NS: f64 = 5.53;
+const STREAM_SCAN_PER_ROW_NS: f64 = 5.97;
 
 
 /// Per-card cost of RUNNING `card_pass` at all, on top of whatever the residual's own nodes cost.
@@ -322,11 +390,11 @@ const STREAM_SCAN_PER_ROW_NS: f64 = 5.53;
 /// That same regression also shows the residual's cost is per CARD, not per printing scanned: the
 /// SLOPE against printings-per-card is ~3.5 for every tier including none (P4) and ~2 for P3, i.e.
 /// independent of what the residual is. So the tier belongs on `eval_domain`, as it now sits.
-const STREAM_RESIDUAL_FLOOR_NS: f64 = 8.18;
+const STREAM_RESIDUAL_FLOOR_NS: f64 = 6.58;
 /// ns per match, for the permutation-walk emit. Small — P3 measured nearly flat
 /// in match count once eval_domain is fixed (see STREAM_MATCH_PHASE_PER_CARD_NS),
 /// so this is a minor term.
-const STREAM_EMIT_PER_MATCH_NS: f64 = 0.13;
+const STREAM_EMIT_PER_MATCH_NS: f64 = 0.12;
 /// ns per candidate card that ARTWORK mode pays and the other two do not.
 ///
 /// `card_match_count`'s artwork arm keeps a per-card `seen_words` bitmask to dedupe artwork groups,
@@ -346,14 +414,14 @@ const STREAM_EMIT_PER_MATCH_NS: f64 = 0.13;
 /// Two independently fitted per-card terms, both elevated in artwork by ~2.4 ns and never flipping
 /// sign. One mechanism showing up twice, so it belongs in its own term rather than as a mode-specific
 /// copy of each rate. ~16 word-ops per card is the right order for 2.4 ns.
-const STREAM_ARTWORK_SEEN_PER_CARD_NS: f64 = 1.36;
+const STREAM_ARTWORK_SEEN_PER_CARD_NS: f64 = 1.21;
 /// ns per card scanned in the small-total gather (`for cid in 0..n_cards`,
 /// counts[cid]==0 check). Cheaper than a match-phase visit (no filter work). Fit
 /// from the narrow-query floor: cmc>=15 / o:annihilator / cmc==7 card SHALLOW all
 /// ~52µs = 31508 × 1.65. Only added when `matches <= STREAM_MIN_MATCHES`, the
 /// exact condition that routes P3 into that gather branch. The 1.65 above was fit on three hand
 /// picked narrow queries; across the sampled space the floor measures ~31µs, not 52µs.
-const STREAM_SMALL_TOTAL_FLOOR_PER_CARD_NS: f64 = 1.64;
+const STREAM_SMALL_TOTAL_FLOOR_PER_CARD_NS: f64 = 1.02;
 /// Per-card cost P3 pays over the WHOLE corpus regardless of how narrow the query is, charged on
 /// `n_cards` rather than `eval_domain`. The thread-local counts buffer is resized and cleared to
 /// `cards.len()` every query — a 126 kB memset on this corpus — and the emission walk is over the
@@ -362,7 +430,7 @@ const STREAM_SMALL_TOTAL_FLOOR_PER_CARD_NS: f64 = 1.64;
 /// as a per-card RATE rather than the previous flat constant so it tracks corpus size at all.
 const STREAM_CORPUS_PASS_PER_CARD_NS: f64 = 0.02;
 /// Fixed P3 setup, net of the O(n_cards) work above.
-const STREAM_FIXED_COST_NS: f64 = 217.5;
+const STREAM_FIXED_COST_NS: f64 = 217.0;
 
 // ─── P4: GatheredScan ───────────────────────────────────────────────────────
 // The universal fallback: per-card loop pushes every match's sort key into a
@@ -432,27 +500,55 @@ const COMPOSE_WALK_STEP_NS: f64 = 0.58;
 /// Per row emitted by the Perm / OrderbyWalk page fill.
 const COMPOSE_WALK_EMIT_PER_ROW_NS: f64 = 2.19;
 /// Per candidate card visited by `gather_composed_page`.
-const COMPOSE_GATHER_CARD_PASS_NS: f64 = 9.81;
+///
+/// Raised from 9.81 on 2026-08-03. `fit_cost_model` has wanted this higher in every run it was asked
+/// (1.23x, 1.35x, 1.60x across seeds) and it is the dominant term for the queries that dominate
+/// compose's regret: a bare `f:` legality leaf under `unique=artwork` puts `eval_domain` at nearly the
+/// whole corpus, so 31,508 candidate cards times a 3.4ns error is ~108us on ONE query. Those queries
+/// measure ~300us and `PrintingCompose -> GatheredScan` is 99% miss.
+///
+/// Its own constant, not shared with `GatheredScan`'s `GATHER_CARD_PASS_NS` (6.88) — the two loops do
+/// different per-card work, and moving this does not disturb that plan.
+const COMPOSE_GATHER_CARD_PASS_NS: f64 = 13.22;
 /// Per printing bit-tested against `pbits` inside the gather.
 const COMPOSE_GATHER_BITTEST_PER_PRINTING_NS: f64 = 0.38;
 /// Per match pushed into the bounded GatherSelect accumulator.
 const COMPOSE_GATHER_PUSH_PER_MATCH_NS: f64 = 3.39;
+/// Per SET printing the grouping arm scores and compares — see `gather_group_printings` for why this
+/// is not the bit-test rate and not the push rate. Cheaper than a push (no `sort_key_bits`, no
+/// buffer growth) and dearer than a bit test (a struct read plus `prefer_score`); fitted below.
+const COMPOSE_GATHER_GROUP_PER_PRINTING_NS: f64 = 1.5;
 /// Per-query setup for the compose fastpath.
 const COMPOSE_FIXED_COST_NS: f64 = 163.56;
 
 /// Printings a forward-permutation / orderby walk steps over to fill one page: `page_span` result
 /// rows at density `match_rate`. Derived rather than stored, and exposed so a harness can check it
-/// against the `printings_scanned` counter -- the Perm and OrderbyWalk paging branches are priced
+/// against the `printing_span` counter -- the Perm and OrderbyWalk paging branches are priced
 /// entirely on this quantity and nothing else validates them.
 pub(crate) fn printings_walked(f: &PlanFeatures) -> f64 {
     let page_span = f64::from((f.offset.saturating_add(f.limit)).min(f.matches));
     let match_rate = (f64::from(f.matches) / f64::from(f.n_printings.max(1))).max(MATCH_RATE_FLOOR);
-    page_span / match_rate
+    page_span / match_rate * WALK_LENGTH_BIAS
 }
+
+/// The closed form above assumes matches are spread UNIFORMLY along the walk order, so a page of
+/// `page_span` rows arrives after `page_span / match_rate` printings. They are not: the permutation
+/// orders cards by the sort column, and matches cluster within that order, so the walk runs longer
+/// than uniform spacing predicts before the page fills.
+///
+/// Measured against `printings_examined` once the walk branches began reporting it, the raw form
+/// reads a median 0.69 -- consistently under on all three acquires that reach a walk
+/// (`printing_range_scan` 0.66, `printing_compose` 0.67, `card_range_popcount` 0.74), which is what
+/// makes it a bias worth dividing out rather than three separate errors.
+///
+/// Bias only. The spread stays wide (p90/p10 ~10-18) because how matches clump along a sort order is
+/// not something a density ratio can see, and no constant will fix that.
+const WALK_LENGTH_BIAS: f64 = 1.45;
 
 pub(crate) fn plan_cost(plan: PhysicalPlan, f: &PlanFeatures) -> f64 {
     let n_cards = f64::from(f.n_cards);
-    let n_printings = f64::from(f.n_printings);
+    // `n_printings` is no longer bound here: it was only feeding the local copy of the walk-length
+    // formula, which now calls `printings_walked` so there is one definition of it.
     let matches = f64::from(f.matches);
     let eval_domain = f64::from(f.eval_domain);
     let scan_units = f64::from(f.scan_units);
@@ -460,10 +556,12 @@ pub(crate) fn plan_cost(plan: PhysicalPlan, f: &PlanFeatures) -> f64 {
     let limit = f64::from(f.limit);
     let page_span = f64::from((f.offset.saturating_add(f.limit)).min(f.matches));
 
-    // Printings walked to fill the page in a forward-permutation walk (both printing-space plans):
-    // roughly `page_span` rows at density `match_rate`.
-    let match_rate = (matches / n_printings).max(MATCH_RATE_FLOOR);
-    let printings_walked = page_span / match_rate;
+    // Printings walked to fill the page in a forward-permutation walk (both printing-space plans).
+    // Calls the shared `printings_walked` rather than recomputing `page_span / match_rate`: this was
+    // a second copy of that formula, and adding WALK_LENGTH_BIAS to the function alone changed what
+    // harnesses were TOLD without changing what the router CHARGED. `fit_cost_model`'s mirror check
+    // caught it as a 3.7% disagreement; there is now one definition.
+    let printings_walked = self::printings_walked(f);
     match plan {
         // #695 bare range, unique=printing: total is the range index's `k` (no synth, no popcount pass),
         // page is a forward permutation walk. So just the walk + fixed setup.
@@ -487,7 +585,9 @@ pub(crate) fn plan_cost(plan: PhysicalPlan, f: &PlanFeatures) -> f64 {
                 // which is exactly why the COMPOSE_GATHER breadth gate is bypassed for it — broad is its
                 // best case, not its worst.
                 super::ComposePaging::Perm | super::ComposePaging::OrderbyWalk => {
-                    printings_walked * COMPOSE_WALK_STEP_NS  // walk to fill the page
+                    // `orderby_walk_scan` is 0 for Perm and for the usd walk, so this is the shared
+                    // page-fill term unless a bucket scan dominates it — see the field's doc.
+                    printings_walked.max(f64::from(f.orderby_walk_scan)) * COMPOSE_WALK_STEP_NS  // walk to fill the page
                         + limit * COMPOSE_WALK_EMIT_PER_ROW_NS  // emit one page of rows
                 }
                 // gather_composed_page: visits every candidate (eval_domain, same rate GatheredScan's
@@ -500,6 +600,7 @@ pub(crate) fn plan_cost(plan: PhysicalPlan, f: &PlanFeatures) -> f64 {
                 super::ComposePaging::Gather => {
                     eval_domain * COMPOSE_GATHER_CARD_PASS_NS
                         + f64::from(f.compose_scan_printings) * COMPOSE_GATHER_BITTEST_PER_PRINTING_NS
+                        + f64::from(f.gather_group_printings) * COMPOSE_GATHER_GROUP_PER_PRINTING_NS
                         + matches * COMPOSE_GATHER_PUSH_PER_MATCH_NS
                 }
                 // The fastpath will refuse this query, so there is no page term to charge. Infinity
