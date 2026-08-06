@@ -5257,6 +5257,19 @@ fn printing_range_fastpath_inner<'a>(
 /// where the residual applies the correct trivalent semantics. Anything else (a text search, a range,
 /// an arithmetic compare) is likewise non-composable. A composable expression's bits are **exact** (a
 /// set bit *is* a matching printing), so no per-printing re-check is needed.
+/// Whether `filter` constrains legality anywhere. Used to scope the `stream_scan_units` correction to the
+/// case the sweep measured wrong: legality is the one printing-varying attribute `card_pass` can resolve at
+/// CARD level for most cards (only the divergent ones defer), so it is the only one where P3 and P4 examine
+/// wildly different printing counts. Border, rarity and watermark all measured at parity.
+fn filter_touches_legality(filter: &FilterExpr) -> bool {
+    match filter {
+        FilterExpr::Legality { .. } => true,
+        FilterExpr::And(cs) | FilterExpr::Or(cs) => cs.iter().any(filter_touches_legality),
+        FilterExpr::Not(inner) => filter_touches_legality(inner),
+        _ => false,
+    }
+}
+
 fn is_printing_composable(filter: &FilterExpr, indexes: &Archived<CardIndexes>) -> bool {
     match filter {
         FilterExpr::True => true,
@@ -6641,6 +6654,36 @@ fn card_range_popcount_applicable(
 
 // ─── Shared P3/P4 candidate preparation ─────────────────────────────────────
 
+/// Whether a plane-consumed predicate leaves the match kernels **nothing to verify per card** — i.e.
+/// `card_pass` is redundant and both kernels take their `all_match` arm.
+///
+/// Legality planes (docs/issues/00667-engine-legality-divergent-carveout.md) are existence
+/// projections ("*some* printing matches"), unlike every other plane (card-invariant fields, true or
+/// false alike for every printing of a card). For `unique=card` that is exactly the semantics wanted.
+/// But `Mode::Printing`/`Artwork` enumerate individual printings, and "the card has some legal
+/// printing" does not mean "this printing is legal" — `card_pass` must still run per printing there
+/// whenever the plane touched a *divergent* format, which is what `plane_expr_is_existential` tests
+/// against the data-derived `divergent_formats` mask.
+///
+/// Extracted so the ROUTER can ask the same question the EXECUTOR does. `prepare_candidates` had the
+/// only copy, and the compose acquire branch — which never calls it — therefore charged
+/// `verify_cost_tier` on every legality-composed query alike. On a card-invariant format that put P3
+/// at meas/pred 0.16-0.44 while `PrintingCompose` read 1.02-1.17, and the argmin lost those cells to a
+/// plan measuring ~2.5x slower. A boolean, not an estimated share: the two attempts to price this as a
+/// divergent *fraction* of the corpus under-charged `f:oldschool`, whose candidates largely ARE the
+/// divergent cards, and traded 408 mispicks for 118 worse ones.
+fn plane_leaves_nothing_to_verify(
+    filter: &FilterExpr,
+    mode: Mode,
+    plane: Option<&PlaneExpr>,
+    indexes: &Archived<CardIndexes>,
+) -> bool {
+    matches!(filter, FilterExpr::True)
+        && plane.is_none_or(|expr| {
+            matches!(mode, Mode::Card) || !plane_expr_is_existential(expr, u64::from(indexes.planes.divergent_formats))
+        })
+}
+
 /// The candidate materialization + filter rewriting shared by `StreamedSelect`
 /// and `GatheredScan`, extracted verbatim from `run_query`. Mutates `filter` via
 /// `memoize_text_predicates` + `order_children_by_verify_cost` under the same
@@ -6670,22 +6713,7 @@ fn prepare_candidates(ctx: &QueryCtx, params: &QueryParams, filter: &mut FilterE
     // calls below and in run_query_streamed become redundant re-verification
     // of what the narrowing already established.
     //
-    // A plane-driven True residual needs one more check first: legality's
-    // planes (docs/issues/00667-engine-legality-divergent-carveout.md) are
-    // existence projections ("*some* printing matches"), unlike every other
-    // plane (card-invariant fields, true or false alike for every printing
-    // of a card). For unique=card that's exactly the semantics wanted --
-    // Mode::Card only needs *a* matching printing to exist, same as Step 2
-    // above. But Mode::Printing/Artwork enumerate individual printings, and
-    // "the card has some legal printing" does not mean "this printing is
-    // legal" -- card_pass must still run per printing there whenever the
-    // plane touched legality, so this only trusts a True residual for those
-    // modes when the plane is existential-free (plane_expr_is_existential).
-    let plane_true_for_mode =
-        plane.is_none_or(|expr| {
-            matches!(mode, Mode::Card) || !plane_expr_is_existential(expr, u64::from(ctx.indexes.planes.divergent_formats))
-        });
-    let all_match_known = (matches!(filter, FilterExpr::True) && plane_true_for_mode) || residual_exact;
+    let all_match_known = plane_leaves_nothing_to_verify(filter, mode, plane, ctx.indexes) || residual_exact;
 
     // The plane bitmap is the exact card-level truth of the plane-consumed
     // subexpression (split_planes), so it composes with the residual's
@@ -7874,18 +7902,51 @@ const COMPOSE_GATHER_SPAN_PER_MATCH: f64 = 1.47;
 /// cancelling, and dividing `est_cards` by 1.78 moved it to 0.47.
 const COMPOSE_CANDIDATE_SPAN_BIAS: f64 = 2.1;
 
-/// `balls_into_bins` with its measured bias divided out. See `COMPOSE_CARD_ESTIMATE_BIAS`.
+/// `balls_into_bins` with its measured clustering bias divided out of the BALL COUNT. See
+/// `COMPOSE_CARD_ESTIMATE_BIAS` for the 1.78 and why clustering causes it.
+///
+/// The bias used to divide the estimator's OUTPUT, which broke its ceiling. `balls_into_bins` saturates
+/// toward `domain` — that is the whole point of using it over `k.min(domain)` — so scaling what it returns
+/// caps the calibrated estimate at `domain / 1.78`, i.e. **17,701 of 31,508 cards no matter how many
+/// printings match**. `border:black` matches 85,046 of 97,206 printings and visits every card in the corpus;
+/// the estimate read 16,511.
+///
+/// Clustering does not mean "fewer cards than the estimator says". It means the `k` matching printings are
+/// not `k` independent draws — a legality leaf broadcast down sets a whole card's printings at once — so the
+/// EFFECTIVE ball count is lower. That is an input. Dividing `k` instead is the same correction in the
+/// selective regime the 1.78 was fitted on (`balls_into_bins(k, d) ≈ k` for `k ≪ d`, so scaling either side
+/// agrees) and keeps the saturation the output form destroyed. Graded against P4's realized `cards_visited`
+/// over 3,490 estimator rows, estimate/realized:
+///
+///     breadth (k / n_printings)      bias on output        bias on input
+///     selective  < 0.1               p50 1.02              p50 1.02      <- fitted here, unchanged
+///     mid        0.1-0.5             p50 0.91              p50 1.18
+///     broad      > 0.5               p50 0.52              p50 0.78
+///     all                            p50 0.87  spread 3.3  p50 0.90  spread 2.7
+///
+/// The mid band overshoots because 1.78 was fitted against the output form; it is not re-fitted here, so
+/// this is the shape change alone. Re-fitting it is a fixed-point iteration on a constant whose own value
+/// depends on where it is applied — the same caveat `fit_cost_model` records for the residual floor.
+///
+/// Why this matters for routing and not just accuracy: `eval_domain` feeds a per-card term in both scan
+/// arms, and P4's rate is 25.77 ns/card against P3's 11.63, so under-counting candidates discounts P4 by
+/// 2.2× as much. On the broad-residual class that inverted the pair — P3 measured 819.7 µs against P4's
+/// 1,308.4 with the model pricing them within 5 µs of each other.
 fn calibrated_balls_into_bins(k: usize, domain: usize) -> usize {
-    let raw = balls_into_bins(k, domain) as f64;
-    ((raw / COMPOSE_CARD_ESTIMATE_BIAS).round() as usize).max(usize::from(k > 0))
+    balls_into_bins_effective(k as f64 / COMPOSE_CARD_ESTIMATE_BIAS, domain).max(usize::from(k > 0))
 }
 
 fn balls_into_bins(k: usize, domain: usize) -> usize {
+    balls_into_bins_effective(k as f64, domain).max(usize::from(k > 0))
+}
+
+/// `domain * (1 - e^(-k/domain))` for a possibly fractional ball count, clamped to the domain.
+fn balls_into_bins_effective(k: f64, domain: usize) -> usize {
     if domain == 0 {
         return 0;
     }
-    let est = domain as f64 * (-(k as f64) / domain as f64).exp().mul_add(-1.0, 1.0);
-    (est.round() as usize).min(domain).max(usize::from(k > 0))
+    let est = domain as f64 * (-k / domain as f64).exp().mul_add(-1.0, 1.0);
+    (est.round() as usize).min(domain)
 }
 
 /// Distinct **artworks** an estimated printing set touches, projected in two stages.
@@ -8005,6 +8066,9 @@ fn mk_plan_feats(
         matches,
         eval_domain,
         scan_units,
+        residual_card_invariant: false, // diagnostic; only the candidates acquire sets it
+        // Defaults to `scan_units`: only an acquire that knows P3 examines fewer printings overrides it.
+        stream_scan_units: scan_units,
         residual_tier_ns100,
         limit: params.limit as u32,
         offset: params.page_offset as u32,
@@ -8044,6 +8108,21 @@ fn candidate_feats(ctx: &QueryCtx, params: &QueryParams, prep: &PreparedCandidat
     // where a residual survives, because roughly half the printings under a candidate then fail it.
     // Discount by the measured pass rate there; undiscounted it swapped a 2.4x under-count for a 2.6x
     // over-count. Result after both: 1.00 tight, 0.91-1.00 with a residual.
+    // Two exact-count routes were measured here and BOTH are worse than this span estimate, for one
+    // shared reason: the quantity wanted is `|candidates AND residual|`, and neither route provides an
+    // intersection.
+    //
+    // - `estimator::estimate_cardinality` (the engine already ships it, index-backed leaves, independence
+    //   over `And`): worse in every mode -- card mean |log| 1.31 against 0.79, p90 33.38 against 9.91.
+    // - `RangeCardCounts::distinct_cards`, which is genuinely EXACT and O(log n): available on only 9% of
+    //   rows with a residual (7% of the misordered ones, 2.0 of 46.5 ms of pairwise gap), and 6x worse where
+    //   it is available -- card p50 6.32 against 1.12. It counts cards matching the residual leaf GLOBALLY,
+    //   not cards matching it among the candidates, so it is exact for the wrong set.
+    //
+    // The exact answer needs the residual evaluated over the candidates, which is the work being costed. A
+    // bitmap AND of the candidate set with an indexed leaf's set would give it for that same 9%; nothing
+    // cheap covers the rest. See the candidates-acquire section of
+    // docs/issues/local-engine-loop-phase-measurement.md.
     let matches = match params.mode {
         Mode::Card => count,
         Mode::Printing | Mode::Artwork => {
@@ -8066,7 +8145,52 @@ fn candidate_feats(ctx: &QueryCtx, params: &QueryParams, prep: &PreparedCandidat
             }
         }
     };
-    mk_plan_feats(ctx, params, matches, count, scan, if prep.all_match_known { 0 } else { verify_cost_tier(filter) })
+    let mut feats =
+        mk_plan_feats(ctx, params, matches, count, scan, if prep.all_match_known { 0 } else { verify_cost_tier(filter) });
+    // Diagnostic only (`explain`), so the residual-pass-rate population can be split by traffic before any
+    // rate moves. A card-invariant residual answers `True`/`False` per card and never `PrintingDep`, so a
+    // matching candidate contributes its WHOLE printing span and a non-matching one none of it — the
+    // all-or-nothing shape. With a printing-level field in play the printings under one card disagree, which
+    // is the shape the single `RESIDUAL_PASS_RATE_*` was fitted on. Nothing reads this in routing.
+    feats.residual_card_invariant = !prep.all_match_known && !touches_printing_field(filter);
+    // A residual that is invariant WITHIN a card never goes printing-dependent: `card_pass` returns
+    // `True`/`False` and never `Tri::PrintingDep`, so `run_query_streamed` sets its per-card `all_match` for
+    // every matching card and `card_match_count` answers from span arithmetic. P3 therefore examines **no
+    // printings at all** and `printings_examined` reads exactly 0 — while the arm was charging
+    // `scan_units * STREAM_SCAN_PER_ROW_NS` for the whole candidate span.
+    //
+    // `name:s` / artwork is the measured case: `scan_units` 97,206 against a realized 0 for P3 and 60,705 for
+    // P4, so the shared feature is 1.60x for the plan that does the work and infinitely wrong for the plan
+    // that does not. That charged P3 580 us of a 1,507 us prediction against a 456 us measurement and handed
+    // the query to `GatheredScan` at 824 us — 368 us lost on one query, repeated across every orderby.
+    //
+    // This is the `all_match_known` gate one step weaker. That gate needs the whole residual to be `True`;
+    // this needs only that it cannot vary within a card, which `name:s`, `o:`, `t:` and `cmc` all satisfy
+    // while being ordinary residuals. P4's `scan_units` is deliberately untouched — it walks each candidate's
+    // span to push, so its 60,705 is real work, and this is exactly the asymmetry an argmin needs.
+    if feats.residual_card_invariant {
+        feats.stream_scan_units = 0;
+    }
+    if prep.all_match_known || feats.residual_card_invariant {
+        feats.artwork_seen_cards = 0;
+    }
+    // Same signal, second term — **measured, and NOT applied.** `run_query_streamed` answers an artwork count
+    // from a STORED per-card group count when `all_match && have_group_counts`, touching no printing, and only
+    // walks the span to dedup groups when a residual survives per printing. So `artwork_seen_cards` charging
+    // `eval_domain` unconditionally is the wrong SHAPE, and measurably the wrong sign in the fast-path regime.
+    // Artwork-minus-printing `ns_loop` delta on identical candidate sets, against a charged +1.21 ns/card:
+    //
+    //     printings_examined == 0    (stored count)   median -0.46 ns/card   n=9
+    //     printings_examined == span (dedup walk)     median +0.38 ns/card   n=8
+    //
+    // Artwork is *cheaper* than printing when the fast path fires. Gating the term on
+    // `all_match_known || residual_card_invariant` duly improved absolute agreement — P3 went from p/m
+    // 1.58-1.83 to 1.14-1.34 on those cells — and **regressed routing**: the artwork regret slice went mean
+    // 1.59 -> 1.71 us and max 185.5 -> 732.5. So the +1.21 is compensating for something else in the P3/P4
+    // artwork balance, and cannot be removed alone. That is item 6, and it needs both arms at once — the same
+    // lesson as `bench_gather_loop`'s "P4 cannot be fixed alone".
+
+    feats
 }
 
 /// The acquire step of `run_query_routed`'s three-step algorithm (see its doc
@@ -8209,7 +8333,14 @@ fn acquire_plan_features(
         // composes once, only if this plan wins (never in acquire; a legality broadcast paid here and
         // then discarded would be pure waste). `synth_printings` = broadcast down (legality) + projection
         // up (card/artwork; 0 for printing). `popcount_words` = the result-space bitmap the total scans.
-        let (printing_matches, broadcast, scatter) = compose_printing_estimate(filter, indexes, offsets, n_printings as usize);
+        //
+        // Estimated from the SAME predicate the executor will compose (`compose_source`), not from the
+        // residual. Reading the residual once a plane had consumed the filter estimated `True` — every
+        // printing in the corpus — so `matches` came back as `n_printings` for every legality query alike
+        // and compose was costed as if it returned everything for nothing. Applicability, estimate and
+        // execution have to agree on which representation this plan is being judged on.
+        let composed = compose_source(filter, unsplit, plane);
+        let (printing_matches, broadcast, scatter) = compose_printing_estimate(composed, indexes, offsets, n_printings as usize);
         // Two build kinds, charged at different rates: `broadcast` = legality broadcast-down (linear
         // pass), `scatter` = range-slice scatter (cheap). `project` = the second pass (printing→
         // card/artwork), 0 for printing mode. Keeping all three separate is what lets a bare range's
@@ -8224,7 +8355,7 @@ fn acquire_plan_features(
         // projection -- and those are the bulk of what reaches here, since `bare_range_bounds`
         // matches one comparison, not an And of two. One-sided ranges DO land here in quantity:
         // every artwork-mode one, plus card-mode ones whose orderby has no permutation.
-        let exact_cards = bare_range_bounds(filter, indexes)
+        let exact_cards = bare_range_bounds(composed, indexes)
             .and_then(|(idx, lo, hi)| range_card_counts_for(indexes, idx).and_then(|counts| counts.distinct_cards(lo, hi)));
         let est_cards =
             exact_cards.map_or_else(|| calibrated_balls_into_bins(printing_matches, n_cards as usize), |n| n as usize);
@@ -8235,7 +8366,19 @@ fn acquire_plan_features(
         // `eval_domain` and scanned 0.14x the claimed `scan_units`. Over-costing both plans inflates
         // the predicted GAP between them (P4 carries the larger per-row rates), which is what routing
         // reads -- measured as a GatheredScan-vs-StreamedSelect gap ratio of 0.32 on this acquire.
-        let scan_all = |cards: usize| ((cards as f64) * printings_per_card * COMPOSE_CANDIDATE_SPAN_BIAS) as usize;
+        // Clamped at `n_printings`, which is an INVARIANT and not a calibration: this estimates the
+        // printings under the candidate CARDS, and those are a subset of the corpus, so a value above
+        // `n_printings` is not a wrong estimate but an impossible one. `COMPOSE_CANDIDATE_SPAN_BIAS`'s 2.1
+        // says candidates are more reprinted than an average card, which is true when a composable
+        // predicate SELECTS by having a matching printing and false when it selects nearly everything —
+        // the same saturation failure `COMPOSE_CARD_ESTIMATE_BIAS` had, one multiplier downstream.
+        //
+        // `border:black` / printing reached 159,325 against a corpus of 97,206 and a realized
+        // `printings_examined` of exactly 97,206. The clamp makes that cell exact. It matters for routing
+        // because this feature is 76% of P3's arm on the broad-residual class, where it drove P3 to
+        // pred/meas 1.53 while P4 sat at 0.88 — the pair inverted, with both plans over the same feature.
+        let scan_all =
+            |cards: usize| (((cards as f64) * printings_per_card * COMPOSE_CANDIDATE_SPAN_BIAS) as usize).min(n_printings as usize);
         let (result_total, project, popcount_words, eval_domain, scan_units) = match mode {
             Mode::Printing => (printing_matches, 0, (n_printings as usize).div_ceil(64), est_cards, scan_all(est_cards)),
             Mode::Card => {
@@ -8270,7 +8413,89 @@ fn acquire_plan_features(
                 (rt, printing_matches, n_artworks.div_ceil(64), est_cards, scan_all(est_cards))
             }
         };
-        let mut feats = mk_plan_feats(ctx, params, result_total as u32, eval_domain as u32, scan_units as u32, verify_cost_tier(filter));
+        // `eval_domain` and `scan_units` describe what the MATERIALIZING alternatives walk, and when the
+        // narrowing does not shrink the candidate set they walk the whole corpus — at which point these are
+        // not badly estimated, they are estimating the wrong QUANTITY. `est_cards` is a count of MATCHING
+        // cards; `cards_visited` counts CANDIDATES, a superset whenever the narrowing is inexact. Measured
+        // against P4's `cards_visited` over 2,904 compose rows, the distribution is bimodal — 34% of rows
+        // visit every card — and on those rows:
+        //
+        //     est_cards            p10 0.43   p50 0.65   p90 0.83   mean |log| 0.454
+        //     n_cards              p10 1.00   p50 1.00   p90 1.00   mean |log| 0.000
+        //
+        // Exact by construction, not calibrated. Overall mean |log| 0.370 -> 0.216. Both plans visited the
+        // SAME card count on 100% of rows, which is also why this feature does not want splitting per plan.
+        //
+        // Predicted with the predicate and the constant the sibling `PrintingRangeScan` branch already uses
+        // for the identical decision — no new constant. Scored against the realized flag, `printing_matches`
+        // over `MAX_NARROW_FRACTION` (0.25) of `n_printings` catches **98%** of full-scan rows at 87%
+        // accuracy, beating every threshold on the two alternative signals tried. Its 26% false positives
+        // over-cost both materializing plans by the same factor, which an argmin largely absorbs; the false
+        // negatives are what were losing `GatheredScan vs StreamedSelect`, so recall is the side to favour.
+        let (eval_domain, scan_units) = if range_too_broad_to_narrow(printing_matches, n_printings as usize) {
+            (n_cards as usize, n_printings as usize)
+        } else {
+            (eval_domain, scan_units)
+        };
+        // The tier is what the MATERIALIZING alternatives pay per candidate, so it must be asked about
+        // the predicate THEY see (`filter` + `plane`), not about `composed` — and gated exactly as
+        // `prepare_candidates` gates it, or the router charges a `card_pass` the kernels will skip. On a
+        // card-invariant legality format `card_pass` resolves at card level for every card, so
+        // `printings_examined` reads 0 and both the per-card residual and the per-row scan are dead
+        // terms; charging them anyway was 92-94% of P3's predicted cost on `f:modern`, `f:gladiator`,
+        // `f:commander` and `f:predh`. `residual_exact` is unavailable here (this branch never narrows),
+        // so this is the conservative half of the executor's disjunction: it can over-charge, never under.
+        let nothing_to_verify = plane_leaves_nothing_to_verify(filter, mode, plane, indexes);
+        let tier = if nothing_to_verify { 0 } else { verify_cost_tier(composed) };
+        // `GatheredScan` walks every printing of every candidate card, so its scan feature is the candidate
+        // SPAN. `scan_all` estimates that span as `est_cards x` the corpus-average printings-per-card `x 2.1`,
+        // which is the right shape only when candidates are an average sample. With nothing to verify they
+        // are not: every printing of a matching card matches, so the span IS `printing_matches` — exact,
+        // and already computed above for compose's own estimate. Graded against P4's realized
+        // `printings_examined` over 597 card-invariant compose queries:
+        //
+        //     scan_units (shipped)   p10 1.13   p50 1.76   p90 5.08
+        //     printing_matches       p10 0.68   p50 0.93   p90 3.08
+        //
+        // A 1.76x over-charge on the dominant term of P4's arm, which is what makes P3 win where P4 is
+        // better: `StreamedSelect -> GatheredScan` is the largest regret slice on this acquire. Scoped to
+        // the same boolean as the tier because the grading inverts on the other population — with a real
+        // residual `scan_units` is right at p50 0.97 and `printing_matches` badly under at 0.39.
+        //
+        // Fixes the BIAS, not the spread: both rows read p90/p10 4.5, so what remains is the candidate
+        // count's own variance (`eval_domain` grades p90/p10 3.1 here) and is not a scan-feature problem.
+        let scan_units = if nothing_to_verify { printing_matches } else { scan_units };
+        let mut feats = mk_plan_feats(ctx, params, result_total as u32, eval_domain as u32, scan_units as u32, tier);
+        // What `StreamedSelect` actually examines here, which is NOT `scan_units`. P4 walks a card's whole
+        // span to push every match; P3's `card_match_count` answers from span arithmetic for every card
+        // `card_pass` resolves at card level, and on a legality-composed filter that is every non-divergent
+        // card -- 556 of 31,508 in production diverge, all in `oldschool`. So P3 examines printings only for
+        // the divergent remainder plus the boundary cards, measured at 0.10-0.26x of P4's count where
+        // `scan_units` claimed parity: 7,770 against 73,783 on `f:modern`, 5,876 against 54,213 on
+        // `f:gladiator`.
+        //
+        // Estimated as the divergent SHARE of the candidate span rather than a fitted fraction, because the
+        // engine holds the set: `legal_divergent`. For a filter with no legality leaf the share is 1.0 and
+        // this reduces to `scan_units`, which the same sweep showed is right to 1.0-2.4x on `border:black`,
+        // `r:mythic` and `watermark:*` -- so the correction is confined to the case that measured wrong.
+        feats.stream_scan_units = if tier == 0 {
+            // Nothing to verify: `card_match_count` answers every card from span arithmetic and examines
+            // no printings whatsoever. Reported as 0 so `bench_feature_accuracy` grades this against the
+            // realized `printings_examined` (also 0) instead of against a scan that never happens. The
+            // arm multiplies the term by zero on the same signal, so this changes no cost — only whether
+            // the feature can be graded honestly.
+            0
+        } else if filter_touches_legality(composed) {
+            let divergent = indexes.legal_divergent.len() as f64;
+            let share = (divergent / f64::from(n_cards)).min(1.0);
+            // Floored at one printing per candidate: with a divergent format in play the kernel does
+            // examine the boundary printing of the cards it matches, which the share alone would put at
+            // zero. Only reachable now when there IS something to verify, which is the case the floor was
+            // argued for -- the `tier == 0` arm above is where it used to be wrong.
+            ((scan_units as f64) * share).max(eval_domain as f64) as u32
+        } else {
+            scan_units as u32
+        };
         feats.broadcast_printings = broadcast as u32;
         feats.scatter_printings = scatter as u32;
         feats.project_printings = project as u32;
@@ -9158,17 +9383,44 @@ fn run_query_streamed<'a>(
     for cid in card_ids {
         n_cards_visited += 1;
         let card = &cards[cid as usize];
-        // #634 Step 1: skip the redundant card_pass re-derivation of Tri::True
-        // when the narrowing already proved every candidate matches. Gated
-        // off for Mode::Artwork specifically: measured a ~45% regression for
-        // `t:creature` unique=artwork with this applied unconditionally here
-        // (0.13ms -> 0.19ms typical, isolated by bisecting call sites) despite
-        // being a no-op change in card_pass's own return value (True either
-        // way) — an unexplained codegen/scheduling effect in this loop for
-        // that mode specifically, not a logical cost. Card/Printing modes
-        // showed no such effect and do benefit (this loop visits every
-        // candidate, not just the ~limit emitted).
-        let all_match = (all_match_known && !matches!(mode, Mode::Artwork))
+        // #634 Step 1: skip the redundant card_pass re-derivation of Tri::True when the narrowing has
+        // already proved every candidate matches.
+        //
+        // **This was gated OFF for `Mode::Artwork`, and the gate is now removed (2026-08-04).** Its comment
+        // cited a ~45% regression on `t:creature`/artwork (0.13ms -> 0.19ms) from applying the skip here,
+        // called it "an unexplained codegen/scheduling effect ... not a logical cost", and said it was
+        // "isolated by bisecting call sites" — i.e. across builds, the one instrument this engine has
+        // repeatedly shown cannot resolve an effect that size and will hand you the wrong sign (see trap 1
+        // in docs/workflows/diagnosing-a-plan-cost-error.md).
+        //
+        // Re-measured with a runtime toggle inside ONE binary, `unique=artwork`, limit 175:
+        //
+        //     query         gate on      gate off    speedup
+        //     o:this        1047.7 us      47.5 us     22.1x
+        //     o:target       556.6         30.1        18.5x
+        //     o:creature    1010.5         56.6        17.9x
+        //     t:creature      84.1         43.0         2.0x   <- the query the gate existed to protect
+        //     o:flying        24.1         13.5         1.8x
+        //     c:r             32.2         18.5         1.7x
+        //     t:land          15.5         12.1         1.3x
+        //
+        // Every cell is faster and the cited regression does not reproduce in either direction. The cost was
+        // worst for an expensive residual: `o:creature` ran a full oracle-text containment check over all
+        // 23,155 candidates the narrowing had already proved matched, which is why the same query in printing
+        // mode — identical candidate set, identical span, `card_pass` skipped — took 56.7 us against
+        // artwork's 1010.5. That query was the single largest routing regret in the engine at 508.9 us, and
+        // the cost model was right about it throughout: it charges `tier = 0` here, because `all_match_known`
+        // is supposed to mean no `card_pass` runs.
+        //
+        // Row identity is what an `all_match` mistake breaks silently in this mode — totals do not move, the
+        // printing that REPS each artwork group does. 1,134 cells over 21 predicates x 3 modes x 3 orderbys x
+        // 3 pages x 2 prefers, hashing the returned `scryfall_id` sequence: **identical**, 378 of them
+        // artwork, including the existential-plane shapes (`f:*`, `border:*`, `r>=rare`, `watermark:*`,
+        // `-f:modern`) where a card-level True does not imply every printing matches. Soundness rests on
+        // `all_match_known` itself, which already refuses an existential plane outside card mode via
+        // `plane_leaves_nothing_to_verify`, and only trusts `residual_exact` when the narrowing was not
+        // printing-space.
+        let all_match = all_match_known
             || match filter.card_pass(card, strings, &mut residual, &mut residual_is_or) {
                 Tri::False | Tri::Null => continue,
                 Tri::True => true,
@@ -9646,7 +9898,10 @@ fn acquire_facts_to_pydict<'py>(py: Python<'py>, f: &AcquireFacts) -> PyResult<B
         ("matches", g.matches),
         ("n_printings", g.n_printings),
         ("scan_units", g.scan_units),
+        // P3's own scan estimate; equals `scan_units` unless the acquire knew the two plans differ.
+        ("stream_scan_units", g.stream_scan_units),
         ("residual_tier_ns100", g.residual_tier_ns100),
+        ("residual_card_invariant", u32::from(g.residual_card_invariant)),
         ("limit", g.limit),
         ("offset", g.offset),
         ("broadcast_printings", g.broadcast_printings),
@@ -10428,6 +10683,8 @@ mod bench_compose_paging;
 mod bench_compose_card_projection;
 #[cfg(test)]
 mod bench_candidate_materialize;
+#[cfg(test)]
+mod bench_loop_design;
 #[cfg(test)]
 mod bench_gather_loop;
 #[cfg(test)]

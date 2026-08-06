@@ -105,6 +105,31 @@ pub(crate) struct PlanFeatures {
     /// non-matching cards dominate either way) and decisive under an exact one, which is why the plane
     /// branch of `acquire_plan_features` sets this field itself rather than taking the span estimate.
     pub scan_units: u32,
+    /// `scan_units` for `StreamedSelect` specifically, where that plan examines a DIFFERENT number of
+    /// printings from `GatheredScan` on the same query. One per-query field cannot serve both: P4's
+    /// `push_card_matches` must walk a card's span to push every match, while P3's `card_match_count`
+    /// answers from span arithmetic for every card `card_pass` resolves outright.
+    ///
+    /// Measured on the compose acquire, `scan_units` against the realized `printings_examined`:
+    ///
+    ///     f:modern / artwork      GatheredScan 101,716 / 73,783 = 1.38    StreamedSelect 101,716 / 7,770 = 13.09
+    ///     f:gladiator / artwork    88,026 / 54,213 = 1.62                  88,026 /  5,876 = 14.98
+    ///
+    /// Right for P4 to within 1.4-1.6x, wrong for P3 by 13-15x, and `scan_units * STREAM_SCAN_PER_ROW_NS`
+    /// is then 525 us of P3's 704 us prediction against a 91 us measured loop. That is a FEATURE error, the
+    /// one class no rate can absorb — unlike the residual floor, whose kernel-vs-traffic gap turned out to
+    /// be a cache artifact.
+    ///
+    /// Set by the acquire branch that knows the difference; `mk_plan_feats` defaults it to `scan_units`, so
+    /// a branch that has not been taught reads exactly as before.
+    pub stream_scan_units: u32,
+    /// Diagnostic: the residual compares only CARD-level fields, so `card_pass` answers `True`/`False`
+    /// per card and never `PrintingDep`. A matching candidate then contributes its whole printing span and
+    /// a non-matching one none of it, which is a different estimator shape from one where printings under a
+    /// single card disagree — and the latter is what `RESIDUAL_PASS_RATE_PRINTING`/`_ARTWORK` was fitted on.
+    /// Exposed so `matches`'s error can be split by population before any rate is touched. **Nothing in
+    /// `plan_cost` reads this.**
+    pub residual_card_invariant: bool,
     /// Per-card verify cost of the residual, ns×100 (`verify_cost_tier`); `0`
     /// when `all_match_known` (the walk skips `card_pass` entirely).
     pub residual_tier_ns100: u32,
@@ -401,6 +426,23 @@ const STREAM_SCAN_PER_ROW_NS: f64 = 5.97;
 /// That same regression also shows the residual's cost is per CARD, not per printing scanned: the
 /// SLOPE against printings-per-card is ~3.5 for every tier including none (P4) and ~2 for P3, i.e.
 /// independent of what the residual is. So the tier belongs on `eval_domain`, as it now sits.
+/// **Measured with a built design 2026-08-04, and NOT changed — the useful part is why.** The floor only
+/// ever binds on `MASK_COMPARE` (tier 4.00); every other tier exceeds 6.58 and `max` takes the tier. So
+/// `bench_streamed_loop`'s always-true `DateCmp` cells are exactly the population it governs, and they say
+/// the residual's per-card cost is 2.45 ns (printing/residual 4.97 less printing/all_match 2.52) against a
+/// charged `CARD_PASS + floor` of 9.05 — i.e. the `card_pass` call IS the whole cost and the mask compare
+/// adds nothing measurable.
+///
+/// Traffic disagrees, and traffic wins on levels: the fitted `CARD_PASS+FLOOR` column reads **8.19 against
+/// the shipped 9.05 (0.90)** for this arm and **21.59 against 21.89 (0.99)** for `GatheredScan`. Both
+/// floors are already right to within 10% and 1%.
+///
+/// That is the third time this file has caught the same artifact. The design measures an always-true
+/// predicate over chunk-rotated slices; production runs real residuals over a warmer archive, and the two
+/// differ by 3.3x here exactly as they differed by 1.6-2.2x in the retraction at the top of
+/// `bench_streamed_loop`. Shape from a built design, levels from traffic — the design's contribution is
+/// the SHAPE finding that the tier adds ~0 over the call for the cheapest class, which is worth knowing
+/// and is not a licence to move the level.
 const STREAM_RESIDUAL_FLOOR_NS: f64 = 6.58;
 /// ns per match, for the permutation-walk emit. Small — P3 measured nearly flat
 /// in match count once eval_domain is fixed (see STREAM_MATCH_PHASE_PER_CARD_NS),
@@ -780,7 +822,7 @@ pub(crate) fn plan_cost(plan: PhysicalPlan, f: &PlanFeatures) -> f64 {
                 * (STREAM_LOOP_PER_CARD_NS
                     + if tier_ns > 0.0 { STREAM_CARD_PASS_NS + tier_ns.max(STREAM_RESIDUAL_FLOOR_NS) } else { 0.0 })
                 // Only with a residual does P3 walk printings; see STREAM_SCAN_PER_ROW_NS.
-                + if tier_ns > 0.0 { scan_units * STREAM_SCAN_PER_ROW_NS } else { 0.0 }
+                + if tier_ns > 0.0 { f64::from(f.stream_scan_units) * STREAM_SCAN_PER_ROW_NS } else { 0.0 }
                 + matches * STREAM_EMIT_PER_MATCH_NS
                 + perm_steps * STREAM_PERM_STEP_NS
                 + f64::from(f.artwork_seen_cards) * STREAM_ARTWORK_SEEN_PER_CARD_NS
