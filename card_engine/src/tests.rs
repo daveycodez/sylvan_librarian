@@ -7,7 +7,7 @@ use super::{
     build_artist_index, build_printing_value_index, build_arith_tuple_index, is_arith_tuple_route, range_candidates, narrow_candidates, narrow_candidates_exact, rarity_candidates,
     range_too_broad_to_narrow, run_query, run_query_with_plan, explain, explain_analyze, AcquireFacts, PlanEstimate, PlanTrial,
     acquire_plan_features, take_phase_stats, PagingTaken, CountSource, NarrowedRepr,
-    EXACT_VALUE_TOTALS, RangeCardCounts, narrow_rec, ValueTotals, build_all_value_totals, build_range_card_counts, exact_result_total,
+    EXACT_VALUE_TOTALS, RangeCardCounts, narrow_rec, ValueTotals, PairTotals, build_all_value_totals, build_pair_totals, build_range_card_counts, exact_result_total,
     PhysicalPlan, ComposePaging, trigram_candidates, finalize_trigram_index, PrintingValueIndex, NARROW_FLOOR,
     gathered_scan_applicable, streamed_select_applicable, plane_popcount_order_applicable, printing_range_scan_applicable,
     walk_printing_page, aligned_page, bare_range_bounds, probe_range_k, printing_range_fastpath, sort_key_bits, orderby_to_col, SortCol, STREAM_MIN_MATCHES,
@@ -2497,6 +2497,14 @@ fn fuzz_store_n(rng: &mut rand::rngs::SmallRng, ncards: usize) -> CardData {
     // read an exact ZERO from an empty-but-"complete" table, which is a wrong total rather than a missing
     // one. `format_shifts` comes from the data, not the global registry, so the keys match what `bind`
     // resolved against.
+    data.indexes.pair_totals = build_pair_totals(
+        &data.cards,
+        &data.printings,
+        &p2c,
+        &data.strings,
+        &data.coll_vocab,
+        usize::from(data.indexes.max_artwork_groups),
+    );
     data.indexes.value_totals = build_all_value_totals(
         &data.cards,
         &data.printings,
@@ -6260,6 +6268,7 @@ fn bench_checked_vs_unchecked_access() {
         collector_number_cards: RangeCardCounts::default(),
         rarity_cards:   RangeCardCounts::default(),
         value_totals:   ValueTotals::default(),
+        pair_totals:    PairTotals::default(),
         sort_perms:     build_sort_permutations(&cards),
         max_artwork_groups: artwork_groups.iter().copied().max().unwrap_or(0),
         artwork_groups,
@@ -7338,7 +7347,7 @@ fn set_watermark_compose_leaves() {
         // The estimate feeds plan choice and must be a valid upper bound on the true match count
         // (AND takes the min-of-children intersection bound, OR the capped sum — never an
         // undercount, which would misprice the plan). For a bare leaf it's exact (postings length).
-        let (est_matches, _, _) = super::compose_printing_estimate(f, &archived.indexes, &archived.offsets, n_printings);
+        let est_matches = super::compose_printing_estimate(f, &archived.indexes, &archived.offsets, n_printings).result;
         assert!(est_matches >= want.len(), "compose_printing_estimate undercounts for {label}: {est_matches} < {}", want.len());
         if matches!(f, FilterExpr::TextExact { .. } | FilterExpr::Not(_)) {
             assert_eq!(est_matches, want.len(), "bare-leaf estimate must be exact for {label}");
@@ -7478,7 +7487,7 @@ fn collection_compose_leaves() {
         want.sort_unstable();
         assert_eq!(got, want, "compose_printing_bits disagrees with the residual path for {label}");
         // The estimate feeds plan choice: a valid upper bound at minimum, and exact for a bare leaf.
-        let (est_matches, _, _) = super::compose_printing_estimate(f, &archived.indexes, &archived.offsets, n_printings);
+        let est_matches = super::compose_printing_estimate(f, &archived.indexes, &archived.offsets, n_printings).result;
         assert!(est_matches >= want.len(), "compose_printing_estimate undercounts for {label}: {est_matches} < {}", want.len());
         if matches!(f, FilterExpr::CollectionCmp { .. } | FilterExpr::Not(_)) {
             assert_eq!(est_matches, want.len(), "bare collection-leaf estimate must be exact for {label}");
