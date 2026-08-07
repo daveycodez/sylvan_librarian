@@ -61,6 +61,66 @@ class TestUpsertCardsStatus:
 
 
 # ---------------------------------------------------------------------------
+# Boolean-backed is: tags (reserved / game_changer)
+# ---------------------------------------------------------------------------
+
+
+def _is_tags_for(api_resource: APIResource, scryfall_id: str) -> dict:
+    with api_resource._conn_pool.connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT card_is_tags FROM magic.cards WHERE scryfall_id = %(sid)s",
+            {"sid": scryfall_id},
+        )
+        row = cursor.fetchone()
+    return row["card_is_tags"] if row else {}
+
+
+class TestBooleanIsTags:
+    """reserved/game_changer booleans on bulk cards sync into card_is_tags both ways."""
+
+    def test_reserved_boolean_lands_as_is_tag(self, api_resource: APIResource) -> None:
+        card = make_raw_card(name="Reserved Import Test")
+        card["reserved"] = True
+        api_resource._upsert_cards([card])
+        assert _is_tags_for(api_resource, card["id"]).get("reserved") is True
+
+    def test_game_changer_boolean_lands_as_gamechanger(self, api_resource: APIResource) -> None:
+        card = make_raw_card(name="Bracket Import Test")
+        card["game_changer"] = True
+        api_resource._upsert_cards([card])
+        tags = _is_tags_for(api_resource, card["id"])
+        assert tags.get("gamechanger") is True
+        assert "reserved" not in tags
+
+    def test_flag_removal_strips_the_tag(self, api_resource: APIResource) -> None:
+        # A card leaving the game-changer roster must lose the tag on reimport.
+        card = make_raw_card(name="Debracketed Test")
+        card["game_changer"] = True
+        api_resource._upsert_cards([card])
+        del card["game_changer"]
+        card["oracle_text"] = "changed so the reimport writes"
+        api_resource._upsert_cards([card])
+        assert "gamechanger" not in _is_tags_for(api_resource, card["id"])
+
+    def test_sync_preserves_unrelated_is_tags(self, api_resource: APIResource) -> None:
+        card = make_raw_card(name="Historic Bystander Test")
+        card["reserved"] = True
+        api_resource._upsert_cards([card])
+        with api_resource._conn_pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                """UPDATE magic.cards SET card_is_tags = card_is_tags || '{"historic": true}'::jsonb
+                   WHERE scryfall_id = %(sid)s""",
+                {"sid": card["id"]},
+            )
+            conn.commit()
+        card["oracle_text"] = "changed so the reimport writes"
+        api_resource._upsert_cards([card])
+        tags = _is_tags_for(api_resource, card["id"])
+        assert tags.get("historic") is True
+        assert tags.get("reserved") is True
+
+
+# ---------------------------------------------------------------------------
 # _CardStream counting tests
 # ---------------------------------------------------------------------------
 

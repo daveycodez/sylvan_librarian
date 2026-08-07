@@ -300,6 +300,16 @@ DEFAULT_RESULT_FIELDS: tuple[str, ...] = (
     "type_line",
 )
 
+# is: values Scryfall ships as BOOLEANS on every bulk card object, so their
+# membership rides the ordinary import stream -- no per-tag API sweep, unlike
+# CUSTOM_IS_TAGS below. Maps the bulk-data field name to the is: tag key.
+# Synced both ways by _sync_boolean_is_tags: a card leaving the list (the
+# game_changer roster moves with WotC's Commander brackets) loses the tag.
+BOOLEAN_IS_TAGS: dict[str, str] = {
+    "reserved": "reserved",
+    "game_changer": "gamechanger",
+}
+
 CUSTOM_IS_TAGS = [
     "historic",  # artifact, legendary, saga
     "pathway",  # land and name contains pathway
@@ -2181,6 +2191,60 @@ class APIResource:
             "message": f"Successfully updated {updated_count} cards with is:{is_tag}",
         }
 
+    def _sync_boolean_is_tags(self, ids_by_tag: dict[str, set[str]], conn: Connection) -> dict[str, int]:
+        """Sync the boolean-backed is: tags (BOOLEAN_IS_TAGS) from the import stream.
+
+        Adds each tag to the printings whose bulk object carried the boolean and strips
+        it from printings no longer carrying it, so list churn (a card entering or
+        leaving the game-changer roster) converges on every import.
+
+        Args:
+        ----
+            ids_by_tag (dict): tag key -> scryfall ids seen with the boolean set.
+            conn (Connection): open connection; committed per tag.
+
+        Returns:
+        -------
+            Dict[str, int]: rows changed per tag (adds plus removals).
+
+        """
+        changed: dict[str, int] = {}
+        with conn.cursor() as cursor:
+            for tag, ids in ids_by_tag.items():
+                new_tag = orjson.dumps({tag: True}).decode("utf-8")
+                id_list = sorted(ids)
+                cursor.execute(
+                    """
+                    UPDATE
+                        magic.cards
+                    SET
+                        card_is_tags = card_is_tags || %(new_tag)s::jsonb
+                    WHERE
+                        scryfall_id = ANY(%(scryfall_ids)s) AND
+                        not(card_is_tags @> %(new_tag)s::jsonb)
+                    """,
+                    {"scryfall_ids": id_list, "new_tag": new_tag},
+                )
+                rows = cursor.rowcount
+                cursor.execute(
+                    """
+                    UPDATE
+                        magic.cards
+                    SET
+                        card_is_tags = card_is_tags - %(tag)s
+                    WHERE
+                        card_is_tags ? %(tag)s AND
+                        NOT (scryfall_id = ANY(%(scryfall_ids)s))
+                    """,
+                    {"scryfall_ids": id_list, "tag": tag},
+                )
+                rows += cursor.rowcount
+                conn.commit()
+                changed[tag] = rows
+                if rows:
+                    logger.info("Synced boolean is:%s on %d printings", tag, rows)
+        return changed
+
     def _add_is_tag_to_printings(self, *, is_tag: str) -> dict[str, Any]:
         """Add a specific is: tag to all printings matching that tag using Scryfall search.
 
@@ -2563,15 +2627,19 @@ class APIResource:
                     self._set_statement_timeout(cursor, 30_000)
 
                 class _CardStream:
-                    """Preprocesses raw cards lazily, tracking stage counts."""
+                    """Preprocesses raw cards lazily, tracking stage counts and boolean is: tags."""
 
                     def __init__(self) -> None:
                         self.raw = 0
                         self.preprocessed = 0
+                        self.boolean_tag_ids: dict[str, set[str]] = {tag: set() for tag in BOOLEAN_IS_TAGS.values()}
 
                     def __iter__(self) -> Iterator[dict[str, Any]]:
                         for card in cards:
                             self.raw += 1
+                            for field, tag in BOOLEAN_IS_TAGS.items():
+                                if card.get(field) and card.get("id"):
+                                    self.boolean_tag_ids[tag].add(card["id"])
                             for processed in preprocess_card(card):
                                 self.preprocessed += 1
                                 yield processed
@@ -2599,6 +2667,9 @@ class APIResource:
                     )
 
                 conn.commit()
+
+                if cards_sent:
+                    self._sync_boolean_is_tags(stream.boolean_tag_ids, conn)
 
                 if cards_sent == 0:
                     if stream.raw == 0:
