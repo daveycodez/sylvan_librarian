@@ -1,6 +1,9 @@
 # Engine: bitmap match phase + per-orderby permutation streaming
 
-Status: written up 2026-07-07 (design discussion following PR #618), not started. GitHub: #619.
+**DONE — shipped; #619 is closed.** `PhysicalPlan::StreamedSelect` and `build_sort_permutations` are in
+`card_engine/src/lib.rs`. The unchecked boxes below are the original plan, not outstanding work.
+
+*Original status, kept for dating* — written up 2026-07-07, design discussion following PR #618.
 
 ## Problem
 
@@ -97,7 +100,7 @@ this is not an approximate-counts design.
 - [00620-engine-flavor-text-narrowing.md](00620-engine-flavor-text-narrowing.md) — the
   other big tail item; independent, composes (its narrowing feeds this match
   phase)
-- [done/00603-engine-card-printing-split.md](done/00603-engine-card-printing-split.md) —
+- [00603-engine-card-printing-split.md](00603-engine-card-printing-split.md) —
   candidate spaces, contiguous printing ranges, prefer walk this reuses
 - PR #609 / #618 — measured-constant-instead-of-cost-model precedent for the
   popcount planner threshold; the ~2× random-access penalty measured there is

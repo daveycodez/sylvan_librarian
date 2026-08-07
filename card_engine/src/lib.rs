@@ -1647,7 +1647,7 @@ fn arith_tuple_narrow(filter: &FilterExpr, idx: &Archived<ArithTupleIndex>, n_ca
     if count > *BITS_PROMOTE {
         return Narrowed::tight(Candidates::CardBits(scatter_bits(post_ids(), n_cards)));
     }
-    // The case that prompted docs/issues/local-engine-candidate-materialize.md: up to 564 posting rows
+    // The case that prompted docs/issues/done/local-engine-candidate-materialize.md: up to 564 posting rows
     // concatenated, each sorted, the whole never so. Only reachable below `BITS_PROMOTE`, since the arm
     // above already hands back a bitmap past it.
     Narrowed::tight(Candidates::Cards(sorted_ids(post_ids(), count, n_cards)))
@@ -2777,7 +2777,7 @@ impl ArchivedPrintingValueIndex {
 /// and the two differ by the local printing:card ratio — measured 1.0 to 4.3 across the corpus, worst
 /// where reprint density is highest. `CardRangePopcount`'s acquire has stood in `k.min(n_cards)` (the
 /// in-range printing count clamped), which over-estimates a median 1.49x and up to 4.33x. See
-/// docs/issues/local-engine-range-cardinality-estimate.md for the estimators that were tried and why
+/// docs/issues/done/local-engine-range-cardinality-estimate.md for the estimators that were tried and why
 /// none of them work: distinct-card counts do not compose by arithmetic, because one card spans many
 /// values, so nothing derived from a coarser summary is exact.
 ///
@@ -3201,7 +3201,7 @@ const MATERIALIZE_BITMAP_RATIO: usize = 490;
 /// Ids must also be `< domain`; `scatter_bits` would panic otherwise, which is the loud failure.
 ///
 /// Same output either way given that, so this is a pure cost choice with no consumer effect. See
-/// `MATERIALIZE_BITMAP_RATIO`, and docs/issues/local-engine-candidate-materialize.md for the k-way merge
+/// `MATERIALIZE_BITMAP_RATIO`, and docs/issues/done/local-engine-candidate-materialize.md for the k-way merge
 /// that lost to both by 3-30x.
 fn sorted_ids(ids: impl Iterator<Item = u32>, k: usize, domain: usize) -> Vec<u32> {
     let bitmap = *RANGE_MATERIALIZE_BITMAP && k.saturating_mul(MATERIALIZE_BITMAP_RATIO) > domain;
@@ -3710,7 +3710,7 @@ impl Candidates {
     /// events: `or_all` can scatter a vec-shaped arm into bits, hiding a sort that did
     /// happen, and a bits-shaped arm can be extracted into a vec by `and_all`. Exact
     /// per-site accounting needs the shared materialization helper that
-    /// docs/issues/local-engine-candidate-materialize.md proposes.
+    /// docs/issues/done/local-engine-candidate-materialize.md proposes.
     fn repr(&self) -> NarrowedRepr {
         match self {
             Candidates::Cards(_) => NarrowedRepr::Cards,
@@ -5869,7 +5869,7 @@ static RANGE_BREADTH_VS_CORPUS: LazyLock<bool> = LazyLock::new(|| guard_env("CAR
 /// candidate bound: an exact 0 was collapsing `eval_domain`/`scan_units` for the MATERIALIZING
 /// alternatives, pricing `GatheredScan` at 0.2 us against a measured 199.3 us, because a plan still has
 /// to scan to discover a set is empty. With the split it is neutral in aggregate and it is what lets
-/// `LEGALITY_SCAN_SCOPE` be on -- docs/issues/local-engine-pair-totals.md.
+/// `LEGALITY_SCAN_SCOPE` be on -- docs/issues/done/local-engine-pair-totals.md.
 static PAIR_TOTALS: LazyLock<bool> = LazyLock::new(|| guard_env("CARD_ENGINE_PAIR_TOTALS", 1u8) != 0);
 
 /// Whether the legality divergent-share correction to `stream_scan_units` is scoped to filters whose
@@ -9287,7 +9287,7 @@ fn declined_sibling_fastpath<'a>(
 /// `eval_domain` to the unnarrowed universe charges a walk-shaped compose for a full-corpus gather
 /// — measured at 33x over-costed from the `PrintingRangeScan` acquire (~125 µs predicted against
 /// ~2.4 µs measured on `usd>20`/printing), which is enough to rank compose last and leave a 46x
-/// faster plan unused. See docs/issues/local-engine-plan-misselection.md.
+/// faster plan unused. See docs/issues/done/local-engine-plan-misselection.md.
 /// The permutation-free gather branch's two decline gates: `Some(reason)` if `printing_compose_fastpath`
 /// will refuse this query, `None` if it will run it.
 ///
@@ -9623,7 +9623,7 @@ fn candidate_feats(ctx: &QueryCtx, params: &QueryParams, prep: &PreparedCandidat
     // The exact answer needs the residual evaluated over the candidates, which is the work being costed. A
     // bitmap AND of the candidate set with an indexed leaf's set would give it for that same 9%; nothing
     // cheap covers the rest. See the candidates-acquire section of
-    // docs/issues/local-engine-loop-phase-measurement.md.
+    // docs/issues/done/local-engine-loop-phase-measurement.md.
     let matches = match params.mode {
         Mode::Card => count,
         Mode::Printing | Mode::Artwork => {
@@ -9781,7 +9781,12 @@ fn acquire_plan_features(
         // Exact distinct cards from the per-value table when it can answer this shape — every op but
         // `Eq` is one-sided, and `Eq` is a single value, so the only fallback is `year:Y`, which spans
         // a whole year of release dates. The `k.min(n_cards)` proxy it falls back to over-estimates a
-        // median 1.49x (docs/issues/local-engine-range-cardinality-estimate.md).
+        // median 1.49x (docs/issues/done/local-engine-range-cardinality-estimate.md).
+        //
+        // A FUSED two-sided range never arrives here at all: `bare_range_bounds` gates this branch and does
+        // not match `And`, so `usd>=a usd<=b` is declined upstream by `exact_result_total` in every mode and
+        // its card/artwork totals come from compose's projection instead. Both interior-interval shapes are
+        // docs/issues/00853-engine-interior-range-distinct-counts.md.
         let card_est = range_card_counts_for(indexes, idx)
             .and_then(|counts| counts.distinct_cards(lo, hi))
             .unwrap_or_else(|| k.min(n_cards));
@@ -10461,7 +10466,7 @@ pub(crate) struct PlanTrial {
     pub(crate) predicted_ns: f64,
     /// Both carried through from `PlanEstimate` unchanged — see its fields. `picked` in particular
     /// is the router's choice, which is NOT necessarily the fastest `trials_ns`: that difference is
-    /// the whole point of docs/issues/local-engine-plan-misselection.md.
+    /// the whole point of docs/issues/done/local-engine-plan-misselection.md.
     pub(crate) materialize_ns: f64,
     pub(crate) picked: bool,
     pub(crate) trials_ns: Vec<u64>,
@@ -12281,3 +12286,5 @@ mod bench_loop_design;
 mod bench_gather_loop;
 #[cfg(test)]
 mod bench_streamed_loop;
+#[cfg(test)]
+mod bench_membership_check;
