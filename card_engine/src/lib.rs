@@ -3959,7 +3959,13 @@ fn narrow_candidates_exact(
         Some(n) => {
             let printing_space = n.set.is_printing_space();
             let domain = if printing_space { n_printings } else { n_cards };
-            if n.set.len() <= domain - domain / 4 {
+            // Breadth is a reason to discard a LOOSE set: the walk would pay union, projection and
+            // materialization and then still verify every candidate, so a near-total loose set is worse
+            // than no narrowing at all. It is not a reason to discard a TIGHT card-space one, where
+            // keeping it removes verification entirely -- 23,675 candidates with no card_pass beats
+            // 31,508 with a full oracle-text memmem each, and not narrowly. (#860)
+            let worth_keeping = n.set.len() <= domain - domain / 4 || (n.tight && !printing_space);
+            if worth_keeping {
                 // The mask is only meaningful alongside the set it was derived from: discarding the set
                 // for broadness discards the proof with it.
                 (Some(n.set), n.tight && !printing_space, n.proven)
@@ -4453,16 +4459,17 @@ fn narrow_rec(
             if word.len() >= 3
                 && matches!(field, TextSearchField::NameLower | TextSearchField::OracleTextLower) =>
         {
-            // Trigram candidates are supersets (false positives until the walk
-            // verifies), so these sets are loose.
+            // A needle of exactly 3 bytes is exactly ONE trigram, so the posting list IS the containment
+            // set — no false positives to verify away. At 4+ bytes the intersection of several trigrams
+            // really is a superset ("the" AND "her" without "ther"), so those stay loose. (#859)
+            let mk = if word.len() == 3 { Narrowed::tight } else { Narrowed::loose };
             match field {
-                TextSearchField::NameLower => trigram_candidates(&indexes.name_trigram, word)
-                    .and_then(|v| Narrowed::loose(Candidates::Cards(v))),
+                TextSearchField::NameLower => trigram_candidates(&indexes.name_trigram, word).and_then(|v| mk(Candidates::Cards(v))),
                 // Oracle postings are in dense text-id space (see OracleTextIndex);
                 // intersect there, then expand the survivors to card indices
                 // through the CSR table.
                 _ => trigram_candidates(&indexes.oracle_trigram.trigrams, word)
-                    .and_then(|text_ids| Narrowed::loose(Candidates::Cards(expand_text_ids(&indexes.oracle_trigram, &text_ids)))),
+                    .and_then(|text_ids| mk(Candidates::Cards(expand_text_ids(&indexes.oracle_trigram, &text_ids)))),
             }
         }
 
@@ -8175,7 +8182,8 @@ fn prepare_candidates(ctx: &QueryCtx, params: &QueryParams, filter: &mut FilterE
     // calls below and in run_query_streamed become redundant re-verification
     // of what the narrowing already established.
     //
-    let all_match_known = plane_leaves_nothing_to_verify(filter, mode, plane, ctx.indexes) || residual_exact;
+    // Computed AFTER `candidate_cards`, because the `residual_exact` half is only sound while the set
+    // it was derived from is the set the walk visits — see the `candidate_cards.is_some()` guard there.
 
     // The plane bitmap is the exact card-level truth of the plane-consumed
     // subexpression (split_planes), so it composes with the residual's
@@ -8219,6 +8227,24 @@ fn prepare_candidates(ctx: &QueryCtx, params: &QueryParams, filter: &mut FilterE
             })
         }
     };
+
+    // `residual_exact` says "every card in the narrowed set matches". That licenses skipping `card_pass`
+    // only while the walk actually visits that set. `candidate_cards` can still come back None above —
+    // the 7/8 breadth filter drops a set that is nearly the whole store — and then the walk falls back
+    // to `0..n_cards` and would emit cards the narrowing never covered. Exactly the hazard the
+    // `proven_conjuncts` block below already guards against, one flag over, and with a wider blast
+    // radius: `proven_conjuncts` skips SOME conjuncts, this skips verification entirely.
+    //
+    // Latent rather than live before #860: `narrow_candidates_exact`'s own 3/4 guard is stricter than
+    // the 7/8 filter at every corpus size, so nothing that survived the first could trip the second.
+    // Relaxing the first for tight sets makes it reachable, and `fuzz_row_identity_matches_reference`
+    // catches it on AND(cmc<8, colors!=0b00011) at seed 19 — 15 rows returned against 14 real matches.
+    //
+    // The `plane_leaves_nothing_to_verify` half needs no such guard: with a plane present
+    // `candidate_cards` is always Some, and with no plane it can only hold for a filter that matches
+    // everything, where scanning everything is the right answer.
+    let all_match_known =
+        plane_leaves_nothing_to_verify(filter, mode, plane, ctx.indexes) || (residual_exact && candidate_cards.is_some());
 
     // Resolve indexable text predicates through their indexes once (#624)
     // when the per-card evaluation they'd replace outweighs the bind cost —
