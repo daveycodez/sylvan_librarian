@@ -25,6 +25,7 @@ from api.parsing.nodes import (
     Query,
     RegexValueNode,
     StringValueNode,
+    TrueNode,
     flatten_nested_operations,
 )
 
@@ -200,10 +201,46 @@ def expand_derived_predicates(query: Query) -> Query:
     return flatten_nested_operations(Query(root))
 
 
+def _prune_true(node: QueryNode) -> QueryNode:
+    """Return `node` with always-true leaves pruned; the original object when nothing changed."""
+    cls = node.__class__
+    if cls is AndNode:
+        ops = [_prune_true(op) for op in node.operands]
+        kept = [op for op in ops if not isinstance(op, TrueNode)]
+        if not kept:
+            return TrueNode()
+        if len(kept) == 1:
+            return kept[0]
+        return AndNode(kept) if kept != list(node.operands) else node
+    if cls is OrNode:
+        ops = [_prune_true(op) for op in node.operands]
+        if any(isinstance(op, TrueNode) for op in ops):
+            return TrueNode()
+        return OrNode(ops) if ops != list(node.operands) else node
+    if cls is NotNode:
+        inner = _prune_true(node.operand)
+        return NotNode(inner) if inner is not node.operand else node
+    return node
+
+
+def prune_true_operands(query: Query) -> Query:
+    """Drop always-true leaves from compounds, so a result-shape directive leaves no residue.
+
+    A directive like `sort:edhrec` parses to the always-true node; without this pass a query
+    carrying one would serialize with a vestigial `AND TRUE`, making `t:goblin sort:edhrec`
+    compare unequal to `t:goblin` despite filtering identically. An Or containing an
+    always-true operand is itself always true.
+    """
+    root = _prune_true(query.root)
+    if root is query.root:
+        return query
+    return Query(root)
+
+
 # The post-parse rewrite pipeline, applied in order at the shared parse seam. Add future AST
 # rewrites to this tuple — both parsers call `rewrite_query`, so a new pass lands in exactly one
 # place and is guaranteed identical treatment across parsers (enforced by test_parser_parity).
-_REWRITE_PASSES = (expand_derived_predicates, lower_literal_regexes)
+_REWRITE_PASSES = (expand_derived_predicates, lower_literal_regexes, prune_true_operands)
 
 
 def rewrite_query(query: Query) -> Query:

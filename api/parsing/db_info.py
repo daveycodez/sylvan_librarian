@@ -76,7 +76,7 @@ DB_COLUMNS = [
     FieldInfo(
         db_column_name="card_color_identity",
         field_type=FieldType.JSONB_OBJECT,
-        search_aliases=["color_identity", "coloridentity", "id", "identity"],
+        search_aliases=["color_identity", "coloridentity", "id", "identity", "ci"],
         parser_class=ParserClass.COLOR,
     ),
     FieldInfo(

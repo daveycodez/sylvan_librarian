@@ -356,8 +356,16 @@ def create_all_condition_parsers(basic_parsers: dict, mana_parsers: dict, color_
     )
     attr_attr_condition.set_parse_action(make_binary_operator_node)
 
+    # Result-shape directives Scryfall accepts inside the query string
+    # (sort:edhrec, order:name, direction:asc, prefer:oldest). They constrain
+    # presentation, not membership, so they parse to the always-true node and
+    # contribute nothing to the filter tree.
+    directive_condition = Regex(r"(?i)(?:sort|order|direction|prefer)(?=:)") + Literal(":") + (quoted_string | string_value_word)
+    directive_condition.set_parse_action(TrueNode)
+
     condition = (
-        mana_condition
+        directive_condition
+        | mana_condition
         | rarity_condition
         | legality_condition
         | color_condition

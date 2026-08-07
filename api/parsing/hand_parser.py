@@ -435,6 +435,23 @@ class Parser:
 
     # ── word dispatch ─────────────────────────────────────────────────────────
 
+    def parse_directive_primary(self, word: str, wl: str, next_tok: Token) -> QueryNode | None:
+        """Consume a result-shape directive (sort:/order:/direction:/prefer:), or return None.
+
+        Scryfall accepts these inside the query string itself; they constrain presentation,
+        not membership, so a directive parses to the always-true node and the prune pass in
+        rewrite.py removes it from the filter tree entirely.
+        """
+        if wl not in ("sort", "order", "direction", "prefer") or next_tok.type != TT.OP or next_tok.value != ":":
+            return None
+        self.consume()  # ':'
+        val_tok = self.peek()
+        if val_tok.type in (TT.WORD, TT.QUOTED, TT.NUMBER):
+            self.consume()
+            return TrueNode()
+        msg = f"Expected value after '{word}:' at position {val_tok.pos}"
+        raise ParseError(msg)
+
     def parse_word_primary(self, word: str) -> QueryNode:
         """Dispatch on whether word is a known attribute alias, keyword, or implicit name."""
         wl = word.lower()
@@ -444,6 +461,10 @@ class Parser:
 
         pc = _ALIAS_TO_PC.get(wl)
         next_tok = self.peek()
+
+        directive = self.parse_directive_primary(word, wl, next_tok)
+        if directive is not None:
+            return directive
 
         # ── dual-class alias (cn / number): dispatch on value shape ──
         if wl in _DUAL_NUM_TEXT and next_tok.type == TT.OP:
