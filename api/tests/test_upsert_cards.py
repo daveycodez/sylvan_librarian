@@ -94,12 +94,16 @@ class TestBooleanIsTags:
 
     def test_flag_removal_strips_the_tag(self, api_resource: APIResource) -> None:
         # A card leaving the game-changer roster must lose the tag on reimport.
+        # Each import builds a FRESH dict, as the real bulk stream does --
+        # preprocess_card embeds a raw_card_blob snapshot into the dict it is
+        # given and short-circuits dicts that already carry one, so reusing
+        # the first import's object would re-store the stale blob.
         card = make_raw_card(name="Debracketed Test")
         card["game_changer"] = True
         api_resource._upsert_cards([card])
-        del card["game_changer"]
-        card["oracle_text"] = "changed so the reimport writes"
-        api_resource._upsert_cards([card])
+        reimport = make_raw_card(card_id=card["id"], name="Debracketed Test")
+        reimport["oracle_text"] = "changed so the reimport writes"
+        api_resource._upsert_cards([reimport])
         assert "gamechanger" not in _is_tags_for(api_resource, card["id"])
 
     def test_sync_preserves_unrelated_is_tags(self, api_resource: APIResource) -> None:
@@ -113,8 +117,10 @@ class TestBooleanIsTags:
                 {"sid": card["id"]},
             )
             conn.commit()
-        card["oracle_text"] = "changed so the reimport writes"
-        api_resource._upsert_cards([card])
+        reimport = make_raw_card(card_id=card["id"], name="Historic Bystander Test")
+        reimport["reserved"] = True
+        reimport["oracle_text"] = "changed so the reimport writes"
+        api_resource._upsert_cards([reimport])
         tags = _is_tags_for(api_resource, card["id"])
         assert tags.get("historic") is True
         assert tags.get("reserved") is True
