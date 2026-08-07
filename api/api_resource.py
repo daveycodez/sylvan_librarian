@@ -45,6 +45,7 @@ from api.enums import CardOrdering, PreferOrder, ResponseShape, SortDirection, U
 from api.middlewares.timing import record_span
 from api.noscript_helpers import generate_results_count_html, generate_results_html
 from api.parsing import generate_sql_query, parse_scryfall_query
+from api.parsing.card_query_nodes import fold_accents
 from api.scryfall_bulk_data_fetcher import BulkDataKey, ScryfallBulkDataFetcher
 from api.settings import settings
 from api.tag_import import import_art_tags as _import_art_tags
@@ -294,6 +295,24 @@ DEFAULT_RESULT_FIELDS: tuple[str, ...] = (
     "set_name",
     "type_line",
 )
+
+# What /named returns for the one card it resolves: the same default 9 fields /search returns,
+# plus scryfall_id so the caller can address the exact printing it was given.
+NAMED_LOOKUP_FIELDS: tuple[str, ...] = (*DEFAULT_RESULT_FIELDS, "scryfall_id")
+
+# Minimum pg_trgm similarity between the (accent-folded, lowercased) query and a card name for the
+# card to count as a plausible fuzzy match at all. 0.4 keeps one-or-two-letter typos ("lighning
+# bolt", "counterspel") comfortably in while rejecting queries that merely share a common word
+# ("bolt of anything" scoring ~0.3 against half the corpus). Deliberately above pg_trgm's default
+# 0.3 similarity_threshold, so the index-assisted % prefilter in the SQL below is always a strict
+# superset of what this floor admits.
+NAMED_LOOKUP_SIMILARITY_FLOOR = 0.4
+
+# How far the best fuzzy candidate must lead the runner-up for the match to count as unambiguous.
+# Two distinct card names within this margin of each other means the query does not clearly
+# identify either ("obelisk of urd" vs. the five Obelisks), which mirrors Scryfall's behavior of
+# returning an error rather than guessing.
+NAMED_LOOKUP_AMBIGUITY_MARGIN = 0.05
 
 CUSTOM_IS_TAGS = [
     "historic",  # artifact, legendary, saga
@@ -1490,6 +1509,109 @@ class APIResource:
             "inner_timings": result_bag.pop("timings"),
             "total_cards": total_cards,
         }
+
+    @route(paths=("named", "cards/named"))
+    def named(
+        self,
+        *,
+        falcon_response: falcon.Response | None = None,
+        fuzzy: str | None = None,
+        **_: object,
+    ) -> dict[str, Any]:
+        """Look up a single card by name, tolerating typos — Scryfall's GET /cards/named?fuzzy=.
+
+        Resolution mirrors Scryfall: a case-insensitive exact name match wins immediately;
+        otherwise the best trigram match on the accent-folded name wins, provided it clears
+        NAMED_LOOKUP_SIMILARITY_FLOOR and leads the next-best *distinct* card name by at least
+        NAMED_LOOKUP_AMBIGUITY_MARGIN. An ambiguous or implausible name is a 404, so a client
+        never silently receives a card the query did not clearly identify.
+
+        Card-face names are not matched yet: only the full printed name (for multi-face cards,
+        "Front // Back") participates, because face names live inside raw_card_blob where no
+        trigram index can reach them.
+
+        Args:
+            falcon_response: The Falcon response object (used only to set cache headers).
+            fuzzy: The card name to look up, exactly or approximately. Required.
+
+        Returns:
+            The single best-matching card, carrying the same default 9 fields /search returns
+            plus scryfall_id — one row, for the printing with the highest prefer_score.
+
+        Raises:
+            falcon.HTTPBadRequest: If no name is supplied.
+            falcon.HTTPNotFound: If nothing matches closely enough, or several cards match
+                about equally well.
+        """
+        self._require_setup_complete()
+        name = (fuzzy or "").strip()
+        if not name:
+            raise falcon.HTTPBadRequest(
+                title="Missing Parameter",
+                description="A card name must be supplied via the fuzzy= query parameter.",
+            )
+        set_cache_header(falcon_response, duration=timedelta(seconds=90))
+        result_cols = ",\n                ".join(f"{RESULT_FIELD_COLUMNS[field]} AS {field}" for field in NAMED_LOOKUP_FIELDS)
+
+        exact_sql = f"""
+            SELECT
+                {result_cols}
+            FROM
+                magic.cards AS card
+            WHERE
+                lower(card_name) = %(name_lower)s
+            ORDER BY
+                prefer_score DESC NULLS LAST,
+                edhrec_rank ASC NULLS LAST
+            LIMIT 1"""
+        exact_rows = self._run_query(query=exact_sql, params={"name_lower": name.lower()}, explain=False)["result"]
+        if exact_rows:
+            return exact_rows[0]
+
+        # The OPERATOR(magic.%) prefilter is what lets idx_cards_cardname_folded_lower_trgm serve
+        # this query; a bare ORDER BY similarity() would score every row in the table. It admits
+        # candidates down to pg_trgm's similarity_threshold (default 0.3), below both the floor and
+        # the lowest runner-up the ambiguity margin can care about (floor - margin), so no decision
+        # made in Python below ever depends on a row the prefilter dropped. DISTINCT ON collapses
+        # printings to one row per card name — best prefer_score — *before* the LIMIT 2, so two
+        # printings of the winner can never masquerade as an ambiguous pair.
+        fuzzy_sql = f"""
+            WITH candidates AS (
+                SELECT DISTINCT ON (card_name)
+                    {result_cols},
+                    magic.similarity(lower(card_name_folded), %(name_folded)s) AS name_similarity
+                FROM
+                    magic.cards AS card
+                WHERE
+                    lower(card_name_folded) OPERATOR(magic.%%) %(name_folded)s
+                ORDER BY
+                    card_name,
+                    prefer_score DESC NULLS LAST,
+                    edhrec_rank ASC NULLS LAST
+            )
+            SELECT
+                *
+            FROM
+                candidates
+            ORDER BY
+                name_similarity DESC
+            LIMIT 2"""
+        folded_name = fold_accents(name.lower())
+        rows = self._run_query(query=fuzzy_sql, params={"name_folded": folded_name}, explain=False)["result"]
+
+        if not rows or rows[0]["name_similarity"] < NAMED_LOOKUP_SIMILARITY_FLOOR:
+            raise falcon.HTTPNotFound(
+                title="Not Found",
+                description=f"No cards found matching {name!r}.",
+            )
+        top, *rest = rows
+        if rest and top["name_similarity"] - rest[0]["name_similarity"] < NAMED_LOOKUP_AMBIGUITY_MARGIN:
+            raise falcon.HTTPNotFound(
+                title="Ambiguous Name",
+                description=f"Multiple different cards match {name!r} about equally well. Add more words to disambiguate.",
+            )
+        del top["name_similarity"]
+        return top
 
     @route(paths=("index", "index.html"))
     def _redirect_to_root(self, **_: object) -> None:

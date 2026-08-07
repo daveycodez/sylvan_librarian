@@ -380,6 +380,7 @@ python -m client.query_runner
 
 - **GET /** - Web interface (serves `index.html`)
 - **GET /search** - Card search with query parameter support
+- **GET /named** - Typo-tolerant single-card lookup by name (`?fuzzy=lighning+bolt`), mirroring Scryfall's `/cards/named` (also served at `/cards/named`)
 - **GET /favicon.ico** - Favicon for web interface
 
 ### Tagging Endpoints
