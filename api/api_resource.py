@@ -1042,14 +1042,21 @@ class APIResource:
                 total_time,
                 rate,
             )
+            # Art tags first: the prefer score's art_style component reads card_art_tags, so
+            # running the backfill ahead of the tag import scored every card as on-style on a
+            # first boot, and nothing rescored until the next import. Oracle tags feed search
+            # rather than scoring, so their position relative to the backfill does not matter.
+            _import_art_tags(self._conn_pool, self._bulk_data_fetcher)
             self.backfill_prefer_scores()
             self.backfill_cubecobra_scores()
             _import_oracle_tags(self._conn_pool, self._bulk_data_fetcher)
-            _import_art_tags(self._conn_pool, self._bulk_data_fetcher)
             self._reload_engine(force=True)
             self._clear_caches()
             self._last_import_time.value = time.time()
             self._setup_complete_cache = None
+            # Every step above logs its own duration; this closes the sequence with the wall
+            # clock the operator actually waited, upsert through engine reload.
+            logger.info("Import complete in %.2f seconds", time.monotonic() - before)
             return
         logger.error("Failed to import data: %s", result["message"])
         return
@@ -1837,13 +1844,12 @@ class APIResource:
         Returns:
             Dict with status and count of cards updated
         """
+        start = time.monotonic()
         logger.info("Starting prefer score backfill")
 
         backfill_sql = db_utils.read_sql("backfill_prefer_scores")
         with self._conn_pool.connection() as conn, conn.cursor() as cursor:
-            statement_timeout = 120_000
-            # Validate and set statement timeout
-            self._set_statement_timeout(cursor, statement_timeout)
+            self._set_statement_timeout(cursor, settings.prefer_score_backfill_timeout_ms)
             cursor.execute(backfill_sql)
             updated_count = cursor.rowcount
 
@@ -1854,12 +1860,21 @@ class APIResource:
 
             conn.commit()
 
-        logger.info("Prefer score backfill complete: %d of %d cards updated", updated_count, total_cards)
+        # cards_updated counts only rows whose score actually moved -- the backfill's UPDATE
+        # skips rows already carrying the right value, so a steady-state re-run reports 0 of N
+        # rather than N of N. Both numbers are worth having: the first says how much churned,
+        # the second that the corpus is fully scored.
+        stats = {
+            "duration_seconds": round(time.monotonic() - start, 2),
+            "cards_updated": updated_count,
+            "cards_scored": total_cards,
+        }
+        logger.info("Prefer score backfill complete: %s", stats)
 
         return {
             "status": "success",
-            "cards_updated": updated_count,
             "message": f"Successfully backfilled prefer scores for {updated_count} of {total_cards} cards",
+            **stats,
         }
 
     def _fetch_cubecobra_data(self, db_oracle_ids: set[uuid.UUID]) -> dict[uuid.UUID, dict[str, Any]]:
@@ -1974,6 +1989,7 @@ class APIResource:
             "w_elo": 1,
             "w_pick_count": 1,
         }
+        start = time.monotonic()
         scale_factor = sum(weights.values()) / 100.0
         weights = {k: v / scale_factor for k, v in weights.items()}
         logger.info("Starting CubeCobra score backfill with weights: %s", weights)
@@ -1983,13 +1999,27 @@ class APIResource:
             self._set_statement_timeout(cursor, 600_000)
             cursor.execute(backfill_sql, weights)
             updated_count = cursor.rowcount
+
+            # The percent ranks are computed over cubecobra_elo and friends, which the normal
+            # import never populates -- they arrive via ingest_cubecobra. Reporting how many
+            # cards actually carry that data distinguishes "ranked the whole corpus" from
+            # "ranked a corpus of all-NULLs", which otherwise look identical in the log.
+            cursor.execute("SELECT COUNT(*) as count FROM magic.cards WHERE cubecobra_elo IS NOT NULL")
+            result = cursor.fetchone()
+            cards_with_data = result["count"] if result else 0
+
             conn.commit()
 
-        logger.info("CubeCobra score backfill complete: %d cards updated", updated_count)
+        stats = {
+            "duration_seconds": round(time.monotonic() - start, 2),
+            "cards_updated": updated_count,
+            "cards_with_cubecobra_data": cards_with_data,
+        }
+        logger.info("CubeCobra score backfill complete: %s", stats)
         return {
             "status": "success",
-            "cards_updated": updated_count,
             "weights": weights,
+            **stats,
         }
 
     @route()
