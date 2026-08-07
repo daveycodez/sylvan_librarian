@@ -1,16 +1,45 @@
 # Sylvan Librarian
 
-[![Python Tests](https://img.shields.io/github/actions/workflow/status/jbylund/sylvan_librarian/python-tests.yml?branch=main&label=python%20tests)](https://github.com/jbylund/sylvan_librarian/actions/workflows/python-tests.yml?query=branch%3Amain)
-[![Rust Tests](https://img.shields.io/github/actions/workflow/status/jbylund/sylvan_librarian/rust-tests.yml?branch=main&label=rust%20tests)](https://github.com/jbylund/sylvan_librarian/actions/workflows/rust-tests.yml?query=branch%3Amain)
-[![Last commit](https://img.shields.io/github/last-commit/jbylund/sylvan_librarian)](https://github.com/jbylund/sylvan_librarian/commits/main)
-[![Issues](https://img.shields.io/github/issues/jbylund/sylvan_librarian)](https://github.com/jbylund/sylvan_librarian/issues)
-[![Pull requests](https://img.shields.io/github/issues-pr/jbylund/sylvan_librarian)](https://github.com/jbylund/sylvan_librarian/pulls)
-[![Stars](https://img.shields.io/github/stars/jbylund/sylvan_librarian)](https://github.com/jbylund/sylvan_librarian/stargazers)
-[![License](https://img.shields.io/github/license/jbylund/sylvan_librarian)](https://github.com/jbylund/sylvan_librarian/blob/main/LICENSE)
-
-[![python tests](https://img.shields.io/endpoint?url=https%3A%2F%2Fd1hot9ps2xugbc.cloudfront.net%2Fbadges%2Ftests-python.json)](https://github.com/jbylund/sylvan_librarian/actions/workflows/python-tests.yml?query=branch%3Amain)
-[![rust tests](https://img.shields.io/endpoint?url=https%3A%2F%2Fd1hot9ps2xugbc.cloudfront.net%2Fbadges%2Ftests-rust.json)](https://github.com/jbylund/sylvan_librarian/actions/workflows/rust-tests.yml?query=branch%3Amain)
-[![js tests](https://img.shields.io/endpoint?url=https%3A%2F%2Fd1hot9ps2xugbc.cloudfront.net%2Fbadges%2Ftests-js.json)](https://github.com/jbylund/sylvan_librarian/actions/workflows/js-tests.yml?query=branch%3Amain)
+<table>
+  <tr>
+    <td align="center"><img src="https://d1hot9ps2xugbc.cloudfront.net/badges/logo-github.svg" alt="GitHub" width="40" height="40"></td>
+    <td>
+      <a href="https://github.com/jbylund/sylvan_librarian/issues"><img src="https://img.shields.io/github/issues/jbylund/sylvan_librarian" alt="Issues"></a>      <br>
+      <a href="https://github.com/jbylund/sylvan_librarian/pulls"><img src="https://img.shields.io/github/issues-pr/jbylund/sylvan_librarian" alt="Pull requests"></a>      <br>
+      <a href="https://github.com/jbylund/sylvan_librarian/stargazers"><img src="https://img.shields.io/github/stars/jbylund/sylvan_librarian" alt="Stars"></a>
+    </td>
+    <td rowspan="4" align="center">
+      <img src="https://d1hot9ps2xugbc.cloudfront.net/badges/languages.svg" alt="Lines of code by language">
+      <br>
+      <a href="https://github.com/jbylund/sylvan_librarian/commits/main"><img src="https://img.shields.io/github/last-commit/jbylund/sylvan_librarian" alt="Last commit"></a>
+      <a href="https://github.com/jbylund/sylvan_librarian/blob/main/LICENSE"><img src="https://img.shields.io/github/license/jbylund/sylvan_librarian" alt="License"></a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><img src="https://d1hot9ps2xugbc.cloudfront.net/badges/logo-python.svg" alt="Python" width="40" height="40"></td>
+    <td>
+      <a href="https://github.com/jbylund/sylvan_librarian/actions/workflows/python-tests.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/jbylund/sylvan_librarian/python-tests.yml?branch=main&label=tests" alt="Python tests"></a>
+      <br>
+      <a href="https://github.com/jbylund/sylvan_librarian/actions/workflows/python-tests.yml?query=branch%3Amain"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fd1hot9ps2xugbc.cloudfront.net%2Fbadges%2Ftests-python.json" alt="Python test count"></a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><img src="https://d1hot9ps2xugbc.cloudfront.net/badges/logo-rust.svg" alt="Rust" width="40" height="40"></td>
+    <td>
+      <a href="https://github.com/jbylund/sylvan_librarian/actions/workflows/rust-tests.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/jbylund/sylvan_librarian/rust-tests.yml?branch=main&label=tests" alt="Rust tests"></a>
+      <br>
+      <a href="https://github.com/jbylund/sylvan_librarian/actions/workflows/rust-tests.yml?query=branch%3Amain"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fd1hot9ps2xugbc.cloudfront.net%2Fbadges%2Ftests-rust.json" alt="Rust test count"></a>
+    </td>
+  </tr>
+  <tr>
+    <td align="center"><img src="https://d1hot9ps2xugbc.cloudfront.net/badges/logo-javascript.svg" alt="JavaScript" width="40" height="40"></td>
+    <td>
+      <a href="https://github.com/jbylund/sylvan_librarian/actions/workflows/js-tests.yml?query=branch%3Amain"><img src="https://img.shields.io/github/actions/workflow/status/jbylund/sylvan_librarian/js-tests.yml?branch=main&label=tests" alt="JavaScript tests"></a>
+      <br>
+      <a href="https://github.com/jbylund/sylvan_librarian/actions/workflows/js-tests.yml?query=branch%3Amain"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fd1hot9ps2xugbc.cloudfront.net%2Fbadges%2Ftests-js.json" alt="JavaScript test count"></a>
+    </td>
+  </tr>
+</table>
 
 ![Web Interface](screenshot.webp)
 
@@ -118,11 +147,6 @@ Based on [comprehensive functionality analysis](docs/technical/scryfall_function
 - **Data Quality**: Regular comparison testing against official Scryfall API
 
 ## Code Organization
-
-![Lines of code by language](https://d1hot9ps2xugbc.cloudfront.net/badges/languages.svg)
-
-*Source lines by language, excluding comments, blank lines, and benchmark harnesses.
-Regenerated daily — see [scripts/gen_badges.py](scripts/gen_badges.py).*
 
 ```
 sylvan_librarian/
