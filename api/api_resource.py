@@ -1127,6 +1127,7 @@ class APIResource:
         direction: SortDirection = SortDirection.ASC,
         fields: Sequence[str] | None = None,
         limit: int = 100,
+        offset: int = 0,
         orderby: CardOrdering = CardOrdering.EDHREC,
         prefer: PreferOrder = PreferOrder.DEFAULT,
         q: str | None = None,
@@ -1145,6 +1146,10 @@ class APIResource:
                 to the usual 9 (name, set_code, collector_number, power, toughness, mana_cost,
                 oracle_text, set_name, type_line). See RESULT_FIELD_COLUMNS for the full vocabulary.
             limit: Maximum number of results to return.
+            offset: Number of results to skip before the first returned card, in the
+                same sort order the query uses -- limit/offset together give clients
+                pagination over the full result set (total_cards is always the
+                unpaginated count).
             orderby: Field to sort by.
             shape: Shape of the "cards" list: 'rows' (list of card objects, default) or
                 'columnar' (one list per field, keyed by field name — smaller on the wire).
@@ -1161,6 +1166,7 @@ class APIResource:
             direction=direction,
             fields=fields,
             limit=limit,
+            offset=offset,
             unique=unique,
             prefer=prefer,
         )
@@ -1168,6 +1174,15 @@ class APIResource:
             # Shallow copy: _search returns cached dicts, which must stay row-shaped.
             results = {**results, "cards": _columnarize_cards(results["cards"])}
         return results
+
+    def _validate_offset(self, offset: int) -> int:
+        """Validate the offset and return it if valid."""
+        if not isinstance(offset, int) or offset < 0:
+            raise falcon.HTTPBadRequest(
+                title="Invalid Offset",
+                description="Offset must be a non-negative integer.",
+            )
+        return offset
 
     def _validate_limit(self, limit: int | None) -> int | None:
         """Validate the limit and return it if valid."""
@@ -1204,6 +1219,7 @@ class APIResource:
         direction: SortDirection = SortDirection.ASC,
         fields: Sequence[str] | None = None,
         limit: int = 100,
+        offset: int = 0,
         orderby: CardOrdering = CardOrdering.EDHREC,
         prefer: PreferOrder = PreferOrder.DEFAULT,
         query: str | None = None,
@@ -1211,13 +1227,14 @@ class APIResource:
     ) -> dict[str, Any]:
         self._require_setup_complete()
         limit = self._validate_limit(limit)
+        offset = self._validate_offset(offset)
         # Resolved once here (rather than inside _search_sql/_search_engine) so an unknown field
         # name always raises HTTPBadRequest instead of being swallowed by the engine's blanket
         # except-and-fall-back-to-SQL below.
         resolved_fields = self._resolve_result_fields(fields)
 
         if settings.enable_cache:
-            cache_key = (direction, limit, orderby, prefer, query, unique, tuple(resolved_fields))
+            cache_key = (direction, limit, offset, orderby, prefer, query, unique, tuple(resolved_fields))
             gen = self._cache_generation.value
             try:
                 search_cache = self._search_gen_cache[gen]
@@ -1256,6 +1273,7 @@ class APIResource:
                     orderby=orderby,
                     direction=direction,
                     limit=limit,
+                    offset=offset,
                     timer=timer,
                     fields=resolved_fields,
                 )
@@ -1292,6 +1310,7 @@ class APIResource:
             orderby=orderby,
             direction=direction,
             limit=limit,
+            offset=offset,
             timer=timer,
             fields=resolved_fields,
         )
@@ -1309,6 +1328,7 @@ class APIResource:
         orderby: CardOrdering,
         direction: SortDirection,
         limit: int,
+        offset: int,
         timer: Timer,
         fields: Sequence[str] | None = None,
     ) -> dict[str, Any]:
@@ -1324,6 +1344,7 @@ class APIResource:
                     direction=str(direction),
                     # limit=None means "no limit"; the engine requires an int, so use a large number
                     limit=limit if limit is not None else 1_000_000,
+                    offset=offset,
                     fields=fields,
                 )
         except _QueryError as err:
@@ -1355,6 +1376,7 @@ class APIResource:
         orderby: CardOrdering,
         direction: SortDirection,
         limit: int,
+        offset: int,
         timer: Timer,
         fields: Sequence[str] | None = None,
     ) -> dict[str, Any]:
@@ -1439,6 +1461,8 @@ class APIResource:
                     {_order_by}
                 LIMIT
                     %(limit)s
+                OFFSET
+                    %(offset)s
             )
             UNION ALL
             (
@@ -1473,6 +1497,8 @@ class APIResource:
                     {_order_by}
                 LIMIT
                     %(limit)s
+                OFFSET
+                    %(offset)s
             )
             UNION ALL
             (
@@ -1484,6 +1510,7 @@ class APIResource:
             )"""
 
         params["limit"] = limit
+        params["offset"] = offset
         query_sql = rewrap(query_sql)
         logger.info("Full query: %s", query_sql)
         logger.info("Params: %s", params)
