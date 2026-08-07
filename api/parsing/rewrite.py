@@ -77,6 +77,70 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     # looser form also catches Crawling Barrens ("they become a 0/0 ..."). The "still a land"
     # clause is what keeps false positives at zero.
     ("is", "manland"): "t:land o:become o:creature o:/still a.* land/",
+    ("is", "creatureland"): "t:land o:become o:creature o:/still a.* land/",
+    # Commander eligibility, refined per review: legendary permanents with a
+    # printed toughness (creatures, Vehicles, Spacecraft -- toughness>=0, the
+    # parser-friendly spelling of toughness>-1; no legendary prints negative
+    # toughness and * compares as 0 on both engines) plus Backgrounds, plus
+    # rules text granting eligibility outright, MINUS the commander banlist:
+    # diffing the eligibility shape against Scryfall's is:commander showed it
+    # excludes banned cards (Griselbrand, Golos, Emrakul, Erayo were the
+    # over-catch) while keeping 329 casual not-legal legends. Residual is the
+    # face-evaluation cluster from docs/issues/00713: back-face legendaries
+    # over-match on combined type lines, and face-granted eligibility text
+    # under-matches until faces are searchable.
+    ("is", "commander"): '((t:legendary (toughness>=0 or t:background)) or o:"can be your commander") -banned:commander',
+    # Land cycles, rewritten onto the community cycle tags already present in
+    # Scryfall's oracle-tags bulk export (per review: membership as data the
+    # corpus carries, not an oracle-text signature that can over-match).
+    # Ancestor propagation makes the parent slugs work even though their
+    # taggings live on per-set children. Every mapping validated EXACT
+    # against api.scryfall.com's is: counts on 2026-08-07 (count in
+    # parens). Cycles whose tag taxonomy doesn't line up with Scryfall's
+    # is: membership (filterland tags 10 vs is: 22, gainland 25 vs 15,
+    # triome 5 vs 10) stay absent rather than approximate.
+    ("is", "fetchland"): "otag:cycle-fetchland",  # 10
+    ("is", "checkland"): "otag:cycle-checkland",  # 10
+    ("is", "painland"): "otag:cycle-painland",  # 10
+    ("is", "slowland"): "otag:cycle-slowland",  # 10
+    ("is", "bondland"): "otag:cycle-bondland",  # 10
+    ("is", "battleland"): "otag:cycle-tangoland",  # 10
+    ("is", "tangoland"): "otag:cycle-tangoland",  # 10; Scryfall accepts both names
+    ("is", "shockland"): "otag:cycle-rav-shockland",  # 10
+    ("is", "dual"): "otag:cycle-abu-dual-land",  # 10, the ABUR duals
+    ("is", "canopyland"): "otag:cycle-horizon-land",  # 6
+    ("is", "scryland"): "otag:cycle-block-ths-scry-land",  # 10
+    ("is", "fastland"): "otag:cycle-fastland",  # 10
+    ("is", "triland"): "otag:cycle-ala-shardland or otag:cycle-ktk-wedgeland",  # 10, name-verified
+    ("is", "triome"): "otag:cycle-iko-triome or otag:cycle-snc-triland",  # 10, name-verified
+    # Non-cycle values with exact deterministic substrates (same 2026-08-07
+    # validation): companion is a keyword, Class a card type, and
+    # is:adventure is LAYOUT semantics by Scryfall's own definition -- it
+    # equals `t:adventure or t:omen` there (164 = 164; Omen cards use the
+    # adventure layout with an Omen-typed face), so layout is the faithful
+    # mirror. Its local count carries the usual corpus-policy delta only.
+    ("is", "companion"): "kw:companion",  # 10, name-verified
+    ("is", "class"): "t:class",  # 34, corpus-exact
+    ("is", "adventure"): "layout:adventure",
+    # Documented-delta cycle entries (2026-08-07, name-diffed vs Scryfall's
+    # is: sets): coverage judged worth shipping over exactness, in the same
+    # spirit as is:bear above. bounceland and filterland are clean SUBSETS
+    # (-2 each: Arid Archway + Guildless Commons, and Cascading Cataracts +
+    # Crystal Quarry, are untagged upstream). storageland runs +5/-2 (the
+    # Mercadian depletion lands are tagged into the family; Crucible of the
+    # Spirit Dragon and Mage-Ring Network are not). gainland is a SUPERSET
+    # (+15, -0): with the refuge cycle included the union covers every
+    # Scryfall member plus newer enters-tapped-gain-life cycles Scryfall's
+    # own list has not caught up with. frenchvanilla uses the community
+    # tag, whose definition runs looser than "keywords only" (~+233).
+    ("is", "bounceland"): "otag:cycle-rav-bounceland or otag:cycle-vis-karoo-land",
+    ("is", "filterland"): "otag:cycle-hybrid-filterland or otag:cycle-ody-filterland",
+    ("is", "storageland"): "otag:cycle-fem-storage-land or otag:cycle-mmq-storage-land or otag:cycle-tsp-storage-land",
+    (
+        "is",
+        "gainland",
+    ): "otag:cycle-ktk-gainland or otag:cycle-msh-gainland or otag:cycle-tmt-gainland or otag:cycle-zen-refugeland",
+    ("is", "frenchvanilla"): "otag:french-vanilla",
 }
 
 

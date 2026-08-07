@@ -165,16 +165,32 @@ STATIC_VALUES: dict[str, list[str]] = {
     # this module ships in the client image, which contains no `api/`.
     #
     # Anything outside this set parses but falls through to a `card_is_tags` lookup, and that
-    # column is empty — `is:reprint`, `is:token`, `is:modal`, `is:spell` and `is:commander` were in
-    # the old load-generator list and every one of them matched zero cards. All 17 are kept rather
+    # column is empty — `is:reprint`, `is:token`, `is:modal` and `is:spell` were in the old
+    # load-generator list and every one of them matched zero cards. All 41 are kept rather
     # than a token few: the family's share of traffic is set by its weight, not by how many values
     # it holds, and each expands to a genuinely different shape — layout lookups, type unions, an
     # oracle-text heuristic, a numeric conjunction.
     "tag": [
+        "is:adventure",
+        "is:battleland",
         "is:bear",
+        "is:bondland",
+        "is:bounceland",
+        "is:canopyland",
+        "is:checkland",
+        "is:class",
         "is:colorshifted",
+        "is:commander",
+        "is:companion",
+        "is:creatureland",
         "is:dfc",
+        "is:dual",
+        "is:fastland",
+        "is:fetchland",
+        "is:filterland",
         "is:flip",
+        "is:frenchvanilla",
+        "is:gainland",
         "is:historic",
         "is:leveler",
         "is:manland",
@@ -184,9 +200,17 @@ STATIC_VALUES: dict[str, list[str]] = {
         "is:old",
         "is:outlaw",
         "is:party",
+        "is:painland",
         "is:permanent",
+        "is:scryland",
+        "is:shockland",
+        "is:slowland",
         "is:split",
+        "is:storageland",
+        "is:tangoland",
         "is:transform",
+        "is:triland",
+        "is:triome",
         "is:vanilla",
     ],
     "devotion": [
