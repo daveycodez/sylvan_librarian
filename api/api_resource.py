@@ -300,6 +300,43 @@ DEFAULT_RESULT_FIELDS: tuple[str, ...] = (
     "type_line",
 )
 
+# is: values Scryfall ships as BOOLEANS on every bulk card object, synced
+# in one set-based statement from raw_card_blob after each import (see
+# _sync_boolean_is_tags) -- no per-tag API sweep, unlike CUSTOM_IS_TAGS
+# below, and no accumulation in the import loop. card_is_tags key -> raw
+# blob key; adding a field here is the whole change. foil/promo/reprint are
+# deliberately NOT here yet (higher cardinality, memory check first).
+BOOLEAN_IS_TAGS: dict[str, str] = {
+    "reserved": "reserved",
+    "gamechanger": "game_changer",
+}
+
+_SYNC_BOOLEAN_IS_TAGS_SQL = """
+WITH tag_map(tag, blob_key) AS (
+    SELECT key, value FROM jsonb_each_text(%(tag_map)s::jsonb)
+),
+proposed AS (
+    SELECT
+        cards.scryfall_id,
+        (cards.card_is_tags - (SELECT array_agg(tag_map.tag) FROM tag_map))
+            || COALESCE(
+                   (
+                       SELECT jsonb_object_agg(tag_map.tag, true)
+                       FROM tag_map
+                       WHERE cards.raw_card_blob -> tag_map.blob_key = 'true'::jsonb
+                   ),
+                   '{}'::jsonb
+               ) AS proposed_is_tags
+    FROM magic.cards
+)
+UPDATE magic.cards
+SET card_is_tags = proposed.proposed_is_tags
+FROM proposed
+WHERE
+    cards.scryfall_id = proposed.scryfall_id AND
+    cards.card_is_tags IS DISTINCT FROM proposed.proposed_is_tags
+"""
+
 CUSTOM_IS_TAGS = [
     "historic",  # artifact, legendary, saga
     "pathway",  # land and name contains pathway
@@ -2181,6 +2218,31 @@ class APIResource:
             "message": f"Successfully updated {updated_count} cards with is:{is_tag}",
         }
 
+    def _sync_boolean_is_tags(self, conn: Connection) -> int:
+        """Sync the boolean-backed is: tags (BOOLEAN_IS_TAGS) from raw_card_blob, one-shot.
+
+        Rebuilds each card's managed keys as (existing minus managed) plus the keys whose
+        blob boolean is true, touching only rows whose result actually differs -- so list
+        churn (a card entering or leaving the game-changer roster) converges on every
+        import, and unrelated card_is_tags entries are never disturbed.
+
+        Args:
+        ----
+            conn (Connection): open connection; committed here.
+
+        Returns:
+        -------
+            int: rows whose card_is_tags changed.
+
+        """
+        with conn.cursor() as cursor:
+            cursor.execute(_SYNC_BOOLEAN_IS_TAGS_SQL, {"tag_map": orjson.dumps(BOOLEAN_IS_TAGS).decode("utf-8")})
+            updated_count = cursor.rowcount
+        conn.commit()
+        if updated_count:
+            logger.info("Synced boolean is: tags on %d printings", updated_count)
+        return updated_count
+
     def _add_is_tag_to_printings(self, *, is_tag: str) -> dict[str, Any]:
         """Add a specific is: tag to all printings matching that tag using Scryfall search.
 
@@ -2599,6 +2661,9 @@ class APIResource:
                     )
 
                 conn.commit()
+
+                if cards_sent:
+                    self._sync_boolean_is_tags(conn)
 
                 if cards_sent == 0:
                     if stream.raw == 0:
