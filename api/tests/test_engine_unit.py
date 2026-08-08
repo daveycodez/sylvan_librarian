@@ -82,6 +82,7 @@ def _run(
     orderby: str = "edhrec",
     direction: str = "asc",
     limit: int = 200,
+    offset: int = 0,
     fields: list[str] | None = None,
 ) -> tuple[int, list[dict]]:
     """Parse q, run engine.query(), return (total, cards). q='' matches all."""
@@ -93,6 +94,7 @@ def _run(
         orderby=orderby,
         direction=direction,
         limit=limit,
+        offset=offset,
         fields=fields,
     )
     return total, list(cards)
@@ -1194,6 +1196,28 @@ class TestCommonCardKeywords:
         result = engine.common_card_keywords()
         for keyword, count in result.items():
             assert count > 0, f"Keyword {keyword!r} has non-positive count {count}"
+
+
+class TestOffsetPagination:
+    """offset skips rows in sort order; total_cards stays the unpaginated count."""
+
+    def test_offset_windows_tile_the_full_ordering(self, engine: QueryEngine) -> None:
+        _, full = _run(engine, "t:creature", unique="card", limit=20)
+        _, first = _run(engine, "t:creature", unique="card", limit=10)
+        _, second = _run(engine, "t:creature", unique="card", limit=10, offset=10)
+        names = [c["name"] for c in full]
+        assert [c["name"] for c in first] == names[:10]
+        assert [c["name"] for c in second] == names[10:20]
+
+    def test_total_cards_ignores_offset(self, engine: QueryEngine) -> None:
+        total_plain, _ = _run(engine, "t:creature", unique="card", limit=5)
+        total_offset, _ = _run(engine, "t:creature", unique="card", limit=5, offset=50)
+        assert total_offset == total_plain
+
+    def test_offset_past_the_end_is_empty(self, engine: QueryEngine) -> None:
+        total, cards = _run(engine, 'name="Lightning Bolt"', unique="card", offset=1000)
+        assert cards == []
+        assert total >= 1
 
 
 class TestFieldSelection:
