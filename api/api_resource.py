@@ -266,6 +266,11 @@ _ENGINE_RELOAD_BATCH_SIZE = 2_000
 # have a same-named entry in FIELD_TABLE with matching semantics, so a `fields=` request for one
 # of these names gets identically-shaped results regardless of which path serves it; FIELD_TABLE
 # is free to have entries with no counterpart here.
+# Pagination default: offset 0 everywhere it appears, extracted so the internal
+# search methods keep it optional (per review) and route/internal defaults can
+# never drift apart.
+DEFAULT_OFFSET = 0
+
 RESULT_FIELD_COLUMNS: dict[str, str] = {
     "name": "card_name",
     "set_code": "card_set_code",
@@ -1127,7 +1132,7 @@ class APIResource:
         direction: SortDirection = SortDirection.ASC,
         fields: Sequence[str] | None = None,
         limit: int = 100,
-        offset: int = 0,
+        offset: int = DEFAULT_OFFSET,
         orderby: CardOrdering = CardOrdering.EDHREC,
         prefer: PreferOrder = PreferOrder.DEFAULT,
         q: str | None = None,
@@ -1219,7 +1224,7 @@ class APIResource:
         direction: SortDirection = SortDirection.ASC,
         fields: Sequence[str] | None = None,
         limit: int = 100,
-        offset: int = 0,
+        offset: int = DEFAULT_OFFSET,
         orderby: CardOrdering = CardOrdering.EDHREC,
         prefer: PreferOrder = PreferOrder.DEFAULT,
         query: str | None = None,
@@ -1328,8 +1333,8 @@ class APIResource:
         orderby: CardOrdering,
         direction: SortDirection,
         limit: int,
-        offset: int,
         timer: Timer,
+        offset: int = DEFAULT_OFFSET,
         fields: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         logger.info("Searching engine for %r", query)
@@ -1376,8 +1381,8 @@ class APIResource:
         orderby: CardOrdering,
         direction: SortDirection,
         limit: int,
-        offset: int,
         timer: Timer,
+        offset: int = DEFAULT_OFFSET,
         fields: Sequence[str] | None = None,
     ) -> dict[str, Any]:
         logger.info("Searching SQL for %r", query)
