@@ -98,8 +98,15 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     ("is", "manland"): "t:land o:become o:creature o:/still a.* land/",
     ("is", "painland"): "otag:cycle-painland",  # 10, exact
     ("is", "scryland"): "otag:cycle-block-ths-scry-land",  # 10, exact
+    # shadowland/snarl: the reveal-or-tapped lands that reveal a BASIC LAND
+    # TYPE card -- the basic-type regex is what separates them from the
+    # Lorwyn-style typal reveal-lands, which reveal a CREATURE-type card and
+    # otherwise share the wording. 10, name-verified (5 shadowlands + 5
+    # snarls); no cycle tag exists for the SOI half.
+    ("is", "shadowland"): "t:land o:/reveal an? (Plains|Island|Swamp|Mountain|Forest)/",
     ("is", "shockland"): "otag:shockland",  # 11, includes Multiversal Passage
     ("is", "slowland"): "otag:cycle-slowland",  # 10, exact
+    ("is", "snarl"): "t:land o:/reveal an? (Plains|Island|Swamp|Mountain|Forest)/",  # same family; Scryfall accepts both
     (
         "is",
         "storageland",
@@ -131,6 +138,15 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     # mirror; the local count carries the usual corpus-policy delta only.
     ("is", "adventure"): "layout:adventure",
     ("is", "frenchvanilla"): "otag:french-vanilla",  # community tag, ~+233 looser than "keywords only"
+    # is:modal by the mode-introducing wording. Runs ~+50 over Scryfall's own
+    # count (835 vs 800 live / 770 paper on 2026-08-09): the union reads any
+    # "choose ..." mode header, which is broader than their curated notion --
+    # accepted as a documented delta, per the trust-the-wording policy the
+    # land segment already follows.
+    (
+        "is",
+        "modal",
+    ): 'o:"choose one" or o:"choose two" or o:"choose three" or o:"choose four" or o:"choose up to"',
 }
 
 

@@ -166,7 +166,7 @@ STATIC_VALUES: dict[str, list[str]] = {
     #
     # Anything outside this set parses but falls through to a `card_is_tags` lookup, and that
     # column is empty — `is:reprint`, `is:token`, `is:modal` and `is:spell` were in the old
-    # load-generator list and every one of them matched zero cards. All 41 are kept rather
+    # load-generator list and every one of them matched zero cards. All 44 are kept rather
     # than a token few: the family's share of traffic is set by its weight, not by how many values
     # it holds, and each expands to a genuinely different shape — layout lookups, type unions, an
     # oracle-text heuristic, a numeric conjunction.
@@ -196,6 +196,7 @@ STATIC_VALUES: dict[str, list[str]] = {
         "is:manland",
         "is:mdfc",
         "is:meld",
+        "is:modal",
         "is:new",
         "is:old",
         "is:outlaw",
@@ -203,8 +204,10 @@ STATIC_VALUES: dict[str, list[str]] = {
         "is:painland",
         "is:permanent",
         "is:scryland",
+        "is:shadowland",
         "is:shockland",
         "is:slowland",
+        "is:snarl",
         "is:split",
         "is:storageland",
         "is:tangoland",

@@ -63,6 +63,12 @@ EQUIVALENCES = [
     ("is:storageland", "otag:cycle-fem-storage-land or otag:cycle-mmq-storage-land or otag:cycle-tsp-storage-land"),
     ("is:gainland", "otag:gainland"),
     ("is:frenchvanilla", "otag:french-vanilla"),
+    ("is:shadowland", "t:land o:/reveal an? (Plains|Island|Swamp|Mountain|Forest)/"),
+    ("is:snarl", "t:land o:/reveal an? (Plains|Island|Swamp|Mountain|Forest)/"),
+    (
+        "is:modal",
+        'o:"choose one" or o:"choose two" or o:"choose three" or o:"choose four" or o:"choose up to"',
+    ),
     # composes under negation and inside compounds
     ("-frame:old", "-(frame:1993 or frame:1997)"),
     ("t:goblin frame:modern", "t:goblin frame:2003"),
