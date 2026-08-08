@@ -196,13 +196,13 @@ DB_COLUMNS = [
     FieldInfo(
         db_column_name="card_oracle_tags",
         field_type=FieldType.JSONB_OBJECT,
-        search_aliases=["oracle_tags", "otag"],
+        search_aliases=["oracle_tags", "otag", "oracletag", "function"],
         parser_class=ParserClass.TEXT,
     ),
     FieldInfo(
         db_column_name="card_art_tags",
         field_type=FieldType.JSONB_OBJECT,
-        search_aliases=["art_tags", "art"],
+        search_aliases=["art_tags", "art", "atag", "arttag"],
         parser_class=ParserClass.TEXT,
     ),
     FieldInfo(

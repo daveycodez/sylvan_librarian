@@ -61,6 +61,27 @@ def test_directive_prefix_of_longer_word_is_a_name() -> None:
     assert generate_sql_query(parse_scryfall_query("sorting")) == generate_sql_query(parse_search_query("sorting"))
 
 
+# Scryfall's tag-alias spellings (each verified live: art/atag/arttag and
+# otag/oracletag/function return identical counts on api.scryfall.com).
+TAG_ALIAS_CASES = [
+    ("atag:squirrel", "art:squirrel"),
+    ("arttag:squirrel", "art:squirrel"),
+    ("oracletag:removal", "otag:removal"),
+    ("function:removal", "otag:removal"),
+]
+
+
+@pytest.mark.parametrize(
+    argnames=["alias_query", "canonical_query"],
+    argvalues=TAG_ALIAS_CASES,
+    ids=[q for q, _ in TAG_ALIAS_CASES],
+)
+def test_tag_aliases_match_canonical(alias_query: str, canonical_query: str) -> None:
+    """Each Scryfall tag-alias spelling produces identical SQL to its canonical form, in both parsers."""
+    assert generate_sql_query(parse_scryfall_query(alias_query)) == generate_sql_query(parse_scryfall_query(canonical_query))
+    assert generate_sql_query(parse_search_query(alias_query)) == generate_sql_query(parse_search_query(canonical_query))
+
+
 CI_CASES = [
     ("ci<=bg", "id<=bg"),
     ("ci:wu", "id:wu"),
