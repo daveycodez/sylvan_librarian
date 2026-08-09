@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import pathlib
 import uuid
-from typing import Any
+from typing import Any, ClassVar
+
+import pytest
 
 from api.card_processing import extract_frame_data_from_raw_card, preprocess_card
 
@@ -597,3 +600,128 @@ class TestFaceMerging:
             ],
         )
         assert preprocess_card(card) == []
+
+
+class TestMultiFaceRawBlob:
+    """`raw_card_blob` on a merged row is the card Scryfall sent, not a face promoted to look like one.
+
+    Every searchable field is merged onto the row's own columns, so the blob has no derivation left
+    to do — and keeping it verbatim is what makes it answerable. A card object cannot be rebuilt
+    from a face: `card_faces` is gone, `name` and `type_line` are the front's, and which fields a
+    real card carries at top level varies by layout. These tests pin both layouts that differ.
+    """
+
+    # The importer lifts the combined name before splitting faces; it is the only key the blob
+    # gains, and the only one a reader has to strip to recover Scryfall's object exactly.
+    IMPORTER_ADDED: ClassVar[set[str]] = {"card_name"}
+
+    @staticmethod
+    def _transform_card() -> dict:
+        """A transform card: images and text live per face, with nothing at top level."""
+        card = create_test_card(
+            name="Test Delver // Test Aberration",
+            object="card",
+            layout="transform",
+            type_line="Creature — Human Wizard // Creature — Human Insect",
+            colors=["U"],
+            color_identity=["U"],
+            card_faces=[
+                {
+                    "object": "card_face",
+                    "name": "Test Delver",
+                    "mana_cost": "{U}",
+                    "type_line": "Creature — Human Wizard",
+                    "oracle_text": "Look at the top card of your library.",
+                    "power": "1",
+                    "toughness": "1",
+                    "colors": ["U"],
+                    "image_uris": {"normal": "https://cards.test/front.jpg"},
+                },
+                {
+                    "object": "card_face",
+                    "name": "Test Aberration",
+                    "mana_cost": "",
+                    "type_line": "Creature — Human Insect",
+                    "oracle_text": "Flying",
+                    "power": "3",
+                    "toughness": "2",
+                    "colors": ["U"],
+                    "image_uris": {"normal": "https://cards.test/back.jpg"},
+                },
+            ],
+        )
+        card.pop("image_uris", None)
+        card.pop("mana_cost", None)
+        return card
+
+    @staticmethod
+    def _split_card() -> dict:
+        """A split card: one physical face, so `mana_cost` and `image_uris` stay at top level."""
+        return create_test_card(
+            name="Test Fire // Test Ice",
+            object="card",
+            layout="split",
+            type_line="Instant // Instant",
+            mana_cost="{1}{R} // {1}{U}",
+            colors=["R", "U"],
+            color_identity=["R", "U"],
+            image_uris={"normal": "https://cards.test/split.jpg"},
+            card_faces=[
+                {
+                    "object": "card_face",
+                    "name": "Test Fire",
+                    "mana_cost": "{1}{R}",
+                    "type_line": "Instant",
+                    "oracle_text": "Deals 2.",
+                },
+                {
+                    "object": "card_face",
+                    "name": "Test Ice",
+                    "mana_cost": "{1}{U}",
+                    "type_line": "Instant",
+                    "oracle_text": "Tap it.",
+                },
+            ],
+        )
+
+    @pytest.mark.parametrize("builder", ["_transform_card", "_split_card"], ids=["transform", "split"])
+    def test_the_blob_is_the_card_it_was_given(self, builder) -> None:
+        """Whatever the layout, the blob differs from the input by the lifted name and nothing else."""
+        card = getattr(self, builder)()
+        original = copy.deepcopy(card)
+        blob = preprocess_card(card)[0]["raw_card_blob"]
+
+        assert set(blob) - set(original) == self.IMPORTER_ADDED
+        assert set(original) - set(blob) == set()
+        assert {key: value for key, value in blob.items() if key not in self.IMPORTER_ADDED} == original
+
+    def test_a_transform_card_keeps_its_images_only_on_the_faces(self) -> None:
+        """The reason every blob image read coalesces to `card_faces->0` (scripts/prefer_weights.py)."""
+        blob = preprocess_card(self._transform_card())[0]["raw_card_blob"]
+        assert "image_uris" not in blob
+        assert blob["card_faces"][0]["image_uris"]["normal"] == "https://cards.test/front.jpg"
+
+    def test_a_split_card_keeps_its_top_level_image(self) -> None:
+        """Which is why stripping the promoted fields by rule could not have worked: layout decides."""
+        blob = preprocess_card(self._split_card())[0]["raw_card_blob"]
+        assert blob["image_uris"]["normal"] == "https://cards.test/split.jpg"
+        assert blob["mana_cost"] == "{1}{R} // {1}{U}"
+
+    def test_the_faces_round_trip_untouched(self) -> None:
+        card = self._transform_card()
+        faces = copy.deepcopy(card["card_faces"])
+        assert preprocess_card(card)[0]["raw_card_blob"]["card_faces"] == faces
+
+    def test_the_blob_is_not_a_face(self) -> None:
+        blob = preprocess_card(self._transform_card())[0]["raw_card_blob"]
+        assert blob["object"] == "card"
+        assert blob["name"] == "Test Delver // Test Aberration"
+        assert blob["type_line"] == "Creature — Human Wizard // Creature — Human Insect"
+
+    def test_the_searchable_row_still_carries_the_merged_faces(self) -> None:
+        """The blob going verbatim must not have cost the merge — that is what #400 was about."""
+        row = preprocess_card(self._transform_card())[0]
+        assert row["card_name"] == "Test Delver // Test Aberration"
+        assert "Flying" in row["oracle_text"]
+        assert "Look at the top card" in row["oracle_text"]
+        assert row["creature_power"] == 1
