@@ -208,10 +208,19 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
         if not face_rows:
             return []
         merged_row = _merge_processed_faces(face_rows)
-        # The blob is the front face's dict, so every existing top-level read (image_uris, lang,
-        # finishes, ...) keeps meaning "the front". Re-attach the raw faces for consumers that
-        # need per-face data — the back-face image sync in scripts/copy_images_to_s3.py.
-        merged_row["raw_card_blob"]["card_faces"] = card_faces
+        # The blob is the card-level object with its faces re-attached — what Scryfall sent, not a
+        # face promoted to look like a card. Every searchable field is already merged onto the row
+        # above, so the blob has no derivation left to do, and keeping it verbatim is what makes it
+        # answerable: a card object cannot be rebuilt from a face (`card_faces` is gone, `name` and
+        # `type_line` are the front's, and which fields a real card carries at top level varies by
+        # layout — a split card has `mana_cost` and `image_uris` there, a transform card does not).
+        #
+        # The one consumer that read a *face* field off the blob is `image_uris`, which for a
+        # transform card now lives only under `card_faces`; every reader coalesces to
+        # `card_faces->0` (scripts/copy_images_to_s3.py, scripts/prefer_weights.py). Everything else
+        # read from the blob — lang, set_type, games, finishes, frame_effects, image_status,
+        # reserved, game_changer — is card-level and identical either way.
+        merged_row["raw_card_blob"] = copy.deepcopy(card) | {"card_faces": card_faces}
         return [merged_row]
 
     # Single face case - set defaults
