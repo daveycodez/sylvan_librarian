@@ -45,7 +45,9 @@ from api.enums import CardOrdering, PreferOrder, ResponseShape, SortDirection, U
 from api.middlewares.timing import record_span
 from api.noscript_helpers import generate_results_count_html, generate_results_html
 from api.parsing import generate_sql_query, parse_scryfall_query
+from api.rulings_import import import_rulings as _import_rulings
 from api.scryfall_bulk_data_fetcher import BulkDataKey, ScryfallBulkDataFetcher
+from api.scryfall_compat import ScryfallCardsRoutes
 from api.settings import settings
 from api.tag_import import import_art_tags as _import_art_tags
 from api.tag_import import import_oracle_tags as _import_oracle_tags
@@ -233,7 +235,7 @@ def _hostname_to_site_name(hostname: str) -> str:
 
 
 # Query parameters that must not be forwarded to action handlers.
-DISALLOWED_QUERY_ARGS: frozenset[str] = frozenset(["falcon_response", "request_host"])
+DISALLOWED_QUERY_ARGS: frozenset[str] = frozenset(["falcon_response", "request", "request_host"])
 
 # Body for an unhandled exception. Fixed and content-free on purpose: the frames live at throw sites
 # inside query and import paths, so their locals can hold connection and query state. Diagnostics go
@@ -595,6 +597,29 @@ def _build_routes_listing(route_table: dict[str, BoundRoute]) -> dict[str, dict[
     return routes
 
 
+def _request_injection(entry: BoundRoute | None, req: falcon.Request) -> dict[str, Any]:
+    """Return the `request` keyword for handlers that declare it, and nothing for the rest.
+
+    Only `POST /cards/collection` wants the request object: its identifiers arrive in the body,
+    which nothing else in the dispatch path reads. Injecting it unconditionally is not an option —
+    a non-string keyword a handler neither declares nor absorbs through `**kwargs` reaches it as a
+    TypeError, and `search` is one such handler.
+
+    Args:
+        entry: The resolved route, or None when the path identified nothing.
+        req: The request being dispatched.
+
+    Returns:
+        `{"request": req}` when the handler declares the parameter, otherwise an empty dict.
+    """
+    if entry is None:
+        return {}
+    binder = getattr(entry.action, "binder", None)
+    if binder is None or not binder.accepts("request"):
+        return {}
+    return {"request": req}
+
+
 def _columnarize_cards(cards: list[dict[str, Any]]) -> dict[str, list[Any]]:
     """Convert a list of card dicts into a dict of per-field value lists.
 
@@ -613,8 +638,13 @@ def _columnarize_cards(cards: list[dict[str, Any]]) -> dict[str, list[Any]]:
     return {k: [c[k] for c in cards] for k in keys}
 
 
-class APIResource:
-    """Class implementing request handling for our simple API."""
+class APIResource(ScryfallCardsRoutes):
+    """Class implementing request handling for our simple API.
+
+    The Scryfall-compatible `/cards/*` routes live in the base class rather than here: they are a
+    self-contained compatibility surface with their own response objects, and `iter_marked_routes`
+    scans inherited attributes, so they register exactly like the routes defined below.
+    """
 
     def __init__(
         self,
@@ -755,6 +785,7 @@ class APIResource:
         before = time.monotonic()
         try:
             params = {k: v for k, v in req.params.items() if k not in DISALLOWED_QUERY_ARGS}
+            params.update(_request_injection(entry, req))
             res = action(*action_args, falcon_response=resp, request_host=req.get_header("X-Proxy-Host") or req.host, **params)
             resp.media = res
         except ParamCoercionError as oops:
@@ -1132,6 +1163,9 @@ class APIResource:
             self.backfill_prefer_scores()
             self.backfill_cubecobra_scores()
             _import_oracle_tags(self._conn_pool, self._bulk_data_fetcher)
+            # Rulings feed only /cards/*/rulings, so nothing above or below depends on them; they
+            # sit here rather than in their own pass so one bulk fetch cycle refreshes everything.
+            self._import_rulings_quietly()
             self._reload_engine(force=True)
             self._clear_caches()
             self._last_import_time.value = time.time()
@@ -2409,6 +2443,27 @@ class APIResource:
     def import_art_tags(self, **_: object) -> dict[str, Any]:
         """Import art tags from Scryfall bulk data into art_tags, art_tag_relationships, and card_art_tags."""
         return _import_art_tags(self._conn_pool, self._bulk_data_fetcher)
+
+    @route()
+    def import_rulings(self, **_: object) -> dict[str, Any]:
+        """Import Scryfall rulings bulk data into magic.rulings, backing the /cards/*/rulings routes.
+
+        Returns:
+            The number of rulings loaded.
+        """
+        return {"rulings_loaded": _import_rulings(self._conn_pool, self._bulk_data_fetcher)}
+
+    def _import_rulings_quietly(self) -> None:
+        """Refresh the rulings during a bulk import, logging rather than failing on error.
+
+        Rulings are the only data in the import sequence nothing else reads: a card search, the
+        prefer scores and the engine reload all work without them. Letting a bad rulings file
+        abort the import would cost the corpus refresh to save a rulings refresh.
+        """
+        try:
+            _import_rulings(self._conn_pool, self._bulk_data_fetcher)
+        except Exception:
+            logger.exception("Rulings import failed; continuing with the rest of the import")
 
     @route()
     def import_all_is_tags(self, **_: object) -> dict[str, Any]:
