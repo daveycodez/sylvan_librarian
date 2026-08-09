@@ -71,23 +71,47 @@ Scryfall (445 = 445; see below).
 Correctness work, so per `docs/workflows/performance-pr-workflow.md` the
 acceptance is differential, not a benchmark story.
 
-Verified against the live Scryfall API — the reference this DSL targets:
+**Differential, on a real corpus.** 30,658 oracle cards, built from Scryfall's
+`oracle_cards` bulk data through this repo's own `preprocess_card`, one row per
+oracle id so card-level fields are unambiguous. The reference applies Python's
+`re` to the same field the query names and counts distinct oracle ids; it
+shares no code with the engine. Where a pattern uses a PostgreSQL-only escape
+the reference uses the independent equivalent spelling (`\y` → `\b`), so the
+translation is checked against something other than itself.
 
-| query | Scryfall | before | after |
+| query | before | after | reference |
 |---|---|---|---|
-| `o:/draw (?!two)/ t:instant` | 435 | decline → SQL | engine |
-| `o:/(?=.*sacrifice)draw/` | 33 | decline → SQL | engine |
-| `o:/(?<=draw )a card/` | 2,542 | decline → SQL | engine |
-| `name:/\yizzet\y/` | 20 | decline → SQL | engine |
-| `t:/goblin\|elf/` | 1,269 | **0, silently** | engine |
-| `t:/^legendary/` | 4,316 | **0, silently** | engine |
-| `t:/dragon.*spirit/` | 18 | **0, silently** | engine |
-| `t:/dragon/` | 445 | 445 (lowered) | 445 |
+| `o:/draw (?!two)/` | decline → SQL | 3,630 | 3,630 |
+| `o:/(?=.*sacrifice)draw/` | decline → SQL | 247 | 247 |
+| `o:/(?<=draw )a card/` | decline → SQL | 2,900 | 2,900 |
+| `o:/^\{T\}:/` | decline → SQL | 1,035 | 1,035 |
+| `name:/\yizzet\y/` | decline → SQL | 14 | 14 |
+| `name:/\mizzet/` | decline → SQL | 14 | 14 |
+| `name:/\bizzet\b/` | 14 | 14 | 14 |
+| `t:/goblin\|elf/` | **0, silently** | 1,157 | 1,157 |
+| `t:/^legendary/` | **0, silently** | 3,926 | 3,926 |
+| `t:/dragon.*spirit/` | **0, silently** | 16 | 16 |
+| `t:/elf (warrior\|shaman)/` | **0, silently** | 171 | 171 |
 | `t:/^drag/` | 0 | 0 | 0 |
+| `t:/dragon/` | 402 | 402 | (lowered to `t:dragon`) |
 
-`t:/^legendary/` (4,316) against `t:legendary` (4,348) is the case that shows
-these are not the same predicate: the anchored regex matches type lines
-*starting* with the supertype, the lookup matches it anywhere.
+13 of 13 match. The `before` column is measured the same way, with this
+branch's engine and the pre-change parser.
+
+**Semantics against Scryfall.** Absolute totals are not comparable — this
+repo's import drops digital-only and funny-set cards (measured: 18,889 of
+116,694 rows in `default_cards`), so its corpus is a deliberate subset. What
+Scryfall settles is what each query *means*, and it confirms every case above
+is a real query with real answers: 1,269 for `t:/goblin|elf/`, 4,316 for
+`t:/^legendary/`, 435 for `o:/draw (?!two)/ t:instant`, 20 for
+`name:/\yizzet\y/`.
+
+It also settles that the bare-literal lowering is safe: `t:/dragon/` and
+`t:dragon` return identical totals on Scryfall (445 = 445, likewise
+creature/elf/aura/legendary/equipment). And `t:/^legendary/` at 4,316 against
+`t:legendary` at 4,348 is what shows the two are not the same predicate — the
+anchored regex matches type lines *starting* with the supertype, the lookup
+matches it anywhere.
 
 One cost constant is added. `REGEX_BACKTRACK_NS100 = 380_000`, from
 `bench_backtrack_engine` (self-contained; no `real.store` needed): lookaround
