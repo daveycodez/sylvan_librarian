@@ -23,6 +23,8 @@ DIRECTIVE_CASES = [
     ("t:goblin sort:edhrec", "t:goblin"),
     ("t:goblin order:name", "t:goblin"),
     ("t:goblin direction:asc", "t:goblin"),
+    ("t:goblin dir:asc", "t:goblin"),
+    ("t:goblin dir:auto", "t:goblin"),
     ("t:goblin prefer:oldest", "t:goblin"),
     ("t:goblin unique:art", "t:goblin"),
     ("t:goblin unique:prints", "t:goblin"),
@@ -69,6 +71,25 @@ def test_directive_prefix_of_longer_word_is_a_name() -> None:
     # "sorting" must not be consumed as "sort" + garbage, nor "uniquely" as "unique" + garbage.
     assert generate_sql_query(parse_scryfall_query("sorting")) == generate_sql_query(parse_search_query("sorting"))
     assert generate_sql_query(parse_scryfall_query("uniquely")) == generate_sql_query(parse_search_query("uniquely"))
+    # "dir" is the riskiest of these: it is a prefix of "direction" AND of ordinary words.
+    assert generate_sql_query(parse_scryfall_query("direct")) == generate_sql_query(parse_search_query("direct"))
+    assert generate_sql_query(parse_scryfall_query("dire")) == generate_sql_query(parse_search_query("dire"))
+
+
+def test_dir_is_recorded_as_the_short_spelling_of_direction() -> None:
+    """`dir:` is Scryfall's short spelling and sets the same parameter (measured 2026-08-09).
+
+    Recorded under its own name rather than rewritten to `direction`, so a warning about a
+    repeated directive can quote back what the client actually wrote.
+    """
+    assert parse_scryfall_query("t:goblin dir:desc").directives == (("dir", "desc", False),)
+    assert parse_search_query("t:goblin dir:desc").directives == (("dir", "desc", False),)
+
+
+def test_direction_is_not_swallowed_by_the_dir_alternative() -> None:
+    """The longer spelling has to win outright, or `direction:desc` parses as `dir` + garbage."""
+    assert parse_scryfall_query("t:goblin direction:desc").directives == (("direction", "desc", False),)
+    assert parse_search_query("t:goblin direction:desc").directives == (("direction", "desc", False),)
 
 
 def test_directive_values_are_captured_in_source_order() -> None:

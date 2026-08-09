@@ -15,6 +15,7 @@ from api.parsing.card_query_nodes import CardAttributeNode, CardBinaryOperatorNo
 from api.parsing.db_info import ALIAS_TO_FIELD_INFOS, COLOR_NAME_TO_CODE, ParserClass
 from api.parsing.mana_symbols import first_invalid_mana_symbol
 from api.parsing.nodes import (
+    DIRECTIVE_NAMES,
     AndNode,
     BinaryOperatorNode,
     DirectiveNode,
@@ -480,14 +481,18 @@ class Parser:
     # ── word dispatch ─────────────────────────────────────────────────────────
 
     def parse_directive_primary(self, word: str, wl: str, next_tok: Token) -> QueryNode | None:
-        """Consume a result-shape directive (unique:/sort:/order:/direction:/prefer:), or return None.
+        """Consume a result-shape directive (unique:/sort:/order:/direction:/dir:/prefer:), or return None.
 
         Scryfall accepts these inside the query string itself; they constrain presentation,
         not membership, so a directive parses to a DirectiveNode carrying its value, and the
         extraction pass in rewrite.py strips it from the filter tree and records it on the
         Query for the API layer to apply.
+
+        `dir` is Scryfall's short spelling of `direction` and sets the same parameter (measured
+        2026-08-09: `dir:desc` and `direction:desc` return the same page, as do `dir:auto` and
+        `direction:auto`). Matching is on the whole word, so `direct:` is unaffected.
         """
-        if wl not in ("sort", "order", "direction", "prefer", "unique") or next_tok.type != TT.OP or next_tok.value != ":":
+        if wl not in DIRECTIVE_NAMES or next_tok.type != TT.OP or next_tok.value != ":":
             return None
         self.consume()  # ':'
         val_tok = self.peek()

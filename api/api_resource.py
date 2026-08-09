@@ -190,13 +190,17 @@ _DIRECTIVE_PREFER: dict[str, PreferOrder] = {str(member): member for member in P
 }
 
 
-# Directive name -> (parameter it sets, vocabulary, noun used in warnings). sort and order
-# are spellings of the same parameter, so they share a slot and can override one another.
+# Directive name -> (parameter it sets, vocabulary, noun used in warnings). Several directives
+# have more than one spelling and share a slot, so they override one another rather than each
+# setting a different parameter: sort/order, and direction/dir. Both pairs are spellings
+# api.scryfall.com accepts inline (measured 2026-08-09: `dir:desc` and `direction:desc` return
+# the same page, as do `dir:auto` and `direction:auto`).
 _DIRECTIVE_TABLES: dict[str, tuple[str, Mapping[str, Any], str]] = {
     "unique": ("unique", _DIRECTIVE_UNIQUE, "unique mode"),
     "sort": ("orderby", _DIRECTIVE_ORDER, "order choice"),
     "order": ("orderby", _DIRECTIVE_ORDER, "order choice"),
     "direction": ("direction", _DIRECTIVE_DIRECTION, "direction"),
+    "dir": ("direction", _DIRECTIVE_DIRECTION, "direction"),
     "prefer": ("prefer", _DIRECTIVE_PREFER, "prefer choice"),
 }
 
