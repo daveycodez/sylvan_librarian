@@ -436,6 +436,17 @@ class TrueNode(LeafNode):
         return ""
 
 
+# The directive names both parsers recognize, longest spelling first so an alternation built from
+# this list matches `direction` outright rather than leaning on a lookahead to reject the `dir`
+# prefix. One list rather than one per parser: the two spell the same vocabulary and a name added
+# to only one of them is a parity divergence that the shared cases would not catch, because a
+# query nobody wrote cannot fail.
+#
+# `sort`/`order` and `direction`/`dir` are pairs of spellings for one parameter each; both pairs
+# are accepted by api.scryfall.com inline (measured 2026-08-09).
+DIRECTIVE_NAMES: tuple[str, ...] = ("unique", "sort", "order", "direction", "dir", "prefer")
+
+
 class DirectiveNode(LeafNode):
     """A result-shape directive written inside the query string (unique:art, sort:usd).
 

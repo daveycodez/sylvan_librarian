@@ -30,6 +30,7 @@ from api.parsing.db_info import (
     ParserClass,
 )
 from api.parsing.nodes import (
+    DIRECTIVE_NAMES,
     AndNode,
     BinaryOperatorNode,
     DirectiveNode,
@@ -384,7 +385,9 @@ def create_all_condition_parsers(basic_parsers: dict, mana_parsers: dict, color_
     # carrying the value; the extraction pass at the rewrite seam strips them from
     # the filter tree and records them on the Query for the API layer to apply.
     directive_condition = (
-        Regex(r"(?i)(?:sort|order|direction|prefer|unique)(?=:)") + Literal(":") + (quoted_string | string_value_word)
+        # DIRECTIVE_NAMES is ordered longest-spelling-first, so `direction` wins the alternation
+        # outright rather than relying on the lookahead to reject the `dir` prefix.
+        Regex(rf"(?i)(?:{'|'.join(DIRECTIVE_NAMES)})(?=:)") + Literal(":") + (quoted_string | string_value_word)
     )
     directive_condition.set_parse_action(make_directive_node)
 

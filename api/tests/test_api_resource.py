@@ -695,6 +695,16 @@ class TestSearchQueryDirectives(TestBaseAPIResourceTest):
         assert kwargs["direction"] == "desc"
         assert kwargs["prefer"] == "oldest"
 
+    def test_dir_is_the_short_spelling_of_direction(self) -> None:
+        """`dir:desc` reaches the engine exactly as `direction:desc` does (Scryfall accepts both)."""
+        mock_engine, _ = self._engine_search("t:goblin sort:usd dir:desc")
+        assert mock_engine.query.call_args.kwargs["direction"] == "desc"
+
+    def test_the_two_direction_spellings_override_one_another(self) -> None:
+        """They set one parameter, so the later wins rather than each applying independently."""
+        mock_engine, _ = self._engine_search("t:goblin direction:desc dir:asc")
+        assert mock_engine.query.call_args.kwargs["direction"] == "asc"
+
     def test_unknown_directive_value_warns_and_keeps_parameter(self) -> None:
         """An unknown value is ignored with a Scryfall-shaped warning; the search still runs."""
         mock_engine, result = self._engine_search("t:goblin unique:bogus")
