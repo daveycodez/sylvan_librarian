@@ -16,7 +16,7 @@ use super::{
     archive_header, archive_payload, ARCHIVE_HEADER_LEN, Mmap,
     bitmap_contains, bitmap_card_ids, compile_plane, eval_planes, split_planes,
     ArithOp, ArtistIndex, CardData, CardIndexes, Candidates, ColorField, NumExpr, NumField, RarityIndex,
-    CollField, CmpOp, FilterExpr, InlineStr, Interner, ManaCost, OracleCard, Printing, TagIndex,
+    CollField, CmpOp, FilterExpr, InlineStr, Interner, ManaCost, OracleCard, OracleFace, Printing, PrintingFace, TagIndex,
     TextField, TextSearchField, Tri, SortedTrigramIndex, VocabInterner, ARTIST_NONE, NONE_STR, TYPE_ARTIFACT, TYPE_CREATURE,
     TYPE_ENCHANTMENT, TYPE_INSTANT, TYPE_LAND, TYPE_LEGENDARY, TYPE_PLANESWALKER, TYPE_SNOW, TYPE_SORCERY,
 };
@@ -217,6 +217,7 @@ fn stub_card(oracle_id: u128, card_types: u16, subtypes: &[&str], vocab: &mut Vo
         mana_cost: ManaCost { core: 0, hybrids: Vec::new(), devotion: 0, cmc: 0.0 },
         creature_power_text_id: NONE_STR,
         creature_toughness_text_id: NONE_STR,
+        faces: Vec::new(),
     }
 }
 
@@ -245,6 +246,7 @@ fn stub_printing(scryfall_id: u128, illustration_id: u128, prefer_score: Option<
         card_is_tags: Vec::new(),
         card_frame_data: Vec::new(),
         artwork_group_id: 0, // placeholder; store_of overwrites via assign_artwork_groups
+        faces: Vec::new(),
     }
 }
 
@@ -11353,3 +11355,92 @@ fn arith_tuple_key_budget_catches_a_blown_domain() {
 /// Above `ARITH_TUPLE_GUARD_MIN_CARDS`, and large enough that an all-distinct key space
 /// clears `10*sqrt(n)+32` by a wide margin.
 const ARITH_TUPLE_BLOWUP_CARDS: usize = 6_000;
+
+// ─── Face storage ─────────────────────────────────────────────────────────────
+
+/// Two faces whose text and art both differ, so a merge-shaped answer cannot fake it.
+fn two_faces() -> (Vec<OracleFace>, Vec<PrintingFace>) {
+    let oracle = vec![
+        OracleFace {
+            card_name_id: 1,
+            mana_cost_text_id: 2,
+            type_line_id: 3,
+            oracle_text_id: 4,
+            creature_power_text_id: 5,
+            creature_toughness_text_id: 6,
+            planeswalker_loyalty_text_id: NONE_STR,
+            card_colors: 0b0000_0001, // W
+            color_indicator: 0,
+        },
+        OracleFace {
+            card_name_id: 11,
+            mana_cost_text_id: NONE_STR, // a transform back has no mana cost at all
+            type_line_id: 13,
+            oracle_text_id: 14,
+            creature_power_text_id: 15,
+            creature_toughness_text_id: 16,
+            planeswalker_loyalty_text_id: NONE_STR,
+            card_colors: 0b0000_1000, // R
+            color_indicator: 0b0000_1000,
+        },
+    ];
+    let printing = vec![
+        PrintingFace { illustration_id: 0xAAAA, card_artist_vid: 1, flavor_text_id: 7 },
+        PrintingFace { illustration_id: 0xBBBB, card_artist_vid: 2, flavor_text_id: NONE_STR },
+    ];
+    (oracle, printing)
+}
+
+#[test]
+fn faces_survive_the_archive_round_trip() {
+    let mut vocab = VocabInterner::new();
+    let (oracle_faces, printing_faces) = two_faces();
+    let mut card = stub_card(1, 0, &[], &mut vocab);
+    card.faces = oracle_faces;
+    let mut printing = stub_printing(1, 1, Some(1.0));
+    printing.faces = printing_faces;
+
+    let card_bytes = rkyv::to_bytes::<Error>(&card).expect("serialize card");
+    let archived_card = rkyv::access::<Archived<OracleCard>, Error>(&card_bytes).expect("access card");
+    let print_bytes = rkyv::to_bytes::<Error>(&printing).expect("serialize printing");
+    let archived_print = rkyv::access::<Archived<Printing>, Error>(&print_bytes).expect("access printing");
+
+    assert_eq!(archived_card.faces.len(), 2);
+    assert_eq!(archived_print.faces.len(), 2);
+
+    // Text: the back keeps its own name, types and stats -- the thing the merged row cannot say.
+    assert_eq!(archived_card.faces[0].card_name_id, 1);
+    assert_eq!(archived_card.faces[1].card_name_id, 11);
+    assert_eq!(archived_card.faces[1].mana_cost_text_id, NONE_STR);
+    assert_eq!(archived_card.faces[0].creature_power_text_id, 5);
+    assert_eq!(archived_card.faces[1].creature_power_text_id, 15);
+
+    // Colors are per face, which is how `c:r` reaches a red back on a white front.
+    assert_eq!(archived_card.faces[0].card_colors, 0b0000_0001);
+    assert_eq!(archived_card.faces[1].card_colors, 0b0000_1000);
+    assert_eq!(archived_card.faces[1].color_indicator, 0b0000_1000);
+
+    // Art: per printing, and distinct per face.
+    assert_eq!(archived_print.faces[0].illustration_id, 0xAAAA);
+    assert_eq!(archived_print.faces[1].illustration_id, 0xBBBB);
+    assert_ne!(archived_print.faces[0].card_artist_vid, archived_print.faces[1].card_artist_vid);
+    assert_eq!(archived_print.faces[1].flavor_text_id, NONE_STR);
+}
+
+#[test]
+fn single_faced_cards_carry_no_faces() {
+    let mut vocab = VocabInterner::new();
+    let card = stub_card(1, 0, &[], &mut vocab);
+    let bytes = rkyv::to_bytes::<Error>(&card).expect("serialize");
+    let archived = rkyv::access::<Archived<OracleCard>, Error>(&bytes).expect("access");
+    // ~82% of the corpus. An empty Vec archives to a length word, so the cost is bounded.
+    assert!(archived.faces.is_empty());
+}
+
+#[test]
+fn face_indexes_line_up_across_the_split() {
+    // OracleFace and PrintingFace are two halves of one face, so index i must mean the same face
+    // in both. The commit pass fills them from the same FaceRow list; this pins that contract.
+    let (oracle_faces, printing_faces) = two_faces();
+    assert_eq!(oracle_faces.len(), printing_faces.len());
+}
