@@ -106,6 +106,18 @@ pub(crate) fn color_list_to_mask(colors: &[&str]) -> u8 {
     colors.iter().fold(0u8, |acc, c| acc | color_to_bit(c))
 }
 
+/// The inverse of `color_list_to_mask`, in Scryfall's WUBRG order (C last, as Scryfall lists it).
+///
+/// New because colors were only ever filtered on, never emitted: answering whether a card matches
+/// `c:r` needs the mask, but reconstructing a card object needs to say which colors it actually is.
+pub(crate) fn mask_to_color_letters(mask: u8) -> Vec<&'static str> {
+    [("W", 1u8), ("U", 2), ("B", 4), ("R", 8), ("G", 16), ("C", 32)]
+        .iter()
+        .filter(|(_, bit)| mask & bit != 0)
+        .map(|(letter, _)| *letter)
+        .collect()
+}
+
 // ─── Mana cost helpers ───────────────────────────────────────────────────────
 
 // ─── Packed pip lanes ────────────────────────────────────────────────────────
@@ -11966,6 +11978,52 @@ const FIELD_TABLE: &[(&str, FieldExtractor)] = &[
         let bits = if c.legality_divergent { u64::from(p.card_legalities) } else { u64::from(c.card_legalities) };
         Ok(legality_bits_to_pydict(py, bits)?.into_any())
     }),
+    // ── The compat residue, in Scryfall's own field names ────────────────────────────────────
+    // Each is requestable on its own, like every entry above, and together they are what a
+    // reconstructed card object needs beyond the columns and the derived URLs. Absent stays
+    // absent: these emit None rather than a zero value, because Scryfall OMITS a key it has no
+    // value for, and a card that sprouts nulls Scryfall never sent differs from Scryfall on
+    // every row.
+    ("lang", |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.lang_id)).into_pyobject(py)?.into_any())),
+    ("image_status", |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.image_status_id)).into_pyobject(py)?.into_any())),
+    ("set_type", |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.set_type_id)).into_pyobject(py)?.into_any())),
+    ("security_stamp", |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.security_stamp_id)).into_pyobject(py)?.into_any())),
+    ("set_id", |py, _c, p, _s, _v| Ok(uuid_from_u128(u128::from(p.compat.set_id)).into_pyobject(py)?.into_any())),
+    ("arena_id", |py, _c, p, _s, _v| Ok(p.compat.arena_id.as_ref().copied().map(u32::from).into_pyobject(py)?.into_any())),
+    ("mtgo_id", |py, _c, p, _s, _v| Ok(p.compat.mtgo_id.as_ref().copied().map(u32::from).into_pyobject(py)?.into_any())),
+    ("mtgo_foil_id", |py, _c, p, _s, _v| Ok(p.compat.mtgo_foil_id.as_ref().copied().map(u32::from).into_pyobject(py)?.into_any())),
+    ("tcgplayer_id", |py, _c, p, _s, _v| Ok(p.compat.tcgplayer_id.as_ref().copied().map(u32::from).into_pyobject(py)?.into_any())),
+    ("tcgplayer_etched_id", |py, _c, p, _s, _v| Ok(p.compat.tcgplayer_etched_id.as_ref().copied().map(u32::from).into_pyobject(py)?.into_any())),
+    ("cardmarket_id", |py, _c, p, _s, _v| Ok(p.compat.cardmarket_id.as_ref().copied().map(u32::from).into_pyobject(py)?.into_any())),
+    ("penny_rank", |py, _c, p, _s, _v| Ok(p.compat.penny_rank.as_ref().copied().map(u32::from).into_pyobject(py)?.into_any())),
+    ("image_updated_at", |py, _c, p, _s, _v| Ok(p.compat.image_updated_at.as_ref().copied().map(u32::from).into_pyobject(py)?.into_any())),
+    // Dollars from integer cents, the same conversion price_usd uses.
+    ("price_usd_foil", |py, _c, p, _s, _v| Ok(p.compat.price_usd_foil.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).into_pyobject(py)?.into_any())),
+    ("price_usd_etched", |py, _c, p, _s, _v| Ok(p.compat.price_usd_etched.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).into_pyobject(py)?.into_any())),
+    ("price_eur_foil", |py, _c, p, _s, _v| Ok(p.compat.price_eur_foil.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).into_pyobject(py)?.into_any())),
+    ("multiverse_ids", |py, _c, p, _s, _v| {
+        let ids: Vec<u32> = p.compat.multiverse_ids.iter().map(|v| u32::from(*v)).collect();
+        Ok(ids.into_pyobject(py)?.into_any())
+    }),
+    ("promo_types", |py, _c, p, _s, v| Ok(sorted_strs(v, &p.compat.promo_types).into_pyobject(py)?.into_any())),
+    ("frame_effects", |py, _c, p, _s, v| Ok(sorted_strs(v, &p.compat.frame_effects).into_pyobject(py)?.into_any())),
+    ("games", |py, _c, p, _s, _v| Ok(bits_to_names(u8::from(p.compat.games), GAME_NAMES).into_pyobject(py)?.into_any())),
+    ("finishes", |py, _c, p, _s, _v| Ok(bits_to_names(u8::from(p.compat.finishes), FINISH_NAMES).into_pyobject(py)?.into_any())),
+    ("booster", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_BOOSTER).into_pyobject(py)?.to_owned().into_any())),
+    ("digital", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_DIGITAL).into_pyobject(py)?.to_owned().into_any())),
+    ("foil", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_FOIL).into_pyobject(py)?.to_owned().into_any())),
+    ("nonfoil", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_NONFOIL).into_pyobject(py)?.to_owned().into_any())),
+    ("full_art", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_FULL_ART).into_pyobject(py)?.to_owned().into_any())),
+    ("highres_image", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_HIGHRES_IMAGE).into_pyobject(py)?.to_owned().into_any())),
+    ("oversized", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_OVERSIZED).into_pyobject(py)?.to_owned().into_any())),
+    ("promo", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_PROMO).into_pyobject(py)?.to_owned().into_any())),
+    ("reprint", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_REPRINT).into_pyobject(py)?.to_owned().into_any())),
+    ("story_spotlight", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_STORY_SPOTLIGHT).into_pyobject(py)?.to_owned().into_any())),
+    ("textless", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_TEXTLESS).into_pyobject(py)?.to_owned().into_any())),
+    ("variation", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_VARIATION).into_pyobject(py)?.to_owned().into_any())),
+    // Each face as its own dict, front first, in Scryfall's key names. Empty list for a
+    // single-faced card, which is how Scryfall omits card_faces entirely.
+    ("card_faces", |py, c, p, s, v| Ok(faces_to_pylist(py, c, p, s, v)?.into_any())),
 ];
 
 /// Mirror of magic.rarity_int_to_text -- the import stores 0-5, Scryfall speaks words.
@@ -11988,6 +12046,62 @@ fn identity_letters(mask: u8) -> Vec<&'static str> {
         .filter(|(_, bit)| mask & bit != 0)
         .map(|(letter, _)| *letter)
         .collect()
+}
+
+
+/// Bitset member names, in the order Scryfall lists them.
+const GAME_NAMES: &[(&str, u8)] = &[("paper", GAME_PAPER), ("mtgo", GAME_MTGO), ("arena", GAME_ARENA)];
+const FINISH_NAMES: &[(&str, u8)] =
+    &[("nonfoil", FINISH_NONFOIL), ("foil", FINISH_FOIL), ("etched", FINISH_ETCHED), ("glossy", FINISH_GLOSSY)];
+
+fn bits_to_names(bits: u8, table: &[(&'static str, u8)]) -> Vec<&'static str> {
+    table.iter().filter(|(_, bit)| bits & bit != 0).map(|(name, _)| *name).collect()
+}
+
+fn compat_flag(p: &APrinting, bit: u16) -> bool {
+    u16::from(p.compat.flags) & bit != 0
+}
+
+/// A compat vocab id, or None when the key was absent. Distinct from `coll_str`, which has no
+/// absent case: every collection element is a real entry, while a compat field routinely is not.
+fn coll_str_opt(vocab: &AStrings, id: u16) -> Option<&str> {
+    if id == VOCAB_NONE { None } else { Some(coll_str(vocab, id)) }
+}
+
+/// The card's faces as Scryfall shapes them: text from the oracle card, art from this printing.
+///
+/// `object` and `image_uris` are omitted deliberately -- the first is the constant "card_face" and
+/// the second is a pure function of the card's id and the face's position, so both are re-emitted
+/// by the caller rather than stored.
+fn faces_to_pylist<'py>(
+    py: Python<'py>,
+    card: &AOracleCard,
+    printing: &APrinting,
+    strings: &AStrings,
+    vocab: &AStrings,
+) -> PyResult<Bound<'py, PyList>> {
+    let mut out: Vec<Bound<PyDict>> = Vec::with_capacity(card.faces.len());
+    for (i, face) in card.faces.iter().enumerate() {
+        let d = PyDict::new(py);
+        d.set_item("name", str_at(strings, u32::from(face.card_name_id)))?;
+        d.set_item("mana_cost", str_at(strings, u32::from(face.mana_cost_text_id)))?;
+        d.set_item("type_line", str_at(strings, u32::from(face.type_line_id)))?;
+        d.set_item("oracle_text", str_at(strings, u32::from(face.oracle_text_id)))?;
+        d.set_item("power", str_at(strings, u32::from(face.creature_power_text_id)))?;
+        d.set_item("toughness", str_at(strings, u32::from(face.creature_toughness_text_id)))?;
+        d.set_item("loyalty", str_at(strings, u32::from(face.planeswalker_loyalty_text_id)))?;
+        d.set_item("colors", mask_to_color_letters(u8::from(face.card_colors)))?;
+        d.set_item("color_indicator", mask_to_color_letters(u8::from(face.color_indicator)))?;
+        // Art is per printing, and a printing may carry fewer face-art records than the card has
+        // faces; those faces simply have no art rather than borrowing the wrong face's.
+        if let Some(art) = printing.faces.get(i) {
+            d.set_item("artist", coll_str_opt(vocab, u16::from(art.card_artist_vid)))?;
+            d.set_item("illustration_id", uuid_from_u128(u128::from(art.illustration_id)))?;
+            d.set_item("flavor_text", str_at(strings, u32::from(art.flavor_text_id)))?;
+        }
+        out.push(d);
+    }
+    PyList::new(py, out)
 }
 
 /// Resolve one interned collection-element id against the archived vocab table.
