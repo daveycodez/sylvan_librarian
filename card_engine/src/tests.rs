@@ -17,6 +17,7 @@ use super::{
     bitmap_contains, bitmap_card_ids, compile_plane, eval_planes, split_planes,
     ArithOp, ArtistIndex, CardData, CardIndexes, Candidates, ColorField, NumExpr, NumField, RarityIndex,
     CollField, CmpOp, FilterExpr, InlineStr, Interner, ManaCost, OracleCard, OracleFace, Printing, PrintingFace, TagIndex,
+    build_printing_by_scryfall_id, build_oracle_by_oracle_id, find_printing_by_scryfall_id, find_oracle_by_oracle_id,
     TextField, TextSearchField, Tri, SortedTrigramIndex, VocabInterner, ARTIST_NONE, NONE_STR, TYPE_ARTIFACT, TYPE_CREATURE,
     TYPE_ENCHANTMENT, TYPE_INSTANT, TYPE_LAND, TYPE_LEGENDARY, TYPE_PLANESWALKER, TYPE_SNOW, TYPE_SORCERY,
 };
@@ -6433,6 +6434,8 @@ fn bench_checked_vs_unchecked_access() {
         name_bigrams:   build_name_bigram_index(&cards),
         legal_divergent: build_divergent_ids(&cards),
         arith_tuple:    build_arith_tuple_index(&cards),
+        printing_by_scryfall_id: build_printing_by_scryfall_id(&printings),
+        oracle_by_oracle_id:     build_oracle_by_oracle_id(&cards),
     };
     let data = CardData {
         cards,
@@ -11443,4 +11446,56 @@ fn face_indexes_line_up_across_the_split() {
     // in both. The commit pass fills them from the same FaceRow list; this pins that contract.
     let (oracle_faces, printing_faces) = two_faces();
     assert_eq!(oracle_faces.len(), printing_faces.len());
+}
+
+// ─── Lookup by id ─────────────────────────────────────────────────────────────
+
+#[test]
+fn printings_are_findable_by_scryfall_id() {
+    // Ids deliberately out of order, and not dense: the permutation has to do real work.
+    let ids: [u128; 5] = [0xF00D, 0x0010, 0xBEEF, 0x0002, 0xCAFE];
+    let printings: Vec<Printing> = ids.iter().map(|&id| stub_printing(id, id, Some(1.0))).collect();
+    let perm = build_printing_by_scryfall_id(&printings);
+
+    let perm_bytes = rkyv::to_bytes::<Error>(&perm).expect("serialize perm");
+    let aperm = rkyv::access::<Archived<Vec<u32>>, Error>(&perm_bytes).expect("access perm");
+    let print_bytes = rkyv::to_bytes::<Error>(&printings).expect("serialize printings");
+    let aprint = rkyv::access::<Archived<Vec<Printing>>, Error>(&print_bytes).expect("access printings");
+
+    for (want_index, &id) in ids.iter().enumerate() {
+        let got = find_printing_by_scryfall_id(aperm, aprint, id);
+        assert_eq!(got, Some(want_index as u32), "id {id:#x} should resolve to its own row");
+    }
+    assert_eq!(find_printing_by_scryfall_id(aperm, aprint, 0xDEAD), None, "absent id");
+    // 0 is parse_uuid_or_hash's null. It must never resolve, even though it sorts first.
+    assert_eq!(find_printing_by_scryfall_id(aperm, aprint, 0), None, "null id");
+}
+
+#[test]
+fn cards_are_findable_by_oracle_id() {
+    let mut vocab = VocabInterner::new();
+    let ids: [u128; 4] = [0x30, 0x10, 0x40, 0x20];
+    let cards: Vec<OracleCard> = ids.iter().map(|&id| stub_card(id, 0, &[], &mut vocab)).collect();
+    let perm = build_oracle_by_oracle_id(&cards);
+
+    let perm_bytes = rkyv::to_bytes::<Error>(&perm).expect("serialize perm");
+    let aperm = rkyv::access::<Archived<Vec<u32>>, Error>(&perm_bytes).expect("access perm");
+    let card_bytes = rkyv::to_bytes::<Error>(&cards).expect("serialize cards");
+    let acards = rkyv::access::<Archived<Vec<OracleCard>>, Error>(&card_bytes).expect("access cards");
+
+    for (want_index, &id) in ids.iter().enumerate() {
+        assert_eq!(find_oracle_by_oracle_id(aperm, acards, id), Some(want_index as u32));
+    }
+    assert_eq!(find_oracle_by_oracle_id(aperm, acards, 0x99), None);
+}
+
+#[test]
+fn the_id_permutation_is_a_permutation() {
+    // Every row appears exactly once: a lookup index that drops a row silently 404s a real card.
+    let ids: [u128; 6] = [5, 3, 9, 1, 7, 3_000_000_000];
+    let printings: Vec<Printing> = ids.iter().map(|&id| stub_printing(id, id, None)).collect();
+    let mut perm = build_printing_by_scryfall_id(&printings);
+    assert_eq!(perm.len(), ids.len());
+    perm.sort_unstable();
+    assert_eq!(perm, (0..ids.len() as u32).collect::<Vec<_>>());
 }

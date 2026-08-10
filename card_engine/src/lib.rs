@@ -2408,6 +2408,56 @@ fn partition_point(len: usize, pred: impl Fn(usize) -> bool) -> usize {
     lo
 }
 
+/// Printing ids ordered by `scryfall_id`, for binary search.
+///
+/// A permutation rather than a `(id, index)` table: the ids are already stored on the printings, so
+/// duplicating them would cost 16 bytes a row to save one indirection on a lookup that happens once
+/// per request. Ids are unique (Scryfall's primary key), so the order is total.
+fn build_printing_by_scryfall_id(printings: &[Printing]) -> Vec<u32> {
+    let mut ids: Vec<u32> = (0..printings.len() as u32).collect();
+    ids.sort_unstable_by_key(|&i| printings[i as usize].scryfall_id);
+    ids
+}
+
+/// Card ids ordered by `oracle_id`, the same shape as `build_printing_by_scryfall_id`.
+fn build_oracle_by_oracle_id(cards: &[OracleCard]) -> Vec<u32> {
+    let mut ids: Vec<u32> = (0..cards.len() as u32).collect();
+    ids.sort_unstable_by_key(|&i| cards[i as usize].oracle_id);
+    ids
+}
+
+/// Binary search a permutation built by one of the two builders above.
+///
+/// `key_of` reads the id the permutation is ordered by. Returns the index into the ORIGINAL array
+/// (the permutation's payload), not the position within the permutation.
+fn find_by_sorted_id(perm: &Archived<Vec<u32>>, id: u128, key_of: impl Fn(u32) -> u128) -> Option<u32> {
+    // 0 is parse_uuid_or_hash's null, and no real id maps to it, so a missing/absent id can never
+    // collide with a stored one.
+    if id == 0 {
+        return None;
+    }
+    let found = perm.binary_search_by(|probe| key_of(u32::from(*probe)).cmp(&id)).ok()?;
+    Some(u32::from(perm[found]))
+}
+
+/// The printing with this Scryfall id, or None. O(log n) against a full scan.
+pub(crate) fn find_printing_by_scryfall_id(
+    perm: &Archived<Vec<u32>>,
+    printings: &Archived<Vec<Printing>>,
+    id: u128,
+) -> Option<u32> {
+    find_by_sorted_id(perm, id, |i| u128::from(printings[i as usize].scryfall_id))
+}
+
+/// The oracle card with this oracle id, or None. Backs `oracleid:` and prints-of-this-card.
+pub(crate) fn find_oracle_by_oracle_id(
+    perm: &Archived<Vec<u32>>,
+    cards: &Archived<Vec<OracleCard>>,
+    id: u128,
+) -> Option<u32> {
+    find_by_sorted_id(perm, id, |i| u128::from(cards[i as usize].oracle_id))
+}
+
 fn build_sort_permutations(cards: &[OracleCard]) -> SortPermutations {
     // Purely card-space now: the printings/offsets arguments existed only to read the first stored
     // printing's prefer_score, which is no longer a sort key (see the closure below).
@@ -3660,6 +3710,16 @@ struct CardIndexes {
     name_unigrams:  NameUnigramIndex,          // card space: exact 1-byte name containment (#858)
     legal_divergent: Vec<u16>,                // card space: ids with divergent legality (#630 phase 2), postings not a plane — see build_divergent_ids
     arith_tuple:    ArithTupleIndex,           // card space: joint (cmc,power,toughness,loyalty) postings for arith predicates (#743)
+    // Lookup by id, which is the one addressing mode the store has never had. `Printing.scryfall_id`
+    // and `OracleCard.oracle_id` are already the UUID's exact bits (parse_uuid_or_hash keeps them,
+    // and the comment on that field says the reason is "so future lookup-by-id can match
+    // Scryfall's") — they were simply not findable except by scanning. These are permutations, not
+    // copies: 4 bytes per row, ~390 KB and ~127 KB at corpus scale, binary searched.
+    //
+    // Without them, every /cards/:id, /cards/collection and prints-of-this-card request is a full
+    // scan, which is what pushed that whole surface onto SQL.
+    printing_by_scryfall_id: Vec<u32>,        // printing space, ordered by scryfall_id
+    oracle_by_oracle_id:     Vec<u32>,        // card space, ordered by oracle_id
 }
 
 
@@ -12290,6 +12350,8 @@ impl QueryEngine {
             name_unigrams:  build_name_unigram_index(&cards),
             legal_divergent: build_divergent_ids(&cards),
             arith_tuple:    build_arith_tuple_index(&cards),
+            printing_by_scryfall_id: build_printing_by_scryfall_id(&printings),
+            oracle_by_oracle_id:     build_oracle_by_oracle_id(&cards),
         };
 
         #[cfg(feature = "alloc-counter")]
@@ -12599,6 +12661,74 @@ impl QueryEngine {
                 let card = &data.cards[cid];
                 let preferred = u32::from(data.offsets[cid]) as usize;
                 card_to_pydict(py, card, &data.printings[preferred], &data.strings, &data.coll_vocab, &resolved_fields)
+            })
+            .collect::<PyResult<_>>()?;
+        PyList::new(py, dicts)
+    }
+
+    /// The printing with this Scryfall id, or None.
+    ///
+    /// Addressing one card by id is the mode the store has never had: the id was stored
+    /// (`Printing.scryfall_id` keeps the UUID's exact bits, deliberately) but only findable by
+    /// scanning every printing. `printing_by_scryfall_id` makes it O(log n), which is what lets a
+    /// by-id route be answered from memory instead of from Postgres.
+    #[pyo3(signature = (scryfall_id, fields=None))]
+    fn card_by_scryfall_id<'py>(
+        &self,
+        py: Python<'py>,
+        scryfall_id: &str,
+        fields: Option<Vec<String>>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let resolved_fields = resolve_fields(fields)?;
+        let mmap = self.get_mmap()?;
+        // Safety: see the access_unchecked justification in query().
+        let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
+        let Some(pid) = find_printing_by_scryfall_id(
+            &data.indexes.printing_by_scryfall_id,
+            &data.printings,
+            parse_uuid_or_hash(scryfall_id),
+        ) else {
+            return Ok(None);
+        };
+        let cid = u32::from(data.indexes.printing_to_card[pid as usize]) as usize;
+        let dict = card_to_pydict(
+            py,
+            &data.cards[cid],
+            &data.printings[pid as usize],
+            &data.strings,
+            &data.coll_vocab,
+            &resolved_fields,
+        )?;
+        Ok(Some(dict))
+    }
+
+    /// Every printing of the card with this oracle id, in stored (descending default-prefer) order.
+    ///
+    /// This is what `unique=prints` over one card asks for, and the shape a prints-of-this-card
+    /// link resolves to. Empty list when the oracle id is unknown.
+    #[pyo3(signature = (oracle_id, fields=None))]
+    fn printings_of_oracle_id<'py>(
+        &self,
+        py: Python<'py>,
+        oracle_id: &str,
+        fields: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyList>> {
+        let resolved_fields = resolve_fields(fields)?;
+        let mmap = self.get_mmap()?;
+        // Safety: see the access_unchecked justification in query().
+        let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
+        let Some(cid) =
+            find_oracle_by_oracle_id(&data.indexes.oracle_by_oracle_id, &data.cards, parse_uuid_or_hash(oracle_id))
+        else {
+            return Ok(PyList::empty(py));
+        };
+        let cid = cid as usize;
+        let start = u32::from(data.offsets[cid]) as usize;
+        let end = u32::from(data.offsets[cid + 1]) as usize;
+        let card = &data.cards[cid];
+        let dicts: Vec<Bound<PyDict>> = (start..end)
+            .map(|pid| {
+                card_to_pydict(py, card, &data.printings[pid], &data.strings, &data.coll_vocab, &resolved_fields)
             })
             .collect::<PyResult<_>>()?;
         PyList::new(py, dicts)
