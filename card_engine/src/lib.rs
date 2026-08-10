@@ -2807,6 +2807,115 @@ pub(crate) fn find_printing_by_external_id(
     Some(u32::from(index[i].2))
 }
 
+// ─── Fuzzy name matching ─────────────────────────────────────────────────────
+// A reimplementation of pg_trgm's similarity(), because the SQL path is a FALLBACK and the engine
+// has to answer `?fuzzy=` itself. Matching pg_trgm exactly matters: if the two paths scored
+// differently, the same query would resolve to different cards depending on which one served it.
+//
+// pg_trgm's algorithm: split on non-alphanumerics, pad each word with two leading spaces and one
+// trailing, take every 3-byte window, deduplicate, and score |intersection| / |union|.
+//
+// Nothing is stored for this. The name vocabulary is ~31,700 oracle names, so scoring the whole
+// corpus per request is a few milliseconds -- cheaper than carrying a trigram index for a route
+// that is a small fraction of traffic.
+
+/// Every distinct trigram of `s`, pg_trgm's way.
+fn trigrams(s: &str) -> std::collections::BTreeSet<[u8; 3]> {
+    let mut out = std::collections::BTreeSet::new();
+    for word in s.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()) {
+        // pg_trgm pads "  word " and windows over the bytes.
+        let mut padded = Vec::with_capacity(word.len() + 3);
+        padded.extend_from_slice(b"  ");
+        padded.extend_from_slice(word.as_bytes());
+        padded.push(b' ');
+        for w in padded.windows(3) {
+            out.insert([w[0], w[1], w[2]]);
+        }
+    }
+    out
+}
+
+/// pg_trgm's `similarity(a, b)`: Jaccard over trigram sets. 0.0 when both are empty.
+pub(crate) fn trigram_similarity(a: &str, b: &str) -> f32 {
+    let (ta, tb) = (trigrams(a), trigrams(b));
+    if ta.is_empty() || tb.is_empty() {
+        return 0.0;
+    }
+    let shared = ta.intersection(&tb).count();
+    let union = ta.len() + tb.len() - shared;
+    if union == 0 { 0.0 } else { shared as f32 / union as f32 }
+}
+
+/// What a `?fuzzy=` lookup resolved to.
+pub(crate) enum FuzzyOutcome {
+    /// The card index that won outright.
+    Hit(u32),
+    /// Two distinct names scored too close to choose between; Scryfall answers `ambiguous`.
+    Ambiguous,
+    /// Nothing cleared the floor.
+    Miss,
+}
+
+/// The typo-tolerant name match, with #912's thresholds.
+///
+/// A candidate must clear `floor`, and the best must lead the next DISTINCT name by `lead`. The
+/// distinctness matters: several printings of one card would otherwise look like a tie with
+/// themselves and report ambiguous.
+pub(crate) fn fuzzy_name_match(cards: &Archived<Vec<OracleCard>>, needle: &str, floor: f32, lead: f32) -> FuzzyOutcome {
+    let needle = needle.to_lowercase();
+    let mut best: Option<(f32, u32, &str)> = None;
+    let mut runner_up: Option<f32> = None;
+    for (cid, card) in cards.iter().enumerate() {
+        let name = card.card_name_folded.as_str();
+        let score = trigram_similarity(name, &needle);
+        if score < floor {
+            continue;
+        }
+        match best {
+            Some((best_score, _, best_name)) if score <= best_score => {
+                // Only a DIFFERENT name can be the runner-up; other printings of the same card are
+                // the same answer, not a competing one.
+                if name != best_name && runner_up.is_none_or(|r| score > r) {
+                    runner_up = Some(score);
+                }
+            }
+            _ => {
+                if let Some((prev_score, _, prev_name)) = best {
+                    if prev_name != name && runner_up.is_none_or(|r| prev_score > r) {
+                        runner_up = Some(prev_score);
+                    }
+                }
+                best = Some((score, cid as u32, name));
+            }
+        }
+    }
+    match (best, runner_up) {
+        (None, _) => FuzzyOutcome::Miss,
+        (Some((score, _, _)), Some(second)) if score - second < lead => FuzzyOutcome::Ambiguous,
+        (Some((_, cid, _)), _) => FuzzyOutcome::Hit(cid),
+    }
+}
+
+/// Card names beginning with `prefix`, case-insensitively, up to `limit`, sorted.
+///
+/// Scryfall's autocomplete catalog. A scan for the same reason fuzzy is: ~31,700 names is small,
+/// and a prefix index would cost archive space for one low-traffic route.
+pub(crate) fn autocomplete_names<'a>(cards: &'a Archived<Vec<OracleCard>>, prefix: &str, limit: usize) -> Vec<&'a str> {
+    let prefix = prefix.to_lowercase();
+    let mut out: Vec<&str> = Vec::new();
+    for card in cards.iter() {
+        if card.card_name_lower.as_str().starts_with(&prefix) {
+            let name = card.card_name_lower.as_str();
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.truncate(limit);
+    out
+}
+
 /// Printing ids ordered by `scryfall_id`, for binary search.
 ///
 /// A permutation rather than a `(id, index)` table: the ids are already stored on the printings, so
@@ -13320,6 +13429,53 @@ impl QueryEngine {
             &resolved_fields,
         )?;
         Ok(Some(dict))
+    }
+
+    /// Scryfall's `?fuzzy=` name lookup, typo-tolerant.
+    ///
+    /// Returns `(status, card)` where status is "hit", "ambiguous" or "miss". Ambiguous is a
+    /// distinct answer rather than a miss: Scryfall reports it with the candidates it could not
+    /// separate, and collapsing it to "not found" would tell the client the card does not exist.
+    #[pyo3(signature = (name, floor, lead, fields=None))]
+    fn fuzzy_card_by_name<'py>(
+        &self,
+        py: Python<'py>,
+        name: &str,
+        floor: f32,
+        lead: f32,
+        fields: Option<Vec<String>>,
+    ) -> PyResult<(String, Option<Bound<'py, PyDict>>)> {
+        let resolved_fields = resolve_fields(fields)?;
+        let mmap = self.get_mmap()?;
+        // Safety: see the access_unchecked justification in query().
+        let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
+        match fuzzy_name_match(&data.cards, name, floor, lead) {
+            FuzzyOutcome::Miss => Ok(("miss".to_string(), None)),
+            FuzzyOutcome::Ambiguous => Ok(("ambiguous".to_string(), None)),
+            FuzzyOutcome::Hit(cid) => {
+                let cid = cid as usize;
+                // The card's default-preferred printing, the same one every other by-name path shows.
+                let preferred = u32::from(data.offsets[cid]) as usize;
+                let dict = card_to_pydict(
+                    py,
+                    &data.cards[cid],
+                    &data.printings[preferred],
+                    &data.strings,
+                    &data.coll_vocab,
+                    &resolved_fields,
+                )?;
+                Ok(("hit".to_string(), Some(dict)))
+            }
+        }
+    }
+
+    /// Card names beginning with `prefix`, up to `limit`. Scryfall's autocomplete catalog.
+    #[pyo3(signature = (prefix, limit))]
+    fn autocomplete(&self, prefix: &str, limit: usize) -> PyResult<Vec<String>> {
+        let mmap = self.get_mmap()?;
+        // Safety: see the access_unchecked justification in query().
+        let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
+        Ok(autocomplete_names(&data.cards, prefix, limit).into_iter().map(str::to_string).collect())
     }
 
     /// The printing carrying this external id, or None.

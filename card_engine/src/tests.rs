@@ -19,6 +19,7 @@ use super::{
     CollField, CmpOp, FilterExpr, InlineStr, Interner, ManaCost, CompatFields, OracleCard, OracleFace, Printing, PrintingFace, RelatedCard, TagIndex,
     build_printing_by_scryfall_id, build_oracle_by_oracle_id, find_printing_by_scryfall_id, find_oracle_by_oracle_id,
     build_external_id_index, find_printing_by_external_id, EXT_MULTIVERSE, EXT_MTGO, EXT_ARENA, EXT_TCGPLAYER,
+    trigram_similarity, fuzzy_name_match, autocomplete_names, FuzzyOutcome,
     VOCAB_NONE, COMPAT_PROMO, COMPAT_REPRINT, COMPAT_TEXTLESS, GAME_PAPER, GAME_ARENA, FINISH_FOIL, FINISH_NONFOIL,
     TextField, TextSearchField, Tri, SortedTrigramIndex, VocabInterner, ARTIST_NONE, NONE_STR, TYPE_ARTIFACT, TYPE_CREATURE,
     TYPE_ENCHANTMENT, TYPE_INSTANT, TYPE_LAND, TYPE_LEGENDARY, TYPE_PLANESWALKER, TYPE_SNOW, TYPE_SORCERY,
@@ -11650,4 +11651,100 @@ fn cards_without_relations_carry_none() {
     let bytes = rkyv::to_bytes::<Error>(&card).expect("serialize");
     let a = rkyv::access::<Archived<OracleCard>, Error>(&bytes).expect("access");
     assert!(a.all_parts.is_empty(), "~59% of cards have no relations");
+}
+
+// ─── Fuzzy name matching ──────────────────────────────────────────────────────
+
+#[test]
+fn trigram_similarity_matches_pg_trgm() {
+    // pg_trgm pads each word "  word " and windows over it, so "abc" yields exactly
+    // {"  a", " ab", "abc", "bc "}. Identical strings therefore score 1.0.
+    assert!((trigram_similarity("abc", "abc") - 1.0).abs() < 1e-6);
+
+    // "abc" vs "abd": {"  a"," ab","abc","bc "} vs {"  a"," ab","abd","bd "}.
+    // shared 2, union 4 + 4 - 2 = 6, so 1/3. Hand-computed against pg_trgm's definition.
+    assert!((trigram_similarity("abc", "abd") - 1.0 / 3.0).abs() < 1e-6);
+
+    // Non-alphanumerics are separators, not characters: punctuation between words changes nothing.
+    assert!((trigram_similarity("urza's bauble", "urza s bauble") - 1.0).abs() < 1e-6);
+
+    // Nothing in common scores 0, and an empty side scores 0 rather than dividing by zero.
+    assert_eq!(trigram_similarity("abc", "xyz"), 0.0);
+    assert_eq!(trigram_similarity("", "abc"), 0.0);
+    assert_eq!(trigram_similarity("", ""), 0.0);
+
+    // Symmetric, as Jaccard is.
+    assert_eq!(trigram_similarity("lightning", "lightnin"), trigram_similarity("lightnin", "lightning"));
+}
+
+#[test]
+fn a_typo_resolves_to_the_intended_card() {
+    let mut vocab = VocabInterner::new();
+    let mut cards = Vec::new();
+    for (i, name) in ["lightning bolt", "shock", "counterspell"].iter().enumerate() {
+        let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
+        c.card_name_folded = InlineStr::from_str(name);
+        c.card_name_lower = InlineStr::from_str(name);
+        cards.push(c);
+    }
+    let bytes = rkyv::to_bytes::<Error>(&cards).expect("serialize");
+    let a = rkyv::access::<Archived<Vec<OracleCard>>, Error>(&bytes).expect("access");
+
+    match fuzzy_name_match(a, "lightnig bolt", 0.4, 0.05) {
+        FuzzyOutcome::Hit(cid) => assert_eq!(cid, 0, "a one-letter typo still finds Lightning Bolt"),
+        _ => panic!("expected a hit"),
+    }
+    // Nothing close enough clears the floor.
+    assert!(matches!(fuzzy_name_match(a, "zzzzzzzz", 0.4, 0.05), FuzzyOutcome::Miss));
+}
+
+#[test]
+fn two_close_names_are_ambiguous_not_a_guess() {
+    // Scryfall reports `ambiguous` rather than picking, and collapsing that to "not found" would
+    // tell the client the card does not exist.
+    let mut vocab = VocabInterner::new();
+    let mut cards = Vec::new();
+    for (i, name) in ["fire dragon", "fire dragoon"].iter().enumerate() {
+        let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
+        c.card_name_folded = InlineStr::from_str(name);
+        cards.push(c);
+    }
+    let bytes = rkyv::to_bytes::<Error>(&cards).expect("serialize");
+    let a = rkyv::access::<Archived<Vec<OracleCard>>, Error>(&bytes).expect("access");
+    assert!(matches!(fuzzy_name_match(a, "fire dragen", 0.4, 0.05), FuzzyOutcome::Ambiguous));
+}
+
+#[test]
+fn printings_of_one_card_do_not_look_ambiguous() {
+    // Several cards sharing a NAME are one answer, not competing ones. Without the distinct-name
+    // rule they would tie with themselves and every fuzzy lookup would report ambiguous.
+    let mut vocab = VocabInterner::new();
+    let mut cards = Vec::new();
+    for i in 0..3u128 {
+        let mut c = stub_card(i + 1, 0, &[], &mut vocab);
+        c.card_name_folded = InlineStr::from_str("lightning bolt");
+        cards.push(c);
+    }
+    let bytes = rkyv::to_bytes::<Error>(&cards).expect("serialize");
+    let a = rkyv::access::<Archived<Vec<OracleCard>>, Error>(&bytes).expect("access");
+    assert!(matches!(fuzzy_name_match(a, "lightning bolt", 0.4, 0.05), FuzzyOutcome::Hit(_)));
+}
+
+#[test]
+fn autocomplete_is_prefix_matched_sorted_and_capped() {
+    let mut vocab = VocabInterner::new();
+    let mut cards = Vec::new();
+    for (i, name) in ["shock", "shatter", "shockwave", "counterspell"].iter().enumerate() {
+        let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
+        c.card_name_lower = InlineStr::from_str(name);
+        cards.push(c);
+    }
+    let bytes = rkyv::to_bytes::<Error>(&cards).expect("serialize");
+    let a = rkyv::access::<Archived<Vec<OracleCard>>, Error>(&bytes).expect("access");
+
+    assert_eq!(autocomplete_names(a, "sho", 20), vec!["shock", "shockwave"]);
+    assert_eq!(autocomplete_names(a, "SHO", 20), vec!["shock", "shockwave"], "case-insensitive");
+    assert_eq!(autocomplete_names(a, "sh", 20), vec!["shatter", "shock", "shockwave"], "sorted");
+    assert_eq!(autocomplete_names(a, "sh", 1).len(), 1, "capped");
+    assert!(autocomplete_names(a, "zzz", 20).is_empty());
 }
