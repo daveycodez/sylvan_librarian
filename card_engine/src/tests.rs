@@ -16,8 +16,9 @@ use super::{
     archive_header, archive_payload, ARCHIVE_HEADER_LEN, Mmap,
     bitmap_contains, bitmap_card_ids, compile_plane, eval_planes, split_planes,
     ArithOp, ArtistIndex, CardData, CardIndexes, Candidates, ColorField, NumExpr, NumField, RarityIndex,
-    CollField, CmpOp, FilterExpr, InlineStr, Interner, ManaCost, OracleCard, OracleFace, Printing, PrintingFace, TagIndex,
+    CollField, CmpOp, FilterExpr, InlineStr, Interner, ManaCost, CompatFields, OracleCard, OracleFace, Printing, PrintingFace, TagIndex,
     build_printing_by_scryfall_id, build_oracle_by_oracle_id, find_printing_by_scryfall_id, find_oracle_by_oracle_id,
+    VOCAB_NONE, COMPAT_PROMO, COMPAT_REPRINT, COMPAT_TEXTLESS, GAME_PAPER, GAME_ARENA, FINISH_FOIL, FINISH_NONFOIL,
     TextField, TextSearchField, Tri, SortedTrigramIndex, VocabInterner, ARTIST_NONE, NONE_STR, TYPE_ARTIFACT, TYPE_CREATURE,
     TYPE_ENCHANTMENT, TYPE_INSTANT, TYPE_LAND, TYPE_LEGENDARY, TYPE_PLANESWALKER, TYPE_SNOW, TYPE_SORCERY,
 };
@@ -248,6 +249,7 @@ fn stub_printing(scryfall_id: u128, illustration_id: u128, prefer_score: Option<
         card_frame_data: Vec::new(),
         artwork_group_id: 0, // placeholder; store_of overwrites via assign_artwork_groups
         faces: Vec::new(),
+        compat: CompatFields::default(),
     }
 }
 
@@ -11498,4 +11500,66 @@ fn the_id_permutation_is_a_permutation() {
     assert_eq!(perm.len(), ids.len());
     perm.sort_unstable();
     assert_eq!(perm, (0..ids.len() as u32).collect::<Vec<_>>());
+}
+
+// ─── Compat residue ───────────────────────────────────────────────────────────
+
+#[test]
+fn compat_fields_survive_the_archive_round_trip() {
+    let compat = CompatFields {
+        arena_id: Some(105_816),
+        mtgo_id: Some(152_037),
+        tcgplayer_id: Some(697_344),
+        cardmarket_id: Some(892_161),
+        penny_rank: Some(42),
+        image_updated_at: Some(1_783_903_008),
+        price_usd_foil: Some(282), // integer cents, same convention as the price columns
+        price_eur_foil: Some(164),
+        set_id: 0x9D73_9461,
+        lang_id: 3,
+        set_type_id: 7,
+        games: GAME_PAPER | GAME_ARENA,
+        finishes: FINISH_NONFOIL | FINISH_FOIL,
+        flags: COMPAT_PROMO | COMPAT_REPRINT,
+        multiverse_ids: vec![1, 2, 3],
+        ..CompatFields::default()
+    };
+
+    let bytes = rkyv::to_bytes::<Error>(&compat).expect("serialize");
+    let a = rkyv::access::<Archived<CompatFields>, Error>(&bytes).expect("access");
+
+    assert_eq!(a.arena_id.as_ref().copied().map(u32::from), Some(105_816));
+    assert_eq!(a.price_usd_foil.as_ref().copied().map(u32::from), Some(282));
+    assert_eq!(u128::from(a.set_id), 0x9D73_9461);
+    assert_eq!(u16::from(a.lang_id), 3);
+    assert_eq!(a.multiverse_ids.len(), 3);
+
+    // Bitsets are only useful if membership survives independently of each other.
+    assert_ne!(u8::from(a.games) & GAME_PAPER, 0);
+    assert_ne!(u8::from(a.games) & GAME_ARENA, 0);
+    assert_eq!(u8::from(a.games) & 0b0000_0010, 0, "mtgo was not set");
+    assert_ne!(u16::from(a.flags) & COMPAT_PROMO, 0);
+    assert_ne!(u16::from(a.flags) & COMPAT_REPRINT, 0);
+    assert_eq!(u16::from(a.flags) & COMPAT_TEXTLESS, 0, "textless was not set");
+}
+
+#[test]
+fn absent_compat_values_stay_absent() {
+    // Scryfall OMITS a key rather than sending null, so a reconstructed card object has to be able
+    // to tell "was not there" from "was empty" -- otherwise every card sprouts nulls Scryfall never
+    // sent, and a client comparing shapes sees a difference on every single row.
+    let bytes = rkyv::to_bytes::<Error>(&CompatFields::default()).expect("serialize");
+    let a = rkyv::access::<Archived<CompatFields>, Error>(&bytes).expect("access");
+
+    assert!(a.arena_id.is_none());
+    assert!(a.mtgo_id.is_none());
+    assert!(a.penny_rank.is_none());
+    assert!(a.price_usd_foil.is_none());
+    assert_eq!(u16::from(a.lang_id), VOCAB_NONE, "absent lang is the sentinel, not vocab id 0");
+    assert_eq!(u16::from(a.set_type_id), VOCAB_NONE);
+    assert_eq!(u128::from(a.set_id), 0);
+    assert_eq!(u8::from(a.games), 0);
+    assert_eq!(u16::from(a.flags), 0);
+    assert!(a.multiverse_ids.is_empty());
+    assert!(a.promo_types.is_empty());
 }

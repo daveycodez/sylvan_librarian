@@ -264,6 +264,104 @@ struct PrintingFace {
     flavor_text_id: u32,
 }
 
+// Bit positions in `CompatFields.flags`. Twelve booleans Scryfall sends on every card object; a
+// word rather than twelve bools because they are only ever read together, when rebuilding one.
+const COMPAT_BOOSTER: u16 = 1 << 0;
+const COMPAT_DIGITAL: u16 = 1 << 1;
+const COMPAT_FOIL: u16 = 1 << 2;
+const COMPAT_NONFOIL: u16 = 1 << 3;
+const COMPAT_FULL_ART: u16 = 1 << 4;
+const COMPAT_HIGHRES_IMAGE: u16 = 1 << 5;
+const COMPAT_OVERSIZED: u16 = 1 << 6;
+const COMPAT_PROMO: u16 = 1 << 7;
+const COMPAT_REPRINT: u16 = 1 << 8;
+const COMPAT_STORY_SPOTLIGHT: u16 = 1 << 9;
+const COMPAT_TEXTLESS: u16 = 1 << 10;
+const COMPAT_VARIATION: u16 = 1 << 11;
+
+// `games` and `finishes` bitsets. Closed vocabularies, so a byte each beats a Vec of interned ids.
+const GAME_PAPER: u8 = 1 << 0;
+const GAME_MTGO: u8 = 1 << 1;
+const GAME_ARENA: u8 = 1 << 2;
+const FINISH_NONFOIL: u8 = 1 << 0;
+const FINISH_FOIL: u8 = 1 << 1;
+const FINISH_ETCHED: u8 = 1 << 2;
+const FINISH_GLOSSY: u8 = 1 << 3;
+
+/// The Scryfall fields that no column holds and no derivation recovers — the `card_compat_blob`
+/// residue, packed.
+///
+/// Measured on a real card object: 66 keys and 5,881 bytes, of which 25 are already columns and 15
+/// are pure functions of the card's id, set or oracle id. What is left is this, and packed it is
+/// ~50 bytes a printing rather than the ~5.9 KB a whole blob would cost. That ratio is the reason
+/// the store can answer a card-shaped question at all: blobs at corpus scale are ~575 MB, and this
+/// is ~5 MB.
+#[derive(Archive, Serialize, Deserialize)]
+struct CompatFields {
+    // Marketplace and client ids. Sparse -- most printings carry two to four of the six.
+    arena_id: Option<u32>,
+    mtgo_id: Option<u32>,
+    mtgo_foil_id: Option<u32>,
+    tcgplayer_id: Option<u32>,
+    tcgplayer_etched_id: Option<u32>,
+    cardmarket_id: Option<u32>,
+    penny_rank: Option<u32>,
+    // The cache-buster Scryfall appends to every image_uris entry; without it the derived URLs are
+    // reachable but not byte-identical to what Scryfall serves.
+    image_updated_at: Option<u32>,
+    // Integer cents, exactly like the three price columns. These three have no column.
+    price_usd_foil: Option<u32>,
+    price_usd_etched: Option<u32>,
+    price_eur_foil: Option<u32>,
+    // The set's own UUID, which `set_uri` addresses by. Per printing rather than per set because
+    // the archive has no set table; ~1.5 MB corpus-wide, the largest single item here.
+    set_id: u128,
+    // Small closed vocabularies interned into coll_vocab: ~10 languages, ~6 image statuses,
+    // ~20 set types, ~5 security stamps.
+    lang_id: u16,
+    image_status_id: u16,
+    set_type_id: u16,
+    security_stamp_id: u16,
+    games: u8,
+    finishes: u8,
+    flags: u16,
+    multiverse_ids: Vec<u32>,
+    promo_types: Vec<u16>,
+    frame_effects: Vec<u16>,
+}
+
+/// Hand-written rather than derived, because `#[derive(Default)]` zeroes the interned ids and
+/// vocab id 0 is a REAL string. A card with no `lang` would then report whatever happens to sit at
+/// slot 0. Absent has to be the sentinel.
+impl Default for CompatFields {
+    fn default() -> Self {
+        Self {
+            arena_id: None,
+            mtgo_id: None,
+            mtgo_foil_id: None,
+            tcgplayer_id: None,
+            tcgplayer_etched_id: None,
+            cardmarket_id: None,
+            penny_rank: None,
+            image_updated_at: None,
+            price_usd_foil: None,
+            price_usd_etched: None,
+            price_eur_foil: None,
+            set_id: 0,
+            lang_id: VOCAB_NONE,
+            image_status_id: VOCAB_NONE,
+            set_type_id: VOCAB_NONE,
+            security_stamp_id: VOCAB_NONE,
+            games: 0,
+            finishes: 0,
+            flags: 0,
+            multiverse_ids: Vec::new(),
+            promo_types: Vec::new(),
+            frame_effects: Vec::new(),
+        }
+    }
+}
+
 #[derive(Archive, Serialize, Deserialize)]
 struct OracleCard {
     // Hot fields first — fits in the first cache lines for fast filter short-circuiting.
@@ -378,6 +476,10 @@ struct Printing {
     // Parallel to the owning OracleCard's `faces`, so index i is the same face in both. Empty for
     // single-faced cards, and empty when a multi-face card's printing carries no per-face art.
     faces: Vec<PrintingFace>,
+
+    // The card_compat_blob residue, packed. Printing-level: every field here varies by printing
+    // (ids, prices, finishes) or is set-level and therefore constant across a set's printings.
+    compat: CompatFields,
 }
 
 /// Parse-time row: one DB row (= one printing) with every field, before the
@@ -440,6 +542,8 @@ struct CardRow {
     // Both halves of each face, together, until the commit pass splits them the same way it splits
     // the row itself: text to the OracleCard, art to the Printing.
     card_faces: Vec<FaceRow>,
+
+    compat: CompatFields,
 }
 
 /// Parse-time face: `OracleFace` and `PrintingFace` before the commit pass separates them.
@@ -472,6 +576,11 @@ const NONE_STR: u32 = u32::MAX;
 
 /// Sentinel for a printing with no artist (see Printing.card_artist_vid).
 pub(crate) const ARTIST_NONE: u16 = u16::MAX;
+
+/// Sentinel for an absent coll_vocab id, same convention as ARTIST_NONE. The compat fields need
+/// one because Scryfall OMITS a key rather than sending null, so a reconstructed card object has
+/// to tell "was not there" from "was empty".
+pub(crate) const VOCAB_NONE: u16 = u16::MAX;
 
 /// Resolve an interned id against the archived string table; None for absent.
 pub(crate) fn str_at(strings: &AStrings, id: u32) -> Option<&str> {
@@ -779,6 +888,98 @@ fn mana_cost_from_pydict(d: &Bound<PyDict>, cmc_val: Option<f32>, mana_vocab: &m
     Ok(ManaCost { core, hybrids, devotion, cmc: cmc_val.unwrap_or(0.0) })
 }
 
+fn opt_bool(d: &Bound<PyDict>, key: &str) -> bool {
+    d.get_item(key).ok().flatten().and_then(|v| v.extract::<bool>().ok()).unwrap_or(false)
+}
+
+/// Set a bit per member present in a string list, for a closed vocabulary.
+fn str_set_bits(d: &Bound<PyDict>, key: &str, table: &[(&str, u8)]) -> u8 {
+    let present = str_list(d, key);
+    table
+        .iter()
+        .filter(|(name, _)| present.iter().any(|p| p == name))
+        .fold(0u8, |acc, (_, bit)| acc | bit)
+}
+
+/// The residue Scryfall sends that no column holds, read out of `card_compat_blob`.
+///
+/// Absent keys stay at their zero value: `NONE_VOCAB` for interned ids, `None` for the optionals,
+/// clear bits for the flags. That matters for round-tripping, because Scryfall OMITS a key rather
+/// than sending null, so "zero" has to mean "was not there".
+fn compat_from_pydict(d: &Bound<PyDict>, vocab: &mut VocabInterner) -> PyResult<CompatFields> {
+    let Some(blob) = d.get_item("card_compat_blob").ok().flatten().and_then(|v| v.cast_into::<PyDict>().ok()) else {
+        return Ok(CompatFields::default());
+    };
+    let prices = blob.get_item("prices").ok().flatten().and_then(|v| v.cast_into::<PyDict>().ok());
+    let price = |key: &str| prices.as_ref().and_then(|p| opt_price_cents(p, key));
+
+    let mut flags = 0u16;
+    for (key, bit) in [
+        ("booster", COMPAT_BOOSTER),
+        ("digital", COMPAT_DIGITAL),
+        ("foil", COMPAT_FOIL),
+        ("nonfoil", COMPAT_NONFOIL),
+        ("full_art", COMPAT_FULL_ART),
+        ("highres_image", COMPAT_HIGHRES_IMAGE),
+        ("oversized", COMPAT_OVERSIZED),
+        ("promo", COMPAT_PROMO),
+        ("reprint", COMPAT_REPRINT),
+        ("story_spotlight", COMPAT_STORY_SPOTLIGHT),
+        ("textless", COMPAT_TEXTLESS),
+        ("variation", COMPAT_VARIATION),
+    ] {
+        if opt_bool(&blob, key) {
+            flags |= bit;
+        }
+    }
+
+    let intern_opt = |vocab: &mut VocabInterner, value: Option<String>| -> PyResult<u16> {
+        match value {
+            Some(v) => vocab.intern(v),
+            None => Ok(VOCAB_NONE),
+        }
+    };
+
+    Ok(CompatFields {
+        arena_id: opt_u32(&blob, "arena_id"),
+        mtgo_id: opt_u32(&blob, "mtgo_id"),
+        mtgo_foil_id: opt_u32(&blob, "mtgo_foil_id"),
+        tcgplayer_id: opt_u32(&blob, "tcgplayer_id"),
+        tcgplayer_etched_id: opt_u32(&blob, "tcgplayer_etched_id"),
+        cardmarket_id: opt_u32(&blob, "cardmarket_id"),
+        penny_rank: opt_u32(&blob, "penny_rank"),
+        image_updated_at: opt_u32(&blob, "image_updated_at"),
+        price_usd_foil: price("usd_foil"),
+        price_usd_etched: price("usd_etched"),
+        price_eur_foil: price("eur_foil"),
+        set_id: opt_str(&blob, "set_id").map_or(0, |s| parse_uuid_or_hash(&s)),
+        lang_id: intern_opt(vocab, opt_str(&blob, "lang"))?,
+        image_status_id: intern_opt(vocab, opt_str(&blob, "image_status"))?,
+        set_type_id: intern_opt(vocab, opt_str(&blob, "set_type"))?,
+        security_stamp_id: intern_opt(vocab, opt_str(&blob, "security_stamp"))?,
+        games: str_set_bits(&blob, "games", &[("paper", GAME_PAPER), ("mtgo", GAME_MTGO), ("arena", GAME_ARENA)]),
+        finishes: str_set_bits(
+            &blob,
+            "finishes",
+            &[
+                ("nonfoil", FINISH_NONFOIL),
+                ("foil", FINISH_FOIL),
+                ("etched", FINISH_ETCHED),
+                ("glossy", FINISH_GLOSSY),
+            ],
+        ),
+        flags,
+        multiverse_ids: blob
+            .get_item("multiverse_ids")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract::<Vec<u32>>().ok())
+            .unwrap_or_default(),
+        promo_types: str_list_to_ids(&blob, "promo_types", vocab)?,
+        frame_effects: str_list_to_ids(&blob, "frame_effects", vocab)?,
+    })
+}
+
 /// Colors as Scryfall spells them on a FACE: a plain list (`["W"]`), not the row columns'
 /// jsonb object. Same mask either way.
 fn str_list_color_mask(d: &Bound<PyDict>, key: &str) -> u8 {
@@ -899,6 +1100,7 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
         creature_toughness_text_id: it.intern_opt(opt_str(d, "creature_toughness_text")),
 
         card_faces: faces_from_pydict(d, it, artists)?,
+        compat: compat_from_pydict(d, vocab)?,
     })
 }
 
@@ -12223,6 +12425,8 @@ impl QueryEngine {
                         flavor_text_id: f.flavor_text_id,
                     })
                     .collect(),
+            
+                compat: row.compat,
             });
         }
         offsets.push(printings.len() as u32);
