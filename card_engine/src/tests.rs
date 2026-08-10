@@ -16,7 +16,7 @@ use super::{
     archive_header, archive_payload, ARCHIVE_HEADER_LEN, Mmap,
     bitmap_contains, bitmap_card_ids, compile_plane, eval_planes, split_planes,
     ArithOp, ArtistIndex, CardData, CardIndexes, Candidates, ColorField, NumExpr, NumField, RarityIndex,
-    CollField, CmpOp, FilterExpr, InlineStr, Interner, ManaCost, CompatFields, OracleCard, OracleFace, Printing, PrintingFace, TagIndex,
+    CollField, CmpOp, FilterExpr, InlineStr, Interner, ManaCost, CompatFields, OracleCard, OracleFace, Printing, PrintingFace, RelatedCard, TagIndex,
     build_printing_by_scryfall_id, build_oracle_by_oracle_id, find_printing_by_scryfall_id, find_oracle_by_oracle_id,
     build_external_id_index, find_printing_by_external_id, EXT_MULTIVERSE, EXT_MTGO, EXT_ARENA, EXT_TCGPLAYER,
     VOCAB_NONE, COMPAT_PROMO, COMPAT_REPRINT, COMPAT_TEXTLESS, GAME_PAPER, GAME_ARENA, FINISH_FOIL, FINISH_NONFOIL,
@@ -221,6 +221,7 @@ fn stub_card(oracle_id: u128, card_types: u16, subtypes: &[&str], vocab: &mut Vo
         creature_power_text_id: NONE_STR,
         creature_toughness_text_id: NONE_STR,
         faces: Vec::new(),
+        all_parts: Vec::new(),
     }
 }
 
@@ -11616,4 +11617,37 @@ fn a_shared_external_id_resolves_to_the_first_printing() {
     let bytes = rkyv::to_bytes::<Error>(&idx).expect("serialize");
     let aidx = rkyv::access::<Archived<Vec<(u8, u64, u32)>>, Error>(&bytes).expect("access");
     assert_eq!(find_printing_by_external_id(aidx, EXT_TCGPLAYER, 500), Some(0));
+}
+
+#[test]
+fn related_cards_stand_alone_without_the_referenced_card() {
+    // The reason all_parts carries its own name and type line: a `token` component references a
+    // card the import FILTERS OUT (preprocess_card drops Token type lines), so an index into our
+    // cards would resolve to nothing. The reference has to be self-contained.
+    let mut vocab = VocabInterner::new();
+    let mut card = stub_card(1, 0, &[], &mut vocab);
+    card.all_parts = vec![
+        RelatedCard { id: 0xAAAA, name_id: 10, type_line_id: 11, component_id: 1 },
+        RelatedCard { id: 0xBBBB, name_id: 20, type_line_id: 21, component_id: 2 },
+    ];
+
+    let bytes = rkyv::to_bytes::<Error>(&card).expect("serialize");
+    let a = rkyv::access::<Archived<OracleCard>, Error>(&bytes).expect("access");
+
+    assert_eq!(a.all_parts.len(), 2);
+    // Order is meaningful for melds: the two parts, then the result.
+    assert_eq!(u128::from(a.all_parts[0].id), 0xAAAA);
+    assert_eq!(u128::from(a.all_parts[1].id), 0xBBBB);
+    assert_eq!(u32::from(a.all_parts[0].name_id), 10);
+    assert_eq!(u32::from(a.all_parts[0].type_line_id), 11);
+    assert_ne!(u16::from(a.all_parts[0].component_id), u16::from(a.all_parts[1].component_id));
+}
+
+#[test]
+fn cards_without_relations_carry_none() {
+    let mut vocab = VocabInterner::new();
+    let card = stub_card(1, 0, &[], &mut vocab);
+    let bytes = rkyv::to_bytes::<Error>(&card).expect("serialize");
+    let a = rkyv::access::<Archived<OracleCard>, Error>(&bytes).expect("access");
+    assert!(a.all_parts.is_empty(), "~59% of cards have no relations");
 }

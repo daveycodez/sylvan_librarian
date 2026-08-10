@@ -268,6 +268,22 @@ struct OracleFace {
     color_indicator: u8,
 }
 
+/// One entry of Scryfall's `all_parts`: a card this one is related to.
+///
+/// Carries the reference's own id, name and type line rather than an index into our cards, because
+/// most of these point OUTSIDE the corpus -- `preprocess_card` filters Token and Card type lines,
+/// and tokens are exactly what a `token` component references. An index would resolve to nothing
+/// for them, so the reference has to stand alone.
+#[derive(Archive, Serialize, Deserialize)]
+struct RelatedCard {
+    id: u128,
+    name_id: u32,
+    type_line_id: u32,
+    // Interned rather than an enum: Scryfall has added components before (meld_part, meld_result,
+    // combo_piece, token) and an unknown one should pass through, not fail the import.
+    component_id: u16,
+}
+
 /// One face's art and flavor, which vary per printing where `OracleFace`'s text does not.
 #[derive(Archive, Serialize, Deserialize)]
 struct PrintingFace {
@@ -433,6 +449,10 @@ struct OracleCard {
 
     // Empty for the ~82% of cards with a single face. Front first, in Scryfall's own order.
     faces: Vec<OracleFace>,
+
+    // Scryfall's all_parts, on ~41% of cards. Oracle-level: a card's relations do not vary by
+    // printing, so this hangs off the card exactly as face TEXT does.
+    all_parts: Vec<RelatedCard>,
 }
 
 #[derive(Archive, Serialize, Deserialize)]
@@ -561,6 +581,7 @@ struct CardRow {
     // Both halves of each face, together, until the commit pass splits them the same way it splits
     // the row itself: text to the OracleCard, art to the Printing.
     card_faces: Vec<FaceRow>,
+    all_parts: Vec<RelatedCard>,
 
     compat: CompatFields,
 }
@@ -999,6 +1020,37 @@ fn compat_from_pydict(d: &Bound<PyDict>, vocab: &mut VocabInterner) -> PyResult<
     })
 }
 
+/// Scryfall's `all_parts`, read out of the compat blob.
+///
+/// Kept in Scryfall's order: it is meaningful for melds (the two parts, then the result).
+fn all_parts_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInterner) -> PyResult<Vec<RelatedCard>> {
+    let Some(blob) = d.get_item("card_compat_blob").ok().flatten().and_then(|v| v.cast_into::<PyDict>().ok()) else {
+        return Ok(Vec::new());
+    };
+    let Some(value) = blob.get_item("all_parts").ok().flatten() else {
+        return Ok(Vec::new());
+    };
+    let Ok(list) = value.cast::<PyList>() else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::with_capacity(list.len());
+    for item in list.iter() {
+        let Ok(part) = item.cast::<PyDict>() else {
+            continue;
+        };
+        out.push(RelatedCard {
+            id: opt_str(&part, "id").map_or(0, |s| parse_uuid_or_hash(&s)),
+            name_id: it.intern(opt_str(&part, "name").unwrap_or_default()),
+            type_line_id: it.intern(opt_str(&part, "type_line").unwrap_or_default()),
+            component_id: match opt_str(&part, "component") {
+                Some(c) => vocab.intern(c)?,
+                None => VOCAB_NONE,
+            },
+        });
+    }
+    Ok(out)
+}
+
 /// Colors as Scryfall spells them on a FACE: a plain list (`["W"]`), not the row columns'
 /// jsonb object. Same mask either way.
 fn str_list_color_mask(d: &Bound<PyDict>, key: &str) -> u8 {
@@ -1119,6 +1171,7 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
         creature_toughness_text_id: it.intern_opt(opt_str(d, "creature_toughness_text")),
 
         card_faces: faces_from_pydict(d, it, artists)?,
+        all_parts: all_parts_from_pydict(d, it, vocab)?,
         compat: compat_from_pydict(d, vocab)?,
     })
 }
@@ -12089,6 +12142,21 @@ const FIELD_TABLE: &[(&str, FieldExtractor)] = &[
     // Each face as its own dict, front first, in Scryfall's key names. Empty list for a
     // single-faced card, which is how Scryfall omits card_faces entirely.
     ("card_faces", |py, c, p, s, v| Ok(faces_to_pylist(py, c, p, s, v)?.into_any())),
+    // Scryfall's related-card list. Each entry carries its own id/name/type_line because most
+    // point outside the corpus -- a `token` component references a card the import filters out.
+    ("all_parts", |py, c, _p, s, v| {
+        let mut out: Vec<Bound<PyDict>> = Vec::with_capacity(c.all_parts.len());
+        for part in c.all_parts.iter() {
+            let d = PyDict::new(py);
+            d.set_item("object", "related_card")?;
+            d.set_item("id", uuid_from_u128(u128::from(part.id)))?;
+            d.set_item("component", coll_str_opt(v, u16::from(part.component_id)))?;
+            d.set_item("name", str_at(s, u32::from(part.name_id)))?;
+            d.set_item("type_line", str_at(s, u32::from(part.type_line_id)))?;
+            out.push(d);
+        }
+        Ok(PyList::new(py, out)?.into_any())
+    }),
 ];
 
 /// Mirror of magic.rarity_int_to_text -- the import stores 0-5, Scryfall speaks words.
@@ -12725,6 +12793,7 @@ impl QueryEngine {
                             color_indicator: f.color_indicator,
                         })
                         .collect(),
+                    all_parts: std::mem::take(&mut row.all_parts),
                 });
             } else if row.card_legalities != cards.last().map(|c| c.card_legalities).unwrap_or(0) {
                 cards.last_mut().unwrap().legality_divergent = true;
