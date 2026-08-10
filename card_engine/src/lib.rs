@@ -2692,6 +2692,68 @@ fn partition_point(len: usize, pred: impl Fn(usize) -> bool) -> usize {
     lo
 }
 
+// Namespaces in `external_id_index`. Scryfall routes /cards/{namespace}/:id for each of these, and
+// MTGO/TCGplayer each match two ids (the foil and etched variants resolve to the same printing).
+pub(crate) const EXT_MULTIVERSE: u8 = 0;
+pub(crate) const EXT_MTGO: u8 = 1;
+pub(crate) const EXT_ARENA: u8 = 2;
+pub(crate) const EXT_TCGPLAYER: u8 = 3;
+pub(crate) const EXT_CARDMARKET: u8 = 4;
+
+/// `(namespace, external id) -> printing`, sorted, for the /cards/{namespace}/:id routes.
+///
+/// Sparse triples rather than five dense columns: most printings carry two to four of the seven
+/// ids, and a multiverse id is a LIST, so one printing can contribute several entries. ~350 KB at
+/// corpus scale, and one binary search answers all five routes.
+///
+/// mtgo_foil_id and tcgplayer_etched_id are folded into their base namespace on purpose -- Scryfall
+/// resolves /cards/mtgo/:id against either mtgo_id or mtgo_foil_id, and the answer is the same
+/// printing either way.
+fn build_external_id_index(printings: &[Printing]) -> Vec<(u8, u64, u32)> {
+    let mut out: Vec<(u8, u64, u32)> = Vec::new();
+    for (pid, p) in printings.iter().enumerate() {
+        let pid = pid as u32;
+        for mv in &p.compat.multiverse_ids {
+            out.push((EXT_MULTIVERSE, u64::from(*mv), pid));
+        }
+        for (ns, id) in [
+            (EXT_MTGO, p.compat.mtgo_id),
+            (EXT_MTGO, p.compat.mtgo_foil_id),
+            (EXT_ARENA, p.compat.arena_id),
+            (EXT_TCGPLAYER, p.compat.tcgplayer_id),
+            (EXT_TCGPLAYER, p.compat.tcgplayer_etched_id),
+            (EXT_CARDMARKET, p.compat.cardmarket_id),
+        ] {
+            if let Some(v) = id {
+                out.push((ns, u64::from(v), pid));
+            }
+        }
+    }
+    // Sorting by the whole triple keeps it deterministic when two printings share an external id
+    // (etched and nonfoil TCGplayer entries do collide); the lowest printing id wins, which is the
+    // store's preferred printing because printings are stored in descending prefer order.
+    out.sort_unstable();
+    out
+}
+
+/// The printing for an external id, or None.
+pub(crate) fn find_printing_by_external_id(
+    index: &Archived<Vec<(u8, u64, u32)>>,
+    namespace: u8,
+    id: u64,
+) -> Option<u32> {
+    let found = index
+        .binary_search_by(|probe| (u8::from(probe.0), u64::from(probe.1)).cmp(&(namespace, id)))
+        .ok()?;
+    // binary_search lands on ANY match; walk back to the first so a shared id resolves to the
+    // lowest printing rather than whichever the search happened to hit.
+    let mut i = found;
+    while i > 0 && (u8::from(index[i - 1].0), u64::from(index[i - 1].1)) == (namespace, id) {
+        i -= 1;
+    }
+    Some(u32::from(index[i].2))
+}
+
 /// Printing ids ordered by `scryfall_id`, for binary search.
 ///
 /// A permutation rather than a `(id, index)` table: the ids are already stored on the printings, so
@@ -4004,6 +4066,9 @@ struct CardIndexes {
     // scan, which is what pushed that whole surface onto SQL.
     printing_by_scryfall_id: Vec<u32>,        // printing space, ordered by scryfall_id
     oracle_by_oracle_id:     Vec<u32>,        // card space, ordered by oracle_id
+    // (namespace, external id) -> printing, sorted. Answers /cards/multiverse|mtgo|arena|tcgplayer
+    // |cardmarket/:id, none of which the store could address before.
+    external_id_index:       Vec<(u8, u64, u32)>,
 }
 
 
@@ -12837,6 +12902,7 @@ impl QueryEngine {
             arith_tuple:    build_arith_tuple_index(&cards),
             printing_by_scryfall_id: build_printing_by_scryfall_id(&printings),
             oracle_by_oracle_id:     build_oracle_by_oracle_id(&cards),
+            external_id_index:       build_external_id_index(&printings),
         };
 
         #[cfg(feature = "alloc-counter")]
@@ -13173,6 +13239,47 @@ impl QueryEngine {
             &data.printings,
             parse_uuid_or_hash(scryfall_id),
         ) else {
+            return Ok(None);
+        };
+        let cid = u32::from(data.indexes.printing_to_card[pid as usize]) as usize;
+        let dict = card_to_pydict(
+            py,
+            &data.cards[cid],
+            &data.printings[pid as usize],
+            &data.strings,
+            &data.coll_vocab,
+            &resolved_fields,
+        )?;
+        Ok(Some(dict))
+    }
+
+    /// The printing carrying this external id, or None.
+    ///
+    /// `namespace` is Scryfall's own path segment. mtgo also matches mtgo_foil_id and tcgplayer
+    /// also matches tcgplayer_etched_id, because Scryfall resolves those to the same printing.
+    #[pyo3(signature = (namespace, external_id, fields=None))]
+    fn card_by_external_id<'py>(
+        &self,
+        py: Python<'py>,
+        namespace: &str,
+        external_id: u64,
+        fields: Option<Vec<String>>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let ns = match namespace {
+            "multiverse" => EXT_MULTIVERSE,
+            "mtgo" => EXT_MTGO,
+            "arena" => EXT_ARENA,
+            "tcgplayer" => EXT_TCGPLAYER,
+            "cardmarket" => EXT_CARDMARKET,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!("unknown id namespace {other:?}")));
+            }
+        };
+        let resolved_fields = resolve_fields(fields)?;
+        let mmap = self.get_mmap()?;
+        // Safety: see the access_unchecked justification in query().
+        let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
+        let Some(pid) = find_printing_by_external_id(&data.indexes.external_id_index, ns, external_id) else {
             return Ok(None);
         };
         let cid = u32::from(data.indexes.printing_to_card[pid as usize]) as usize;

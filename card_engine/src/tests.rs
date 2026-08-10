@@ -18,6 +18,7 @@ use super::{
     ArithOp, ArtistIndex, CardData, CardIndexes, Candidates, ColorField, NumExpr, NumField, RarityIndex,
     CollField, CmpOp, FilterExpr, InlineStr, Interner, ManaCost, CompatFields, OracleCard, OracleFace, Printing, PrintingFace, TagIndex,
     build_printing_by_scryfall_id, build_oracle_by_oracle_id, find_printing_by_scryfall_id, find_oracle_by_oracle_id,
+    build_external_id_index, find_printing_by_external_id, EXT_MULTIVERSE, EXT_MTGO, EXT_ARENA, EXT_TCGPLAYER,
     VOCAB_NONE, COMPAT_PROMO, COMPAT_REPRINT, COMPAT_TEXTLESS, GAME_PAPER, GAME_ARENA, FINISH_FOIL, FINISH_NONFOIL,
     TextField, TextSearchField, Tri, SortedTrigramIndex, VocabInterner, ARTIST_NONE, NONE_STR, TYPE_ARTIFACT, TYPE_CREATURE,
     TYPE_ENCHANTMENT, TYPE_INSTANT, TYPE_LAND, TYPE_LEGENDARY, TYPE_PLANESWALKER, TYPE_SNOW, TYPE_SORCERY,
@@ -6440,6 +6441,7 @@ fn bench_checked_vs_unchecked_access() {
         arith_tuple:    build_arith_tuple_index(&cards),
         printing_by_scryfall_id: build_printing_by_scryfall_id(&printings),
         oracle_by_oracle_id:     build_oracle_by_oracle_id(&cards),
+        external_id_index:       build_external_id_index(&printings),
     };
     let data = CardData {
         cards,
@@ -11564,4 +11566,54 @@ fn absent_compat_values_stay_absent() {
     assert_eq!(u16::from(a.flags), 0);
     assert!(a.multiverse_ids.is_empty());
     assert!(a.promo_types.is_empty());
+}
+
+#[test]
+fn external_ids_resolve_to_their_printing() {
+    let mut a = stub_printing(1, 1, Some(1.0));
+    a.compat = CompatFields {
+        multiverse_ids: vec![100, 101],
+        mtgo_id: Some(200),
+        mtgo_foil_id: Some(201),
+        arena_id: Some(300),
+        ..CompatFields::default()
+    };
+    let mut b = stub_printing(2, 2, Some(1.0));
+    b.compat =
+        CompatFields { tcgplayer_id: Some(400), tcgplayer_etched_id: Some(401), ..CompatFields::default() };
+    let printings = vec![a, b];
+
+    let idx = build_external_id_index(&printings);
+    let bytes = rkyv::to_bytes::<Error>(&idx).expect("serialize");
+    let aidx = rkyv::access::<Archived<Vec<(u8, u64, u32)>>, Error>(&bytes).expect("access");
+
+    // A multiverse id is a LIST, so one printing contributes several entries.
+    assert_eq!(find_printing_by_external_id(aidx, EXT_MULTIVERSE, 100), Some(0));
+    assert_eq!(find_printing_by_external_id(aidx, EXT_MULTIVERSE, 101), Some(0));
+    // mtgo resolves against BOTH mtgo_id and mtgo_foil_id, as Scryfall's route does.
+    assert_eq!(find_printing_by_external_id(aidx, EXT_MTGO, 200), Some(0));
+    assert_eq!(find_printing_by_external_id(aidx, EXT_MTGO, 201), Some(0));
+    assert_eq!(find_printing_by_external_id(aidx, EXT_ARENA, 300), Some(0));
+    // ...and tcgplayer against both plain and etched.
+    assert_eq!(find_printing_by_external_id(aidx, EXT_TCGPLAYER, 400), Some(1));
+    assert_eq!(find_printing_by_external_id(aidx, EXT_TCGPLAYER, 401), Some(1));
+
+    // Namespaces are separate keyspaces: id 200 is an mtgo id, not an arena one.
+    assert_eq!(find_printing_by_external_id(aidx, EXT_ARENA, 200), None);
+    assert_eq!(find_printing_by_external_id(aidx, EXT_MTGO, 999), None);
+}
+
+#[test]
+fn a_shared_external_id_resolves_to_the_first_printing() {
+    // Etched and nonfoil rows do collide on a TCGplayer id. Printings are stored in descending
+    // prefer order, so the lowest index is the one the rest of the API would show.
+    let mut a = stub_printing(1, 1, Some(9.0));
+    a.compat = CompatFields { tcgplayer_id: Some(500), ..CompatFields::default() };
+    let mut b = stub_printing(2, 2, Some(1.0));
+    b.compat = CompatFields { tcgplayer_id: Some(500), ..CompatFields::default() };
+
+    let idx = build_external_id_index(&vec![a, b]);
+    let bytes = rkyv::to_bytes::<Error>(&idx).expect("serialize");
+    let aidx = rkyv::access::<Archived<Vec<(u8, u64, u32)>>, Error>(&bytes).expect("access");
+    assert_eq!(find_printing_by_external_id(aidx, EXT_TCGPLAYER, 500), Some(0));
 }
