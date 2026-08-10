@@ -726,3 +726,114 @@ class TestMultiFaceRawBlob:
         assert "Flying" in row["oracle_text"]
         assert "Look at the top card" in row["oracle_text"]
         assert row["creature_power"] == 1
+
+
+class TestEngineCardObjects:
+    """What the ENGINE needs to answer a card-shaped question, without reading raw_card_blob.
+
+    The engine serves searches and Postgres is the fallback for when it errors, so a field that
+    lives only in the blob is a field /cards/* cannot answer on the primary path. These pin the
+    two columns that close that gap.
+    """
+
+    @staticmethod
+    def _two_faced() -> dict:
+        """A transform card whose two faces disagree on every per-face field that matters."""
+        return create_test_card(
+            name="Front Test // Back Test",
+            layout="transform",
+            lang="en",
+            set_type="expansion",
+            games=["paper", "mtgo"],
+            finishes=["nonfoil", "foil"],
+            arena_id=12345,
+            card_faces=[
+                {
+                    "name": "Front Test",
+                    "type_line": "Creature — Human",
+                    "mana_cost": "{1}{W}",
+                    "colors": ["W"],
+                    "power": "2",
+                    "toughness": "2",
+                    "oracle_text": "Front text.",
+                    "flavor_text": "Front flavor.",
+                    "artist": "Front Artist",
+                    "illustration_id": "11111111-1111-1111-1111-111111111111",
+                },
+                {
+                    "name": "Back Test",
+                    "type_line": "Creature — Werewolf",
+                    "mana_cost": "",
+                    "colors": ["R"],
+                    "power": "3",
+                    "toughness": "3",
+                    "oracle_text": "Back text.",
+                    "artist": "Back Artist",
+                    "illustration_id": "22222222-2222-2222-2222-222222222222",
+                },
+            ],
+        )
+
+    def test_faces_are_stored_structurally(self) -> None:
+        """Each face keeps its own fields, front first, so the engine can read a face."""
+        faces = preprocess_card(self._two_faced())[0]["card_faces"]
+        assert [face["name"] for face in faces] == ["Front Test", "Back Test"]
+        assert faces[0]["illustration_id"] == "11111111-1111-1111-1111-111111111111"
+        assert faces[1]["illustration_id"] == "22222222-2222-2222-2222-222222222222"
+        assert faces[0]["artist"] == "Front Artist"
+        assert faces[1]["artist"] == "Back Artist"
+
+    def test_back_face_stats_survive_the_merge(self) -> None:
+        """Both faces' stats stay reachable, retiring the merge's documented residual.
+
+        _merge_processed_faces keeps only the FRONT's stat group, while Scryfall matches either
+        face. The per-face records carry both, so the back's 3/3 is searchable again.
+        """
+        row = preprocess_card(self._two_faced())[0]
+        assert row["creature_power_text"] == "2"
+        assert [face["power"] for face in row["card_faces"]] == ["2", "3"]
+        assert [face["toughness"] for face in row["card_faces"]] == ["2", "3"]
+
+    def test_absent_face_keys_stay_absent(self) -> None:
+        """A face without flavor_text stores no flavor_text key.
+
+        Scryfall omits it rather than sending null, and a reconstructed face has to agree
+        key-for-key.
+        """
+        faces = preprocess_card(self._two_faced())[0]["card_faces"]
+        assert faces[0]["flavor_text"] == "Front flavor."
+        assert "flavor_text" not in faces[1]
+
+    def test_single_faced_cards_have_no_face_records(self) -> None:
+        """One face is not a face list; the column stays absent so the engine stores nothing."""
+        assert "card_faces" not in preprocess_card(create_test_card(name="Solo Test"))[0]
+
+    def test_compat_blob_carries_what_no_column_holds(self) -> None:
+        """The fields /cards/* needs and nothing else stores."""
+        blob = preprocess_card(self._two_faced())[0]["card_compat_blob"]
+        assert blob["lang"] == "en"
+        assert blob["set_type"] == "expansion"
+        assert blob["games"] == ["paper", "mtgo"]
+        assert blob["finishes"] == ["nonfoil", "foil"]
+        assert blob["arena_id"] == 12345
+
+    def test_compat_blob_excludes_what_columns_already_hold(self) -> None:
+        """Redundancy is the whole cost of raw_card_blob; the residue must not repeat it."""
+        blob = preprocess_card(self._two_faced())[0]["card_compat_blob"]
+        for stored in ("name", "type_line", "oracle_text", "colors", "legalities", "set"):
+            assert stored not in blob, f"{stored} has a column of its own"
+
+    def test_compat_blob_excludes_derivable_uris(self) -> None:
+        """Every *_uri is a pure function of the card's id, set or oracle id."""
+        blob = preprocess_card(self._two_faced())[0]["card_compat_blob"]
+        for derived in ("uri", "scryfall_uri", "image_uris", "rulings_uri", "prints_search_uri"):
+            assert derived not in blob, f"{derived} is derivable"
+
+    def test_compat_blob_is_much_smaller_than_the_raw_blob(self) -> None:
+        """The reason this exists: the blob is overwhelmingly redundant with columns we have."""
+        row = preprocess_card(self._two_faced())[0]
+        assert len(json.dumps(row["card_compat_blob"])) < len(json.dumps(row["raw_card_blob"])) / 2
+
+    def test_single_faced_cards_still_get_a_compat_blob(self) -> None:
+        """The residue is card-level, so it is not a multi-face concern."""
+        assert "card_compat_blob" in preprocess_card(create_test_card(name="Solo Test"))[0]

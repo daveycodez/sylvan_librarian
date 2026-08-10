@@ -116,6 +116,87 @@ _FACE_STAT_GROUPS = (
 # cross newlines), "//" because that is the face separator Scryfall itself renders.
 _FACE_TEXT_SEPARATOR = "\n//\n"
 
+# What `card_faces` stores per face, in Scryfall's own key names and value shapes.
+#
+# The merged row above is what the query planner filters on; this is what a face IS. Keeping it
+# structurally (rather than inside raw_card_blob) is what lets the ENGINE answer face-level
+# questions: the store is the only thing an engine-path request reads, and a JSONB column is not
+# in it. It also retires the merge's one documented residual — when several faces carry a stat
+# group (Brutal Cathar's 2/2 // 3/3) the merged row keeps only the front's, while Scryfall matches
+# either; per-face power/toughness/loyalty make the back searchable again.
+#
+# `object` is the constant "card_face" and `image_uris` is a pure function of the card's id and the
+# face's position, so neither is stored; both are re-emitted on read.
+_FACE_OBJECT_FIELDS = (
+    "name",
+    "mana_cost",
+    "type_line",
+    "oracle_text",
+    "power",
+    "toughness",
+    "loyalty",
+    "colors",
+    "color_indicator",
+    "flavor_text",
+    "artist",
+    "artist_id",
+    "illustration_id",
+)
+
+
+def _face_records(card_faces: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Snapshot each face's own fields, front first.
+
+    Args:
+        card_faces: The card's raw `card_faces` array, as Scryfall sent it.
+
+    Returns:
+        One dict per face, carrying only the keys the face actually has. Absent keys stay absent
+        rather than becoming null, because Scryfall omits them and a reconstructed face has to
+        agree key-for-key.
+    """
+    return [{field: face[field] for field in _FACE_OBJECT_FIELDS if field in face} for face in card_faces]
+
+
+# Keys that do NOT go in card_compat_blob, because a column already holds them or they are a pure
+# function of one. Kept subtractive, and mirrored in 2026-08-10-01-engine-card-objects.sql: the
+# residue is "whatever is left", so a Scryfall key nobody has seen yet lands in the blob by default
+# instead of being silently dropped the first time it appears.
+#
+# `prices` is deliberately absent from this set even though price_usd/eur/tix are columns --
+# usd_foil, usd_etched and eur_foil are not, and keeping the object whole costs a few bytes against
+# losing three fields.
+_COMPAT_BLOB_EXCLUDED = frozenset(
+    {
+        # stored in a column of their own
+        "id", "oracle_id", "name", "released_at", "layout", "mana_cost", "cmc", "type_line",
+        "oracle_text", "power", "toughness", "loyalty", "colors", "color_identity", "keywords",
+        "set", "set_name", "collector_number", "rarity", "flavor_text", "artist",
+        "illustration_id", "border_color", "edhrec_rank", "legalities", "produced_mana",
+        "watermark", "reserved", "game_changer", "frame",
+        # pure functions of id / set / collector_number / oracle_id, re-emitted on read
+        "object", "uri", "scryfall_uri", "image_uris", "rulings_uri", "prints_search_uri",
+        "set_uri", "set_search_uri", "scryfall_set_uri", "card_back_id", "related_uris",
+        "purchase_uris", "resource_id",
+        # its own column
+        "card_faces",
+        # added by this module before the snapshot is taken
+        "card_name", "face_name", "face_idx", "scryfall_id",
+    },
+)  # fmt: skip
+
+
+def _compat_blob(card: dict[str, Any]) -> dict[str, Any]:
+    """The Scryfall keys that no column holds and no derivation recovers.
+
+    Args:
+        card: The card object as Scryfall sent it, before this module's own keys matter.
+
+    Returns:
+        The residue, ready to store as card_compat_blob.
+    """
+    return {key: value for key, value in card.items() if key not in _COMPAT_BLOB_EXCLUDED}
+
 
 def _merge_processed_faces(faces: list[dict[str, Any]]) -> dict[str, Any]:
     """Collapse fully-processed per-face rows into the card's single searchable row.
@@ -221,6 +302,10 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
         # read from the blob — lang, set_type, games, finishes, frame_effects, image_status,
         # reserved, game_changer — is card-level and identical either way.
         merged_row["raw_card_blob"] = copy.deepcopy(card) | {"card_faces": card_faces}
+        # The engine's copy of the same thing. raw_card_blob is a Postgres column and the SQL path
+        # is a fallback, so anything only the blob carries is unanswerable on the engine path.
+        merged_row["card_faces"] = _face_records(card_faces)
+        merged_row["card_compat_blob"] = _compat_blob(card)
         return [merged_row]
 
     # Single face case - set defaults
@@ -237,6 +322,7 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
     # Store the original card data before modifications for raw_card_blob
     raw_card_data = copy.deepcopy(card)
     card["raw_card_blob"] = raw_card_data
+    card["card_compat_blob"] = _compat_blob(raw_card_data)
     card["scryfall_id"] = card["id"]
 
     card_types, card_subtypes = parse_type_line(card["type_line"])
