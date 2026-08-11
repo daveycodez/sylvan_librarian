@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from api.parsing.hand_parser import _is_word_cont
 from api.parsing.hand_parser import parse_query as _parse_query
 from api.parsing.rewrite import rewrite_query
 from api.parsing.spans import QUOTE_CHARS, brace_close_index, find_close_index, opens_regex
@@ -44,6 +45,14 @@ def balance_partial_query(query: str) -> str:
         # them are content, not delimiters. The span rules come from api.parsing.spans so the balancer
         # and the lexer cannot drift apart — where they disagree, the balancer "fixes" a quote the
         # lexer never saw (#905).
+        # A word character either side of an apostrophe makes it part of the word rather than an
+        # opening quote -- the same rule _scan_word_end applies in the tokenizer. Without this the
+        # balancer "closes" the apostrophe in urza's, producing urza's', which does not parse:
+        # strictly worse than before bare names accepted apostrophes at all. (`pos` has already
+        # moved past `char`, so the character itself is at `pos - 1`.)
+        if char == "'" and 0 < pos - 1 < len(query) - 1 and _is_word_cont(query[pos - 2]) and _is_word_cont(query[pos]):
+            continue
+
         if char in QUOTE_CHARS:
             close_index, dangling_escape, _ = find_close_index(query, pos, char)
             if close_index is None:

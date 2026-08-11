@@ -441,9 +441,23 @@ class CardSearch {
   // The JS counterpart of no single Python function — spans.py's callers each make this same
   // three-way dispatch themselves, since hand_parser's lexer and parsing_f's balancer need the
   // unterminated case too.
+  // A word character either side of an apostrophe makes it part of the word rather than an
+  // opening quote — the same rule _scan_word_end applies in the tokenizer. Without this the
+  // balancer "closes" the apostrophe in urza's, producing urza's', which does not parse.
+  isWordApostrophe(query, i) {
+    const wordChar = /[\p{L}\p{N}_.]/u;
+    return (
+      query[i] === "'" &&
+      i > 0 &&
+      wordChar.test(query[i - 1]) &&
+      i + 1 < query.length &&
+      wordChar.test(query[i + 1])
+    );
+  }
+
   closedSpanEnd(query, i) {
     const char = query[i];
-    if (char === '"' || char === "'") {
+    if ((char === '"' || char === "'") && !this.isWordApostrophe(query, i)) {
       return this.quoteCloseIndex(query, i + 1, char);
     }
     if (char === '/' && this.opensRegex(query, i)) {
@@ -609,6 +623,12 @@ class CardSearch {
 
     for (let i = 0; i < query.length; i++) {
       const char = query[i];
+
+      // An apostrophe inside a word is content, not an opening quote — see isWordApostrophe.
+      if (this.isWordApostrophe(query, i)) {
+        blanked += char;
+        continue;
+      }
 
       // A quoted string, a /regex/ and a {mana symbol} are all opaque: the quotes and parens inside
       // them are content, not delimiters.
