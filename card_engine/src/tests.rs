@@ -11553,6 +11553,17 @@ fn compat_fields_survive_the_archive_round_trip() {
 }
 
 #[test]
+fn the_niche_actually_niches() {
+    // The size the "Halve What the Compat Residue Costs a Printing" reasoning depends on, pinned
+    // rather than asserted in a commit message. rkyv 0.8 does NOT niche an Option<NonZeroU32> on
+    // its own -- without `#[rkyv(with = NicheInto<Zero>)]` each of the eleven is 8 bytes and this
+    // struct is 128, which is what it measured at before the attribute was added. Multiplied by
+    // ~98,000 printings, the difference is 4.2 MB.
+    assert_eq!(std::mem::size_of::<Archived<CompatFields>>(), 84);
+    assert_eq!(std::mem::size_of::<Archived<Option<NonZeroU32>>>(), 8, "the bare Option is NOT niched");
+}
+
+#[test]
 fn absent_compat_values_stay_absent() {
     // Scryfall OMITS a key rather than sending null, so a reconstructed card object has to be able
     // to tell "was not there" from "was empty" -- otherwise every card sprouts nulls Scryfall never
@@ -11736,18 +11747,28 @@ fn printings_of_one_card_do_not_look_ambiguous() {
 #[test]
 fn autocomplete_is_prefix_matched_sorted_and_capped() {
     let mut vocab = VocabInterner::new();
+    let mut interner = Interner::new();
     let mut cards = Vec::new();
-    for (i, name) in ["shock", "shatter", "shockwave", "counterspell"].iter().enumerate() {
+    // Matched on the lowercased key, ANSWERED with the printed name -- the two differ, which is
+    // the point: a catalog entry is something a client hands back to /cards/named?exact=.
+    for (i, name) in ["Shock", "Shatter", "Shockwave", "Counterspell"].iter().enumerate() {
         let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
-        c.card_name_lower = InlineStr::from_str(name);
+        c.card_name_lower = InlineStr::from_str(&name.to_lowercase());
+        c.card_name_id = interner.intern((*name).to_string());
         cards.push(c);
     }
     let bytes = rkyv::to_bytes::<Error>(&cards).expect("serialize");
     let a = rkyv::access::<Archived<Vec<OracleCard>>, Error>(&bytes).expect("access");
+    let string_bytes = rkyv::to_bytes::<Error>(&interner.strings).expect("serialize strings");
+    let strings = rkyv::access::<Archived<Vec<String>>, Error>(&string_bytes).expect("access strings");
 
-    assert_eq!(autocomplete_names(a, "sho", 20), vec!["shock", "shockwave"]);
-    assert_eq!(autocomplete_names(a, "SHO", 20), vec!["shock", "shockwave"], "case-insensitive");
-    assert_eq!(autocomplete_names(a, "sh", 20), vec!["shatter", "shock", "shockwave"], "sorted");
-    assert_eq!(autocomplete_names(a, "sh", 1).len(), 1, "capped");
-    assert!(autocomplete_names(a, "zzz", 20).is_empty());
+    assert_eq!(autocomplete_names(a, strings, "sho", 20), vec!["Shock", "Shockwave"]);
+    assert_eq!(autocomplete_names(a, strings, "SHO", 20), vec!["Shock", "Shockwave"], "case-insensitive");
+    assert_eq!(
+        autocomplete_names(a, strings, "sh", 20),
+        vec!["Shatter", "Shock", "Shockwave"],
+        "sorted, and PRINTED -- a lowercase catalog entry is not a name Scryfall prints"
+    );
+    assert_eq!(autocomplete_names(a, strings, "sh", 1).len(), 1, "capped");
+    assert!(autocomplete_names(a, strings, "zzz", 20).is_empty());
 }

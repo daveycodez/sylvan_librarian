@@ -3,6 +3,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDate, PyDateAccess, PyDict, PyList, PyTuple};
 use rkyv::{Archive, Archived, Deserialize, Serialize};
+use rkyv::niche::niching::Zero;
+use rkyv::with::NicheInto;
 use memmap2::Mmap;
 use memchr::memmem;
 use serde_json::Value;
@@ -316,22 +318,39 @@ const FINISH_GLOSSY: u8 = 1 << 3;
 #[derive(Archive, Serialize, Deserialize)]
 struct CompatFields {
     // Marketplace and client ids. Sparse -- most printings carry two to four of the six -- and
-    // NonZeroU32 rather than u32 so rkyv niches the None into the value itself: an Option<u32>
+    // NonZeroU32 rather than u32 so rkyv can niche the None into the value itself: an Option<u32>
     // archives as 8 bytes (tag plus payload), an Option<NonZeroU32> as 4. Eleven of them, on every
     // printing, so the niche is worth 44 bytes a row on its own. None of these ids is ever 0.
+    //
+    // The `NicheInto<Zero>` attribute is REQUIRED for that. rkyv 0.8 does not niche an
+    // Option<NonZeroU32> on its own -- measured at 8 bytes without it, so CompatFields was 128
+    // rather than the 84 it is now, and the whole 44-byte saving this comment describes was not
+    // actually happening. The 160 -> 128 the commit message reports came from set_id's u128
+    // alignment going away, not from the niche.
+    #[rkyv(with = NicheInto<Zero>)]
     arena_id: Option<NonZeroU32>,
+    #[rkyv(with = NicheInto<Zero>)]
     mtgo_id: Option<NonZeroU32>,
+    #[rkyv(with = NicheInto<Zero>)]
     mtgo_foil_id: Option<NonZeroU32>,
+    #[rkyv(with = NicheInto<Zero>)]
     tcgplayer_id: Option<NonZeroU32>,
+    #[rkyv(with = NicheInto<Zero>)]
     tcgplayer_etched_id: Option<NonZeroU32>,
+    #[rkyv(with = NicheInto<Zero>)]
     cardmarket_id: Option<NonZeroU32>,
+    #[rkyv(with = NicheInto<Zero>)]
     penny_rank: Option<NonZeroU32>,
     // The cache-buster Scryfall appends to every image_uris entry; without it the derived URLs are
     // reachable but not byte-identical to what Scryfall serves.
+    #[rkyv(with = NicheInto<Zero>)]
     image_updated_at: Option<NonZeroU32>,
     // Integer cents, exactly like the three price columns. These three have no column.
+    #[rkyv(with = NicheInto<Zero>)]
     price_usd_foil: Option<NonZeroU32>,
+    #[rkyv(with = NicheInto<Zero>)]
     price_usd_etched: Option<NonZeroU32>,
+    #[rkyv(with = NicheInto<Zero>)]
     price_eur_foil: Option<NonZeroU32>,
     // Small closed vocabularies interned into coll_vocab: ~10 languages, ~6 image statuses,
     // ~20 set types, ~5 security stamps -- and the SET, which is why set_id is no longer the
@@ -2756,8 +2775,16 @@ pub(crate) const EXT_CARDMARKET: u8 = 4;
 /// `(namespace, external id) -> printing`, sorted, for the /cards/{namespace}/:id routes.
 ///
 /// Sparse triples rather than five dense columns: most printings carry two to four of the seven
-/// ids, and a multiverse id is a LIST, so one printing can contribute several entries. ~350 KB at
-/// corpus scale, and one binary search answers all five routes.
+/// ids, and a multiverse id is a LIST, so one printing can contribute several entries. One binary
+/// search answers all five routes.
+///
+/// MEASURED at corpus scale: 347,625 entries. rkyv archives a `(u8, u64, u32)` as 24 bytes -- the
+/// u64 forces 8-byte alignment on a 13-byte payload -- so this is 8.34 MB, not the ~350 KB an
+/// earlier revision of this comment estimated. Every id Scryfall issues fits in a u32 (the largest
+/// live value is ~1.1M) and the namespace is a property of the block rather than of each entry, so
+/// `(u32, u32)` plus a five-entry offset table would take it to 2.78 MB. Left as it is here
+/// because Postgres has no archive ceiling; a deployment that serves the archive from a size-
+/// capped store will want the packed form.
 ///
 /// mtgo_foil_id and tcgplayer_etched_id are folded into their base namespace on purpose -- Scryfall
 /// resolves /cards/mtgo/:id against either mtgo_id or mtgo_foil_id, and the answer is the same
@@ -2900,15 +2927,26 @@ pub(crate) fn fuzzy_name_match(cards: &Archived<Vec<OracleCard>>, needle: &str, 
 ///
 /// Scryfall's autocomplete catalog. A scan for the same reason fuzzy is: ~31,700 names is small,
 /// and a prefix index would cost archive space for one low-traffic route.
-pub(crate) fn autocomplete_names<'a>(cards: &'a Archived<Vec<OracleCard>>, prefix: &str, limit: usize) -> Vec<&'a str> {
+pub(crate) fn autocomplete_names<'a>(
+    cards: &'a Archived<Vec<OracleCard>>,
+    strings: &'a AStrings,
+    prefix: &str,
+    limit: usize,
+) -> Vec<&'a str> {
     let prefix = prefix.to_lowercase();
     let mut out: Vec<&str> = Vec::new();
     for card in cards.iter() {
-        if card.card_name_lower.as_str().starts_with(&prefix) {
-            let name = card.card_name_lower.as_str();
-            if !out.contains(&name) {
-                out.push(name);
-            }
+        let lower = card.card_name_lower.as_str();
+        if !lower.starts_with(&prefix) {
+            continue;
+        }
+        // The PRINTED name, not the lowercased key it matched on. A catalog entry is something a
+        // client hands straight back to /cards/named?exact=, and "lightning bolt" is not the name
+        // Scryfall prints. This was invisible while the route went to SQL (which selects
+        // card_name); wiring the route to this function is what puts it on the wire.
+        let name = str_at(strings, u32::from(card.card_name_id)).unwrap_or(lower);
+        if !out.contains(&name) {
+            out.push(name);
         }
     }
     out.sort_unstable();
@@ -12269,6 +12307,12 @@ const FIELD_TABLE: &[(&str, FieldExtractor)] = &[
     // `colors` is this PR's addition; #877 already supplies layout, cmc, rarity,
     // color_identity and legalities, so those are not repeated here.
     ("colors", |py, c, _p, _s, _v| Ok(identity_letters(c.card_colors).into_pyobject(py)?.into_any())),
+    // `to_scryfall_card` reads both of these, and neither had an entry here or a place in
+    // CARD_OBJECT_FIELDS -- so on the ENGINE path every card object carried `border_color: null`
+    // and no `frame` at all, where Scryfall always sends both. Only the accessors were missing;
+    // both values were already stored.
+    ("border_color", |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.card_border_id)).into_pyobject(py)?.into_any())),
+    ("frame", |py, _c, p, _s, v| Ok(frame_of(p, v).into_pyobject(py)?.into_any())),
     // ── The remaining fields a card object needs ─────────────────────────────────────────────
     ("oracle_id", |py, c, _p, _s, _v| Ok(uuid_from_u128(u128::from(c.oracle_id)).into_pyobject(py)?.into_any())),
     ("flavor_text", |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.flavor_text_id)).into_pyobject(py)?.into_any())),
@@ -12314,6 +12358,21 @@ pub(crate) fn identity_letters(mask: u8) -> Vec<&'static str> {
 /// `20200101` -> `"2020-01-01"`. The store packs the date as an int; Scryfall sends ISO.
 fn released_int_to_iso(value: u32) -> String {
     format!("{:04}-{:02}-{:02}", value / 10_000, (value / 100) % 100, value % 100)
+}
+
+/// Scryfall's `frame`, recovered from `card_frame_data`.
+///
+/// The import folds Scryfall's `frame` and its `frame_effects` into one title-cased collection
+/// (card_processing.py), so the frame is whichever member belongs to Scryfall's closed frame
+/// vocabulary rather than "the first one" -- a card with no frame but an effect would otherwise
+/// report the effect as its frame.
+pub(crate) fn frame_of(p: &APrinting, vocab: &AStrings) -> Option<&'static str> {
+    const FRAMES: [(&str, &str); 5] =
+        [("1993", "1993"), ("1997", "1997"), ("2003", "2003"), ("2015", "2015"), ("Future", "future")];
+    p.card_frame_data.iter().find_map(|id| {
+        let name = coll_str(vocab, u16::from(*id));
+        FRAMES.iter().find(|(titled, _)| *titled == name).map(|(_, scryfall)| *scryfall)
+    })
 }
 
 /// Bitset member names, in the order Scryfall lists them.
@@ -13500,7 +13559,7 @@ impl QueryEngine {
         let mmap = self.get_mmap()?;
         // Safety: see the access_unchecked justification in query().
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
-        Ok(autocomplete_names(&data.cards, prefix, limit).into_iter().map(str::to_string).collect())
+        Ok(autocomplete_names(&data.cards, &data.strings, prefix, limit).into_iter().map(str::to_string).collect())
     }
 
     /// The printing carrying this external id, or None.

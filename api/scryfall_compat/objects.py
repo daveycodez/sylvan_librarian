@@ -49,7 +49,7 @@ CARD_OBJECT_FIELDS = (
     "power", "toughness", "colors", "color_identity", "card_keywords", "set_code", "set_name",
     "collector_number", "rarity", "flavor_text", "artist", "illustration_id", "released_at",
     "legalities", "edhrec_rank", "price_usd", "price_eur", "price_tix", "watermark",
-    "card_frame_data", "card_is_tags",
+    "card_frame_data", "card_is_tags", "border_color", "frame",
     "lang", "image_status", "set_type", "security_stamp", "set_id", "arena_id", "mtgo_id",
     "mtgo_foil_id", "tcgplayer_id", "tcgplayer_etched_id", "cardmarket_id", "penny_rank",
     "image_updated_at", "price_usd_foil", "price_usd_etched", "price_eur_foil", "multiverse_ids",
@@ -74,6 +74,7 @@ _SQL_COLUMN_ALIASES = {
     "card_layout": "layout",
     "card_watermark": "watermark",
     "card_artist": "artist",
+    "card_border": "border_color",
 }
 
 _RARITY_BY_INT = {0: "common", 1: "uncommon", 2: "rare", 3: "mythic", 4: "special", 5: "bonus"}
@@ -284,7 +285,7 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
         "card_back_id": CARD_BACK_ID,
         "artist": row.get("artist"),
         "illustration_id": str(row["illustration_id"]) if row.get("illustration_id") else None,
-        "border_color": row.get("card_border"),
+        "border_color": row.get("border_color"),
         "full_art": bool(row.get("full_art")),
         "textless": bool(row.get("textless")),
         "booster": bool(row.get("booster")),
@@ -311,6 +312,7 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
         ("toughness", row.get("toughness")),
         ("flavor_text", row.get("flavor_text") or None),
         ("watermark", row.get("watermark")),
+        ("frame", row.get("frame")),
         ("edhrec_rank", row.get("edhrec_rank")),
         ("penny_rank", row.get("penny_rank")),
         ("arena_id", row.get("arena_id")),

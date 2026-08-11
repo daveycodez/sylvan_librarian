@@ -17,6 +17,7 @@ from api.scryfall_compat.objects import (
     error_object,
     image_uri,
     ruling_object,
+    sql_row_to_engine_row,
     to_scryfall_card,
 )
 
@@ -101,6 +102,24 @@ class TestToScryfallCard:
         card = to_scryfall_card(row())
         for key in ("power", "toughness", "flavor_text", "watermark", "arena_id", "promo_types"):
             assert key not in card, f"{key} should be omitted, not null"
+
+    def test_border_color_and_frame_come_from_the_engine_row(self):
+        """Both come from the engine row now.
+
+        They were read from keys no engine row carried, so every engine-served card had
+        `border_color: null` and no `frame` at all -- where Scryfall always sends both.
+        """
+        card = to_scryfall_card(row(border_color="black", frame="2015"))
+        assert card["border_color"] == "black"
+        assert card["frame"] == "2015"
+
+    def test_border_color_survives_the_sql_alias(self):
+        """The SQL column aliases into the engine's field name.
+
+        The column is `card_border` and the engine field is `border_color`; one builder reads one
+        name, so the SQL row is aliased into it rather than the builder reading both.
+        """
+        assert sql_row_to_engine_row({"card_border": "borderless"})["border_color"] == "borderless"
 
     def test_present_optional_keys_appear(self):
         card = to_scryfall_card(row(power="3", toughness="2", flavor_text="Kaboom.", arena_id=12345))

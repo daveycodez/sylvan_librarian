@@ -533,7 +533,7 @@ class ScryfallCardsRoutes:
         clauses = " OR ".join(f"(raw_card_blob ->> '{column}')::bigint = %(value)s" for column in columns)
         return self._fetch_one_card(f"({clauses})", {"value": external_id})
 
-    def _fetch_one_card(self, where: str, params: dict[str, Any]) -> dict[str, Any] | None:
+    def _fetch_one_card(self, where: str, params: dict[str, Any], *, rank_first: str = "") -> dict[str, Any] | None:
         """Fetch the single best printing matching a predicate.
 
         Ties are broken by prefer_score, so a lookup that spans printings (by name, by oracle id)
@@ -542,6 +542,11 @@ class ScryfallCardsRoutes:
         Args:
             where: SQL predicate, referencing `card` as the table alias.
             params: Bound parameters for the predicate.
+            rank_first: An ORDER BY term applied BEFORE prefer_score, for a caller whose predicate
+                admits matches of different qualities. `named?exact=` needs it: it matches either
+                face of a "Front // Back" name, and without this a two-faced card whose back face
+                carries the name outranks the card actually named that whenever its score is
+                higher.
 
         Returns:
             The card, or None when nothing matched.
@@ -549,7 +554,7 @@ class ScryfallCardsRoutes:
         rows = self._run_query(
             query=(
                 f"SELECT {_CARD_COLUMNS} FROM magic.cards AS card WHERE {where} "
-                "ORDER BY prefer_score DESC NULLS LAST, released_at DESC LIMIT 1"
+                f"ORDER BY {rank_first}prefer_score DESC NULLS LAST, released_at DESC LIMIT 1"
             ),
             params=params,
             explain=False,
@@ -779,7 +784,15 @@ class ScryfallCardsRoutes:
                 "OR lower(split_part(card_name_folded, ' // ', 1)) = %(folded)s "
                 "OR lower(split_part(card_name_folded, ' // ', 2)) = %(folded)s)",
             )
-            card = self._fetch_one_card(" AND ".join(clauses), params)
+            # A WHOLE-name match beats a face match. Matching a face is right -- Scryfall resolves
+            # `exact=Delver of Secrets` to the two-faced card -- but it is a fallback, not a peer:
+            # on the current corpus `exact=Lightning Bolt` otherwise answers
+            # "Emeritus of Conflict // Lightning Bolt", whose prefer_score is the higher of the two.
+            card = self._fetch_one_card(
+                " AND ".join(clauses),
+                params,
+                rank_first="(lower(card_name_folded) = %(folded)s) DESC, ",
+            )
             if card is None:
                 return self._scryfall_respond(
                     falcon_response,
@@ -995,6 +1008,33 @@ class ScryfallCardsRoutes:
         Returns:
             The matching printing, `_AMBIGUOUS`, or None.
         """
+        # The ENGINE first, like every other lookup on this surface. `fuzzy_name_match`
+        # reimplements pg_trgm's similarity() exactly for this, and until now nothing called it:
+        # the whole of "Fuzzy Name Match and Autocomplete, Computed Not Stored" was unreachable
+        # from the API, which is the same defect the duplicate `_card_by_external_id` had.
+        #
+        # A set filter still goes to SQL: the engine matches on names alone and has no way to
+        # restrict to one set, and answering the unrestricted match would be a different card.
+        if not base_clauses:
+            engine = self._engine_for_lookup()
+            if engine is not None:
+                try:
+                    status, row = engine.fuzzy_card_by_name(
+                        needle,
+                        FUZZY_SIMILARITY_FLOOR,
+                        FUZZY_SIMILARITY_LEAD,
+                        list(CARD_OBJECT_FIELDS),
+                    )
+                    if status == "ambiguous":
+                        return _AMBIGUOUS
+                    if status == "miss":
+                        return None
+                    if row:
+                        return {"scryfall_id": row["id"], "card_name": row["name"]}
+                # Any engine failure falls back to SQL; it never 500s.
+                except Exception:
+                    logger.exception("Engine fuzzy match failed, falling back to SQL")
+
         params = {**base_params, "needle": needle, "floor": FUZZY_SIMILARITY_FLOOR}
         # `%%` escapes psycopg's placeholder marker: the bare `%` operator would be read as the
         # start of one. OPERATOR(magic.%) is pg_trgm's similarity match, which the folded-name GIN
@@ -1047,6 +1087,17 @@ class ScryfallCardsRoutes:
         min_query_length = 2
         if len(needle) < min_query_length:
             return self._scryfall_respond(falcon_response, catalog_object([]), pretty=is_pretty)
+
+        # The ENGINE first, for the same reason the fuzzy match above now does: `autocomplete` was
+        # added by "Fuzzy Name Match and Autocomplete, Computed Not Stored" and nothing called it.
+        engine = self._engine_for_lookup()
+        if engine is not None:
+            try:
+                names = engine.autocomplete(needle, MAX_AUTOCOMPLETE_VALUES)
+                return self._scryfall_respond(falcon_response, catalog_object(list(names)), pretty=is_pretty)
+            # Any engine failure falls back to SQL; it never 500s.
+            except Exception:
+                logger.exception("Engine autocomplete failed, falling back to SQL")
 
         rows = self._run_query(
             query=(
