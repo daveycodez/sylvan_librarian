@@ -163,3 +163,28 @@ def test_ci_is_an_identity_alias(ci_query: str, id_query: str) -> None:
     """`ci` produces identical SQL to the established identity aliases, in both parsers."""
     assert generate_sql_query(parse_scryfall_query(ci_query)) == generate_sql_query(parse_scryfall_query(id_query))
     assert generate_sql_query(parse_search_query(ci_query)) == generate_sql_query(parse_search_query(id_query))
+
+
+# `-` is not a word character to the hand tokenizer, so `usd-low` lexes as WORD MINUS WORD.
+# The hand parser consumed a single token after the colon and stopped at `usd`, leaving `-low`
+# to fail the parse -- while pyparsing's `string_value_word` (\w[\w.-]*) took the whole thing.
+# So the two parsers disagreed on every hyphenated directive value, and the hyphenated prefer
+# spellings _DIRECTIVE_PREFER enumerates were unreachable from inside a query through the hand
+# parser. No existing case used one, which is why parity did not see it.
+HYPHENATED_DIRECTIVES = [
+    ("prefer:usd-low", "prefer", "usd-low"),
+    ("prefer:usd-high t:bolt", "prefer", "usd-high"),
+    ("prefer:usd-low t:goblin", "prefer", "usd-low"),
+]
+
+
+@pytest.mark.parametrize(
+    argnames=["query", "name", "value"],
+    argvalues=HYPHENATED_DIRECTIVES,
+    ids=[q for q, _, _ in HYPHENATED_DIRECTIVES],
+)
+def test_hyphenated_directive_values_survive_both_parsers(query: str, name: str, value: str) -> None:
+    """A hyphenated directive value reaches the directive whole, in both parsers."""
+    for parse in (parse_scryfall_query, parse_search_query):
+        directives = parse(query).directives
+        assert directives == ((name, value, False),), f"{parse.__name__} lost the hyphen in {query!r}"
