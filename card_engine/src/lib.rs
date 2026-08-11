@@ -2922,34 +2922,80 @@ pub(crate) fn fuzzy_name_match(cards: &Archived<Vec<OracleCard>>, needle: &str, 
     }
 }
 
-/// Card names beginning with `prefix`, case-insensitively, up to `limit`, sorted.
+/// Card names MATCHING `needle`, case-insensitively, in the SQL route's own order, up to `limit`.
 ///
 /// Scryfall's autocomplete catalog. A scan for the same reason fuzzy is: ~31,700 names is small,
 /// and a prefix index would cost archive space for one low-traffic route.
+///
+/// The ordering is the SQL fallback's, reproduced rather than approximated, because the route now
+/// asks the engine FIRST and falls back only on failure -- so any disagreement between the two is
+/// not a fallback, it is two different answers to one request, and the engine's is the one that
+/// ships. That query is:
+///
+///   WHERE lower(card_name) LIKE '%needle%'
+///   ORDER BY rank, length(card_name), card_name
+///
+/// with rank 0 for a prefix match and 1 for a bare substring. Three things follow, and a
+/// prefix-only alphabetical scan gets all three wrong:
+///
+///   - SUBSTRING matches are in the result set. `bolt` must answer with `Firebolt` and `Rift Bolt`,
+///     not just the names starting with it.
+///   - A prefix match outranks a substring match regardless of name.
+///   - Within a rank the order is by LENGTH, not alphabetical: `Bolt Bend` before `Boltbender`.
+///
+/// Sorted whole rather than short-circuited, for the same reason: the ordering is by length, so a
+/// shorter name later in the corpus outranks a longer one already found, and stopping at `limit`
+/// matches would answer with the wrong ones.
+///
+/// MEASURED against api.scryfall.com, because the SQL is this project's approximation and Scryfall
+/// is the target. `q=bolt` there returns Bolt Bend, Boltwave, Bolt Hound, Boltbender,
+/// Bolt of Keranos, Boltwing Marauder, THEN Beacon Bolt, Twin Bolt, Firebolt, Rift Bolt.
+///
+///   - The rank split is real: every prefix match precedes every substring match, and the
+///     substring matches ARE in the catalog. That is the half this function was getting wrong,
+///     and it is the half that decides WHICH CARDS a client is offered.
+///   - The order WITHIN a rank is neither length nor alphabetical there (Bolt Bend 9 before
+///     Boltwave 8 before Bolt Hound 10), so it is some relevance signal we do not have here.
+///     `length, card_name` is the SQL's stand-in and is kept, deliberately: matching the SQL keeps
+///     the engine and fallback paths answering alike, which is a property this branch can hold,
+///     where matching Scryfall's ranking is not.
 pub(crate) fn autocomplete_names<'a>(
     cards: &'a Archived<Vec<OracleCard>>,
     strings: &'a AStrings,
-    prefix: &str,
+    needle: &str,
     limit: usize,
 ) -> Vec<&'a str> {
-    let prefix = prefix.to_lowercase();
-    let mut out: Vec<&str> = Vec::new();
+    let needle = needle.to_lowercase();
+    let mut hits: Vec<(u8, usize, &str)> = Vec::new();
     for card in cards.iter() {
         let lower = card.card_name_lower.as_str();
-        if !lower.starts_with(&prefix) {
+        let rank = if lower.starts_with(&needle) {
+            0u8
+        } else if lower.contains(&needle) {
+            1u8
+        } else {
             continue;
-        }
+        };
         // The PRINTED name, not the lowercased key it matched on. A catalog entry is something a
         // client hands straight back to /cards/named?exact=, and "lightning bolt" is not the name
         // Scryfall prints. This was invisible while the route went to SQL (which selects
         // card_name); wiring the route to this function is what puts it on the wire.
-        let name = str_at(strings, u32::from(card.card_name_id)).unwrap_or(lower);
-        if !out.contains(&name) {
-            out.push(name);
+        let printed = str_at(strings, u32::from(card.card_name_id)).unwrap_or(lower);
+        hits.push((rank, printed.len(), printed));
+    }
+    // GROUP BY card_name: several printings of one card are one suggestion. Deduped AFTER the sort
+    // so the surviving entry is the first in the route's order, and by name alone -- two printings
+    // differing only in rank must not both appear.
+    hits.sort_unstable();
+    let mut out: Vec<&str> = Vec::with_capacity(limit.min(hits.len()));
+    for (_, _, printed) in hits {
+        if out.last() != Some(&printed) && !out.contains(&printed) {
+            out.push(printed);
+            if out.len() == limit {
+                break;
+            }
         }
     }
-    out.sort_unstable();
-    out.truncate(limit);
     out
 }
 
