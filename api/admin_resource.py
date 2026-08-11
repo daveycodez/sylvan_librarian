@@ -125,6 +125,11 @@ BOOLEAN_IS_TAGS: dict[str, str] = {
     "league": "cards.raw_card_blob->'promo_types' @> '\"league\"'",
     "masterpiece": "cards.raw_card_blob->>'set_type' = 'masterpiece'",
     "media_insert": "cards.raw_card_blob->'promo_types' @> '\"mediainsert\"'",
+    # Low cardinality -- memorabilia and the oversized promo sets, ~2.7% of printings -- so it
+    # does not carry the foil/promo/reprint concern in the header above. It is also one of the
+    # filters that turns OFF default visibility (see _unhides_extras), which is only expressible
+    # at all once the tag exists.
+    "oversized": "cards.raw_card_blob->'oversized' = 'true'::jsonb",
     # "Partner with <name>" cards carry a plain "Partner" keyword alongside it (verified
     # against the corpus), so checking for "Partner" alone already covers both.
     "partner": "cards.raw_card_blob->'keywords' @> '\"Partner\"'",
