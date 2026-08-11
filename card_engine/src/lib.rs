@@ -106,18 +106,6 @@ pub(crate) fn color_list_to_mask(colors: &[&str]) -> u8 {
     colors.iter().fold(0u8, |acc, c| acc | color_to_bit(c))
 }
 
-/// The inverse of `color_list_to_mask`, in Scryfall's WUBRG order (C last, as Scryfall lists it).
-///
-/// New because colors were only ever filtered on, never emitted: answering whether a card matches
-/// `c:r` needs the mask, but reconstructing a card object needs to say which colors it actually is.
-pub(crate) fn mask_to_color_letters(mask: u8) -> Vec<&'static str> {
-    [("W", 1u8), ("U", 2), ("B", 4), ("R", 8), ("G", 16), ("C", 32)]
-        .iter()
-        .filter(|(_, bit)| mask & bit != 0)
-        .map(|(letter, _)| *letter)
-        .collect()
-}
-
 // ─── Mana cost helpers ───────────────────────────────────────────────────────
 
 // ─── Packed pip lanes ────────────────────────────────────────────────────────
@@ -12266,6 +12254,21 @@ const FIELD_TABLE: &[(&str, FieldExtractor)] = &[
         }
         Ok(PyList::new(py, out)?.into_any())
     }),
+    // `colors` is this PR's addition; #877 already supplies layout, cmc, rarity,
+    // color_identity and legalities, so those are not repeated here.
+    ("colors", |py, c, _p, _s, _v| Ok(identity_letters(c.card_colors).into_pyobject(py)?.into_any())),
+    // ── The remaining fields a card object needs ─────────────────────────────────────────────
+    ("oracle_id", |py, c, _p, _s, _v| Ok(uuid_from_u128(u128::from(c.oracle_id)).into_pyobject(py)?.into_any())),
+    ("flavor_text", |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.flavor_text_id)).into_pyobject(py)?.into_any())),
+    ("artist", |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.card_artist_vid)).into_pyobject(py)?.into_any())),
+    ("watermark", |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.card_watermark_id)).into_pyobject(py)?.into_any())),
+    ("edhrec_rank", |py, c, _p, _s, _v| Ok(c.edhrec_rank.as_ref().copied().map(u32::from).into_pyobject(py)?.into_any())),
+    ("price_eur", |py, _c, p, _s, _v| Ok(p.price_eur.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).into_pyobject(py)?.into_any())),
+    ("price_tix", |py, _c, p, _s, _v| Ok(p.price_tix.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).into_pyobject(py)?.into_any())),
+    // ISO date, the shape Scryfall sends and JSON can carry. The store holds it as an int.
+    ("released_at", |py, _c, p, _s, _v| {
+        Ok(p.released_at_int.as_ref().copied().map(u32::from).map(released_int_to_iso).into_pyobject(py)?.into_any())
+    }),
 ];
 
 /// Mirror of magic.rarity_int_to_text -- the import stores 0-5, Scryfall speaks words.
@@ -12281,8 +12284,12 @@ fn rarity_int_to_text(value: u8) -> Option<&'static str> {
     }
 }
 
-/// Decode an identity bitmap into Scryfall's WUBRG-ordered letter list.
-fn identity_letters(mask: u8) -> Vec<&'static str> {
+/// Decode a colour bitmap into Scryfall's WUBRG-ordered letter list (C last, as Scryfall lists it).
+///
+/// Used for color_identity, a card's own colors, and each face's colors and colour indicator.
+/// #877 introduced it; this PR widened its visibility rather than adding a second function with
+/// the same body under a different name.
+pub(crate) fn identity_letters(mask: u8) -> Vec<&'static str> {
     [("W", 1u8), ("U", 2), ("B", 4), ("R", 8), ("G", 16), ("C", 32)]
         .iter()
         .filter(|(_, bit)| mask & bit != 0)
@@ -12290,6 +12297,12 @@ fn identity_letters(mask: u8) -> Vec<&'static str> {
         .collect()
 }
 
+
+
+/// `20200101` -> `"2020-01-01"`. The store packs the date as an int; Scryfall sends ISO.
+fn released_int_to_iso(value: u32) -> String {
+    format!("{:04}-{:02}-{:02}", value / 10_000, (value / 100) % 100, value % 100)
+}
 
 /// Bitset member names, in the order Scryfall lists them.
 const GAME_NAMES: &[(&str, u8)] = &[("paper", GAME_PAPER), ("mtgo", GAME_MTGO), ("arena", GAME_ARENA)];
@@ -12332,8 +12345,8 @@ fn faces_to_pylist<'py>(
         d.set_item("power", str_at(strings, u32::from(face.creature_power_text_id)))?;
         d.set_item("toughness", str_at(strings, u32::from(face.creature_toughness_text_id)))?;
         d.set_item("loyalty", str_at(strings, u32::from(face.planeswalker_loyalty_text_id)))?;
-        d.set_item("colors", mask_to_color_letters(u8::from(face.card_colors)))?;
-        d.set_item("color_indicator", mask_to_color_letters(u8::from(face.color_indicator)))?;
+        d.set_item("colors", identity_letters(u8::from(face.card_colors)))?;
+        d.set_item("color_indicator", identity_letters(u8::from(face.color_indicator)))?;
         // Art is per printing, and a printing may carry fewer face-art records than the card has
         // faces; those faces simply have no art rather than borrowing the wrong face's.
         if let Some(art) = printing.faces.get(i) {

@@ -36,6 +36,7 @@ from api.parsing import generate_sql_query, parse_scryfall_query
 from api.parsing.card_query_nodes import fold_accents
 from api.scryfall_compat import objects
 from api.scryfall_compat.objects import (
+    CARD_OBJECT_FIELDS,
     DEFAULT_IMAGE_VERSION,
     IMAGE_VERSIONS,
     MAX_AUTOCOMPLETE_VALUES,
@@ -48,31 +49,37 @@ from api.scryfall_compat.objects import (
     error_object,
     not_found_error,
     ruling_object,
+    sql_row_to_engine_row,
     to_scryfall_card,
 )
+from api.settings import settings
 from api.utils.routing import route
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
 logger = logging.getLogger(__name__)
 
 # Columns every card lookup needs: the blob `to_scryfall_card` reads, plus the id it is re-sorted
 # by when a batch comes back in an order the caller did not ask for.
-_CARD_COLUMNS = "scryfall_id, raw_card_blob"
+# The columns a card object is built from. Deliberately NOT raw_card_blob: there is one builder
+# (objects.to_scryfall_card) and both paths go through it, so the fallback cannot answer differently
+# from the engine. The blob is also no longer the card for a multi-face row -- it is the front face
+# -- so building from it would silently degrade exactly the cards the merge was written to fix.
+_CARD_COLUMNS = (
+    "scryfall_id, oracle_id, card_name, card_layout, mana_cost_text, cmc, type_line, oracle_text, "
+    "creature_power_text AS power, creature_toughness_text AS toughness, card_colors, "
+    "card_color_identity, card_keywords, card_set_code, set_name, collector_number, "
+    "card_rarity_int, flavor_text, card_artist AS artist, illustration_id, released_at, "
+    "card_legalities, card_border, card_watermark, card_frame_data, card_is_tags, "
+    "card_compat_blob, card_faces"
+)
 
 # Path segments that name an external id namespace rather than a set code.
 _EXTERNAL_ID_NAMESPACES = ("multiverse", "mtgo", "arena", "tcgplayer", "cardmarket")
 
 # Blob keys each namespace matches. Scryfall's MTGO and TCGplayer routes each accept two ids —
 # the regular printing's and the foil/etched printing's — and both resolve to the same card.
-_EXTERNAL_ID_KEYS: dict[str, tuple[str, ...]] = {
-    "mtgo": ("mtgo_id", "mtgo_foil_id"),
-    "arena": ("arena_id",),
-    "tcgplayer": ("tcgplayer_id", "tcgplayer_etched_id"),
-    "cardmarket": ("cardmarket_id",),
-}
-
 # Scryfall's `order` vocabulary, which `CardOrdering` covers except for the two below. Built from
 # the enum rather than listed, so an ordering added there is accepted here without a second edit;
 # the extra member that is not Scryfall's (`cubecobra`) is a harmless superset.
@@ -177,6 +184,27 @@ _CSV_NESTED_COLUMNS = (
     ("related_uris", ("gatherer", "tcgplayer_infinite_articles", "tcgplayer_infinite_decks", "edhrec")),
     ("purchase_uris", ("tcgplayer", "cardmarket", "cardhoarder")),
 )
+
+
+class _EngineMiss:
+    """The engine could not serve this lookup, so the caller should try SQL.
+
+    Distinct from None, which means the engine answered and there is no such card. Collapsing the
+    two would let an unloaded store 404 a card that exists.
+    """
+
+
+_ENGINE_MISS = _EngineMiss()
+
+# SQL fallback only: the blob subfields each external-id namespace maps to. The engine path uses its
+# own index and never reads these.
+_EXTERNAL_ID_COLUMNS: dict[str, tuple[str, ...]] = {
+    "multiverse": ("multiverse_ids",),
+    "mtgo": ("mtgo_id", "mtgo_foil_id"),
+    "arena": ("arena_id",),
+    "tcgplayer": ("tcgplayer_id", "tcgplayer_etched_id"),
+    "cardmarket": ("cardmarket_id",),
+}
 
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
@@ -434,6 +462,77 @@ class ScryfallCardsRoutes:
             cursor.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
 
+    def _engine_for_lookup(self) -> object | None:
+        """The engine when it can answer, or None when the caller must fall back to SQL.
+
+        Mirrors the three branches `search()` already uses: feature-gated off, store not loaded, or
+        ready. SQL is the fallback for when the engine cannot serve, not a peer path -- every route
+        below asks here first and only reaches Postgres if this returns None or the engine raises.
+        """
+        if not settings.enable_engine:
+            return None
+        try:
+            if self._engine.size() == 0:
+                self._trigger_background_reload_if_needed()
+                return None
+        # An engine that cannot report its size cannot serve, whatever the reason.
+        except Exception:  # noqa: BLE001
+            return None
+        return self._engine
+
+    def _engine_card(self, fetch: Callable[[Any], dict[str, Any] | None]) -> dict[str, Any] | _EngineMiss | None:
+        """Run one engine lookup, or report that the engine could not serve it.
+
+        Returns the card, None for a genuine "no such card", or _ENGINE_MISS when the caller should
+        try SQL. Separating the last from the first matters: a store that is not loaded must not
+        answer 404 for a card that exists.
+        """
+        engine = self._engine_for_lookup()
+        if engine is None:
+            return _ENGINE_MISS
+        try:
+            row = fetch(engine)
+        # Any engine failure is a fallback, never a 500.
+        except Exception:
+            logger.exception("Engine lookup failed, falling back to SQL")
+            return _ENGINE_MISS
+        return to_scryfall_card(row) if row else None
+
+    def _card_by_scryfall_id(self, scryfall_id: str) -> dict[str, Any] | None:
+        """One card by Scryfall id, from the store when it can answer."""
+        found = self._engine_card(lambda e: e.card_by_scryfall_id(str(scryfall_id), list(CARD_OBJECT_FIELDS)))
+        if found is not _ENGINE_MISS:
+            return found
+        return self._fetch_one_card("scryfall_id = %(value)s", {"value": str(scryfall_id)})
+
+    def _card_by_oracle_id(self, oracle_id: str) -> dict[str, Any] | None:
+        """The representative printing of one oracle card, from the store when it can answer."""
+        engine = self._engine_for_lookup()
+        if engine is not None:
+            try:
+                rows = engine.printings_of_oracle_id(str(oracle_id), list(CARD_OBJECT_FIELDS))
+                # Printings are stored in descending default-prefer order, so the first is the
+                # representative printing every other by-name path shows.
+                return to_scryfall_card(rows[0]) if rows else None
+            except Exception:
+                logger.exception("Engine oracle-id lookup failed, falling back to SQL")
+        return self._fetch_one_card("oracle_id = %(value)s", {"value": str(oracle_id)})
+
+    def _card_by_external_id(self, namespace: str, external_id: int | None) -> dict[str, Any] | None:
+        """One card by a marketplace or client id, from the store when it can answer."""
+        if external_id is None:
+            return None
+        found = self._engine_card(
+            lambda e: e.card_by_external_id(namespace, int(external_id), list(CARD_OBJECT_FIELDS)),
+        )
+        if found is not _ENGINE_MISS:
+            return found
+        columns = _EXTERNAL_ID_COLUMNS.get(namespace, ())
+        if not columns:
+            return None
+        clauses = " OR ".join(f"(raw_card_blob ->> '{column}')::bigint = %(value)s" for column in columns)
+        return self._fetch_one_card(f"({clauses})", {"value": external_id})
+
     def _fetch_one_card(self, where: str, params: dict[str, Any]) -> dict[str, Any] | None:
         """Fetch the single best printing matching a predicate.
 
@@ -455,7 +554,7 @@ class ScryfallCardsRoutes:
             params=params,
             explain=False,
         )["result"]
-        return to_scryfall_card(rows[0]) if rows else None
+        return to_scryfall_card(sql_row_to_engine_row(rows[0])) if rows else None
 
     def _cards_by_ids(self, scryfall_ids: Sequence[str]) -> list[dict[str, Any]]:
         """Fetch cards by scryfall id, preserving the order of the ids given.
@@ -468,6 +567,18 @@ class ScryfallCardsRoutes:
         """
         if not scryfall_ids:
             return []
+        engine = self._engine_for_lookup()
+        if engine is not None:
+            try:
+                by_id_engine = {}
+                for card_id in scryfall_ids:
+                    row = engine.card_by_scryfall_id(str(card_id), list(CARD_OBJECT_FIELDS))
+                    if row:
+                        by_id_engine[str(card_id)] = to_scryfall_card(row)
+                return [by_id_engine[i] for i in scryfall_ids if i in by_id_engine]
+            # Hydration failure falls back; it does not 500.
+            except Exception:
+                logger.exception("Engine hydration failed, falling back to SQL")
         rows = self._run_query(
             # A comma-joined string rather than a list: _run_query passes list parameters through
             # maybe_json(), which binds them as jsonb, and jsonb does not cast to uuid[].
@@ -477,7 +588,7 @@ class ScryfallCardsRoutes:
             params={"ids": ",".join(scryfall_ids)},
             explain=False,
         )["result"]
-        by_id = {str(row["scryfall_id"]): to_scryfall_card(row) for row in rows}
+        by_id = {str(row["scryfall_id"]): to_scryfall_card(sql_row_to_engine_row(row)) for row in rows}
         return [by_id[card_id] for card_id in scryfall_ids if card_id in by_id]
 
     # ---------------------------------------------------------------- GET /cards/search
@@ -1016,7 +1127,7 @@ class ScryfallCardsRoutes:
         if not rows:
             return self._scryfall_respond(falcon_response, not_found_error(_NO_MATCH_DETAILS), pretty=is_pretty)
         return self._render_card(
-            to_scryfall_card(rows[0]),
+            to_scryfall_card(sql_row_to_engine_row(rows[0])),
             falcon_response=falcon_response,
             card_format=format.lower(),
             face=face,
@@ -1101,9 +1212,9 @@ class ScryfallCardsRoutes:
             defines.
         """
         if "id" in identifier and _is_uuid(str(identifier["id"])):
-            return self._fetch_one_card("scryfall_id = %(value)s", {"value": str(identifier["id"])})
+            return self._card_by_scryfall_id(str(identifier["id"]))
         if "oracle_id" in identifier and _is_uuid(str(identifier["oracle_id"])):
-            return self._fetch_one_card("oracle_id = %(value)s", {"value": str(identifier["oracle_id"])})
+            return self._card_by_oracle_id(str(identifier["oracle_id"]))
         if "illustration_id" in identifier and _is_uuid(str(identifier["illustration_id"])):
             return self._fetch_one_card("illustration_id = %(value)s", {"value": str(identifier["illustration_id"])})
         if "mtgo_id" in identifier:
@@ -1230,7 +1341,7 @@ class ScryfallCardsRoutes:
         if not number:
             if not _is_uuid(identifier):
                 return None
-            return self._fetch_one_card("scryfall_id = %(value)s", {"value": identifier})
+            return self._card_by_scryfall_id(identifier)
 
         clauses = ["lower(card_set_code) = lower(%(set_code)s)", "collector_number = %(number)s"]
         params: dict[str, Any] = {"set_code": identifier, "number": number}
@@ -1238,22 +1349,6 @@ class ScryfallCardsRoutes:
         clauses.append("raw_card_blob ->> 'lang' = %(lang)s")
         params["lang"] = suffix or "en"
         return self._fetch_one_card(" AND ".join(clauses), params)
-
-    def _card_by_external_id(self, namespace: str, external_id: int | None) -> dict[str, Any] | None:
-        """Fetch a card by one of the external id namespaces.
-
-        Args:
-            namespace: One of the keys of `_EXTERNAL_ID_KEYS`.
-            external_id: The id to match.
-
-        Returns:
-            The card, or None when nothing matched.
-        """
-        keys = _EXTERNAL_ID_KEYS.get(namespace)
-        if external_id is None or not keys:
-            return None
-        clauses = [f"(raw_card_blob ->> '{key}')::bigint = %(value)s" for key in keys]
-        return self._fetch_one_card(f"({' OR '.join(clauses)})", {"value": external_id})
 
     def _card_by_multiverse_id(self, multiverse_id: int | None) -> dict[str, Any] | None:
         """Fetch a card by Gatherer multiverse id.

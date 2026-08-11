@@ -17,7 +17,9 @@ import closes.
 
 from __future__ import annotations
 
+import datetime
 import urllib.parse
+import uuid
 from typing import Any
 
 # Keys `preprocess_card` adds to the object it snapshots into raw_card_blob. Stripping them, and
@@ -40,31 +42,292 @@ MAX_COLLECTION_IDENTIFIERS = 75
 MAX_AUTOCOMPLETE_VALUES = 20
 
 
-def to_scryfall_card(row: dict[str, Any]) -> dict[str, Any]:
-    """Recover the Scryfall card object for one `magic.cards` row.
+# Every field the engine must return for a card object to be assembled. Passed as `fields=` on each
+# lookup, so the engine emits exactly this and nothing is fetched that is never read.
+CARD_OBJECT_FIELDS = (
+    "name", "scryfall_id", "oracle_id", "layout", "mana_cost", "cmc", "type_line", "oracle_text",
+    "power", "toughness", "colors", "color_identity", "card_keywords", "set_code", "set_name",
+    "collector_number", "rarity", "flavor_text", "artist", "illustration_id", "released_at",
+    "legalities", "edhrec_rank", "price_usd", "price_eur", "price_tix", "watermark",
+    "card_frame_data", "card_is_tags",
+    "lang", "image_status", "set_type", "security_stamp", "set_id", "arena_id", "mtgo_id",
+    "mtgo_foil_id", "tcgplayer_id", "tcgplayer_etched_id", "cardmarket_id", "penny_rank",
+    "image_updated_at", "price_usd_foil", "price_usd_etched", "price_eur_foil", "multiverse_ids",
+    "promo_types", "frame_effects", "games", "finishes", "booster", "digital", "foil", "nonfoil",
+    "full_art", "highres_image", "oversized", "promo", "reprint", "story_spotlight", "textless",
+    "variation", "card_faces", "all_parts",
+)  # fmt: skip
+
+# Scryfall's card back, one image for every normal card.
+CARD_BACK_ID = "0aeebaf5-8c7d-4636-9e82-8c27447861f7"
+
+# The file extension each image size is served as.
+_IMAGE_EXTENSIONS = {"small": "jpg", "normal": "jpg", "large": "jpg", "png": "png", "art_crop": "jpg", "border_crop": "jpg"}
+
+# magic.cards column -> the engine's name for the same value. The columns predate the engine, and
+# `to_scryfall_card` reads engine names.
+_SQL_COLUMN_ALIASES = {
+    "card_name": "name",
+    "card_set_code": "set_code",
+    "mana_cost_text": "mana_cost",
+    "card_legalities": "legalities",
+    "card_layout": "layout",
+    "card_watermark": "watermark",
+    "card_artist": "artist",
+}
+
+_RARITY_BY_INT = {0: "common", 1: "uncommon", 2: "rare", 3: "mythic", 4: "special", 5: "bonus"}
+
+
+def sql_row_to_engine_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Reshape a `magic.cards` row into the shape the engine emits.
+
+    There is ONE card-object builder and both paths go through it; this is what lets the SQL
+    fallback use it. Two builders would be two chances to disagree with Scryfall, and a fallback is
+    where a different answer is least affordable — it runs when the engine is already in trouble.
+
+    Building from `raw_card_blob` instead is not an option: for a multi-face row the blob is the
+    FRONT FACE, not the card, so it would silently degrade exactly the cards the merge exists to fix.
 
     Args:
-        row: A row carrying at least `raw_card_blob`.
+        row: A row selected with routes._CARD_COLUMNS.
 
     Returns:
-        The card object as Scryfall's bulk data holds it.
+        The same values under the engine's field names, with the compat residue flattened.
     """
-    card = {key: value for key, value in row["raw_card_blob"].items() if key not in _IMPORTER_ADDED_KEYS}
-    # Scryfall omits flavor_text on printings that have none; the importer writes "" so that
-    # negated flavor filters treat flavorless prints as empty. Absent and "" are the same state,
-    # and "" is one Scryfall never sends, so dropping it is the exact inverse.
-    if card.get("flavor_text") == "":
-        del card["flavor_text"]
+    out: dict[str, Any] = {}
+    for column, value in row.items():
+        if column in ("card_compat_blob", "raw_card_blob", "card_colors", "card_color_identity"):
+            continue
+        # psycopg binds dates and uuids as objects; JSON carries neither, and the engine path
+        # already emits strings. Normalizing here is what keeps ONE builder viable.
+        if isinstance(value, datetime.date):
+            normalized: Any = value.isoformat()
+        elif isinstance(value, uuid.UUID):
+            normalized = str(value)
+        else:
+            normalized = value
+        out[_SQL_COLUMN_ALIASES.get(column, column)] = normalized
 
-    if card.get("object") == "card_face":
-        # A multi-face row written by an importer that still promoted the front face into the
-        # blob, i.e. one not rewritten since the merged-row work. Rows are rewritten by an import,
-        # not by a migration, so this is a window of at most one import cycle after deploy rather
-        # than a state to design around. Nothing here can rebuild the card — the face is all that
-        # survives — so it is at least presented as the card it came from, rather than leaking
-        # `card_face` into a payload that claims to be a card.
-        card["object"] = "card"
-        card["name"] = row["raw_card_blob"].get("card_name", card.get("name"))
+    # jsonb objects store these as {key: true} sets; the engine emits lists.
+    for target, column in (("colors", "card_colors"), ("color_identity", "card_color_identity")):
+        value = row.get(column)
+        out[target] = sorted(value) if isinstance(value, dict) else []
+    for key in ("card_keywords", "card_is_tags"):
+        if isinstance(row.get(key), dict):
+            out[key] = sorted(row[key])
+
+    if row.get("card_rarity_int") is not None:
+        out["rarity"] = _RARITY_BY_INT.get(row["card_rarity_int"])
+
+    # The residue is one column here and individual fields on an engine row.
+    out.update(row.get("card_compat_blob") or {})
+    return out
+
+
+def _image_uris(scryfall_id: str, updated_at: int | None, face: str = "front") -> dict[str, str]:
+    """Build the CDN URLs for one face.
+
+    Scryfall's paths are a pure function of the card id: its first two hex digits become directory
+    levels, and `image_updated_at` rides as a cache-buster. Nothing about these is stored.
+    """
+    scryfall_id = str(scryfall_id or "")
+    if not scryfall_id:
+        return {}
+    suffix = f"?{updated_at}" if updated_at else ""
+    first, second = scryfall_id[0], scryfall_id[1]
+    return {
+        size: f"https://cards.scryfall.io/{size}/{face}/{first}/{second}/{scryfall_id}.{ext}{suffix}"
+        for size, ext in _IMAGE_EXTENSIONS.items()
+    }
+
+
+def _slug(name: str) -> str:
+    """Scryfall's URL slug for a card name: lowercase, non-alphanumerics collapsed to hyphens."""
+    out = "".join(c if c.isalnum() else "-" for c in name.lower())
+    while "--" in out:
+        out = out.replace("--", "-")
+    return out.strip("-")
+
+
+def _related_uris(name: str) -> dict[str, str]:
+    """Scryfall's `related_uris`, pointing at the destinations directly.
+
+    Scryfall wraps the TCGplayer entries in `partner.tcgplayer.com/...?u=<encoded real URL>` with
+    its own affiliate code. The destination is the same page, and emitting the wrapper from this
+    host would route another service's affiliate revenue to Scryfall.
+    """
+    quoted = urllib.parse.quote_plus(name)
+    return {
+        "tcgplayer_infinite_articles": f"https://www.tcgplayer.com/search/articles?productLineName=magic&q={quoted}",
+        "tcgplayer_infinite_decks": f"https://www.tcgplayer.com/search/decks?productLineName=magic&q={quoted}",
+        "edhrec": f"https://edhrec.com/route/?cc={quoted}",
+    }
+
+
+def _purchase_uris(row: dict[str, Any]) -> dict[str, str]:
+    """Scryfall's `purchase_uris`, rebuilt from the marketplace ids. Same affiliate reasoning."""
+    out: dict[str, str] = {}
+    if row.get("tcgplayer_id"):
+        out["tcgplayer"] = f"https://www.tcgplayer.com/product/{row['tcgplayer_id']}?page=1"
+    if row.get("cardmarket_id"):
+        out["cardmarket"] = f"https://www.cardmarket.com/en/Magic/Products?idProduct={row['cardmarket_id']}"
+    if row.get("mtgo_id"):
+        out["cardhoarder"] = f"https://www.cardhoarder.com/cards/{row['mtgo_id']}"
+    return out
+
+
+def _prices(row: dict[str, Any]) -> dict[str, Any]:
+    """Scryfall's `prices` object: the three price columns plus the three residue variants."""
+
+    def fmt(value: float | None) -> str | None:
+        return None if value is None else f"{float(value):.2f}"
+
+    return {
+        "usd": fmt(row.get("price_usd")),
+        "usd_foil": fmt(row.get("price_usd_foil")),
+        "usd_etched": fmt(row.get("price_usd_etched")),
+        "eur": fmt(row.get("price_eur")),
+        "eur_foil": fmt(row.get("price_eur_foil")),
+        "tix": fmt(row.get("price_tix")),
+    }
+
+
+def _faces(row: dict[str, Any]) -> list[dict[str, Any]]:
+    """The card's faces, with the two keys the engine deliberately does not store re-added.
+
+    `object` is the constant "card_face", and a face's `image_uris` is the card's CDN function with
+    front/back swapped, so neither is worth archive space.
+    """
+    faces = row.get("card_faces") or []
+    out = []
+    for index, face in enumerate(faces):
+        built: dict[str, Any] = {"object": "card_face"}
+        built.update({key: value for key, value in face.items() if value not in (None, "", [])})
+        if len(faces) > 1:
+            built["image_uris"] = _image_uris(
+                row.get("scryfall_id", ""),
+                row.get("image_updated_at"),
+                "front" if index == 0 else "back",
+            )
+        out.append(built)
+    return out
+
+
+def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfall.com") -> dict[str, Any]:
+    """Build the Scryfall card object for one engine row.
+
+    BUILDS rather than unwraps a stored copy, which is the whole reason /cards/* can be served from
+    the engine: an object assembled from columns is answerable from the store, while one recovered
+    from `raw_card_blob` is answerable only from Postgres — and Postgres is the fallback for when
+    the engine errors.
+
+    Three sources, and every one of Scryfall's keys comes from exactly one: 29 stored columns, 12
+    derived (every *_uri and image_uris, pure functions of the id/set/collector number/oracle id),
+    and the 33-key residue carried in card_compat_blob. Only `resource_id` is dropped — an
+    undocumented Scryfall internal with no stable meaning.
+
+    Args:
+        row: An engine row carrying CARD_OBJECT_FIELDS, or a SQL row through sql_row_to_engine_row.
+        base_url: The host self-referencing URIs should address.
+
+    Returns:
+        The card object. Keys Scryfall omits stay omitted rather than becoming null, because a
+        client comparing shapes would otherwise see a difference on every row.
+    """
+    # str() because a SQL row binds these as UUID objects while an engine row is already a string,
+    # and every derived URI slices the id.
+    scryfall_id = str(row.get("scryfall_id") or "")
+    oracle_id = str(row.get("oracle_id") or "")
+    name = row.get("name") or ""
+    set_code = row.get("set_code") or ""
+    number = row.get("collector_number") or ""
+    faces = _faces(row)
+
+    card: dict[str, Any] = {
+        "object": "card",
+        "id": scryfall_id,
+        "oracle_id": oracle_id,
+        "multiverse_ids": row.get("multiverse_ids") or [],
+        "name": name,
+        "lang": row.get("lang") or "en",
+        "released_at": row.get("released_at"),
+        "uri": f"{base_url}/cards/{scryfall_id}",
+        "scryfall_uri": f"https://scryfall.com/card/{set_code}/{number}/{_slug(name)}?utm_source=api",
+        "layout": row.get("card_layout") or row.get("layout"),
+        "highres_image": bool(row.get("highres_image")),
+        "image_status": row.get("image_status"),
+        "cmc": row.get("cmc"),
+        "type_line": row.get("type_line"),
+        "colors": row.get("colors") or [],
+        "color_identity": row.get("color_identity") or [],
+        "keywords": row.get("card_keywords") or [],
+        "games": row.get("games") or [],
+        "reserved": "reserved" in (row.get("card_is_tags") or []),
+        "finishes": row.get("finishes") or [],
+        "oversized": bool(row.get("oversized")),
+        "promo": bool(row.get("promo")),
+        "reprint": bool(row.get("reprint")),
+        "variation": bool(row.get("variation")),
+        "set_id": row.get("set_id"),
+        "set": set_code,
+        "set_name": row.get("set_name"),
+        "set_type": row.get("set_type"),
+        "set_uri": f"{base_url}/sets/{row['set_id']}" if row.get("set_id") else None,
+        "set_search_uri": f"{base_url}/cards/search?order=set&q=e%3A{set_code}&unique=prints",
+        "scryfall_set_uri": f"https://scryfall.com/sets/{set_code}?utm_source=api",
+        "rulings_uri": f"{base_url}/cards/{scryfall_id}/rulings",
+        "prints_search_uri": f"{base_url}/cards/search?order=released&q=oracleid%3A{oracle_id}&unique=prints",
+        "collector_number": number,
+        "digital": bool(row.get("digital")),
+        "rarity": row.get("rarity"),
+        "card_back_id": CARD_BACK_ID,
+        "artist": row.get("artist"),
+        "illustration_id": str(row["illustration_id"]) if row.get("illustration_id") else None,
+        "border_color": row.get("card_border"),
+        "full_art": bool(row.get("full_art")),
+        "textless": bool(row.get("textless")),
+        "booster": bool(row.get("booster")),
+        "story_spotlight": bool(row.get("story_spotlight")),
+        "prices": _prices(row),
+        "related_uris": _related_uris(name),
+        "purchase_uris": _purchase_uris(row),
+    }
+
+    # A multi-face card carries its faces and NOT the top-level text they replace; a single-faced
+    # one carries the text and no `card_faces`. Which keys sit at top level varies by LAYOUT, which
+    # is why this is a branch rather than a fixed key set.
+    if faces:
+        card["card_faces"] = faces
+    else:
+        card["mana_cost"] = row.get("mana_cost")
+        card["oracle_text"] = row.get("oracle_text")
+        card["image_uris"] = _image_uris(scryfall_id, row.get("image_updated_at"))
+
+    # Keys Scryfall sends only when the card has them. Emitting null instead would differ from
+    # Scryfall on every card that lacks them, which for most of these is most cards.
+    for key, value in (
+        ("power", row.get("power")),
+        ("toughness", row.get("toughness")),
+        ("flavor_text", row.get("flavor_text") or None),
+        ("watermark", row.get("watermark")),
+        ("edhrec_rank", row.get("edhrec_rank")),
+        ("penny_rank", row.get("penny_rank")),
+        ("arena_id", row.get("arena_id")),
+        ("mtgo_id", row.get("mtgo_id")),
+        ("mtgo_foil_id", row.get("mtgo_foil_id")),
+        ("tcgplayer_id", row.get("tcgplayer_id")),
+        ("tcgplayer_etched_id", row.get("tcgplayer_etched_id")),
+        ("cardmarket_id", row.get("cardmarket_id")),
+        ("security_stamp", row.get("security_stamp")),
+        ("promo_types", row.get("promo_types") or None),
+        ("frame_effects", row.get("frame_effects") or None),
+        ("all_parts", row.get("all_parts") or None),
+        ("legalities", row.get("legalities")),
+    ):
+        if value is not None:
+            card[key] = value
+
     return card
 
 

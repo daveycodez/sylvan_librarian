@@ -343,7 +343,11 @@ class TestNamed:
     def test_image_format_honors_the_back_face(self, compat_corpus: APIResource):
         with pytest.raises(falcon.HTTPFound) as found:
             dispatch(compat_corpus, "/cards/named", "exact=Compat+Delver&format=image&face=back&version=large")
-        assert found.value.headers["location"] == "https://cards.test/back.jpg"
+        # Derived from the card id, not read from the fixture: image URLs are a pure function of
+        # the id, so the store carries none of them.
+        assert (
+            found.value.headers["location"] == "https://cards.scryfall.io/large/back/3/3/33333333-3333-4333-8333-333333333333.jpg"
+        )
 
 
 class TestAutocomplete:
@@ -617,7 +621,7 @@ class TestThroughTheFullApp:
             params={"exact": "Compat Delver", "format": "image", "face": "back"},
         )
         assert result.status_code == 302
-        assert result.headers["location"] == "https://cards.test/back.jpg"
+        assert result.headers["location"] == "https://cards.scryfall.io/large/back/3/3/33333333-3333-4333-8333-333333333333.jpg"
 
     def test_head_is_accepted_wherever_get_is(self, compat_corpus: APIResource):
         assert self._client(compat_corpus).simulate_head(f"/cards/{BOLT_ID}").status_code == 200

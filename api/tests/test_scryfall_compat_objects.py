@@ -21,83 +21,130 @@ from api.scryfall_compat.objects import (
 )
 
 
-def blob(**overrides: object) -> dict:
-    """A raw_card_blob as preprocess_card snapshots it for a single-face card."""
+def row(**overrides: object) -> dict:
+    """An engine row carrying CARD_OBJECT_FIELDS, as the store emits it."""
     return {
-        "object": "card",
-        "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "scryfall_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "oracle_id": "11111111-2222-3333-4444-555555555555",
         "name": "Lightning Bolt",
         "mana_cost": "{R}",
+        "cmc": 1.0,
         "type_line": "Instant",
         "oracle_text": "Lightning Bolt deals 3 damage to any target.",
-        "flavor_text": "",
-        "card_name": "Lightning Bolt",
-        "face_name": "Lightning Bolt",
-        "face_idx": 1,
+        "colors": ["R"],
+        "color_identity": ["R"],
+        "set_code": "lea",
+        "set_name": "Limited Edition Alpha",
+        "set_id": "99999999-8888-7777-6666-555555555555",
+        "collector_number": "161",
+        "rarity": "common",
+        "released_at": "1993-08-05",
+        "lang": "en",
+        "layout": "normal",
+        "legalities": {"modern": "legal"},
+        "tcgplayer_id": 697344,
+        "cardmarket_id": 892161,
+        "mtgo_id": 152037,
+        "image_updated_at": 1783903008,
+        "card_faces": [],
+        "all_parts": [],
     } | overrides
 
 
 class TestToScryfallCard:
-    """A stored row becomes the card object Scryfall would have sent."""
+    """An engine row BECOMES a card object; nothing is unwrapped from a stored copy.
 
-    def test_importer_added_keys_are_stripped(self):
-        card = to_scryfall_card({"raw_card_blob": blob()})
-        assert "card_name" not in card
-        assert "face_name" not in card
-        assert "face_idx" not in card
+    That distinction is the reason /cards/* can be served from the store at all: a blob is a
+    Postgres column, and Postgres is the fallback for when the engine errors.
+    """
 
-    def test_normalized_empty_flavor_text_is_dropped(self):
-        """The importer writes "" where Scryfall omits the key; absent and "" are one state."""
-        card = to_scryfall_card({"raw_card_blob": blob()})
-        assert "flavor_text" not in card
+    def test_stored_columns_carry_through(self):
+        card = to_scryfall_card(row())
+        assert card["object"] == "card"
+        assert card["id"] == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        assert card["name"] == "Lightning Bolt"
+        assert card["type_line"] == "Instant"
+        assert card["colors"] == ["R"]
+        assert card["set"] == "lea"
+        assert card["rarity"] == "common"
+        assert card["legalities"] == {"modern": "legal"}
 
-    def test_real_flavor_text_survives(self):
-        card = to_scryfall_card({"raw_card_blob": blob(flavor_text="Kaboom.")})
+    def test_uris_are_derived_not_stored(self):
+        """Every *_uri is a pure function of the id, set, collector number or oracle id."""
+        card = to_scryfall_card(row(), base_url="https://example.test")
+        assert card["uri"] == "https://example.test/cards/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        assert card["rulings_uri"] == "https://example.test/cards/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/rulings"
+        assert "oracleid%3A11111111-2222-3333-4444-555555555555" in card["prints_search_uri"]
+        assert card["scryfall_uri"] == "https://scryfall.com/card/lea/161/lightning-bolt?utm_source=api"
+        assert card["scryfall_set_uri"] == "https://scryfall.com/sets/lea?utm_source=api"
+
+    def test_image_uris_follow_scryfalls_cdn_path(self):
+        """The first two hex digits of the id are directory levels, and the cache-buster rides."""
+        card = to_scryfall_card(row())
+        assert card["image_uris"]["large"] == (
+            "https://cards.scryfall.io/large/front/a/a/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jpg?1783903008"
+        )
+        assert card["image_uris"]["png"].endswith(".png?1783903008")
+
+    def test_purchase_uris_drop_scryfalls_affiliate_wrapper(self):
+        """Same destination, without routing another service's affiliate revenue to Scryfall."""
+        card = to_scryfall_card(row())
+        assert card["purchase_uris"]["tcgplayer"] == "https://www.tcgplayer.com/product/697344?page=1"
+        assert card["purchase_uris"]["cardhoarder"] == "https://www.cardhoarder.com/cards/152037"
+        for uri in card["purchase_uris"].values():
+            assert "partner.tcgplayer.com" not in uri
+            assert "affiliate_id" not in uri
+            assert "scryfall" not in uri
+
+    def test_absent_keys_stay_absent(self):
+        """Scryfall OMITS a key it has no value for. Emitting null would differ on every row."""
+        card = to_scryfall_card(row())
+        for key in ("power", "toughness", "flavor_text", "watermark", "arena_id", "promo_types"):
+            assert key not in card, f"{key} should be omitted, not null"
+
+    def test_present_optional_keys_appear(self):
+        card = to_scryfall_card(row(power="3", toughness="2", flavor_text="Kaboom.", arena_id=12345))
+        assert card["power"] == "3"
         assert card["flavor_text"] == "Kaboom."
+        assert card["arena_id"] == 12345
 
-    def test_single_face_round_trips_the_rest_untouched(self):
-        card = to_scryfall_card({"raw_card_blob": blob()})
-        assert card == {
-            "object": "card",
-            "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-            "name": "Lightning Bolt",
-            "mana_cost": "{R}",
-            "type_line": "Instant",
-            "oracle_text": "Lightning Bolt deals 3 damage to any target.",
-        }
+    def test_prices_use_scryfalls_string_format(self):
+        card = to_scryfall_card(row(price_usd=1.5, price_usd_foil=282.0))
+        assert card["prices"]["usd"] == "1.50"
+        assert card["prices"]["usd_foil"] == "282.00"
+        assert card["prices"]["eur"] is None, "prices keys are always present, unlike optional keys"
 
-    def test_a_multi_face_blob_round_trips_its_faces(self):
-        """The importer stores the card, not a face, so there is nothing to reconstruct."""
-        faces = [{"object": "card_face", "name": "Delver of Secrets"}, {"object": "card_face", "name": "Insectile Aberration"}]
-        row = {
-            "raw_card_blob": blob(
+    def test_a_single_faced_card_has_top_level_text_and_no_faces(self):
+        card = to_scryfall_card(row())
+        assert "card_faces" not in card
+        assert card["oracle_text"] == "Lightning Bolt deals 3 damage to any target."
+        assert card["image_uris"]
+
+    def test_a_multi_faced_card_moves_its_text_into_the_faces(self):
+        """Which keys sit at top level varies by LAYOUT, so this is a branch, not a fixed shape."""
+        card = to_scryfall_card(
+            row(
                 name="Delver of Secrets // Insectile Aberration",
-                card_name="Delver of Secrets // Insectile Aberration",
-                card_faces=faces,
-            ),
-        }
-        card = to_scryfall_card(row)
-        assert card["object"] == "card"
-        assert card["name"] == "Delver of Secrets // Insectile Aberration"
-        assert card["card_faces"] == faces
+                card_faces=[
+                    {"name": "Delver of Secrets", "oracle_text": "Front.", "mana_cost": "{U}"},
+                    {"name": "Insectile Aberration", "oracle_text": "Back.", "power": "3"},
+                ],
+            )
+        )
+        assert "oracle_text" not in card
+        assert "image_uris" not in card
+        assert [f["name"] for f in card["card_faces"]] == ["Delver of Secrets", "Insectile Aberration"]
+        assert all(f["object"] == "card_face" for f in card["card_faces"])
+        # Each face gets its own side of the CDN path.
+        assert "/front/" in card["card_faces"][0]["image_uris"]["large"]
+        assert "/back/" in card["card_faces"][1]["image_uris"]["large"]
 
-    def test_a_pre_merge_face_blob_is_presented_as_its_card(self):
-        """A row not rewritten since the merged-row work still holds a promoted front face.
+    def test_related_cards_pass_through_when_present(self):
+        parts = [{"object": "related_card", "id": "x", "component": "token", "name": "Goblin", "type_line": "Token"}]
+        assert to_scryfall_card(row(all_parts=parts))["all_parts"] == parts
 
-        Rows are rewritten by an import, not by a migration, so this lasts at most one import
-        cycle after deploy. The face is all that survives, so it is at least labeled `card` under
-        the card's full name rather than shipped as a `card_face` claiming to be a card.
-        """
-        row = {
-            "raw_card_blob": blob(
-                object="card_face",
-                name="Insectile Aberration",
-                card_name="Delver of Secrets // Insectile Aberration",
-            ),
-        }
-        card = to_scryfall_card(row)
-        assert card["object"] == "card"
-        assert card["name"] == "Delver of Secrets // Insectile Aberration"
+    def test_card_back_id_is_the_shared_constant(self):
+        assert to_scryfall_card(row())["card_back_id"] == "0aeebaf5-8c7d-4636-9e82-8c27447861f7"
 
 
 class TestEnvelopes:
