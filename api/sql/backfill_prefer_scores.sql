@@ -49,6 +49,19 @@ WITH artwork_printings AS MATERIALIZED (
 -- JSONB_BUILD_OBJECT expression is substituted into the UPDATE's target list AND its
 -- IS DISTINCT FROM guard, so every component is computed twice over -- and any subquery
 -- inside it twice again.
+-- Cards with at least one ON-STYLE printing. The representative pin below yields to `art_style`
+-- only when there is somewhere else to go: a card printed solely in licensed sets keeps its label
+-- rather than losing its representative entirely.
+on_style_cards AS MATERIALIZED (
+    SELECT DISTINCT oracle_id
+    FROM magic.cards
+    WHERE NOT (
+        (
+            card_art_tags ? 'external-ip'
+            AND NOT (card_art_tags ?| ARRAY['dungeons-and-dragons', 'the-lord-of-the-rings'])
+        ) OR card_art_tags ?| ARRAY['anime', 'comic-style', 'line-art', 'word-art-title']
+    )
+),
 computed_components AS MATERIALIZED (
     SELECT
         source.scryfall_id,
@@ -197,6 +210,39 @@ computed_components AS MATERIALIZED (
             --
             -- A year/era term was the obvious alternative and was rejected: it would
             -- permanently penalise all future art, whereas a tag on the artwork generalises.
+            -- Scryfall's own representative choice, as a PIN rather than another weight: where a
+            -- label exists it decides, and every component above ranks the printings underneath it.
+            --
+            -- Why a label at all, when this table exists to make that judgement: because it is a
+            -- vastly larger evidence base for the same question. `oracle_cards` is one card object
+            -- per oracle_id and that object IS the printing Scryfall shows, so it is ~38k
+            -- preferences against the 1,070 that ten grading sessions produced for #720. Measured
+            -- on a 31,724-card corpus, agreement with it goes 73.9% -> 96.6%; the ceiling is the
+            -- 3.4% of labels naming a printing that corpus does not carry.
+            --
+            -- THE VETO IS THE INTERESTING PART, and it is why this is not simply "defer to
+            -- Scryfall". Its dump optimises "most up-to-date recognizable version" -- measured
+            -- median ~4 months newer than this score's pick -- and newer increasingly means
+            -- licensed crossovers. On 213 cards it names an OFF-STYLE printing while an on-style
+            -- one exists: it would show Marvel Super Heroes Commander art for Birds of Paradise,
+            -- Harmonize, Shock and Skullclamp, which is exactly what `art_style` was built to
+            -- prevent on 177 of 177 labelled comparisons. So the pin yields to `art_style` in that
+            -- case and nowhere else, costing ~0.7 points of agreement to keep #720's result.
+            --
+            -- LEFT JOIN, so an empty table scores every card exactly as before: the extra dump is
+            -- an optional input, not a hard dependency.
+            'representative', (
+                CASE
+                    WHEN scryfall_representatives.scryfall_id IS NULL THEN 0
+                    WHEN (
+                        (
+                            card_art_tags ? 'external-ip'
+                            AND NOT (card_art_tags ?| ARRAY['dungeons-and-dragons', 'the-lord-of-the-rings'])
+                        ) OR card_art_tags ?| ARRAY['anime', 'comic-style', 'line-art', 'word-art-title']
+                    ) AND on_style_cards.oracle_id IS NOT NULL THEN 0
+                    ELSE 1000
+                END
+            ),
             'art_style', (
                 CASE
                     WHEN (
@@ -214,6 +260,10 @@ computed_components AS MATERIALIZED (
     CROSS JOIN LATERAL JSONB_TO_RECORD(source.raw_card_blob) AS blob(
         image_status text, lang text, games jsonb, frame_effects jsonb, finishes jsonb
     )
+    LEFT JOIN magic.scryfall_representatives ON (
+        scryfall_representatives.scryfall_id = source.scryfall_id
+    )
+    LEFT JOIN on_style_cards ON (on_style_cards.oracle_id = source.oracle_id)
     LEFT JOIN artwork_printings ON (
         artwork_printings.illustration_id = source.illustration_id AND
         artwork_printings.card_name = source.card_name
