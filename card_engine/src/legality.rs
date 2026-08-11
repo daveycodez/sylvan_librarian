@@ -190,8 +190,15 @@ mod tests {
             "a format assigned after the order was cached must appear in it"
         );
 
-        // And the rebuild is cached, not repeated: a second call with no writer in between
-        // returns the same allocation.
-        assert!(Arc::ptr_eq(&after, &format_order()), "second call must reuse the cached order");
+        // The caching itself: two calls with no writer between them reuse the allocation. Asserted
+        // only when the generation held still across the pair, because this registry is global and
+        // any other test loading a store bumps it -- an unconditional assert here is FLAKY, which
+        // is how it was first written and how it failed once in a full parallel run.
+        let generation = FORMAT_GENERATION.load(AtomicOrdering::Acquire);
+        let first = format_order();
+        let second = format_order();
+        if FORMAT_GENERATION.load(AtomicOrdering::Acquire) == generation {
+            assert!(Arc::ptr_eq(&first, &second), "second call must reuse the cached order");
+        }
     }
 }
