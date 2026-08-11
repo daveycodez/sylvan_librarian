@@ -455,7 +455,22 @@ class Parser:
         val_tok = self.peek()
         if val_tok.type in (TT.WORD, TT.QUOTED, TT.NUMBER):
             self.consume()
-            return DirectiveNode(wl, str(val_tok.value).lower())
+            value = str(val_tok.value)
+            # Glue hyphenated continuations, exactly as _text_value does. `-` is not a word
+            # character, so `usd-low` lexes as WORD MINUS WORD; consuming a single token stopped
+            # at `usd` and left `-low` to fail the parse. That made the hyphenated spellings
+            # Scryfall accepts -- and that _DIRECTIVE_PREFER enumerates -- unreachable from
+            # inside a query by any input. A QUOTED value is already one token.
+            if val_tok.type is not TT.QUOTED:
+                while (
+                    self.peek().type == TT.MINUS
+                    and not self.peek().space_before
+                    and self.peek(1).type in (TT.WORD, TT.NUMBER)
+                    and not self.peek(1).space_before
+                ):
+                    self.consume()
+                    value += f"-{self.consume().value}"
+            return DirectiveNode(wl, value.lower())
         msg = f"Expected value after '{word}:' at position {val_tok.pos}"
         raise ParseError(msg)
 
