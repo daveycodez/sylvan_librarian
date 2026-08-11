@@ -117,3 +117,40 @@ def test_get_db_cards_back_face_carries_its_own_png_url() -> None:
 
     by_face = {image.face_idx: image.png_url for image in images}
     assert by_face == {"1": "https://x/front.png", "2": "https://x/back.png"}
+
+
+def test_face_urls_are_derived_from_columns_not_the_blob() -> None:
+    """Both face URLs come from scryfall_id/card_layout, never from raw_card_blob.
+
+    This is the bug that shipped every transform card's BACK image under its face-1 key
+    and its front image nowhere: `raw_card_blob->'image_uris'` is the stored face's, and
+    before the face merge the stored face was the back. Scryfall omits top-level
+    image_uris on a multi-face card, so there was nothing else for it to be.
+
+    Reading the blob is also unavailable, not merely wrong: preprocess_card popped
+    card_faces before snapshotting, so no pre-merge row has that key to fall back to.
+
+    Pinning the query text is unusual, and deliberate. The rest of this file mocks
+    fetchall, so every assertion holds equally well against a query reading the wrong
+    column -- which is precisely how this went unnoticed.
+    """
+    mock_conn = Mock()
+    mock_cursor = Mock()
+    mock_conn.cursor.return_value.__enter__ = Mock(return_value=mock_cursor)
+    mock_conn.cursor.return_value.__exit__ = Mock(return_value=False)
+    mock_cursor.fetchall.return_value = []
+
+    fetch_cards_from_db(mock_conn, limit=1, set_code=None)
+
+    query = mock_cursor.execute.call_args[0][0]
+    assert "scryfall_id" in query, "the image path is a pure function of the card's id"
+    assert "card_layout" in query, "whether a back face exists is a property of the layout"
+    assert "cards.scryfall.io/png/front/" in query
+    assert "cards.scryfall.io/png/back/" in query
+    # The layouts that actually have a second physical face. A split or adventure card
+    # shares a "//" name and must NOT get a back image.
+    assert "transform" in query
+    assert "modal_dfc" in query
+    assert "'split'" not in query
+    # The regression itself: no image URL may be read out of the blob.
+    assert "image_uris" not in query, "raw_card_blob->image_uris is the stored face's, not the front's"
