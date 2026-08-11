@@ -11628,7 +11628,7 @@ fn a_shared_external_id_resolves_to_the_first_printing() {
     let mut b = stub_printing(2, 2, Some(1.0));
     b.compat = CompatFields { tcgplayer_id: NonZeroU32::new(500), ..CompatFields::default() };
 
-    let idx = build_external_id_index(&vec![a, b]);
+    let idx = build_external_id_index(&[a, b]);
     let bytes = rkyv::to_bytes::<Error>(&idx).expect("serialize");
     let aidx = rkyv::access::<Archived<Vec<(u8, u64, u32)>>, Error>(&bytes).expect("access");
     assert_eq!(find_printing_by_external_id(aidx, EXT_TCGPLAYER, 500), Some(0));
