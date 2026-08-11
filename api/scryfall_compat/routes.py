@@ -220,6 +220,30 @@ FUZZY_SIMILARITY_LEAD = 0.05
 # object rather than a flag so the caller compares with `is` and cannot confuse it with a row.
 _AMBIGUOUS: dict[str, Any] = {"ambiguous": True}
 
+# How long a /cards/* answer may be reused, measured against api.scryfall.com rather than chosen:
+# it sends `public, max-age=57600` on search, named, autocomplete and every by-id addressing, and
+# the tier rides on its error responses too. These routes sent NO Cache-Control at all, so a CDN in
+# front of this service cached none of them -- CachingMiddleware is an internal response cache and
+# says nothing to anyone downstream.
+#
+# `/cards/random` keeps its stronger `no-store` (Scryfall sends `no-cache`): the draw must not be
+# replayed by either layer, and no-store is the one that also defeats the internal cache.
+_CARDS_CACHE_CONTROL = "public, max-age=57600"
+
+
+def _set_cards_cache(falcon_response: falcon.Response | None) -> None:
+    """Set the /cards/* cache tier.
+
+    Local rather than `api_resource.set_cache_header`, which is the same line of code: these
+    routes are a MIXIN ON `APIResource`, so `api_resource` imports this module and importing back
+    is a circular import that fails at startup.
+
+    Args:
+        falcon_response: The response to write to, or None for an internal caller.
+    """
+    if falcon_response is not None:
+        falcon_response.set_header("Cache-Control", _CARDS_CACHE_CONTROL)
+
 # Hosts an absolute self-URL should address over plain HTTP. Everything else is assumed to be
 # reached over TLS, which is what `next_page` has to say for a client to follow it.
 _PLAINTEXT_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "[::1]")  # noqa: S104
@@ -642,6 +666,9 @@ class ScryfallCardsRoutes:
             A List object of cards, or a Scryfall error object.
         """
         is_pretty = _as_bool(pretty)
+        # Before the handler runs, so the tier rides on the 400s raised inside it too -- which is
+        # what api.scryfall.com does (an empty-query 400 comes back with the route's own max-age).
+        _set_cards_cache(falcon_response)
         if not q or not q.strip():
             return self._scryfall_respond(falcon_response, bad_request_error(_EMPTY_QUERY_DETAILS), pretty=is_pretty)
 
@@ -761,6 +788,7 @@ class ScryfallCardsRoutes:
             A card object, or a Scryfall error object.
         """
         is_pretty = _as_bool(pretty)
+        _set_cards_cache(falcon_response)
         self._require_setup_complete()
         if not (exact or fuzzy):
             return self._scryfall_respond(
@@ -1082,6 +1110,7 @@ class ScryfallCardsRoutes:
             A Catalog object of card names.
         """
         is_pretty = _as_bool(pretty)
+        _set_cards_cache(falcon_response)
         self._require_setup_complete()
         needle = (q or "").strip()
         min_query_length = 2
@@ -1209,6 +1238,10 @@ class ScryfallCardsRoutes:
             identifiers that resolved to nothing, or a Scryfall error object.
         """
         is_pretty = _as_bool(pretty)
+        # A shared cache keys on the URL and this route's answer depends entirely on the BODY,
+        # so it is private and always revalidated -- api.scryfall.com sends the same.
+        if falcon_response is not None:
+            falcon_response.set_header("Cache-Control", "max-age=0, private, must-revalidate")
         self._require_setup_complete()
         try:
             body = request.get_media() if request is not None else None
@@ -1335,6 +1368,7 @@ class ScryfallCardsRoutes:
             A card, List or Catalog object, or a Scryfall error object.
         """
         is_pretty = _as_bool(pretty)
+        _set_cards_cache(falcon_response)
         self._require_setup_complete()
 
         if not identifier:
