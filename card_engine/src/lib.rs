@@ -7,6 +7,7 @@ use memmap2::Mmap;
 use memchr::memmem;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU32;
 use std::io::Write as IoWrite;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -314,26 +315,31 @@ const FINISH_GLOSSY: u8 = 1 << 3;
 /// is ~5 MB.
 #[derive(Archive, Serialize, Deserialize)]
 struct CompatFields {
-    // Marketplace and client ids. Sparse -- most printings carry two to four of the six.
-    arena_id: Option<u32>,
-    mtgo_id: Option<u32>,
-    mtgo_foil_id: Option<u32>,
-    tcgplayer_id: Option<u32>,
-    tcgplayer_etched_id: Option<u32>,
-    cardmarket_id: Option<u32>,
-    penny_rank: Option<u32>,
+    // Marketplace and client ids. Sparse -- most printings carry two to four of the six -- and
+    // NonZeroU32 rather than u32 so rkyv niches the None into the value itself: an Option<u32>
+    // archives as 8 bytes (tag plus payload), an Option<NonZeroU32> as 4. Eleven of them, on every
+    // printing, so the niche is worth 44 bytes a row on its own. None of these ids is ever 0.
+    arena_id: Option<NonZeroU32>,
+    mtgo_id: Option<NonZeroU32>,
+    mtgo_foil_id: Option<NonZeroU32>,
+    tcgplayer_id: Option<NonZeroU32>,
+    tcgplayer_etched_id: Option<NonZeroU32>,
+    cardmarket_id: Option<NonZeroU32>,
+    penny_rank: Option<NonZeroU32>,
     // The cache-buster Scryfall appends to every image_uris entry; without it the derived URLs are
     // reachable but not byte-identical to what Scryfall serves.
-    image_updated_at: Option<u32>,
+    image_updated_at: Option<NonZeroU32>,
     // Integer cents, exactly like the three price columns. These three have no column.
-    price_usd_foil: Option<u32>,
-    price_usd_etched: Option<u32>,
-    price_eur_foil: Option<u32>,
-    // The set's own UUID, which `set_uri` addresses by. Per printing rather than per set because
-    // the archive has no set table; ~1.5 MB corpus-wide, the largest single item here.
-    set_id: u128,
+    price_usd_foil: Option<NonZeroU32>,
+    price_usd_etched: Option<NonZeroU32>,
+    price_eur_foil: Option<NonZeroU32>,
     // Small closed vocabularies interned into coll_vocab: ~10 languages, ~6 image statuses,
-    // ~20 set types, ~5 security stamps.
+    // ~20 set types, ~5 security stamps -- and the SET, which is why set_id is no longer the
+    // raw u128 UUID. There are ~1,000 sets against ~98,000 printings, so interning it costs a
+    // vocab entry each and 2 bytes a row instead of 16. It also removes the only 16-byte-aligned
+    // member of this struct, and with it the padding that alignment forced on every printing.
+    // The UUID is reconstructed on read from the vocab string.
+    set_vid: u16,
     lang_id: u16,
     image_status_id: u16,
     set_type_id: u16,
@@ -363,7 +369,7 @@ impl Default for CompatFields {
             price_usd_foil: None,
             price_usd_etched: None,
             price_eur_foil: None,
-            set_id: 0,
+            set_vid: VOCAB_NONE,
             lang_id: VOCAB_NONE,
             image_status_id: VOCAB_NONE,
             set_type_id: VOCAB_NONE,
@@ -934,6 +940,12 @@ fn str_set_bits(d: &Bound<PyDict>, key: &str, table: &[(&str, u8)]) -> u8 {
 /// Absent keys stay at their zero value: `NONE_VOCAB` for interned ids, `None` for the optionals,
 /// clear bits for the flags. That matters for round-tripping, because Scryfall OMITS a key rather
 /// than sending null, so "zero" has to mean "was not there".
+/// Like `opt_u32`, but into a NonZeroU32 so rkyv can niche the None. A 0 reads as absent, which
+/// is right for every field this is used on: an id or a price of 0 is not a value Scryfall sends.
+fn opt_nonzero_u32(d: &Bound<PyDict>, key: &str) -> Option<NonZeroU32> {
+    opt_u32(d, key).and_then(NonZeroU32::new)
+}
+
 fn compat_from_pydict(d: &Bound<PyDict>, vocab: &mut VocabInterner) -> PyResult<CompatFields> {
     let Some(blob) = d.get_item("card_compat_blob").ok().flatten().and_then(|v| v.cast_into::<PyDict>().ok()) else {
         return Ok(CompatFields::default());
@@ -969,18 +981,18 @@ fn compat_from_pydict(d: &Bound<PyDict>, vocab: &mut VocabInterner) -> PyResult<
     };
 
     Ok(CompatFields {
-        arena_id: opt_u32(&blob, "arena_id"),
-        mtgo_id: opt_u32(&blob, "mtgo_id"),
-        mtgo_foil_id: opt_u32(&blob, "mtgo_foil_id"),
-        tcgplayer_id: opt_u32(&blob, "tcgplayer_id"),
-        tcgplayer_etched_id: opt_u32(&blob, "tcgplayer_etched_id"),
-        cardmarket_id: opt_u32(&blob, "cardmarket_id"),
-        penny_rank: opt_u32(&blob, "penny_rank"),
-        image_updated_at: opt_u32(&blob, "image_updated_at"),
-        price_usd_foil: price("usd_foil"),
-        price_usd_etched: price("usd_etched"),
-        price_eur_foil: price("eur_foil"),
-        set_id: opt_str(&blob, "set_id").map_or(0, |s| parse_uuid_or_hash(&s)),
+        arena_id: opt_nonzero_u32(&blob, "arena_id"),
+        mtgo_id: opt_nonzero_u32(&blob, "mtgo_id"),
+        mtgo_foil_id: opt_nonzero_u32(&blob, "mtgo_foil_id"),
+        tcgplayer_id: opt_nonzero_u32(&blob, "tcgplayer_id"),
+        tcgplayer_etched_id: opt_nonzero_u32(&blob, "tcgplayer_etched_id"),
+        cardmarket_id: opt_nonzero_u32(&blob, "cardmarket_id"),
+        penny_rank: opt_nonzero_u32(&blob, "penny_rank"),
+        image_updated_at: opt_nonzero_u32(&blob, "image_updated_at"),
+        price_usd_foil: price("usd_foil").and_then(NonZeroU32::new),
+        price_usd_etched: price("usd_etched").and_then(NonZeroU32::new),
+        price_eur_foil: price("eur_foil").and_then(NonZeroU32::new),
+        set_vid: intern_opt(vocab, opt_str(&blob, "set_id"))?,
         lang_id: intern_opt(vocab, opt_str(&blob, "lang"))?,
         image_status_id: intern_opt(vocab, opt_str(&blob, "image_status"))?,
         set_type_id: intern_opt(vocab, opt_str(&blob, "set_type"))?,
@@ -2766,7 +2778,7 @@ fn build_external_id_index(printings: &[Printing]) -> Vec<(u8, u64, u32)> {
             (EXT_CARDMARKET, p.compat.cardmarket_id),
         ] {
             if let Some(v) = id {
-                out.push((ns, u64::from(v), pid));
+                out.push((ns, u64::from(v.get()), pid));
             }
         }
     }
@@ -12203,19 +12215,19 @@ const FIELD_TABLE: &[(&str, FieldExtractor)] = &[
     ("image_status", |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.image_status_id)).into_pyobject(py)?.into_any())),
     ("set_type", |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.set_type_id)).into_pyobject(py)?.into_any())),
     ("security_stamp", |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.security_stamp_id)).into_pyobject(py)?.into_any())),
-    ("set_id", |py, _c, p, _s, _v| Ok(uuid_from_u128(u128::from(p.compat.set_id)).into_pyobject(py)?.into_any())),
-    ("arena_id", |py, _c, p, _s, _v| Ok(p.compat.arena_id.as_ref().copied().map(u32::from).into_pyobject(py)?.into_any())),
-    ("mtgo_id", |py, _c, p, _s, _v| Ok(p.compat.mtgo_id.as_ref().copied().map(u32::from).into_pyobject(py)?.into_any())),
-    ("mtgo_foil_id", |py, _c, p, _s, _v| Ok(p.compat.mtgo_foil_id.as_ref().copied().map(u32::from).into_pyobject(py)?.into_any())),
-    ("tcgplayer_id", |py, _c, p, _s, _v| Ok(p.compat.tcgplayer_id.as_ref().copied().map(u32::from).into_pyobject(py)?.into_any())),
-    ("tcgplayer_etched_id", |py, _c, p, _s, _v| Ok(p.compat.tcgplayer_etched_id.as_ref().copied().map(u32::from).into_pyobject(py)?.into_any())),
-    ("cardmarket_id", |py, _c, p, _s, _v| Ok(p.compat.cardmarket_id.as_ref().copied().map(u32::from).into_pyobject(py)?.into_any())),
-    ("penny_rank", |py, _c, p, _s, _v| Ok(p.compat.penny_rank.as_ref().copied().map(u32::from).into_pyobject(py)?.into_any())),
-    ("image_updated_at", |py, _c, p, _s, _v| Ok(p.compat.image_updated_at.as_ref().copied().map(u32::from).into_pyobject(py)?.into_any())),
+    ("set_id", |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.set_vid)).into_pyobject(py)?.into_any())),
+    ("arena_id", |py, _c, p, _s, _v| Ok(p.compat.arena_id.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
+    ("mtgo_id", |py, _c, p, _s, _v| Ok(p.compat.mtgo_id.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
+    ("mtgo_foil_id", |py, _c, p, _s, _v| Ok(p.compat.mtgo_foil_id.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
+    ("tcgplayer_id", |py, _c, p, _s, _v| Ok(p.compat.tcgplayer_id.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
+    ("tcgplayer_etched_id", |py, _c, p, _s, _v| Ok(p.compat.tcgplayer_etched_id.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
+    ("cardmarket_id", |py, _c, p, _s, _v| Ok(p.compat.cardmarket_id.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
+    ("penny_rank", |py, _c, p, _s, _v| Ok(p.compat.penny_rank.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
+    ("image_updated_at", |py, _c, p, _s, _v| Ok(p.compat.image_updated_at.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
     // Dollars from integer cents, the same conversion price_usd uses.
-    ("price_usd_foil", |py, _c, p, _s, _v| Ok(p.compat.price_usd_foil.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).into_pyobject(py)?.into_any())),
-    ("price_usd_etched", |py, _c, p, _s, _v| Ok(p.compat.price_usd_etched.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).into_pyobject(py)?.into_any())),
-    ("price_eur_foil", |py, _c, p, _s, _v| Ok(p.compat.price_eur_foil.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).into_pyobject(py)?.into_any())),
+    ("price_usd_foil", |py, _c, p, _s, _v| Ok(p.compat.price_usd_foil.as_ref().map(|v| f64::from(v.get()) / 100.0).into_pyobject(py)?.into_any())),
+    ("price_usd_etched", |py, _c, p, _s, _v| Ok(p.compat.price_usd_etched.as_ref().map(|v| f64::from(v.get()) / 100.0).into_pyobject(py)?.into_any())),
+    ("price_eur_foil", |py, _c, p, _s, _v| Ok(p.compat.price_eur_foil.as_ref().map(|v| f64::from(v.get()) / 100.0).into_pyobject(py)?.into_any())),
     ("multiverse_ids", |py, _c, p, _s, _v| {
         let ids: Vec<u32> = p.compat.multiverse_ids.iter().map(|v| u32::from(*v)).collect();
         Ok(ids.into_pyobject(py)?.into_any())

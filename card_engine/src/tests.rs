@@ -26,6 +26,7 @@ use super::{
 };
 use rkyv::{rancor::Error, Archived};
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::OnceLock;
 // Trait bringing random_range/random_bool/random into scope for the #677 fuzzer
 // helpers below (SmallRng's inherent methods live on this extension trait).
@@ -11513,15 +11514,15 @@ fn the_id_permutation_is_a_permutation() {
 #[test]
 fn compat_fields_survive_the_archive_round_trip() {
     let compat = CompatFields {
-        arena_id: Some(105_816),
-        mtgo_id: Some(152_037),
-        tcgplayer_id: Some(697_344),
-        cardmarket_id: Some(892_161),
-        penny_rank: Some(42),
-        image_updated_at: Some(1_783_903_008),
-        price_usd_foil: Some(282), // integer cents, same convention as the price columns
-        price_eur_foil: Some(164),
-        set_id: 0x9D73_9461,
+        arena_id: NonZeroU32::new(105_816),
+        mtgo_id: NonZeroU32::new(152_037),
+        tcgplayer_id: NonZeroU32::new(697_344),
+        cardmarket_id: NonZeroU32::new(892_161),
+        penny_rank: NonZeroU32::new(42),
+        image_updated_at: NonZeroU32::new(1_783_903_008),
+        price_usd_foil: NonZeroU32::new(282), // integer cents, same convention as the price columns
+        price_eur_foil: NonZeroU32::new(164),
+        set_vid: 7,
         lang_id: 3,
         set_type_id: 7,
         games: GAME_PAPER | GAME_ARENA,
@@ -11534,9 +11535,11 @@ fn compat_fields_survive_the_archive_round_trip() {
     let bytes = rkyv::to_bytes::<Error>(&compat).expect("serialize");
     let a = rkyv::access::<Archived<CompatFields>, Error>(&bytes).expect("access");
 
-    assert_eq!(a.arena_id.as_ref().copied().map(u32::from), Some(105_816));
-    assert_eq!(a.price_usd_foil.as_ref().copied().map(u32::from), Some(282));
-    assert_eq!(u128::from(a.set_id), 0x9D73_9461);
+    assert_eq!(a.arena_id.as_ref().map(|v| v.get()), Some(105_816));
+    assert_eq!(a.price_usd_foil.as_ref().map(|v| v.get()), Some(282));
+    // set_vid is a vocab id now, not the raw UUID: ~1,000 sets against ~98,000
+    // printings, so interning it costs 2 bytes a row instead of 16.
+    assert_eq!(u16::from(a.set_vid), 7);
     assert_eq!(u16::from(a.lang_id), 3);
     assert_eq!(a.multiverse_ids.len(), 3);
 
@@ -11563,7 +11566,7 @@ fn absent_compat_values_stay_absent() {
     assert!(a.price_usd_foil.is_none());
     assert_eq!(u16::from(a.lang_id), VOCAB_NONE, "absent lang is the sentinel, not vocab id 0");
     assert_eq!(u16::from(a.set_type_id), VOCAB_NONE);
-    assert_eq!(u128::from(a.set_id), 0);
+    assert_eq!(u16::from(a.set_vid), VOCAB_NONE);
     assert_eq!(u8::from(a.games), 0);
     assert_eq!(u16::from(a.flags), 0);
     assert!(a.multiverse_ids.is_empty());
@@ -11575,14 +11578,14 @@ fn external_ids_resolve_to_their_printing() {
     let mut a = stub_printing(1, 1, Some(1.0));
     a.compat = CompatFields {
         multiverse_ids: vec![100, 101],
-        mtgo_id: Some(200),
-        mtgo_foil_id: Some(201),
-        arena_id: Some(300),
+        mtgo_id: NonZeroU32::new(200),
+        mtgo_foil_id: NonZeroU32::new(201),
+        arena_id: NonZeroU32::new(300),
         ..CompatFields::default()
     };
     let mut b = stub_printing(2, 2, Some(1.0));
     b.compat =
-        CompatFields { tcgplayer_id: Some(400), tcgplayer_etched_id: Some(401), ..CompatFields::default() };
+        CompatFields { tcgplayer_id: NonZeroU32::new(400), tcgplayer_etched_id: NonZeroU32::new(401), ..CompatFields::default() };
     let printings = vec![a, b];
 
     let idx = build_external_id_index(&printings);
@@ -11610,9 +11613,9 @@ fn a_shared_external_id_resolves_to_the_first_printing() {
     // Etched and nonfoil rows do collide on a TCGplayer id. Printings are stored in descending
     // prefer order, so the lowest index is the one the rest of the API would show.
     let mut a = stub_printing(1, 1, Some(9.0));
-    a.compat = CompatFields { tcgplayer_id: Some(500), ..CompatFields::default() };
+    a.compat = CompatFields { tcgplayer_id: NonZeroU32::new(500), ..CompatFields::default() };
     let mut b = stub_printing(2, 2, Some(1.0));
-    b.compat = CompatFields { tcgplayer_id: Some(500), ..CompatFields::default() };
+    b.compat = CompatFields { tcgplayer_id: NonZeroU32::new(500), ..CompatFields::default() };
 
     let idx = build_external_id_index(&vec![a, b]);
     let bytes = rkyv::to_bytes::<Error>(&idx).expect("serialize");
