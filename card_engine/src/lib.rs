@@ -1058,10 +1058,10 @@ fn all_parts_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut Vocab
             continue;
         };
         out.push(RelatedCard {
-            id: opt_str(&part, "id").map_or(0, |s| parse_uuid_or_hash(&s)),
-            name_id: it.intern(opt_str(&part, "name").unwrap_or_default()),
-            type_line_id: it.intern(opt_str(&part, "type_line").unwrap_or_default()),
-            component_id: match opt_str(&part, "component") {
+            id: opt_str(part, "id").map_or(0, |s| parse_uuid_or_hash(&s)),
+            name_id: it.intern(opt_str(part, "name").unwrap_or_default()),
+            type_line_id: it.intern(opt_str(part, "type_line").unwrap_or_default()),
+            component_id: match opt_str(part, "component") {
                 Some(c) => vocab.intern(c)?,
                 None => VOCAB_NONE,
             },
@@ -1095,23 +1095,23 @@ fn faces_from_pydict(d: &Bound<PyDict>, it: &mut Interner, artists: &mut VocabIn
         let Ok(face) = item.cast::<PyDict>() else {
             continue;
         };
-        let card_artist_vid = match opt_str(&face, "artist") {
+        let card_artist_vid = match opt_str(face, "artist") {
             Some(a) => artists.intern(a.to_lowercase())?,
             None => ARTIST_NONE,
         };
         faces.push(FaceRow {
-            card_name_id: it.intern(opt_str(&face, "name").unwrap_or_default()),
-            mana_cost_text_id: it.intern_opt(opt_str(&face, "mana_cost")),
-            type_line_id: it.intern(opt_str(&face, "type_line").unwrap_or_default()),
-            oracle_text_id: it.intern(opt_str(&face, "oracle_text").unwrap_or_default()),
-            creature_power_text_id: it.intern_opt(opt_str(&face, "power")),
-            creature_toughness_text_id: it.intern_opt(opt_str(&face, "toughness")),
-            planeswalker_loyalty_text_id: it.intern_opt(opt_str(&face, "loyalty")),
-            card_colors: str_list_color_mask(&face, "colors"),
-            color_indicator: str_list_color_mask(&face, "color_indicator"),
-            illustration_id: opt_str(&face, "illustration_id").map_or(0, |s| parse_uuid_or_hash(&s)),
+            card_name_id: it.intern(opt_str(face, "name").unwrap_or_default()),
+            mana_cost_text_id: it.intern_opt(opt_str(face, "mana_cost")),
+            type_line_id: it.intern(opt_str(face, "type_line").unwrap_or_default()),
+            oracle_text_id: it.intern(opt_str(face, "oracle_text").unwrap_or_default()),
+            creature_power_text_id: it.intern_opt(opt_str(face, "power")),
+            creature_toughness_text_id: it.intern_opt(opt_str(face, "toughness")),
+            planeswalker_loyalty_text_id: it.intern_opt(opt_str(face, "loyalty")),
+            card_colors: str_list_color_mask(face, "colors"),
+            color_indicator: str_list_color_mask(face, "color_indicator"),
+            illustration_id: opt_str(face, "illustration_id").map_or(0, |s| parse_uuid_or_hash(&s)),
             card_artist_vid,
-            flavor_text_id: it.intern_opt(opt_str(&face, "flavor_text")),
+            flavor_text_id: it.intern_opt(opt_str(face, "flavor_text")),
         });
     }
     Ok(faces)
@@ -2823,12 +2823,12 @@ pub(crate) fn find_printing_by_external_id(
     id: u64,
 ) -> Option<u32> {
     let found = index
-        .binary_search_by(|probe| (u8::from(probe.0), u64::from(probe.1)).cmp(&(namespace, id)))
+        .binary_search_by(|probe| (probe.0, u64::from(probe.1)).cmp(&(namespace, id)))
         .ok()?;
     // binary_search lands on ANY match; walk back to the first so a shared id resolves to the
     // lowest printing rather than whichever the search happened to hit.
     let mut i = found;
-    while i > 0 && (u8::from(index[i - 1].0), u64::from(index[i - 1].1)) == (namespace, id) {
+    while i > 0 && (index[i - 1].0, u64::from(index[i - 1].1)) == (namespace, id) {
         i -= 1;
     }
     Some(u32::from(index[i].2))
@@ -2907,11 +2907,10 @@ pub(crate) fn fuzzy_name_match(cards: &Archived<Vec<OracleCard>>, needle: &str, 
                 }
             }
             _ => {
-                if let Some((prev_score, _, prev_name)) = best {
-                    if prev_name != name && runner_up.is_none_or(|r| prev_score > r) {
+                if let Some((prev_score, _, prev_name)) = best
+                    && prev_name != name && runner_up.is_none_or(|r| prev_score > r) {
                         runner_up = Some(prev_score);
                     }
-                }
                 best = Some((score, cid as u32, name));
             }
         }
@@ -12272,8 +12271,8 @@ const FIELD_TABLE: &[(&str, FieldExtractor)] = &[
     }),
     ("promo_types", |py, _c, p, _s, v| Ok(sorted_strs(v, &p.compat.promo_types).into_pyobject(py)?.into_any())),
     ("frame_effects", |py, _c, p, _s, v| Ok(sorted_strs(v, &p.compat.frame_effects).into_pyobject(py)?.into_any())),
-    ("games", |py, _c, p, _s, _v| Ok(bits_to_names(u8::from(p.compat.games), GAME_NAMES).into_pyobject(py)?.into_any())),
-    ("finishes", |py, _c, p, _s, _v| Ok(bits_to_names(u8::from(p.compat.finishes), FINISH_NAMES).into_pyobject(py)?.into_any())),
+    ("games", |py, _c, p, _s, _v| Ok(bits_to_names(p.compat.games, GAME_NAMES).into_pyobject(py)?.into_any())),
+    ("finishes", |py, _c, p, _s, _v| Ok(bits_to_names(p.compat.finishes, FINISH_NAMES).into_pyobject(py)?.into_any())),
     ("booster", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_BOOSTER).into_pyobject(py)?.to_owned().into_any())),
     ("digital", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_DIGITAL).into_pyobject(py)?.to_owned().into_any())),
     ("foil", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_FOIL).into_pyobject(py)?.to_owned().into_any())),
@@ -12416,8 +12415,8 @@ fn faces_to_pylist<'py>(
         d.set_item("power", str_at(strings, u32::from(face.creature_power_text_id)))?;
         d.set_item("toughness", str_at(strings, u32::from(face.creature_toughness_text_id)))?;
         d.set_item("loyalty", str_at(strings, u32::from(face.planeswalker_loyalty_text_id)))?;
-        d.set_item("colors", identity_letters(u8::from(face.card_colors)))?;
-        d.set_item("color_indicator", identity_letters(u8::from(face.color_indicator)))?;
+        d.set_item("colors", identity_letters(face.card_colors))?;
+        d.set_item("color_indicator", identity_letters(face.color_indicator))?;
         // Art is per printing, and a printing may carry fewer face-art records than the card has
         // faces; those faces simply have no art rather than borrowing the wrong face's.
         if let Some(art) = printing.faces.get(i) {

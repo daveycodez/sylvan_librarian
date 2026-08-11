@@ -11544,9 +11544,9 @@ fn compat_fields_survive_the_archive_round_trip() {
     assert_eq!(a.multiverse_ids.len(), 3);
 
     // Bitsets are only useful if membership survives independently of each other.
-    assert_ne!(u8::from(a.games) & GAME_PAPER, 0);
-    assert_ne!(u8::from(a.games) & GAME_ARENA, 0);
-    assert_eq!(u8::from(a.games) & 0b0000_0010, 0, "mtgo was not set");
+    assert_ne!(a.games & GAME_PAPER, 0);
+    assert_ne!(a.games & GAME_ARENA, 0);
+    assert_eq!(a.games & 0b0000_0010, 0, "mtgo was not set");
     assert_ne!(u16::from(a.flags) & COMPAT_PROMO, 0);
     assert_ne!(u16::from(a.flags) & COMPAT_REPRINT, 0);
     assert_eq!(u16::from(a.flags) & COMPAT_TEXTLESS, 0, "textless was not set");
@@ -11578,7 +11578,7 @@ fn absent_compat_values_stay_absent() {
     assert_eq!(u16::from(a.lang_id), VOCAB_NONE, "absent lang is the sentinel, not vocab id 0");
     assert_eq!(u16::from(a.set_type_id), VOCAB_NONE);
     assert_eq!(u16::from(a.set_vid), VOCAB_NONE);
-    assert_eq!(u8::from(a.games), 0);
+    assert_eq!(a.games, 0);
     assert_eq!(u16::from(a.flags), 0);
     assert!(a.multiverse_ids.is_empty());
     assert!(a.promo_types.is_empty());
