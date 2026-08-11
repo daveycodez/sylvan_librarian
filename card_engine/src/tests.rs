@@ -2,10 +2,10 @@ use super::{
     and_child_rank, assign_name_ranks,
     build_numeric_index, build_oracle_text_index, build_tag_index, build_trigram_index,
     build_rarity_index, build_flavor_index, build_hybrid_tag_index, bitmap_beats_postings, HybridTagIndex, build_sort_permutations,
-    assign_artwork_groups, build_artwork_base_from, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
+    assign_artwork_groups, assign_artist_ranks, build_artwork_base_from, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
     cards_of_printings, count_common_keywords, count_common_types,
     build_artist_index, build_printing_value_index, build_arith_tuple_index, is_arith_tuple_route, range_candidates, narrow_candidates, narrow_candidates_exact, rarity_candidates,
-    range_too_broad_to_narrow, run_query, run_query_routed, run_query_with_plan, explain, explain_analyze, AcquireFacts, PlanEstimate, PlanTrial,
+    perm_primary_key, range_too_broad_to_narrow, run_query, run_query_routed, run_query_with_plan, explain, explain_analyze, AcquireFacts, PlanEstimate, PlanTrial,
     acquire_plan_features, take_phase_stats, PagingTaken, CountSource, NarrowedRepr,
     EXACT_VALUE_TOTALS, RangeCardCounts, narrow_rec, ValueTotals, PairTotals, build_all_value_totals, build_pair_totals, build_range_card_counts, exact_result_total,
     PhysicalPlan, PlanScope, CandidatePlan, ComposePaging, trigram_candidates, finalize_trigram_index, PrintingValueIndex, NARROW_FLOOR,
@@ -11455,4 +11455,40 @@ fn an_explicit_prefer_still_beats_the_price_orderby() {
     // `oldest`/`newest` are price-blind: store_of makes the LAST printing the oldest.
     assert_eq!(representative(&data, "oldest", "usd", "desc"), 3);
     assert_eq!(representative(&data, "newest", "usd", "desc"), 1);
+}
+
+/// `order=artist` treats an artistless printing the way every other ordering treats an absent
+/// value, rather than as a real rank at the far end.
+///
+/// `assign_artist_ranks` parks the artistless printings in a trailing rank block, and reporting
+/// that block as a VALUE made this the one ordering whose absent side moved with the direction in
+/// the wrong sense: last ascending (correct) but FIRST descending (not), because a real rank
+/// reflects under `desc` and an absent sentinel does not.
+#[test]
+fn an_artistless_printing_sorts_like_an_absent_value() {
+    let mut vocab = VocabInterner::new();
+    let cards = vec![stub_card(1, TYPE_CREATURE, &[], &mut vocab), stub_card(2, TYPE_CREATURE, &[], &mut vocab)];
+    let mut data = store_of(cards, &[1, 1], vocab);
+    let artist_vocab = vec!["aaa".to_string()];
+    data.printings[0].card_artist_vid = 0;
+    data.printings[1].card_artist_vid = ARTIST_NONE;
+    assign_artist_ranks(&mut data.printings, &artist_vocab);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+
+    // Asserted RELATIVE to a column that is already nullable, not against a fixed direction, so
+    // this pins the property that matters -- artist's absent side behaves like everybody else's --
+    // without also pinning WHICH side that is. It therefore holds both before and after the
+    // nulls-sort-lowest change, and would fail if only one of the two were ever flipped.
+    for descending in [false, true] {
+        let artist_named = sort_key_bits(&archived.cards[0], &archived.printings[0], SortCol::Artist, descending);
+        let artist_absent = sort_key_bits(&archived.cards[1], &archived.printings[1], SortCol::Artist, descending);
+        let cmc_present = perm_primary_key(Some(1.0), descending);
+        let cmc_absent = perm_primary_key(None, descending);
+        assert_eq!(
+            artist_absent > artist_named,
+            cmc_absent > cmc_present,
+            "artist's absent side disagrees with cmc's (descending={descending})",
+        );
+    }
 }

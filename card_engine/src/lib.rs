@@ -5481,7 +5481,16 @@ fn sort_key_bits(card: &AOracleCard, p: &APrinting, sort_col: SortCol, descendin
         // Dense ranks assigned post-load; the stored code and artist id do not sort alphabetically
         // on their own (see assign_set_ranks / assign_artist_ranks).
         SortCol::Set        => Some(u32::from(p.set_rank) as f32),
-        SortCol::Artist     => Some(u32::from(p.artist_rank) as f32),
+        // Nullable, unlike `Set` beside it: `card_set_code` is non-null but an artist is not, and
+        // `assign_artist_ranks` puts the artistless printings in a trailing rank block keyed on
+        // `(name.is_none(), name)`. Reporting that block as a VALUE made `order=artist` the one
+        // ordering whose absent side moved with the direction in the wrong sense — artistless
+        // sorted last ascending (right) but FIRST descending (wrong), because a real rank reflects
+        // and the absent sentinel does not. Returning None puts it back under the same rule as
+        // every other column. No change to `assign_artist_ranks`: its trailing block is disjoint
+        // from every named rank, so it simply stops being read. 7 printings on the production
+        // corpus, so this is a correctness tidy rather than a visible reshuffle.
+        SortCol::Artist     => (p.card_artist_vid != ARTIST_NONE).then(|| u32::from(p.artist_rank) as f32),
     };
     let pk = primary.map_or(u32::MAX, |v| f32_sort_bits(if descending { -v } else { v }));
     let e = card.edhrec_rank.as_ref().map(|v| u32::from(*v)).unwrap_or(u32::MAX);
