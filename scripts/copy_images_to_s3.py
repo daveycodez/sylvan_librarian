@@ -128,11 +128,8 @@ def fetch_cards_from_db(
         List of dictionaries containing
              card_set_code,
              collector_number,
-             png_url (front face; for merged multi-face rows the top-level image_uris
-                 IS the front's, with the blob's card_faces[0] as fallback),
-             back_png_url (card_faces[1]'s image, present only for cards with a
-                 physical back face — transform/MDFC; split/adventure/flip faces
-                 carry no per-face images)
+             png_url (the FRONT face),
+             back_png_url (the back face, or NULL for a card that has no physical back)
     """
     with conn.cursor() as cursor:
         where_clause = ""
@@ -149,15 +146,39 @@ def fetch_cards_from_db(
 
         where_clause = " AND ".join(conditions)
 
+        # Both URLs are DERIVED from scryfall_id rather than read out of raw_card_blob, and
+        # whether a back face exists is read from card_layout. Two reasons, both load-bearing:
+        #
+        # 1. The blob is wrong for exactly the cards this is about. Until the face merge, a
+        #    multi-face row WAS its last face, so `raw_card_blob->'image_uris'` is that face's
+        #    -- the BACK's -- because Scryfall omits top-level image_uris on a transform card
+        #    and puts one on each face. Every such card therefore has its back image uploaded
+        #    under the face-1 key, and its front uploaded nowhere. (Verified against the live
+        #    CDN: img/bot/6/1/*.webp is Slicer, High-Speed Antagonist -- the back.) A coalesce
+        #    onto card_faces[0] does not rescue it, because the first branch is non-NULL.
+        # 2. The blob is unavailable for the same cards. preprocess_card popped card_faces
+        #    before snapshotting, so no pre-merge row's blob has that key at all, which is why
+        #    2026-08-10-01's backfill leaves card_faces NULL corpus-wide and back_png_url with
+        #    it. Reading the blob means "correct only after a full reimport"; reading columns
+        #    means correct now.
+        #
+        # scryfall_id and card_layout are both NOT NULL/indexed columns populated for every
+        # row today, and Scryfall's image path is a pure function of the id, so this is right
+        # on the existing corpus with no reimport and self-heals rows the blob never captured.
         query = f"""
             SELECT
                 card_set_code,
                 collector_number,
-                coalesce(
-                    raw_card_blob->'image_uris'->>'png',
-                    raw_card_blob->'card_faces'->0->'image_uris'->>'png'
-                ) as png_url,
-                raw_card_blob->'card_faces'->1->'image_uris'->>'png' as back_png_url
+                'https://cards.scryfall.io/png/front/'
+                    || left(scryfall_id::text, 1) || '/' || substr(scryfall_id::text, 2, 1)
+                    || '/' || scryfall_id::text || '.png' as png_url,
+                CASE WHEN card_layout IN (
+                        'transform', 'modal_dfc', 'reversible_card', 'double_faced_token', 'art_series'
+                     ) THEN
+                    'https://cards.scryfall.io/png/back/'
+                        || left(scryfall_id::text, 1) || '/' || substr(scryfall_id::text, 2, 1)
+                        || '/' || scryfall_id::text || '.png'
+                END as back_png_url
             FROM
                 magic.cards
             WHERE
