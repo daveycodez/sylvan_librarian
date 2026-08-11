@@ -45,12 +45,20 @@ def balance_partial_query(query: str) -> str:
         # them are content, not delimiters. The span rules come from api.parsing.spans so the balancer
         # and the lexer cannot drift apart — where they disagree, the balancer "fixes" a quote the
         # lexer never saw (#905).
-        # A word character either side of an apostrophe makes it part of the word rather than an
-        # opening quote -- the same rule _scan_word_end applies in the tokenizer. Without this the
-        # balancer "closes" the apostrophe in urza's, producing urza's', which does not parse:
-        # strictly worse than before bare names accepted apostrophes at all. (`pos` has already
-        # moved past `char`, so the character itself is at `pos - 1`.)
-        if char == "'" and 0 < pos - 1 < len(query) - 1 and _is_word_cont(query[pos - 2]) and _is_word_cont(query[pos]):
+        # An apostrophe preceded by a word character and followed by either another word character
+        # or NOTHING is part of the word rather than an opening quote -- the same rule
+        # _scan_word_end applies in the tokenizer, and the two must agree exactly or this emits
+        # something the lexer rejects. Without the "or nothing", "urza'" balanced to "urza''",
+        # which parses as `urza` AND an empty quoted string: the search widened to every card
+        # containing "urza" and the explanation rendered "the name contains Urza and " with
+        # nothing after the "and". (`pos` has already moved past `char`, so the character itself
+        # is at `pos - 1`.)
+        if (
+            char == "'"
+            and pos - 1 > 0
+            and _is_word_cont(query[pos - 2])
+            and (pos == len(query) or _is_word_cont(query[pos]))
+        ):
             continue
 
         if char in QUOTE_CHARS:

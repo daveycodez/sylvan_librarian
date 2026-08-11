@@ -441,17 +441,20 @@ class CardSearch {
   // The JS counterpart of no single Python function — spans.py's callers each make this same
   // three-way dispatch themselves, since hand_parser's lexer and parsing_f's balancer need the
   // unterminated case too.
-  // A word character either side of an apostrophe makes it part of the word rather than an
-  // opening quote — the same rule _scan_word_end applies in the tokenizer. Without this the
-  // balancer "closes" the apostrophe in urza's, producing urza's', which does not parse.
+  // An apostrophe preceded by a word character and followed by either another word character or
+  // NOTHING is part of the word, not an opening quote — the same rule _scan_word_end applies in
+  // the tokenizer, and the two must agree exactly or this sends something the API rejects.
+  // Without the "or nothing", typing "urza'" on the way to "urza's" sent "urza''", which parses
+  // as `urza` AND an empty quoted string: results silently widened to every card containing
+  // "urza", and the count line read "35 cards where the name contains Urza and " — a dangling
+  // conjunction, with the apostrophe the user typed dropped from the search entirely.
   isWordApostrophe(query, i) {
     const wordChar = /[\p{L}\p{N}_.]/u;
     return (
       query[i] === "'" &&
       i > 0 &&
       wordChar.test(query[i - 1]) &&
-      i + 1 < query.length &&
-      wordChar.test(query[i + 1])
+      (i + 1 >= query.length || wordChar.test(query[i + 1]))
     );
   }
 
