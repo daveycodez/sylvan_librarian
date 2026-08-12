@@ -93,7 +93,10 @@ def import_rulings(conn_pool: psycopg_pool.ConnectionPool, fetcher: ScryfallBulk
             cursor.execute("DELETE FROM magic.rulings")
             for batch in itertools.batched(_valid_rulings(fetcher.stream_data_for_key(BulkDataKey.RULINGS)), _BATCH_SIZE):
                 cursor.execute(_INSERT_SQL, {"rows": Jsonb(list(batch))})
-                loaded += len(batch)
+                # rowcount, not len(batch): the file repeats a tuple often enough to matter -- 37 of
+                # 77,998 entries on 2026-08-11 -- and ON CONFLICT DO NOTHING drops those. Counting
+                # what was sent would report a row total the table does not hold.
+                loaded += cursor.rowcount
         conn.commit()
 
     logger.info("Imported %d rulings in %.2f seconds", loaded, time.monotonic() - before)

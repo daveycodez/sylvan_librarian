@@ -38,7 +38,9 @@ Two things the stored data did not already support:
   with its faces re-attached — so no column holds a duplicate.
 - **Rulings.** New `magic.rulings`, loaded from the bulk `rulings` file the fetcher already knew
   about, as a whole-table replace inside one transaction (the file carries no ruling id, and
-  rulings are occasionally retracted).
+  rulings are occasionally retracted). Identity being the tuple means the file can repeat one — 37
+  of 77,998 entries on 2026-08-11 — so the count the import reports is what Postgres kept, not what
+  was sent to it.
 
 Lookups are index-backed on the 97,808-card corpus, including three folded-name expression indexes
 so that `named?exact=`, which matches either face of a `Front // Back` card, plans as a BitmapOr
