@@ -222,6 +222,7 @@ fn stub_card(oracle_id: u128, card_types: u16, subtypes: &[&str], vocab: &mut Vo
         mana_cost: ManaCost { core: 0, hybrids: Vec::new(), devotion: 0, cmc: 0.0 },
         creature_power_text_id: NONE_STR,
         creature_toughness_text_id: NONE_STR,
+        planeswalker_loyalty_text_id: NONE_STR,
         faces: Vec::new(),
         all_parts: Vec::new(),
     }
@@ -11381,6 +11382,7 @@ fn two_faces() -> (Vec<OracleFace>, Vec<PrintingFace>) {
             creature_power_text_id: 5,
             creature_toughness_text_id: 6,
             planeswalker_loyalty_text_id: NONE_STR,
+            defense_text_id: NONE_STR,
             card_colors: 0b0000_0001, // W
             color_indicator: 0,
         },
@@ -11392,6 +11394,7 @@ fn two_faces() -> (Vec<OracleFace>, Vec<PrintingFace>) {
             creature_power_text_id: 15,
             creature_toughness_text_id: 16,
             planeswalker_loyalty_text_id: NONE_STR,
+            defense_text_id: NONE_STR,
             card_colors: 0b0000_1000, // R
             color_indicator: 0b0000_1000,
         },

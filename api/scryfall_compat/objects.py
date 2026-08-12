@@ -46,7 +46,7 @@ MAX_AUTOCOMPLETE_VALUES = 20
 # lookup, so the engine emits exactly this and nothing is fetched that is never read.
 CARD_OBJECT_FIELDS = (
     "name", "scryfall_id", "oracle_id", "layout", "mana_cost", "cmc", "type_line", "oracle_text",
-    "power", "toughness", "colors", "color_identity", "card_keywords", "set_code", "set_name",
+    "power", "toughness", "loyalty", "colors", "color_identity", "card_keywords", "set_code", "set_name",
     "collector_number", "rarity", "flavor_text", "artist", "illustration_id", "released_at",
     "legalities", "edhrec_rank", "price_usd", "price_eur", "price_tix", "watermark",
     "card_frame_data", "card_is_tags", "border_color", "frame",
@@ -310,6 +310,9 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
     for key, value in (
         ("power", row.get("power")),
         ("toughness", row.get("toughness")),
+        # Where Scryfall puts it, beside the creature stats it is the planeswalker analogue of. The
+        # PRINTED string: `planeswalker_loyalty` is a u8 in the engine and cannot hold "X" or "1+*".
+        ("loyalty", row.get("loyalty")),
         ("flavor_text", row.get("flavor_text") or None),
         ("watermark", row.get("watermark")),
         ("frame", row.get("frame")),

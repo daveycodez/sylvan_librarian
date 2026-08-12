@@ -135,6 +135,9 @@ _FACE_OBJECT_FIELDS = (
     "power",
     "toughness",
     "loyalty",
+    # Battles print their defense on the FACE (Invasion of Alara's front face is `defense: 7`) and
+    # no column holds it, so leaving it out drops the number from every battle's card object.
+    "defense",
     "colors",
     "color_indicator",
     "flavor_text",

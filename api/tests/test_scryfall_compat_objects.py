@@ -100,8 +100,23 @@ class TestToScryfallCard:
     def test_absent_keys_stay_absent(self):
         """Scryfall OMITS a key it has no value for. Emitting null would differ on every row."""
         card = to_scryfall_card(row())
-        for key in ("power", "toughness", "flavor_text", "watermark", "arena_id", "promo_types"):
+        for key in ("power", "toughness", "loyalty", "flavor_text", "watermark", "arena_id", "promo_types"):
             assert key not in card, f"{key} should be omitted, not null"
+
+    def test_a_planeswalkers_printed_loyalty_is_the_string(self):
+        """The engine holds `planeswalker_loyalty` as a u8 for `loy:`; the card object needs the text.
+
+        Without its own field the key was emitted by nothing at all, so every planeswalker's card
+        object came back with no `loyalty` -- and deriving it from the number would still lose "X"
+        (Nissa, Steward of Elements) and "1+*", which do not fit in a u8.
+        """
+        card = to_scryfall_card(row(name="Jace Beleren", loyalty="3"))
+        assert card["loyalty"] == "3"
+
+        keys = list(card)
+        assert keys.index("loyalty") > keys.index("type_line"), "loyalty sits with the printed stats"
+
+        assert to_scryfall_card(row(loyalty="X"))["loyalty"] == "X"
 
     def test_border_color_and_frame_come_from_the_engine_row(self):
         """Both come from the engine row now.

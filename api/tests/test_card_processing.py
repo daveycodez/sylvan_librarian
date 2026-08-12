@@ -466,6 +466,7 @@ class TestFaceMerging:
                     "mana_cost": "{2}{U}",
                     "colors": ["U"],
                     "oracle_text": "When this Siege enters, look at the top card.",
+                    "defense": "7",
                     "illustration_id": "11111111-1111-1111-1111-111111111111",
                 },
                 {
@@ -480,6 +481,17 @@ class TestFaceMerging:
                 },
             ],
         )
+
+    def test_battle_face_keeps_its_defense(self) -> None:
+        """Scryfall prints a battle's defense on the FACE, and no column holds it.
+
+        Every battle so far is a transform card, so a face field list without `defense` loses the
+        number outright rather than degrading it.
+        """
+        merged = preprocess_card(self._battle_card())[0]
+        assert merged["card_faces"][0]["defense"] == "7"
+        # Absent on the face that has none, because Scryfall omits rather than nulls.
+        assert "defense" not in merged["card_faces"][1]
 
     def test_battle_front_types_are_searchable(self) -> None:
         """`t:battle` must match transform battles — the union carries the front's types.

@@ -253,6 +253,9 @@ struct OracleFace {
     creature_power_text_id: u32,
     creature_toughness_text_id: u32,
     planeswalker_loyalty_text_id: u32,
+    // Battles print their defense on the FACE, never at top level -- every battle so far is a
+    // transform card, so without this the number is simply lost (Invasion of Alara's `defense: 7`).
+    defense_text_id: u32,
     card_colors: u8,
     // Scryfall's color_indicator: the printed dot for a face whose color is not implied by its mana
     // cost (a transform back has no mana cost at all). Same WUBRGC bit layout as card_colors.
@@ -459,6 +462,10 @@ struct OracleCard {
 
     creature_power_text_id: u32,
     creature_toughness_text_id: u32,
+    // The PRINTED loyalty, beside the printed power and toughness. `planeswalker_loyalty` above is
+    // the u8 the query planner filters `loy:` on and cannot stand in for it: "X" (Nissa, Steward of
+    // Elements) and "1+*" are real printed loyalties that do not fit in it at all.
+    planeswalker_loyalty_text_id: u32,
 
     // Empty for the ~82% of cards with a single face. Front first, in Scryfall's own order.
     faces: Vec<OracleFace>,
@@ -590,6 +597,7 @@ struct CardRow {
 
     creature_power_text_id: u32,
     creature_toughness_text_id: u32,
+    planeswalker_loyalty_text_id: u32,
 
     // Both halves of each face, together, until the commit pass splits them the same way it splits
     // the row itself: text to the OracleCard, art to the Printing.
@@ -609,6 +617,9 @@ struct FaceRow {
     creature_power_text_id: u32,
     creature_toughness_text_id: u32,
     planeswalker_loyalty_text_id: u32,
+    // Battles print their defense on the FACE, never at top level -- every battle so far is a
+    // transform card, so without this the number is simply lost (Invasion of Alara's `defense: 7`).
+    defense_text_id: u32,
     card_colors: u8,
     color_indicator: u8,
     illustration_id: u128,
@@ -1108,6 +1119,7 @@ fn faces_from_pydict(d: &Bound<PyDict>, it: &mut Interner, artists: &mut VocabIn
             creature_power_text_id: it.intern_opt(opt_str(face, "power")),
             creature_toughness_text_id: it.intern_opt(opt_str(face, "toughness")),
             planeswalker_loyalty_text_id: it.intern_opt(opt_str(face, "loyalty")),
+            defense_text_id: it.intern_opt(opt_str(face, "defense")),
             card_colors: str_list_color_mask(face, "colors"),
             color_indicator: str_list_color_mask(face, "color_indicator"),
             illustration_id: opt_str(face, "illustration_id").map_or(0, |s| parse_uuid_or_hash(&s)),
@@ -1189,6 +1201,7 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
 
         creature_power_text_id: it.intern_opt(opt_str(d, "creature_power_text")),
         creature_toughness_text_id: it.intern_opt(opt_str(d, "creature_toughness_text")),
+        planeswalker_loyalty_text_id: it.intern_opt(opt_str(d, "planeswalker_loyalty_text")),
 
         card_faces: faces_from_pydict(d, it, artists)?,
         all_parts: all_parts_from_pydict(d, it, vocab)?,
@@ -12252,6 +12265,7 @@ const FIELD_TABLE: &[(&str, FieldExtractor)] = &[
     ("collector_number", |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.collector_number_id)).into_pyobject(py)?.into_any())),
     ("power", |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.creature_power_text_id)).into_pyobject(py)?.into_any())),
     ("toughness", |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.creature_toughness_text_id)).into_pyobject(py)?.into_any())),
+    ("loyalty", |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.planeswalker_loyalty_text_id)).into_pyobject(py)?.into_any())),
     ("mana_cost", |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.mana_cost_text_id)).into_pyobject(py)?.into_any())),
     ("oracle_text", |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.oracle_text_id)).into_pyobject(py)?.into_any())),
     ("set_name", |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.set_name_id)).into_pyobject(py)?.into_any())),
@@ -12462,6 +12476,7 @@ fn faces_to_pylist<'py>(
         d.set_item("power", str_at(strings, u32::from(face.creature_power_text_id)))?;
         d.set_item("toughness", str_at(strings, u32::from(face.creature_toughness_text_id)))?;
         d.set_item("loyalty", str_at(strings, u32::from(face.planeswalker_loyalty_text_id)))?;
+        d.set_item("defense", str_at(strings, u32::from(face.defense_text_id)))?;
         d.set_item("colors", identity_letters(face.card_colors))?;
         d.set_item("color_indicator", identity_letters(face.color_indicator))?;
         // Art is per printing, and a printing may carry fewer face-art records than the card has
@@ -12548,7 +12563,7 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 // `NameUnigramIndex` (#858) is a new archived type, so a store built before it must fail the header
 // check and be rebuilt rather than be read as garbage. Dated 2026-08-06, patch 01; the check is
 // EQUALITY, so the invariant is only that a value is never reused for a different layout.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026081001;
+const ARCHIVE_FORMAT_VERSION: u32 = 2026081201;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -13014,6 +13029,7 @@ impl QueryEngine {
                     mana_cost: row.mana_cost.clone(),
                     creature_power_text_id: row.creature_power_text_id,
                     creature_toughness_text_id: row.creature_toughness_text_id,
+                    planeswalker_loyalty_text_id: row.planeswalker_loyalty_text_id,
                     // Face TEXT is the same on every printing of a card, so the group's first row
                     // supplies it, exactly like the scalars above. Borrowed rather than taken:
                     // the Printing below still needs the art half of the same faces.
@@ -13028,6 +13044,7 @@ impl QueryEngine {
                             creature_power_text_id: f.creature_power_text_id,
                             creature_toughness_text_id: f.creature_toughness_text_id,
                             planeswalker_loyalty_text_id: f.planeswalker_loyalty_text_id,
+                            defense_text_id: f.defense_text_id,
                             card_colors: f.card_colors,
                             color_indicator: f.color_indicator,
                         })
