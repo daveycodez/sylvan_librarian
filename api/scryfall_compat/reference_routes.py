@@ -31,10 +31,24 @@ from api.utils.routing import route
 
 logger = logging.getLogger(__name__)
 
-# The reference data changes when a set is announced or spoiled, not per request. Same tier the
-# card routes use, for the same reason: it is the CDN in front of this service that this header
-# talks to, and none of these responses vary per client.
-_REFERENCE_CACHE_CONTROL = "public, max-age=57600"
+# Cache tiers, matched to what api.scryfall.com sends on each of these routes (measured
+# 2026-08-11). They are not the `public, max-age=57600` the card routes carry:
+#
+#   /sets, /sets/:code, /sets/tcgplayer/:id, /catalog/*, /symbology   ->  public
+#   /symbology/parse-mana                    ->  max-age=0, private, must-revalidate
+#
+# Bare `public` with no max-age leaves freshness to the cache's heuristics, which is weaker than an
+# explicit lifetime and is arguably a wart upstream. It is mirrored anyway, because a client that
+# swaps its base URL should get the same caching behaviour it tuned against Scryfall — a response
+# this service holds for 16 hours where Scryfall revalidates is a behavioural difference the client
+# cannot see until it serves something stale.
+_MIRRORED_CACHE_CONTROL = "public"
+
+# parse-mana is the deterministic one, so caching it hard would be safe -- but Scryfall marks it
+# private and must-revalidate, and parity is the point. `private` does not defeat this service's own
+# CachingMiddleware (only `no-store` does, which is why /cards/random uses that), so the in-process
+# cache still answers repeat parses.
+_PARSE_MANA_CACHE_CONTROL = "max-age=0, private, must-revalidate"
 
 # The twenty catalogs Scryfall documents. Listed rather than discovered so that a request for a name
 # this instance has never imported 404s as an unknown catalog, instead of reporting an empty one and
@@ -81,14 +95,15 @@ def _as_bool(value: str | None, *, default: bool = False) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
-def _set_reference_cache(falcon_response: falcon.Response | None) -> None:
-    """Set the reference-route cache tier.
+def _set_reference_cache(falcon_response: falcon.Response | None, tier: str = _MIRRORED_CACHE_CONTROL) -> None:
+    """Set a reference-route cache tier.
 
     Args:
         falcon_response: The response to write to, or None for an internal caller.
+        tier: The Cache-Control value; defaults to the tier the mirrored routes share.
     """
     if falcon_response is not None:
-        falcon_response.set_header("Cache-Control", _REFERENCE_CACHE_CONTROL)
+        falcon_response.set_header("Cache-Control", tier)
 
 
 class ScryfallReferenceRoutes(ScryfallResponder):
@@ -311,7 +326,7 @@ class ScryfallReferenceRoutes(ScryfallResponder):
             A ManaCost object, or a Scryfall error.
         """
         is_pretty = _as_bool(pretty)
-        _set_reference_cache(falcon_response)
+        _set_reference_cache(falcon_response, _PARSE_MANA_CACHE_CONTROL)
 
         if cost is None:
             return self._scryfall_respond(

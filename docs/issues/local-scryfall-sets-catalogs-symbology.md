@@ -99,6 +99,27 @@ An unparseable fragment is a **422**, not a 400.
 `api/tests/test_scryfall_mana.py` pins all of this against 79 goldens captured from the live API,
 including all 31 colour subsets written both forwards and backwards.
 
+## Cache headers are mirrored too
+
+Measured on 2026-08-11, these routes do **not** carry the `public, max-age=57600` the card routes do:
+
+| Route | Cache-Control |
+| --- | --- |
+| `/sets`, `/sets/:code`, `/sets/tcgplayer/:id`, `/catalog/*`, `/symbology` | `public` |
+| `/symbology/parse-mana` | `max-age=0, private, must-revalidate` |
+
+Both are mirrored rather than chosen, and both are mildly surprising. Bare `public` with no max-age
+leaves freshness to the cache's heuristics, which is weaker than an explicit lifetime; `parse-mana`
+is the one deterministic route here and would be perfectly safe to cache hard, yet upstream marks it
+private. Matching anyway is the point of the surface: a client that swapped its base URL would
+otherwise get a response held for 16 hours where Scryfall revalidates, and would not find out until
+it served something stale. `private` does not defeat this service's own `CachingMiddleware` — only
+`no-store` does, which is why `/cards/random` uses that — so repeat parses are still answered
+in-process.
+
+The first cut of this branch applied the card tier to all six routes. `test_scryfall_reference_routes.py`
+now pins each header to its measured upstream value.
+
 ## Structure
 
 `ScryfallReferenceRoutes` is a second mixin on `APIResource` beside `ScryfallCardsRoutes`, not an

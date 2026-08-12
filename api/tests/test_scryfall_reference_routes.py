@@ -225,11 +225,35 @@ class TestParseMana:
 class TestSharedBehaviour:
     """Conventions the reference routes inherit from the cards surface."""
 
-    @pytest.mark.parametrize("path", ["/sets", "/sets/zzt", "/catalog/creature-types", "/symbology"])
-    def test_every_route_sets_a_cache_tier(self, reference_corpus: APIResource, path: str) -> None:
-        """These routes previously sent no Cache-Control at all, so no CDN cached them."""
-        resp = dispatch(reference_corpus, path)
-        assert resp.headers["cache-control"] == "public, max-age=57600"
+    @pytest.mark.parametrize(
+        ("path", "expected"),
+        [
+            # Measured from api.scryfall.com on 2026-08-11. Deliberately NOT the card routes'
+            # `public, max-age=57600`: the mirrored routes send a bare `public` upstream, and
+            # parse-mana is marked private and must-revalidate despite being the one deterministic
+            # route here. A client that swaps its base URL should get the caching behaviour it
+            # tuned against Scryfall, so these mirror upstream rather than being chosen.
+            ("/sets", "public"),
+            ("/sets/zzt", "public"),
+            ("/sets/tcgplayer/90210", "public"),
+            ("/catalog/creature-types", "public"),
+            ("/symbology", "public"),
+            ("/symbology/parse-mana?cost=R", "max-age=0, private, must-revalidate"),
+        ],
+    )
+    def test_each_route_sends_the_tier_scryfall_sends(
+        self,
+        reference_corpus: APIResource,
+        path: str,
+        expected: str,
+    ) -> None:
+        route, _, query = path.partition("?")
+        resp = dispatch(reference_corpus, route, query)
+        assert resp.headers["cache-control"] == expected
+
+    def test_an_error_still_carries_the_cache_tier(self, reference_corpus: APIResource) -> None:
+        """The header is set before the handler body, so a 404 is cacheable like Scryfall's."""
+        assert dispatch(reference_corpus, "/sets/nope").headers["cache-control"] == "public"
 
     @pytest.mark.parametrize("path", ["/sets", "/catalog/creature-types", "/symbology"])
     def test_pretty_indents_the_body(self, reference_corpus: APIResource, path: str) -> None:
