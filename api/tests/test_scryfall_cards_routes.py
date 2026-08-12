@@ -570,6 +570,43 @@ class TestRulings:
         assert body["data"] == []
         assert body["has_more"] is False
 
+    @pytest.mark.parametrize(
+        ("path", "details"),
+        [
+            # The path addresses nothing at all.
+            ("/cards/not-a-uuid", "The requested object or REST method was not found."),
+            ("/cards/multiverse", "The requested object or REST method was not found."),
+            # A well-formed address that resolves to no card.
+            ("/cards/00000000-0000-4000-8000-000000000000", "No card found with the given ID or set code and collector number."),
+            ("/cards/multiverse/99999999", "No card found with the given ID or set code and collector number."),
+            # `/cards/<x>/rulings` where x is not an id reads as a set code and a collector number
+            # called "rulings", so Scryfall answers the CARD miss rather than the rulings one.
+            ("/cards/not-a-uuid/rulings", "No card found with the given ID or set code and collector number."),
+            # The rulings shapes.
+            (
+                "/cards/00000000-0000-4000-8000-000000000000/rulings",
+                "No card found with the given ID, multiverse ID, or set code & collector number.",
+            ),
+            (
+                "/cards/multiverse/99999999/rulings",
+                "No card found with the given ID, multiverse ID, or set code & collector number.",
+            ),
+            ("/cards/zzz/999/rulings", "No card found with the given ID, multiverse ID, or set code & collector number."),
+        ],
+    )
+    def test_a_miss_carries_the_body_scryfall_words_for_that_shape(
+        self, compat_corpus: APIResource, path: str, details: str
+    ) -> None:
+        """Three bodies, not one, and none of them the string this used to send.
+
+        Captured from api.scryfall.com on 2026-08-12. Nothing pinned `details` before -- the route
+        tests asserted the status and the code and left the field a client string-matches alone,
+        which is exactly how a compatibility surface drifts on it.
+        """
+        response = dispatch(compat_corpus, path)
+        assert response.status == falcon.HTTP_404
+        assert payload(response)["details"] == details
+
     def test_rulings_for_an_unknown_card_is_a_404(self, compat_corpus: APIResource):
         assert dispatch(compat_corpus, f"/cards/{uuid.uuid4()}/rulings").status == falcon.HTTP_404
 

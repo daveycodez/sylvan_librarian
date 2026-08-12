@@ -252,6 +252,50 @@ _PLAINTEXT_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "[::1]")  # noqa: S104
 _JSON_CONTENT_TYPE = "application/json; charset=utf-8"
 
 
+# Scryfall's three not-found bodies for these routes, measured against api.scryfall.com on
+# 2026-08-12. They are worded by the SHAPE of the path rather than by the outcome, and none of them
+# is the single string this used to answer with -- which carried a "Please double-check your URI and
+# try again." tail Scryfall does not send, so the generic case was wrong as well as the specific
+# ones.
+#
+#   /cards/<not-an-id>, /cards/<namespace>        the path addresses nothing
+#   /cards/<id>, /cards/<ns>/<id>, /cards/<code>/<number>(/<lang>)
+#                                                 a card miss: the address is well formed
+#   the rulings variants                          the same, worded for the routes that take a
+#                                                 multiverse id too
+#
+# `&` rather than `and`, and `multiverse ID` appearing only in the rulings one, are both Scryfall's.
+_NOT_ADDRESSABLE_DETAILS = "The requested object or REST method was not found."
+_CARD_MISS_DETAILS = "No card found with the given ID or set code and collector number."
+_RULINGS_MISS_DETAILS = "No card found with the given ID, multiverse ID, or set code & collector number."
+
+
+def _miss_details(identifier: str, number: str, suffix: str) -> str:
+    """Pick the body a `/cards/...` miss answers with.
+
+    Decided from the segments, not from what the lookup did, because that is how Scryfall words
+    them: `/cards/nonsense` and `/cards/<a real id that matches nothing>` are both misses and get
+    different sentences.
+
+    `/cards/<x>/rulings` where x is not an id is the subtle one, and it is measured both ways:
+    Scryfall reads it as a set code and a collector number that happens to be "rulings", so it
+    answers the CARD miss rather than the rulings one.
+
+    Args:
+        identifier: First path segment.
+        number: Second path segment.
+        suffix: Third path segment.
+
+    Returns:
+        The `details` string for the 404.
+    """
+    if not number and not _is_uuid(identifier):
+        return _NOT_ADDRESSABLE_DETAILS
+    if (number == "rulings" and _is_uuid(identifier)) or suffix == "rulings":
+        return _RULINGS_MISS_DETAILS
+    return _CARD_MISS_DETAILS
+
+
 def _is_uuid(value: str) -> bool:
     """Return whether a path segment is shaped like a UUID.
 
@@ -1385,9 +1429,7 @@ class ScryfallCardsRoutes:
         if card is None:
             return self._scryfall_respond(
                 falcon_response,
-                not_found_error(
-                    "The requested object or REST method was not found. Please double-check your URI and try again.",
-                ),
+                not_found_error(_miss_details(identifier, number, suffix)),
                 pretty=is_pretty,
             )
         if wants_rulings:
