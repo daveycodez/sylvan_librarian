@@ -17,7 +17,17 @@ PROJECTNAME := sylvan_librarian
 
 # macOS ships python3 but no bare "python", so every recipe that shells out to
 # the interpreter has to go through this rather than assume a name.
-PYTHON := $(shell command -v python 2>/dev/null || command -v python3 2>/dev/null)
+#
+# The repo's own virtualenv comes FIRST when it exists. That is where
+# install_test_deps puts uv and the test requirements, and where `maturin
+# develop` installs the engine extension -- so resolving to a system
+# interpreter finds one with none of them, and `make engine` dies on "No module
+# named uv" without building anything. The failure is quiet in the way that
+# matters: the .so already on disk is left in place and the suite runs against
+# it, so a Rust change can look tested when nothing rebuilt it.
+PYTHON := $(shell \
+	[ -x "$(mkfile_dir)/.venv/bin/python" ] && echo "$(mkfile_dir)/.venv/bin/python" \
+	|| command -v python 2>/dev/null || command -v python3 2>/dev/null)
 
 GIT_ROOT := $(shell git rev-parse --show-toplevel)
 GIT_SHA := $(shell git rev-parse HEAD 2>/dev/null || echo "unknown")
@@ -233,8 +243,8 @@ js-deps: # @doc update JavaScript dependencies and apply safe security fixes
 engine: $(ENGINE_SO) # @doc build the Rust card engine extension if its sources changed
 
 $(ENGINE_SO): $(engine_sources)
-	@maturin --version > /dev/null 2>&1 || $(PYTHON) -m uv pip install maturin
-	cd card_engine && PATH="$$HOME/.cargo/bin:$$PATH" maturin develop --release
+	@$(PYTHON) -m maturin --version > /dev/null 2>&1 || $(PYTHON) -m uv pip install maturin
+	cd card_engine && PATH="$$HOME/.cargo/bin:$$PATH" $(PYTHON) -m maturin develop --release
 
 test tests: install_test_deps engine
 	$(PYTHON) -m pytest -vvv --capture=no --durations=10
