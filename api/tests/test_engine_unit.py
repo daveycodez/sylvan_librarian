@@ -1237,6 +1237,25 @@ class TestFieldSelection:
             "type_line",
         }
 
+    def test_loyalty_is_the_printed_string_from_the_engine(self, engine: QueryEngine) -> None:
+        """`loyalty` comes from planeswalker_loyalty_text, not the u8 the planner filters on.
+
+        The numeric column is an `Option<u8>` -- "always 1-12" -- so it cannot carry "X" (Nissa,
+        Steward of Elements) or "1+*". Before this field existed the key was served by nothing, and
+        every planeswalker's card object came back without it.
+        """
+        _, cards = _run(engine, "t:planeswalker", unique="card", fields=["name", "loyalty"])
+        assert cards, "the fixture corpus has planeswalkers"
+        assert all(c["loyalty"] for c in cards), f"every planeswalker reports a loyalty: {cards}"
+        assert {c["name"]: c["loyalty"] for c in cards} == {
+            "Jace, the Mind Sculptor": "3",
+            "Nicol Bolas, Planeswalker": "5",
+        }
+
+        # A card with no loyalty reports none, rather than a zero the u8 would have implied.
+        _, bolt = _run(engine, 'name="Lightning Bolt"', unique="card", limit=1, fields=["name", "loyalty"])
+        assert bolt[0]["loyalty"] is None
+
     def test_requested_fields_returned_exactly(self, engine: QueryEngine) -> None:
         _, cards = _run(
             engine,
