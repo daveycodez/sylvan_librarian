@@ -12844,6 +12844,21 @@ impl QueryEngine {
                 self.shm_path.display(),
             )));
         }
+        // Adopt this archive's legality shifts NOW, while the mapping is being established, rather
+        // than leaving it to the first filter query. `legality_bits_to_pydict` and its JSON twin
+        // decode against the process-global FORMAT_SHIFTS registry and report an EMPTY object when
+        // it is unpopulated -- not an error -- and the only other caller of sync_format_shifts is
+        // bind_and_split_filter, on the filter path. A multi-process server is exactly the case
+        // that breaks: a worker that mmaps an archive it did not import has an empty registry, so
+        // every route resolving a card WITHOUT filtering (/cards/named, /cards/:id,
+        // /cards/collection) answered `"legalities": {}` until that worker happened to serve a
+        // search. Syncing here makes the registry a property of having an archive mapped.
+        //
+        // Safety: the same argument as every other access_unchecked on this mapping -- the header
+        // was just checked against this build's, and the file is replaced by rename, never
+        // modified in place while mapped.
+        let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
+        sync_format_shifts(&data.format_shifts);
         *guard = Some(CachedMmap { mmap: Arc::clone(&mmap), inode });
         Ok(mmap)
     }
