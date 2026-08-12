@@ -215,6 +215,32 @@ def _faces(row: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _decimal(value: float | int | None) -> float | None:
+    """Carry a mana value as the DECIMAL Scryfall types it as.
+
+    api.scryfall.com answers `"cmc":1.0`, not `"cmc":1` — check
+    https://api.scryfall.com/cards/named?exact=Lightning+Bolt. The field is decimal because
+    fractional mana values are real: Little Girl costs {HW} and answers `"cmc":0.5`
+    (https://api.scryfall.com/cards/named?exact=Little+Girl). A whole-numbered mana value therefore
+    still serializes with its decimal point, and `magic.cards.cmc` being an `integer` column is what
+    made this service answer `1` instead.
+
+    That column is also why the underlying 0.5 cannot be stored at all today; changing its type is a
+    migration and belongs on its own, and nothing that half-mana exists in is imported. This keeps
+    the SERIALIZATION honest in the meantime, which is what a client comparing against Scryfall
+    sees.
+
+    Args:
+        value: The stored mana value, or None. Typed narrowly rather than `Any` because this is the
+            one place the column's type matters: an `integer` column is exactly what produced the
+            wrong output.
+
+    Returns:
+        The value as a float, or None when the card has none.
+    """
+    return None if value is None else float(value)
+
+
 def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfall.com") -> dict[str, Any]:
     """Build the Scryfall card object for one engine row.
 
@@ -258,7 +284,7 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
         "layout": row.get("card_layout") or row.get("layout"),
         "highres_image": bool(row.get("highres_image")),
         "image_status": row.get("image_status"),
-        "cmc": row.get("cmc"),
+        "cmc": _decimal(row.get("cmc")),
         "type_line": row.get("type_line"),
         "colors": row.get("colors") or [],
         "color_identity": row.get("color_identity") or [],

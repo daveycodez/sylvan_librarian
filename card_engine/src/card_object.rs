@@ -332,8 +332,14 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     write_bool(out, &mut first, "highres_image", bool_of(row, "highres_image"));
     write_str_or_null(out, &mut first, "image_status", str_of(row, "image_status"));
     write_key(out, &mut first, "cmc");
-    match num_of(row, "cmc") {
-        Some(v) => serde_json::to_writer(&mut *out, v).expect("number"),
+    // As a DECIMAL, which is what api.scryfall.com answers with: `"cmc":1.0`, not `"cmc":1` (see
+    // https://api.scryfall.com/cards/named?exact=Lightning+Bolt). Writing the stored number
+    // directly emits `1`, because `magic.cards.cmc` is an integer column -- and that would also
+    // put the engine at odds with `to_scryfall_card`, which now carries the same value as a float.
+    // The two must agree byte for byte: the engine answers a card when it can and the SQL path
+    // answers it when the engine cannot, and a client must not be able to tell which one did.
+    match num_of(row, "cmc").and_then(serde_json::Value::as_f64) {
+        Some(v) => serde_json::to_writer(&mut *out, &v).expect("number"),
         None => out.extend_from_slice(b"null"),
     }
     write_str_or_null(out, &mut first, "type_line", str_of(row, "type_line"));
@@ -633,5 +639,32 @@ mod tests {
         assert!(at(r#""prices":"#) < at(r#""watermark":"#));
         assert!(at(r#""watermark":"#) < at(r#""cardmarket_id":"#));
         assert!(at(r#""cardmarket_id":"#) < at(r#""security_stamp":"#));
+    }
+
+    #[test]
+    fn cmc_is_written_as_a_decimal() {
+        // api.scryfall.com answers `"cmc":1.0`, not `"cmc":1` -- the field is decimal because
+        // fractional mana values are real (Little Girl costs {HW} and answers `"cmc":0.5`). The
+        // stored value arrives as an INTEGER, because `magic.cards.cmc` is an integer column, and
+        // writing it straight through is what produced `1`.
+        let serde_json::Value::Object(map) = json!({
+            "name": "Lightning Bolt", "scryfall_id": "01000000-0000-0000-0000-000000000007", "cmc": 1,
+        }) else {
+            panic!()
+        };
+        let mut out = Vec::new();
+        write_scryfall_card(&mut out, &map, "https://api.example/v1");
+        let text = String::from_utf8(out).expect("utf-8");
+        assert!(text.contains(r#""cmc":1.0"#), "cmc must be decimal: {text}");
+
+        // And a card with no mana value at all still says so.
+        let serde_json::Value::Object(none) = json!({
+            "name": "Ancestral Vision", "scryfall_id": "01000000-0000-0000-0000-000000000008",
+        }) else {
+            panic!()
+        };
+        let mut out = Vec::new();
+        write_scryfall_card(&mut out, &none, "https://api.example/v1");
+        assert!(String::from_utf8(out).expect("utf-8").contains(r#""cmc":null"#));
     }
 }

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 
 import pytest
 
@@ -69,6 +70,18 @@ class TestToScryfallCard:
         assert card["set"] == "lea"
         assert card["rarity"] == "common"
         assert card["legalities"] == {"modern": "legal"}
+
+    def test_cmc_is_a_decimal_even_when_the_column_holds_an_integer(self):
+        """`"cmc":1.0` is what api.scryfall.com answers, and `magic.cards.cmc` is an integer column.
+
+        The field is decimal because fractional mana values are real -- Little Girl costs {HW} and
+        Scryfall answers `"cmc":0.5` for it. A whole-numbered mana value therefore still carries its
+        decimal point, and a client comparing bodies against Scryfall can see the difference.
+        """
+        card = to_scryfall_card(row(cmc=1))
+        assert isinstance(card["cmc"], float)
+        assert '"cmc": 1.0' in json.dumps(card)
+        assert to_scryfall_card(row(cmc=None))["cmc"] is None
 
     def test_uris_are_derived_not_stored(self):
         """Every *_uri is a pure function of the id, set, collector number or oracle id."""
