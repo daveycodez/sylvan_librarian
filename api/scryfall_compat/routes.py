@@ -1509,6 +1509,22 @@ class ScryfallCardsRoutes:
     def _rulings_for(self, card: dict[str, Any]) -> dict[str, Any]:
         """Build the rulings List object for a card.
 
+        Newest first, which is the order api.scryfall.com serves and NOT the ascending one this
+        started with. Measured on 2026-08-12 over the cards whose rulings span more than one date:
+        16 of 16 came back `published_at` descending, 0 ascending -- so ascending inverted every
+        multi-date card for a client that had changed nothing but its base URL. Three concrete
+        examples, as Scryfall returns them: Kindred Discovery 2023-09-01, 2022-06-10, 2022-06-10,
+        2017-08-25; Eye of the Storm 2006-02-01, 2006-01-01, 2005-10-01 x3; Diabolic Intent
+        2022-10-14 x2, 2013-04-15 x2, 2004-10-04.
+
+        WITHIN one date the order cannot be reproduced from the bulk file, and `comment` is a
+        deterministic stand-in rather than a claim to match. Scryfall orders same-date rulings by an
+        internal ruling id; the file carries no id, and none of the file's own order, that order
+        reversed, comment ascending or comment descending matched on any of 10 sampled cards that
+        have a date carrying several rulings. That is most cards -- 13,847 of the 19,770 with
+        rulings, against the 2026-08-11 dump -- so the remaining 5,923 (one ruling, or one per date)
+        are the ones this now matches exactly. See docs/issues/local-scryfall-cards-api.md.
+
         Args:
             card: The card whose oracle id the rulings hang off.
 
@@ -1521,7 +1537,7 @@ class ScryfallCardsRoutes:
         rows = self._run_query(
             query=(
                 "SELECT oracle_id, source, published_at, comment FROM magic.rulings "
-                "WHERE oracle_id = %(oracle_id)s ORDER BY published_at, comment"
+                "WHERE oracle_id = %(oracle_id)s ORDER BY published_at DESC, comment"
             ),
             params={"oracle_id": str(oracle_id)},
             explain=False,

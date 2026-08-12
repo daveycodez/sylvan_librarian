@@ -161,6 +161,16 @@ Ordered by how likely they are to matter.
    this project supports — to paper over one that is misconfigured.
 8. **`GET /cards` at a deep offset costs ~300 ms** (measured at page 501 of 559). The endpoint is
    rarely used and the result is cached per import generation.
+9. **Same-day rulings are not in Scryfall's order.** The rulings routes sort `published_at DESC,
+   comment`. The descending half is Scryfall's own — measured 2026-08-12, 16 of 16 cards whose
+   rulings span several dates came back newest-first and 0 oldest-first — but the tie inside one
+   date is Scryfall's internal ruling id, which the bulk file does not carry. None of the file's
+   own line order, that order reversed, comment ascending or comment descending reproduced it on
+   any of 10 sampled cards, so `comment` is a deterministic stand-in rather than a match. It
+   affects 13,847 of the 19,770 cards that have rulings (2026-08-11 dump); the other 5,923 — one
+   ruling, or one per date — come back exactly as Scryfall orders them. Closing the rest would mean
+   an id only the API exposes, i.e. a per-card request, which is the dependency the bulk import
+   exists to avoid.
 
 ## Follow-ups worth considering
 

@@ -40,7 +40,10 @@ Two things the stored data did not already support:
   about, as a whole-table replace inside one transaction (the file carries no ruling id, and
   rulings are occasionally retracted). Identity being the tuple means the file can repeat one — 37
   of 77,998 entries on 2026-08-11 — so the count the import reports is what Postgres kept, not what
-  was sent to it.
+  was sent to it. They are served **newest first** (`published_at DESC`), which is the order
+  api.scryfall.com uses: measured 2026-08-12, 16 of 16 cards whose rulings span several dates came
+  back newest-first and 0 oldest-first. The tie inside one date is Scryfall's own ruling id and
+  cannot be reproduced from the file — see the issue doc's divergence list.
 
 Lookups are index-backed on the 97,808-card corpus, including three folded-name expression indexes
 so that `named?exact=`, which matches either face of a `Front // Back` card, plans as a BitmapOr

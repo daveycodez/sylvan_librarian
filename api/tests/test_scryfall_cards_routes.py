@@ -124,9 +124,16 @@ def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
     api_resource._upsert_cards([copy.deepcopy(card) for card in (_bolt(), _bear(), _delver())])
     with api_resource._conn_pool.connection() as conn, conn.cursor() as cursor:
         cursor.execute("DELETE FROM magic.rulings WHERE oracle_id = %(oracle_id)s", {"oracle_id": BOLT_ORACLE_ID})
-        cursor.execute(
+        # Three rulings across two dates, two of them same-day: a single ruling cannot tell one
+        # ordering from another, which is how the ascending sort went unnoticed. Inserted oldest
+        # first so the expected answer is not the insertion order either.
+        cursor.executemany(
             "INSERT INTO magic.rulings (oracle_id, source, published_at, comment) VALUES (%s, %s, %s, %s)",
-            (BOLT_ORACLE_ID, "wotc", "2004-10-04", "Any target means any target."),
+            [
+                (BOLT_ORACLE_ID, "wotc", "2004-10-04", "Any target means any target."),
+                (BOLT_ORACLE_ID, "wotc", "2021-02-05", "Zero damage is still damage."),
+                (BOLT_ORACLE_ID, "wotc", "2021-02-05", "A later clarification."),
+            ],
         )
         conn.commit()
     # /cards/search runs through _search, which prefers the in-process engine when its store is
@@ -528,11 +535,27 @@ class TestRulings:
         body = payload(dispatch(compat_corpus, f"/cards/{BOLT_ID}/rulings"))
         assert body["object"] == "list"
         assert body["data"][0]["object"] == "ruling"
-        assert body["data"][0]["comment"] == "Any target means any target."
+
+    def test_rulings_are_newest_first_like_scryfalls(self, compat_corpus: APIResource):
+        """The order api.scryfall.com serves: `published_at` descending.
+
+        Measured against it on 2026-08-12 -- 16 of 16 cards whose rulings span more than one date
+        came back newest-first, 0 oldest-first. The ascending sort this replaced inverted every one
+        of them, which is the opposite of what a compatibility surface is for.
+
+        The order WITHIN one date is `comment` only because something has to be deterministic:
+        Scryfall breaks that tie with an internal ruling id the bulk file does not carry.
+        """
+        body = payload(dispatch(compat_corpus, f"/cards/{BOLT_ID}/rulings"))
+        assert [(row["published_at"], row["comment"]) for row in body["data"]] == [
+            ("2021-02-05", "A later clarification."),
+            ("2021-02-05", "Zero damage is still damage."),
+            ("2004-10-04", "Any target means any target."),
+        ]
 
     def test_rulings_by_set_and_collector_number(self, compat_corpus: APIResource):
         body = payload(dispatch(compat_corpus, f"/cards/{SET_CODE}/1/rulings"))
-        assert len(body["data"]) == 1
+        assert len(body["data"]) == 3
 
     @pytest.mark.parametrize(
         ("namespace", "external_id"),
@@ -540,7 +563,7 @@ class TestRulings:
     )
     def test_rulings_by_external_id(self, compat_corpus: APIResource, namespace, external_id):
         body = payload(dispatch(compat_corpus, f"/cards/{namespace}/{external_id}/rulings"))
-        assert len(body["data"]) == 1
+        assert len(body["data"]) == 3
 
     def test_a_card_with_no_rulings_returns_an_empty_list(self, compat_corpus: APIResource):
         body = payload(dispatch(compat_corpus, f"/cards/{BEAR_ID}/rulings"))
