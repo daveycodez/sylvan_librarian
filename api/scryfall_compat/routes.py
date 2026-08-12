@@ -29,7 +29,6 @@ import re
 from typing import TYPE_CHECKING, Any
 
 import falcon
-import orjson
 
 from api.enums import CardOrdering, PreferOrder, SortDirection, UniqueOn
 from api.parsing import generate_sql_query, parse_scryfall_query
@@ -52,6 +51,7 @@ from api.scryfall_compat.objects import (
     sql_row_to_engine_row,
     to_scryfall_card,
 )
+from api.scryfall_compat.responder import ScryfallResponder
 from api.settings import settings
 from api.utils.routing import route
 
@@ -248,10 +248,6 @@ def _set_cards_cache(falcon_response: falcon.Response | None) -> None:
 # reached over TLS, which is what `next_page` has to say for a client to follow it.
 _PLAINTEXT_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "[::1]")  # noqa: S104
 
-# Spelled out rather than falcon.MEDIA_JSON, which omits the charset Scryfall sends.
-_JSON_CONTENT_TYPE = "application/json; charset=utf-8"
-
-
 # Scryfall's three not-found bodies for these routes, measured against api.scryfall.com on
 # 2026-08-12. They are worded by the SHAPE of the path rather than by the outcome, and none of them
 # is the single string this used to answer with -- which carried a "Please double-check your URI and
@@ -418,56 +414,15 @@ def _cards_to_csv(cards: Sequence[dict[str, Any]]) -> str:
     return buffer.getvalue()
 
 
-class ScryfallCardsRoutes:
+class ScryfallCardsRoutes(ScryfallResponder):
     """The `/cards/*` routes, mixed into `APIResource`.
 
     Every handler returns the value that becomes the response body, or None after writing the
     response itself (the text and CSV formats, which are not JSON). Errors are returned as
     Scryfall error objects with the matching status rather than raised, so the generic Falcon
-    error serializer never sees them.
+    error serializer never sees them — `ScryfallResponder` is where that rule lives, shared with
+    the `/sets`, `/catalog` and `/symbology` routes.
     """
-
-    # ---------------------------------------------------------------- response plumbing
-
-    def _scryfall_respond(
-        self,
-        falcon_response: falcon.Response | None,
-        payload: dict[str, Any],
-        *,
-        pretty: bool = False,
-    ) -> dict[str, Any] | None:
-        """Write a JSON payload, honoring the error status it carries and `pretty`.
-
-        Args:
-            falcon_response: The response to write to.
-            payload: The Scryfall object to serialize.
-            pretty: Whether to emit indented JSON.
-
-        Returns:
-            The payload when the caller should let the framework serialize it, or None when this
-            method already wrote the body.
-        """
-        if falcon_response is not None:
-            falcon_response.content_type = _JSON_CONTENT_TYPE
-            status = payload.get("status") if payload.get("object") == "error" else None
-            if isinstance(status, int):
-                falcon_response.status = falcon.util.code_to_http_status(status)
-            if pretty:
-                falcon_response.text = orjson.dumps(payload, option=orjson.OPT_INDENT_2).decode()
-                return None
-        return payload
-
-    def _respond_text(self, falcon_response: falcon.Response | None, body: str, content_type: str) -> None:
-        """Write a non-JSON body.
-
-        Args:
-            falcon_response: The response to write to.
-            body: The rendered document.
-            content_type: Its media type.
-        """
-        if falcon_response is not None:
-            falcon_response.content_type = content_type
-            falcon_response.text = body
 
     def _render_card(  # noqa: PLR0913
         self,

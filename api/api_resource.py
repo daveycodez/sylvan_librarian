@@ -47,7 +47,10 @@ from api.noscript_helpers import generate_results_count_html, generate_results_h
 from api.parsing import generate_sql_query, parse_scryfall_query
 from api.rulings_import import import_rulings as _import_rulings
 from api.scryfall_bulk_data_fetcher import BulkDataKey, ScryfallBulkDataFetcher
-from api.scryfall_compat import ScryfallCardsRoutes
+from api.scryfall_compat import ScryfallCardsRoutes, ScryfallReferenceRoutes
+from api.scryfall_reference_import import import_catalogs as _import_catalogs
+from api.scryfall_reference_import import import_sets as _import_sets
+from api.scryfall_reference_import import import_symbology as _import_symbology
 from api.settings import settings
 from api.tag_import import import_art_tags as _import_art_tags
 from api.tag_import import import_oracle_tags as _import_oracle_tags
@@ -638,12 +641,15 @@ def _columnarize_cards(cards: list[dict[str, Any]]) -> dict[str, list[Any]]:
     return {k: [c[k] for c in cards] for k in keys}
 
 
-class APIResource(ScryfallCardsRoutes):
+class APIResource(ScryfallCardsRoutes, ScryfallReferenceRoutes):
     """Class implementing request handling for our simple API.
 
-    The Scryfall-compatible `/cards/*` routes live in the base class rather than here: they are a
+    The Scryfall-compatible routes live in the base classes rather than here: they are a
     self-contained compatibility surface with their own response objects, and `iter_marked_routes`
-    scans inherited attributes, so they register exactly like the routes defined below.
+    scans inherited attributes, so they register exactly like the routes defined below. They are
+    two mixins rather than one because they answer from different places — `ScryfallCardsRoutes`
+    from the corpus and the engine, `ScryfallReferenceRoutes` from the tables mirrored off
+    api.scryfall.com — and share only the response plumbing in `ScryfallResponder`.
     """
 
     def __init__(
@@ -1166,6 +1172,10 @@ class APIResource(ScryfallCardsRoutes):
             # Rulings feed only /cards/*/rulings, so nothing above or below depends on them; they
             # sit here rather than in their own pass so one bulk fetch cycle refreshes everything.
             self._import_rulings_quietly()
+            # Alongside the rulings and for the same reason: reference data nothing else in this
+            # sequence reads, refreshed on the same cycle so one pass brings the whole surface up
+            # to date rather than leaving /sets and /catalog to age until a manual call.
+            self._import_reference_quietly()
             self._reload_engine(force=True)
             self._clear_caches()
             self._last_import_time.value = time.time()
@@ -2464,6 +2474,51 @@ class APIResource(ScryfallCardsRoutes):
             _import_rulings(self._conn_pool, self._bulk_data_fetcher)
         except Exception:
             logger.exception("Rulings import failed; continuing with the rest of the import")
+
+    @route()
+    def import_sets(self, **_: object) -> dict[str, Any]:
+        """Mirror Scryfall's set list into magic.sets, backing the /sets routes.
+
+        Returns:
+            A summary of the load.
+        """
+        return _import_sets(self._conn_pool, self._bulk_data_fetcher)
+
+    @route()
+    def import_catalogs(self, **_: object) -> dict[str, Any]:
+        """Mirror the twenty Scryfall catalogs into magic.catalogs, backing /catalog/*.
+
+        Returns:
+            A summary of the load.
+        """
+        return _import_catalogs(self._conn_pool, self._bulk_data_fetcher)
+
+    @route()
+    def import_symbology(self, **_: object) -> dict[str, Any]:
+        """Mirror Scryfall's card symbols into magic.card_symbols, backing /symbology.
+
+        Returns:
+            A summary of the load.
+        """
+        return _import_symbology(self._conn_pool, self._bulk_data_fetcher)
+
+    def _import_reference_quietly(self) -> None:
+        """Refresh sets, catalogs and symbology during a bulk import, logging rather than failing.
+
+        Each of the three is independent of the other two and of everything else in the sequence,
+        so one failing upstream endpoint must not cost the other two their refresh — nor the corpus
+        its. This is the rulings argument applied three more times: nothing downstream reads any of
+        these tables, so a stale one degrades three endpoints rather than breaking the import.
+        """
+        for name, step in (
+            ("Set", _import_sets),
+            ("Catalog", _import_catalogs),
+            ("Symbology", _import_symbology),
+        ):
+            try:
+                step(self._conn_pool, self._bulk_data_fetcher)
+            except Exception:
+                logger.exception("%s import failed; continuing with the rest of the import", name)
 
     @route()
     def import_all_is_tags(self, **_: object) -> dict[str, Any]:

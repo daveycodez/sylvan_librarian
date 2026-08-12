@@ -403,6 +403,18 @@ Every route Scryfall documents under `/cards`, answering with Scryfall's own res
 chiefly that the corpus is a filtered subset of Scryfall's — is recorded in
 [docs/issues/local-scryfall-cards-api.md](docs/issues/local-scryfall-cards-api.md).
 
+The reference half of the API, mirrored from Scryfall rather than derived from the corpus:
+
+- **GET /sets**, **/sets/:code**, **/sets/:id**, **/sets/tcgplayer/:id** - 1,047 Set objects
+- **GET /catalog/:name** - all twenty catalogs, 62,187 values
+- **GET /symbology** - 84 card symbols
+- **GET /symbology/parse-mana?cost=** - computed, not stored, so it answers before the first import
+
+These are mirrored because the corpus cannot answer them: a Set object carries eight fields no card
+carries, `card_count` counts printings this instance never imported, and a symbol's `svg_uri` exists
+nowhere in the card data. Details in
+[docs/issues/local-scryfall-sets-catalogs-symbology.md](docs/issues/local-scryfall-sets-catalogs-symbology.md).
+
 ### Tagging Endpoints
 
 - **GET /update_tagged_cards** - Import cards for specific tags

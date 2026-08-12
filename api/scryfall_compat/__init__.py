@@ -6,6 +6,7 @@ the same response objects, so a client can be pointed at this host by swapping i
 and the `format=text` rendering — with no knowledge of Falcon or of the database.
 """
 
+from api.scryfall_compat.reference_routes import ScryfallReferenceRoutes
 from api.scryfall_compat.routes import ScryfallCardsRoutes
 
-__all__ = ["ScryfallCardsRoutes"]
+__all__ = ["ScryfallCardsRoutes", "ScryfallReferenceRoutes"]
