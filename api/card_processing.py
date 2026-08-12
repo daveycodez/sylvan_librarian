@@ -256,8 +256,10 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
     card["planeswalker_loyalty_text"] = card.get("loyalty")
     card["card_artist"] = card.get("artist")
 
-    # Handle CMC and edhrec_rank conversion using helper function
-    card["cmc"] = maybe_int(card.get("cmc"))
+    # Mana value is a Decimal in Scryfall's schema, not an Integer: {HW} gives Little Girl a
+    # cmc of exactly 0.5. maybe_int here did `int(float(val))`, which rounded that to 0 — the
+    # column is `real` as of 2026-08-12-01-fractional-mana-value.sql, so keep the float.
+    card["cmc"] = maybe_float(card.get("cmc"))
 
     # Handle rarity conversion - implement in Python to avoid SQL boilerplate
     rarity_text = card.get("rarity", "").lower()

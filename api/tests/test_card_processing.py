@@ -397,6 +397,29 @@ class TestCardProcessing:
         assert result["creature_power"] is None
         assert result["creature_toughness"] is None
 
+    def test_preprocess_card_keeps_a_fractional_mana_value(self) -> None:
+        """A half-mana card's cmc survives the import cast.
+
+        Scryfall types cmc Decimal, and the {HW} symbol is what makes that matter:
+        /cards/named?exact=Little+Girl answers "mana_cost":"{HW}", "cmc":0.5. The cast here
+        used to be int(float(val)), which turned that into 0 — the same value a zero-cost
+        card has. (Little Girl itself is still filtered out of the corpus by the funny-set
+        and legality rules above; this is about the cast, not the corpus.)
+        """
+        card = create_test_card(name="Little Girl", mana_cost="{HW}", cmc=0.5, power="1", toughness="1")
+
+        result = preprocess_card(card)
+
+        assert result[0]["cmc"] == 0.5
+
+    def test_preprocess_card_keeps_a_whole_mana_value_whole(self) -> None:
+        """Widening the cast must not perturb the ~31.5k rows that are already integral."""
+        card = create_test_card(name="Lightning Bolt", mana_cost="{R}", cmc=1)
+
+        result = preprocess_card(card)
+
+        assert result[0]["cmc"] == 1
+
     def test_preprocess_hound_tamer_dfc(self) -> None:
         """Test preprocess_card processes Hound Tamer DFC sample data correctly."""
         sample_file = _SAMPLE_DATA_DIR / "hound_tamer.json"

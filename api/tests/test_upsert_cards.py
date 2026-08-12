@@ -15,7 +15,7 @@ from api.api_resource import APIResource
 from api.card_processing import preprocess_card
 from api.db.bulk_upsert import bulk_upsert
 from api.scryfall_bulk_data_fetcher import BulkDataKey
-from api.tests.helpers import make_raw_card
+from api.tests.helpers import make_raw_card, search_kwargs
 from api.tests.support import mock_app_context
 
 if TYPE_CHECKING:
@@ -220,6 +220,74 @@ class TestBooleanIsTags:
         card["preview"] = {"source": "The Command Zone"}
         api_resource.admin._upsert_cards([card])
         assert "scryfallpreview" not in _is_tags_for(api_resource, card["id"])
+
+
+def _cmc_for(api_resource: APIResource, scryfall_id: str) -> float | None:
+    with api_resource._conn_pool.connection() as conn, conn.cursor() as cursor:
+        cursor.execute("SELECT cmc FROM magic.cards WHERE scryfall_id = %(sid)s", {"sid": scryfall_id})
+        row = cursor.fetchone()
+    return row["cmc"] if row else None
+
+
+class TestFractionalManaValue:
+    """A fractional cmc survives the whole import round trip: cast, column, read back.
+
+    Scryfall types cmc Decimal — /cards/named?exact=Little+Girl answers "mana_cost":"{HW}",
+    "cmc":0.5 — and the column was `integer` until
+    2026-08-12-01-fractional-mana-value.sql. These write through the real _upsert_cards
+    path and read the stored column, so they cover the import cast and the schema
+    together; either one still being integer-shaped fails them.
+
+    The corpus itself is unchanged: the only card with a fractional mana value is in a
+    funny set, which preprocess_card still drops. These construct their own card.
+    """
+
+    def test_half_mana_value_stores_as_a_half(self, api_resource: APIResource) -> None:
+        card = make_raw_card(name="Half Mana Import Test")
+        card["mana_cost"] = "{HW}"
+        card["cmc"] = 0.5
+        api_resource._upsert_cards([card])
+        assert _cmc_for(api_resource, card["id"]) == 0.5
+
+    def test_whole_mana_value_still_stores_whole(self, api_resource: APIResource) -> None:
+        """The ~31.5k rows that were already integral must read back unchanged."""
+        card = make_raw_card(name="Whole Mana Import Test")
+        card["mana_cost"] = "{2}{R}"
+        card["cmc"] = 3
+        api_resource._upsert_cards([card])
+        assert _cmc_for(api_resource, card["id"]) == 3
+
+    def test_a_half_is_findable_through_the_sql_search_path(self, api_resource: APIResource) -> None:
+        """`mv=0.5` binds a Python float against the column and matches in real Postgres.
+
+        Membership rather than equality on the result set, as this fixture's session-shared
+        database requires — other tests in this class import half-mana cards of their own.
+        """
+        card = make_raw_card(name="Half Mana Search Test")
+        card["mana_cost"] = "{HW}"
+        card["cmc"] = 0.5
+        api_resource._upsert_cards([card])
+
+        found = {c["name"] for c in api_resource._search_sql(**search_kwargs("mv=0.5", limit=100))["cards"]}
+        assert "Half Mana Search Test" in found
+        # ...and the whole-number predicate its floor would have collapsed into stays clean.
+        zero = {c["name"] for c in api_resource._search_sql(**search_kwargs("mv=0", limit=100))["cards"]}
+        assert "Half Mana Search Test" not in zero
+
+    def test_the_column_is_not_an_integer_type(self, api_resource: APIResource) -> None:
+        """The column type is asserted directly, not just inferred from a round trip.
+
+        A passing round trip alone would not distinguish a `real` column from an `integer`
+        one that happened to be handed whole numbers.
+        """
+        with api_resource._conn_pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                """SELECT data_type FROM information_schema.columns
+                   WHERE table_schema = 'magic' AND table_name = 'cards' AND column_name = 'cmc'""",
+            )
+            row = cursor.fetchone()
+        assert row is not None
+        assert row["data_type"] == "real"
 
 
 # ---------------------------------------------------------------------------

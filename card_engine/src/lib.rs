@@ -261,7 +261,13 @@ struct OracleCard {
     mana_cost_text_id: u32,
     type_line_id: u32,
 
-    cmc: Option<u8>,                  // always an integer; max ~16 in practice
+    // Mana value. Scryfall types this field Decimal, not Integer, and means it: the
+    // half-mana symbol {HW} gives Little Girl (Unhinged) a cmc of exactly 0.5. f32 is the
+    // same type the `real` column it loads from holds, so nothing rounds on the way in;
+    // whole numbers up to 2^24 and every half step are exact. The corpus filter still
+    // drops funny sets, so today every stored value is integral and this only stops the
+    // TYPE from being the thing that loses the fraction.
+    cmc: Option<f32>,
     creature_power: Option<i8>,       // can be negative (e.g. Char-Rumbler)
     creature_toughness: Option<i8>,
     planeswalker_loyalty: Option<u8>, // always 1-12
@@ -371,7 +377,7 @@ struct CardRow {
     set_name_id: u32,
     released_at_int: Option<u32>,
 
-    cmc: Option<u8>,
+    cmc: Option<f32>,
     creature_power: Option<i8>,
     creature_toughness: Option<i8>,
     planeswalker_loyalty: Option<u8>,
@@ -763,7 +769,9 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
         card_color_identity: jsonb_color_to_bits(d, "card_color_identity"),
         produced_mana: jsonb_color_to_bits(d, "produced_mana"),
 
-        cmc: opt_u8(d, "cmc"), // Un-set cards have fractional cmc, but we don't load those into the dataset
+        // Read as f32, not truncated to an integer: `mana_cost` below already asked for the
+        // same key as an f32, so an integer cmc here was the only place the two disagreed.
+        cmc: opt_f32(d, "cmc"),
         creature_power: opt_i8(d, "creature_power"),
         creature_toughness: opt_i8(d, "creature_toughness"),
         planeswalker_loyalty: opt_u8(d, "planeswalker_loyalty"),
@@ -1500,19 +1508,28 @@ fn union_sorted(a: Vec<u32>, b: Vec<u32>) -> Vec<u32> {
 }
 
 // ─── Numeric index ────────────────────────────────────────────────────────────
-// Sorted Vec<(i16, u32)> maps field value -> card index for cmc/power/toughness.
-// i16 covers both u8 (cmc: 0-255) and i8 (power/toughness: -128-127) without loss.
+// Sorted Vec<(f32, u32)> maps field value -> card index for cmc/power/toughness.
+// f32 was i16 until cmc became fractional (Scryfall types it Decimal — {HW} is 0.5):
+// the key has to hold what the field holds, or `cmc=0.5` can only ever answer nothing.
+// Widening costs no memory — (i16, u32) already padded to 8 bytes for the u32's
+// alignment, and (f32, u32) is 8 bytes with no padding at all — and no precision:
+// power/toughness are i8 and every i8 is exact in f32.
 // Binary search gives the candidate slice; sort by card index for intersection.
 
-type NumericIndex = Vec<(i16, u32)>;
+type NumericIndex = Vec<(f32, u32)>;
 
-fn build_numeric_index(cards: &[OracleCard], get_val: impl Fn(&OracleCard) -> Option<i16>) -> NumericIndex {
+fn build_numeric_index(cards: &[OracleCard], get_val: impl Fn(&OracleCard) -> Option<f32>) -> NumericIndex {
     let mut idx: NumericIndex = cards
         .iter()
         .enumerate()
         .filter_map(|(i, c)| get_val(c).map(|v| (v, i as u32)))
         .collect();
-    idx.sort_unstable();
+    // total_cmp rather than a derived Ord, which f32 doesn't have. No value in here is NaN
+    // (each one is a number Postgres stored in a `real`/`integer` column), so the total
+    // order and the numeric order agree on everything actually present; total_cmp just
+    // spares the partial_cmp unwrap. Ties break on card index so the slice stays ascending
+    // in id — the invariant `sort_unstable` on a (key, id) tuple used to give for free.
+    idx.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     idx
 }
 
@@ -1554,18 +1571,21 @@ fn negate_op(op: CmpOp) -> CmpOp {
 /// `n_cards` is the id DOMAIN, which is not `idx.len()`: the numeric indexes are nullable (a card with
 /// no power has no entry), so ids run past the index's length and a bitmap sized from it would panic.
 fn numeric_candidates(idx: &Archived<NumericIndex>, op: CmpOp, val: f64, n_cards: usize) -> Option<Vec<u32>> {
+    // No `val.fract() != 0.0 => empty` shortcut for Eq any more: that was only ever sound
+    // while every indexed value was an integer, and `cmc=0.5` is exactly the query it
+    // would answer wrongly now. Binary search needs no such special case — a threshold no
+    // card holds produces an empty [s, e) on its own.
     let (start, end) = match op {
         CmpOp::Ne => return None,
         CmpOp::Eq => {
-            if val.fract() != 0.0 { return Some(Vec::new()); }
-            let s = idx.partition_point(|p| (i16::from(p.0) as f64) < val);
-            let e = idx.partition_point(|p| (i16::from(p.0) as f64) <= val);
+            let s = idx.partition_point(|p| (f32::from(p.0) as f64) < val);
+            let e = idx.partition_point(|p| (f32::from(p.0) as f64) <= val);
             (s, e)
         }
-        CmpOp::Lt => (0, idx.partition_point(|p| (i16::from(p.0) as f64) < val)),
-        CmpOp::Le => (0, idx.partition_point(|p| (i16::from(p.0) as f64) <= val)),
-        CmpOp::Gt => (idx.partition_point(|p| (i16::from(p.0) as f64) <= val), idx.len()),
-        CmpOp::Ge => (idx.partition_point(|p| (i16::from(p.0) as f64) < val), idx.len()),
+        CmpOp::Lt => (0, idx.partition_point(|p| (f32::from(p.0) as f64) < val)),
+        CmpOp::Le => (0, idx.partition_point(|p| (f32::from(p.0) as f64) <= val)),
+        CmpOp::Gt => (idx.partition_point(|p| (f32::from(p.0) as f64) <= val), idx.len()),
+        CmpOp::Ge => (idx.partition_point(|p| (f32::from(p.0) as f64) < val), idx.len()),
     };
     // Card space, so the domain is `n_cards` -- `MATERIALIZE_BITMAP_RATIO` reads the domain rather than
     // assuming printing space, which is the whole reason it is a ratio.
@@ -1587,9 +1607,18 @@ fn numeric_candidates(idx: &Archived<NumericIndex>, op: CmpOp, val: f64, n_cards
 /// natively at build-time interning — no sentinel encoding. `f64::from` on the
 /// stored ints is lossless (all four domains fit exactly in f32, so also f64) and
 /// matches field_num's own widening exactly (the differential test asserts this).
+///
+/// cmc is held as its `f32::to_bits` pattern rather than as an `f32`, because this key
+/// is a HashMap key and f32 has neither `Eq` nor `Hash`. The two ways bit equality can
+/// disagree with numeric equality are NaN (never equal to itself) and ±0.0 (equal but
+/// bitwise distinct); neither reaches here, because every value is a mana value Postgres
+/// stored — a finite, non-negative number, and Scryfall's own `0` for a zero-cost card
+/// arrives as +0.0. Interning on bits is therefore exactly interning on value, and a
+/// mis-intern would cost only a duplicate combination, never a wrong verdict: each
+/// combination is re-evaluated from its own stored key.
 #[derive(Archive, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
 struct ArithTupleKey {
-    cmc: Option<u8>,
+    cmc_bits: Option<u32>,
     power: Option<i8>,
     toughness: Option<i8>,
     loyalty: Option<u8>,
@@ -1647,7 +1676,7 @@ fn build_arith_tuple_index(cards: &[OracleCard]) -> ArithTupleIndex {
     let mut postings: Vec<Vec<u32>> = Vec::new();
     for (i, c) in cards.iter().enumerate() {
         let key = ArithTupleKey {
-            cmc: c.cmc,
+            cmc_bits: c.cmc.map(f32::to_bits),
             power: c.creature_power,
             toughness: c.creature_toughness,
             loyalty: c.planeswalker_loyalty,
@@ -1693,7 +1722,10 @@ fn arith_tuple_narrow(filter: &FilterExpr, idx: &Archived<ArithTupleIndex>, n_ca
         // Widen exactly as field_num does (see ArithTupleKey's doc): u8/i8 → f64 is lossless and
         // matches field_num's `_ as f32 as f64` for these domains. The archived Option<u8>/<i8>
         // store their scalars natively (no endian wrapper), so `f64::from(*v)` reads them directly.
-        let cmc = key.cmc.as_ref().map(|v| f64::from(*v));
+        // cmc goes back through `from_bits` first — same round trip `to_bits` made at build time,
+        // so what field_num would read off the card and what this reads off the key are the same
+        // f32 before either widens to f64.
+        let cmc = key.cmc_bits.as_ref().map(|v| f64::from(f32::from_bits(u32::from(*v))));
         let power = key.power.as_ref().map(|v| f64::from(*v));
         let toughness = key.toughness.as_ref().map(|v| f64::from(*v));
         let loyalty = key.loyalty.as_ref().map(|v| f64::from(*v));
@@ -2422,7 +2454,7 @@ fn build_sort_permutations(cards: &[OracleCard]) -> SortPermutations {
     };
     let (edhrec, edhrec_inv) = both(&|c| c.edhrec_rank.map(|v| v as f32));
     let (cubecobra, cubecobra_inv) = both(&|c| c.cubecobra_score);
-    let (cmc, cmc_inv) = both(&|c| c.cmc.map(|v| v as f32));
+    let (cmc, cmc_inv) = both(&|c| c.cmc);
     let (power, power_inv) = both(&|c| c.creature_power.map(|v| v as f32));
     let (toughness, toughness_inv) = both(&|c| c.creature_toughness.map(|v| v as f32));
     let (name, name_inv) = both(&|c| Some(c.name_rank as f32));
@@ -11743,7 +11775,16 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 // are `AOracleCard` and `APrinting`, and neither moves, because the change is entirely inside
 // `CardIndexes`. So this constant is the only thing stopping a reader from accessing an older
 // store's `HashMap<String, Vec<u32>>` as a `HybridTagIndex` through `access_unchecked`.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026081301;
+//
+// 2026082301 — cmc went `Option<u8>` -> `Option<f32>` on `OracleCard`, `NumericIndex`'s key went
+// `i16` -> `f32`, and `ArithTupleKey` / `BucketBounds` changed with them. The struct sizes below
+// happen to move too (`size_of::<AOracleCard>` measures 288 before and 304 after), so the header
+// would reject an old store even without this — but only by luck of the OracleCard change: the
+// three INDEX types are not measured by the header at all, and a change confined to them would
+// slip straight through. That is the case this field exists for, and reading an old store under
+// the new layout would reinterpret integer cmc bytes as float bits and answer nonsense rather
+// than fail loudly.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026082301;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -12299,9 +12340,9 @@ impl QueryEngine {
         let indexes = CardIndexes {
             name_trigram:   build_trigram_index(&cards, |c| c.card_name_folded.as_str()),
             oracle_trigram: build_oracle_text_index(&cards, &strings),
-            cmc:            build_numeric_index(&cards, |c| c.cmc.map(|v| v as i16)),
-            power:          build_numeric_index(&cards, |c| c.creature_power.map(|v| v as i16)),
-            toughness:      build_numeric_index(&cards, |c| c.creature_toughness.map(|v| v as i16)),
+            cmc:            build_numeric_index(&cards, |c| c.cmc),
+            power:          build_numeric_index(&cards, |c| c.creature_power.map(f32::from)),
+            toughness:      build_numeric_index(&cards, |c| c.creature_toughness.map(f32::from)),
             rarity:         build_rarity_index(&printings, &offsets),
             subtypes:       build_hybrid_tag_index(&cards, &coll_vocab, |c| &c.card_subtypes),
             keywords:       build_hybrid_tag_index(&cards, &coll_vocab, |c| &c.card_keywords),

@@ -73,6 +73,34 @@ def engine_fixture(fresh_engine: Callable[[], QueryEngine]) -> QueryEngine:
     return e
 
 
+#: Ascending, and one of them is a half — see TestFractionalManaValue.
+_HALF_MANA_CMCS = (0.0, 0.5, 1.0, 2.5, 3.0)
+
+
+@pytest.fixture(scope="module", name="half_mana_engine")
+def half_mana_engine_fixture(fresh_engine: Callable[[], QueryEngine]) -> QueryEngine:
+    """Five cards named after their own mana value, one of them a half.
+
+    Built off a real fixture row so every other column is a shape the engine has already
+    been loaded with; only the identity fields and cmc vary.
+    """
+    template = json.loads(_FIXTURE.read_text())[0]
+    cards = []
+    for i, cmc in enumerate(_HALF_MANA_CMCS):
+        card = dict(template)
+        card["card_name"] = f"Card {cmc}"
+        card["card_name_folded"] = card["card_name"].lower()
+        card["cmc"] = cmc
+        card["oracle_id"] = str(uuid.UUID(int=i + 1))
+        card["scryfall_id"] = str(uuid.UUID(int=1000 + i))
+        card["illustration_id"] = str(uuid.UUID(int=2000 + i))
+        card["edhrec_rank"] = i + 1
+        cards.append(card)
+    e = fresh_engine()
+    e.reload(cards)
+    return e
+
+
 def _run(
     engine: QueryEngine,
     q: str = "",
@@ -582,6 +610,48 @@ class TestSort:
         _, desc_cards = _run(engine, 'name="Lightning Bolt"', orderby="edhrec", direction="desc")
         # Reversed direction should produce reversed order (10 distinct printings)
         assert _names(asc_cards) == list(reversed(_names(desc_cards)))
+
+
+class TestFractionalManaValue:
+    """A mana value is a Decimal in Scryfall's schema, and one card exercises that.
+
+    The half-mana symbol {HW} gives Little Girl (Unhinged) a mana value of exactly 0.5 —
+    checked against the live API on 2026-08-12, /cards/named?exact=Little+Girl answers
+    "mana_cost":"{HW}", "cmc":0.5, and it is the only card in the whole corpus with a
+    fractional one. It is not in the dataset (api/card_processing.py drops set_type ==
+    "funny", and it is legal in no format either), so this builds its own store rather
+    than adding a 91st printing to the shared fixture: the point is that the value can
+    make the round trip from a query string, through the parser, into the engine and back
+    out in the right order — not that the corpus contains it.
+
+    Each of these fails when cmc is an integer, and in both directions: `mv=0.5` finds
+    nothing, and `mv=0` starts finding the half-mana card.
+    """
+
+    def test_half_mana_value_is_findable(self, half_mana_engine: QueryEngine) -> None:
+        total, cards = _run(half_mana_engine, "mv=0.5")
+        assert total == 1
+        assert _names(cards) == ["Card 0.5"]
+
+    def test_zero_does_not_match_a_half(self, half_mana_engine: QueryEngine) -> None:
+        """The direction an integer column gets wrong silently: 0.5 truncates onto 0."""
+        total, cards = _run(half_mana_engine, "cmc=0")
+        assert total == 1
+        assert _names(cards) == ["Card 0.0"]
+
+    def test_a_half_sits_strictly_between_its_neighbours(self, half_mana_engine: QueryEngine) -> None:
+        assert _run(half_mana_engine, "mv<1")[0] == 2  # 0 and 0.5
+        assert _run(half_mana_engine, "mv>0.5")[0] == 3  # 1, 2.5, 3 — not 0.5 itself
+        assert _run(half_mana_engine, "mv>=0.5 mv<=2.5")[0] == 3  # 0.5, 1, 2.5
+
+    def test_every_alias_spells_the_same_fraction(self, half_mana_engine: QueryEngine) -> None:
+        """The cmc / mv / manavalue aliases are one field (api/parsing/db_info.py), fraction included."""
+        for alias in ("cmc", "mv", "manavalue"):
+            assert _run(half_mana_engine, f"{alias}=2.5")[0] == 1, alias
+
+    def test_sort_orders_a_half_between_the_integers(self, half_mana_engine: QueryEngine) -> None:
+        _, cards = _run(half_mana_engine, orderby="cmc", direction="asc")
+        assert _names(cards) == [f"Card {cmc}" for cmc in _HALF_MANA_CMCS]
 
 
 class TestDevotion:
