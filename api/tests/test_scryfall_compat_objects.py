@@ -210,6 +210,17 @@ class TestEnvelopes:
     def test_catalog_object_counts_its_values(self):
         assert catalog_object(["Bolt", "Shock"]) == {"object": "catalog", "total_values": 2, "data": ["Bolt", "Shock"]}
 
+    def test_the_uri_is_present_only_when_given(self) -> None:
+        """`/catalog/*` sends one and `/cards/autocomplete` does not, both measured 2026-08-12.
+
+        So the default has to stay absent: building one unconditionally would put a key on the
+        autocomplete catalog that Scryfall never sends there.
+        """
+        assert "uri" not in catalog_object(["Bolt"])
+        with_uri = catalog_object(["Bolt"], uri="https://api.scryfall.com/catalog/card-names")
+        assert with_uri["uri"] == "https://api.scryfall.com/catalog/card-names"
+        assert list(with_uri) == ["object", "uri", "total_values", "data"]
+
     def test_ruling_object_renders_the_date_as_iso(self):
         row = {
             "oracle_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",

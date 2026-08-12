@@ -145,6 +145,20 @@ class TestSetLookup:
     def test_by_tcgplayer_id(self, reference_corpus: APIResource) -> None:
         assert payload(dispatch(reference_corpus, f"/sets/tcgplayer/{TCGPLAYER_ID}"))["code"] == "zzt"
 
+    @pytest.mark.parametrize(
+        "path",
+        ["/sets/zzz", "/sets/tcgplayer/999999", "/sets/tcgplayer", "/sets/00000000-0000-4000-8000-000000000000"],
+    )
+    def test_a_set_miss_carries_scryfalls_own_wording(self, reference_corpus: APIResource, path: str) -> None:
+        """Not the cards surface's generic body, and not a message about the id being absent.
+
+        Captured from api.scryfall.com on 2026-08-12, including the `/sets/tcgplayer` shape: it
+        answers the ordinary set miss there too.
+        """
+        resp = dispatch(reference_corpus, path)
+        assert resp.status == falcon.HTTP_404
+        assert payload(resp)["details"] == "No Magic set found for the given code or ID"
+
     def test_an_unknown_code_is_a_404(self, reference_corpus: APIResource) -> None:
         resp = dispatch(reference_corpus, "/sets/nope")
         assert resp.status == falcon.HTTP_404
@@ -170,10 +184,24 @@ class TestCatalog:
         assert body["total_values"] == len(CREATURE_TYPES)
         assert body["data"] == CREATURE_TYPES
 
+    def test_a_catalog_carries_its_own_uri(self, reference_corpus: APIResource) -> None:
+        """Measured: `/catalog/*` sends `uri`, and it sits between `object` and `total_values`.
+
+        `/cards/autocomplete` answers the same object with no `uri` at all, which is why
+        `catalog_object` takes one rather than always building one -- see the test below.
+        """
+        body = payload(dispatch(reference_corpus, "/catalog/creature-types"))
+        assert body["uri"] == "https://api.scryfall.com/catalog/creature-types"
+        assert list(body) == ["object", "uri", "total_values", "data"]
+
     def test_an_unknown_catalog_is_a_404(self, reference_corpus: APIResource) -> None:
         resp = dispatch(reference_corpus, "/catalog/not-a-catalog")
         assert resp.status == falcon.HTTP_404
-        assert payload(resp)["object"] == "error"
+        body = payload(resp)
+        assert body["object"] == "error"
+        # Scryfall's catalog miss has no "Please double-check your URI and try again." tail, where
+        # the cards surface's generic body does. Measured, not assumed.
+        assert body["details"] == "The requested object or REST method was not found."
 
     def test_a_known_but_unimported_catalog_is_empty_rather_than_missing(self, reference_corpus: APIResource) -> None:
         """The name is real, so 404 would tell a client the endpoint does not exist."""
@@ -215,7 +243,10 @@ class TestParseMana:
         """Scryfall answers 422 here, not 400."""
         resp = dispatch(reference_corpus, "/symbology/parse-mana", "cost=%7BQ%7D")
         assert resp.status == falcon.HTTP_422
-        assert payload(resp)["object"] == "error"
+        body = payload(resp)
+        assert body["object"] == "error"
+        # `validation_error`, which is what Scryfall sends with this 422 -- not `bad_request`.
+        assert body["code"] == "validation_error"
 
     def test_it_answers_without_any_imported_data(self, reference_corpus: APIResource) -> None:
         """A pure function of the parameter, so it works before the first import."""

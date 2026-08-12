@@ -76,6 +76,22 @@ CATALOG_NAMES = (
     "flavor-words",
 )
 
+# Scryfall's own not-found wording on these routes, measured against api.scryfall.com on
+# 2026-08-12. Neither is the generic body the cards surface sends, and the catalog one is that
+# sentence WITHOUT its "Please double-check your URI and try again." tail -- same sentence,
+# different ending, so they are spelled out separately rather than shared.
+#
+#   /sets/<code>, /sets/<id>, /sets/tcgplayer/<id>, /sets/tcgplayer
+#       "No Magic set found for the given code or ID"
+#   /catalog/<unknown>
+#       "The requested object or REST method was not found."
+_SET_MISS_DETAILS = "No Magic set found for the given code or ID"
+_CATALOG_MISS_DETAILS = "The requested object or REST method was not found."
+
+# The host a Catalog's own `uri` points at: Scryfall's, not this service's, which is the rule the
+# card objects already follow for `uri`, `rulings_uri` and `prints_search_uri`.
+_SCRYFALL_API = "https://api.scryfall.com"
+
 # Path segment naming the external-id namespace under /sets, mirroring the /cards namespaces.
 _SETS_TCGPLAYER_NAMESPACE = "tcgplayer"
 
@@ -148,11 +164,9 @@ class ScryfallReferenceRoutes(ScryfallResponder):
 
         if identifier.lower() == _SETS_TCGPLAYER_NAMESPACE:
             if not second:
-                return self._scryfall_respond(
-                    falcon_response,
-                    not_found_error("A TCGplayer id is required to look a set up by it."),
-                    pretty=is_pretty,
-                )
+                # Scryfall answers the namespace-with-no-id path with its ordinary set miss, not
+                # with a message about the id being absent. Clearer is not the goal here.
+                return self._scryfall_respond(falcon_response, not_found_error(_SET_MISS_DETAILS), pretty=is_pretty)
             found = self._set_by_tcgplayer_id(second)
         elif second:
             # /sets takes at most one identifying segment; anything longer addresses nothing.
@@ -161,13 +175,7 @@ class ScryfallReferenceRoutes(ScryfallResponder):
             found = self._set_by_code_or_id(identifier)
 
         if found is None:
-            return self._scryfall_respond(
-                falcon_response,
-                not_found_error(
-                    "The requested object or REST method was not found. Please double-check your URI and try again.",
-                ),
-                pretty=is_pretty,
-            )
+            return self._scryfall_respond(falcon_response, not_found_error(_SET_MISS_DETAILS), pretty=is_pretty)
         return self._scryfall_respond(falcon_response, found, pretty=is_pretty)
 
     def _all_sets(self) -> list[dict[str, Any]]:
@@ -249,13 +257,7 @@ class ScryfallReferenceRoutes(ScryfallResponder):
 
         wanted = name.strip().lower()
         if wanted not in CATALOG_NAMES:
-            return self._scryfall_respond(
-                falcon_response,
-                not_found_error(
-                    "The requested object or REST method was not found. Please double-check your URI and try again.",
-                ),
-                pretty=is_pretty,
-            )
+            return self._scryfall_respond(falcon_response, not_found_error(_CATALOG_MISS_DETAILS), pretty=is_pretty)
 
         rows = self._run_query(
             query="SELECT entries FROM magic.catalogs WHERE name = %(name)s",
@@ -265,7 +267,11 @@ class ScryfallReferenceRoutes(ScryfallResponder):
         # A known catalog that has not been imported yet is empty rather than missing: the name is
         # real, so 404 would tell a client the endpoint does not exist.
         entries = rows[0]["entries"] if rows else []
-        return self._scryfall_respond(falcon_response, catalog_object(list(entries)), pretty=is_pretty)
+        return self._scryfall_respond(
+            falcon_response,
+            catalog_object(list(entries), uri=f"{_SCRYFALL_API}/catalog/{wanted}"),
+            pretty=is_pretty,
+        )
 
     # ---------------------------------------------------------------- GET /symbology
 
@@ -340,7 +346,7 @@ class ScryfallReferenceRoutes(ScryfallResponder):
             # 422 rather than 400, which is what Scryfall answers an unparseable fragment with.
             return self._scryfall_respond(
                 falcon_response,
-                error_object(code="bad_request", status=422, details=str(bad_cost)),
+                error_object(code="validation_error", status=422, details=str(bad_cost)),
                 pretty=is_pretty,
             )
         return self._scryfall_respond(falcon_response, parsed, pretty=is_pretty)

@@ -417,16 +417,31 @@ def card_list(  # noqa: PLR0913
     return result
 
 
-def catalog_object(values: list[str]) -> dict[str, Any]:
+def catalog_object(values: list[str], uri: str | None = None) -> dict[str, Any]:
     """Build Scryfall's Catalog object.
+
+    `uri` is present IFF one is given, and the two callers genuinely differ -- measured against
+    api.scryfall.com on 2026-08-12, `/catalog/battle-types` answers
+    `{"object": "catalog", "uri": "...", "total_values": 1, "data": ["Siege"]}` while
+    `/cards/autocomplete` answers the same object with no `uri` at all. Building one unconditionally
+    would put a key on the autocomplete catalog that Scryfall does not send.
+
+    The uri points at api.scryfall.com rather than at this host, which is the rule the card objects
+    already follow: a self-referencing URI is part of the payload, not pagination.
 
     Args:
         values: The catalog entries.
+        uri: The catalog's own URI, for the routes that carry one.
 
     Returns:
         The Catalog object.
     """
-    return {"object": "catalog", "total_values": len(values), "data": values}
+    catalog: dict[str, Any] = {"object": "catalog"}
+    if uri is not None:
+        catalog["uri"] = uri
+    catalog["total_values"] = len(values)
+    catalog["data"] = values
+    return catalog
 
 
 def ruling_object(row: dict[str, Any]) -> dict[str, Any]:
