@@ -902,6 +902,7 @@ fn jsonb_obj_to_ids(d: &Bound<PyDict>, key: &str, vocab: &mut VocabInterner) -> 
 
 // ─── Format legality bitmap ──────────────────────────────────────────────────
 
+pub mod card_object;
 mod legality;
 use legality::*;
 
