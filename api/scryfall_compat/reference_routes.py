@@ -181,10 +181,7 @@ class ScryfallReferenceRoutes(ScryfallResponder):
             The Set object, or None when nothing matches.
         """
         rows = self._run_query(
-            query=(
-                "SELECT set_object FROM magic.sets "
-                "WHERE lower(code) = %(folded)s OR id::text = %(raw)s LIMIT 1"
-            ),
+            query=("SELECT set_object FROM magic.sets WHERE lower(code) = %(folded)s OR id::text = %(raw)s LIMIT 1"),
             params={"folded": identifier.lower(), "raw": identifier.lower()},
             explain=False,
         )["result"]

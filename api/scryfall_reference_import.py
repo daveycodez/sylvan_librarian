@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
 def import_sets(conn_pool: psycopg_pool.ConnectionPool, fetcher: ScryfallBulkDataFetcher) -> dict[str, Any]:
     """Replace `magic.sets` with Scryfall's current set list.
 
@@ -142,8 +143,7 @@ def import_symbology(conn_pool: psycopg_pool.ConnectionPool, fetcher: ScryfallBu
     symbols = [entry for entry in payload.get("data", []) if entry.get("symbol")]
 
     rows = [
-        {"symbol": entry["symbol"], "position": position, "symbol_object": Jsonb(entry)}
-        for position, entry in enumerate(symbols)
+        {"symbol": entry["symbol"], "position": position, "symbol_object": Jsonb(entry)} for position, entry in enumerate(symbols)
     ]
 
     with conn_pool.connection() as conn:

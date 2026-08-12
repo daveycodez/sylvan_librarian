@@ -37,6 +37,7 @@ def _all_steps_stubbed() -> Iterator[dict[str, MagicMock]]:
     with contextlib.ExitStack() as stack:
         yield {name: stack.enter_context(patch(f"api.api_resource.{name}")) for name in _STEPS}
 
+
 SETS_PAYLOAD = {
     "object": "list",
     "has_more": False,

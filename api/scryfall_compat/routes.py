@@ -244,6 +244,7 @@ def _set_cards_cache(falcon_response: falcon.Response | None) -> None:
     if falcon_response is not None:
         falcon_response.set_header("Cache-Control", _CARDS_CACHE_CONTROL)
 
+
 # Hosts an absolute self-URL should address over plain HTTP. Everything else is assumed to be
 # reached over TLS, which is what `next_page` has to say for a client to follow it.
 _PLAINTEXT_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "[::1]")  # noqa: S104
