@@ -413,7 +413,17 @@ struct OracleCard {
     // Accent-folded card_name_lower (e.g. "éowyn" -> "eowyn"), precomputed in Python via
     // fold_accents() (#649). Backs fuzzy name: search (name_trigram/name_bigrams/TextContains)
     // so "eowyn" matches "Éowyn"; exact-match paths deliberately keep using card_name_lower.
-    card_name_folded: InlineStr<61>,
+    //
+    // An INTERNED ID, not a second inline copy. It differs from `card_name_lower` only where a name
+    // carries a diacritic -- 88 of 31,724 cards on the current corpus -- so 61 bytes a card stored
+    // a string identical to the one above it 99.72% of the time. `NONE_STR` means exactly that,
+    // "read card_name_lower", and only the exceptions reach the strings table, at ~1.6 KB.
+    // `OracleCard` goes 304 -> 240 bytes.
+    //
+    // FOLDED is the half that moved because it is the COLDER of the two -- six read sites against
+    // `card_name_lower`'s, and every one of them already holds a `strings` table. Resolve with
+    // `folded_name`, never by reading this field.
+    card_name_folded_id: u32,
     card_colors: u8,
     card_color_identity: u8,
     produced_mana: u8,
@@ -637,6 +647,27 @@ pub(crate) type AOffsets = Archived<Vec<u32>>;
 
 /// Sentinel id for absent optional strings (a card never has 4 billion distinct strings).
 const NONE_STR: u32 = u32::MAX;
+
+/// A card's accent-folded lowercase name.
+///
+/// `NONE_STR` in `card_name_folded_id` means "identical to `card_name_lower`", which is every card
+/// whose name carries no diacritic, so this is an inline read on the overwhelming majority and a
+/// `strings` lookup only for the handful that need one.
+fn folded_name<'a>(card: &'a AOracleCard, strings: &'a AStrings) -> &'a str {
+    let id = u32::from(card.card_name_folded_id);
+    if id == NONE_STR {
+        return card.card_name_lower.as_str();
+    }
+    str_at(strings, id).unwrap_or_else(|| card.card_name_lower.as_str())
+}
+
+/// Build-time twin of `folded_name`, over unarchived rows and the interner's plain `Vec<String>`.
+fn folded_name_of<'a>(card: &'a OracleCard, strings: &'a [String]) -> &'a str {
+    if card.card_name_folded_id == NONE_STR {
+        return card.card_name_lower.as_str();
+    }
+    strings.get(card.card_name_folded_id as usize).map_or_else(|| card.card_name_lower.as_str(), String::as_str)
+}
 
 /// Sentinel for a printing with no artist (see Printing.card_artist_vid).
 pub(crate) const ARTIST_NONE: u16 = u16::MAX;
@@ -1644,11 +1675,11 @@ struct NameBigramIndex {
     n_cards: u32,
 }
 
-fn build_name_bigram_index(cards: &[OracleCard]) -> NameBigramIndex {
+fn build_name_bigram_index(cards: &[OracleCard], strings: &[String]) -> NameBigramIndex {
     let mut lists: HashMap<[u8; 2], Vec<u32>> = HashMap::new();
     for (i, card) in cards.iter().enumerate() {
         // Folded (#649) — this index backs the same fuzzy name: path as name_trigram.
-        let bytes = card.card_name_folded.as_str().as_bytes();
+        let bytes = folded_name_of(card, strings).as_bytes();
         let mut seen: Vec<[u8; 2]> = Vec::new(); // names are short; a vec beats a set
         for w in bytes.windows(2) {
             let bg = [w[0], w[1]];
@@ -1708,13 +1739,13 @@ struct NameUnigramIndex {
     n_cards: u32,
 }
 
-fn build_name_unigram_index(cards: &[OracleCard]) -> NameUnigramIndex {
+fn build_name_unigram_index(cards: &[OracleCard], strings: &[String]) -> NameUnigramIndex {
     let mut lists: HashMap<u8, Vec<u32>> = HashMap::new();
     for (i, card) in cards.iter().enumerate() {
         // Folded (#649), matching what `name_trigram` / `name_bigrams` index and what the walk evaluates
         // — that agreement is what makes the tight narrowing sound.
         let mut seen = [false; 256];
-        for &b in card.card_name_folded.as_str().as_bytes() {
+        for &b in folded_name_of(card, strings).as_bytes() {
             if !seen[b as usize] {
                 seen[b as usize] = true;
                 lists.entry(b).or_default().push(i as u32);
@@ -2938,7 +2969,13 @@ pub(crate) enum FuzzyOutcome {
 /// A candidate must clear `floor`, and the best must lead the next DISTINCT name by `lead`. The
 /// distinctness matters: several printings of one card would otherwise look like a tie with
 /// themselves and report ambiguous.
-pub(crate) fn fuzzy_name_match(cards: &Archived<Vec<OracleCard>>, needle: &str, floor: f32, lead: f32) -> FuzzyOutcome {
+pub(crate) fn fuzzy_name_match(
+    cards: &Archived<Vec<OracleCard>>,
+    strings: &AStrings,
+    needle: &str,
+    floor: f32,
+    lead: f32,
+) -> FuzzyOutcome {
     let needle = needle.to_lowercase();
     // The needle's trigrams are LOOP-INVARIANT, and a sorted Vec is the shape this scan wants
     // rather than the BTreeSet `trigram_similarity` returns. Calling that helper per card rebuilt
@@ -2961,7 +2998,7 @@ pub(crate) fn fuzzy_name_match(cards: &Archived<Vec<OracleCard>>, needle: &str, 
     let mut best: Option<(f32, u32, &str)> = None;
     let mut runner_up: Option<f32> = None;
     for (cid, card) in cards.iter().enumerate() {
-        let name = card.card_name_folded.as_str();
+        let name = folded_name(card, strings);
         trigrams_into(name, &mut name_tg);
         if name_tg.is_empty() {
             continue;
@@ -3081,7 +3118,7 @@ pub(crate) fn exact_name_match(data: &Archived<CardData>, folded: &str, set_code
     let mut best: Option<(bool, f32, usize, usize)> = None;
     for cid in name_scan_candidates(data, folded) {
         let cid = cid as usize;
-        let stored = data.cards[cid].card_name_folded.as_str();
+        let stored = folded_name(&data.cards[cid], &data.strings);
         if !folded_name_matches(stored, folded) {
             continue;
         }
@@ -3110,7 +3147,7 @@ pub(crate) fn names_containing_all_words(
     let mut by_name: Vec<(&str, f32, usize, usize)> = Vec::new();
     for cid in name_scan_candidates(data, longest) {
         let cid = cid as usize;
-        let name = data.cards[cid].card_name_folded.as_str();
+        let name = folded_name(&data.cards[cid], &data.strings);
         if !words.iter().all(|w| name.contains(w.as_str())) {
             continue;
         }
@@ -3184,7 +3221,7 @@ pub(crate) fn autocomplete_names<'a>(data: &'a Archived<CardData>, needle: &str,
     // have dropped exactly these cards, so the speedup was unreachable until the bug was fixed.
     for cid in name_scan_candidates(data, &needle) {
         let card = &data.cards[cid as usize];
-        let folded = card.card_name_folded.as_str();
+        let folded = folded_name(card, &data.strings);
         let rank = if folded.starts_with(&needle) {
             0u8
         } else if folded.contains(&needle) {
@@ -12772,7 +12809,13 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 // `NameUnigramIndex` (#858) is a new archived type, so a store built before it must fail the header
 // check and be rebuilt rather than be read as garbage. Dated 2026-08-06, patch 01; the check is
 // EQUALITY, so the invariant is only that a value is never reused for a different layout.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026081201;
+//   2026081401 — `OracleCard.card_name_folded` becomes an interned `card_name_folded_id`, taking
+//                the struct 304 -> 240 bytes. It held a string identical to `card_name_lower` on
+//                every card whose name carries no diacritic — 31,636 of 31,724 on the current
+//                corpus — so 61 bytes a card bought 88 exceptions. The header catches this one on
+//                its own (`size_of::<AOracleCard>` moves), but the constant moves too so the
+//                reason is recorded where the other layout changes are.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026081401;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -13180,7 +13223,7 @@ impl QueryEngine {
         let staging = self.staging.lock().unwrap().take().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err("reload_commit called without reload_begin")
         })?;
-        let Staging { mut rows, interner, vocab, artists, mana, lock_file } = staging;
+        let Staging { mut rows, mut interner, vocab, artists, mana, lock_file } = staging;
 
         // The store groups printings by oracle_id, so rows without one would all
         // collapse into a single card. The DB enforces NOT NULL; fail loudly here
@@ -13225,7 +13268,15 @@ impl QueryEngine {
                 offsets.push(printings.len() as u32);
                 cards.push(OracleCard {
                     card_name_lower: row.card_name_lower,
-                    card_name_folded: row.card_name_folded,
+                    // Only names that actually fold differently reach the table; the rest carry
+                    // NONE_STR, meaning "identical to card_name_lower". Interned rather than
+                    // appended because the interner is still whole here, so the handful of
+                    // exceptions dedupe against strings the corpus already holds.
+                    card_name_folded_id: if row.card_name_folded.as_str() == row.card_name_lower.as_str() {
+                        NONE_STR
+                    } else {
+                        interner.intern(row.card_name_folded.as_str().to_owned())
+                    },
                     card_colors: row.card_colors,
                     card_color_identity: row.card_color_identity,
                     produced_mana: row.produced_mana,
@@ -13383,7 +13434,7 @@ impl QueryEngine {
             usize::from(artwork_group_counts.iter().copied().max().unwrap_or(0)),
         );
         let indexes = CardIndexes {
-            name_trigram:   build_trigram_index(&cards, |c| c.card_name_folded.as_str()),
+            name_trigram:   build_trigram_index(&cards, |c| folded_name_of(c, &strings)),
             oracle_trigram: build_oracle_text_index(&cards, &strings),
             cmc:            build_numeric_index(&cards, |c| c.cmc.map(|v| v as i16)),
             power:          build_numeric_index(&cards, |c| c.creature_power.map(|v| v as i16)),
@@ -13445,8 +13496,8 @@ impl QueryEngine {
             rarity_cards,
             value_totals,
             pair_totals,
-            name_bigrams:   build_name_bigram_index(&cards),
-            name_unigrams:  build_name_unigram_index(&cards),
+            name_bigrams:   build_name_bigram_index(&cards, &strings),
+            name_unigrams:  build_name_unigram_index(&cards, &strings),
             legal_divergent: build_divergent_ids(&cards),
             arith_tuple:    build_arith_tuple_index(&cards),
             printing_by_scryfall_id: build_printing_by_scryfall_id(&printings),
@@ -13820,7 +13871,7 @@ impl QueryEngine {
         let mmap = self.get_mmap()?;
         // Safety: see the access_unchecked justification in query().
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
-        match fuzzy_name_match(&data.cards, name, floor, lead) {
+        match fuzzy_name_match(&data.cards, &data.strings, name, floor, lead) {
             FuzzyOutcome::Miss => Ok(("miss".to_string(), None)),
             FuzzyOutcome::Ambiguous => Ok(("ambiguous".to_string(), None)),
             FuzzyOutcome::Hit(cid) => {
