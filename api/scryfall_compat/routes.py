@@ -656,6 +656,33 @@ class ScryfallCardsRoutes:
         # exactly that happened.
         return {"scryfall_id": row["scryfall_id"], "card_name": row["name"]}
 
+    def _card_by_illustration_id(self, illustration_id: str) -> dict[str, Any] | None:
+        """Return the best printing carrying an illustration id.
+
+        The ENGINE first, like every other identifier `/cards/collection` accepts. This was the one
+        left on SQL, and it is a scan there too — `illustration_id` has no index on the table, where
+        the engine answers it from a sorted permutation in O(log n).
+
+        Args:
+            illustration_id: The illustration UUID.
+
+        Returns:
+            The matching printing, or None.
+        """
+        engine = self._engine_for_lookup()
+        if engine is not None:
+            try:
+                row = engine.card_by_illustration_id(illustration_id, list(CARD_OBJECT_FIELDS))
+            # Any engine failure falls back to SQL; it never 500s.
+            except Exception:
+                logger.exception("Engine illustration lookup failed, falling back to SQL")
+            else:
+                if row is None:
+                    return None
+                return self._fetch_one_card("scryfall_id = %(value)s", {"value": str(row["scryfall_id"])})
+
+        return self._fetch_one_card("illustration_id = %(value)s", {"value": illustration_id})
+
     def _cards_by_ids(self, scryfall_ids: Sequence[str]) -> list[dict[str, Any]]:
         """Fetch cards by scryfall id, preserving the order of the ids given.
 
@@ -1417,7 +1444,7 @@ class ScryfallCardsRoutes:
         if "oracle_id" in identifier and _is_uuid(str(identifier["oracle_id"])):
             return self._card_by_oracle_id(str(identifier["oracle_id"]))
         if "illustration_id" in identifier and _is_uuid(str(identifier["illustration_id"])):
-            return self._fetch_one_card("illustration_id = %(value)s", {"value": str(identifier["illustration_id"])})
+            return self._card_by_illustration_id(str(identifier["illustration_id"]))
         if "mtgo_id" in identifier:
             return self._card_by_external_id("mtgo", _as_int(str(identifier["mtgo_id"])))
         if "multiverse_id" in identifier:

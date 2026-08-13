@@ -6443,6 +6443,7 @@ fn bench_checked_vs_unchecked_access() {
         legal_divergent: build_divergent_ids(&cards),
         arith_tuple:    build_arith_tuple_index(&cards),
         printing_by_scryfall_id: build_printing_by_scryfall_id(&printings),
+        printing_by_illustration_id: crate::build_printing_by_illustration_id(&printings),
         oracle_by_oracle_id:     build_oracle_by_oracle_id(&cards),
         external_id_index:       build_external_id_index(&printings),
     };
@@ -11586,6 +11587,36 @@ fn absent_compat_values_stay_absent() {
     assert_eq!(u16::from(a.flags), 0);
     assert!(a.multiverse_ids.is_empty());
     assert!(a.promo_types.is_empty());
+}
+
+/// An illustration id is NOT unique -- reprints sharing art carry the same one -- so the binary
+/// search lands anywhere inside a run. The SQL this replaces ordered by `prefer_score` and took the
+/// first, which is the first printing in CORPUS order, so the index must return the run's MINIMUM
+/// pid rather than whichever member the search happened to hit.
+#[test]
+fn an_illustration_id_resolves_to_its_first_printing() {
+    let mut vocab = VocabInterner::new();
+    let mut cards = Vec::new();
+    for i in 0..4u128 {
+        cards.push(stub_card(i + 1, 0, &[], &mut vocab));
+    }
+    let mut data = store_of(cards, &[1, 1, 1, 1], vocab);
+    // Shared art on three printings, deliberately NOT in pid order once sorted: 7 on pids 3, 1, 2.
+    data.printings[0].illustration_id = 9;
+    data.printings[1].illustration_id = 7;
+    data.printings[2].illustration_id = 7;
+    data.printings[3].illustration_id = 7;
+    data.indexes.printing_by_illustration_id = crate::build_printing_by_illustration_id(&data.printings);
+
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let perm = &a.indexes.printing_by_illustration_id;
+
+    assert_eq!(crate::find_printing_by_illustration_id(perm, &a.printings, 7), Some(1), "the FIRST, not any");
+    assert_eq!(crate::find_printing_by_illustration_id(perm, &a.printings, 9), Some(0));
+    assert_eq!(crate::find_printing_by_illustration_id(perm, &a.printings, 8), None, "a miss is None, not a neighbour");
+    // 0 is parse_uuid_or_hash's null and must never match a stored row.
+    assert_eq!(crate::find_printing_by_illustration_id(perm, &a.printings, 0), None);
 }
 
 #[test]

@@ -3270,6 +3270,18 @@ fn build_printing_by_scryfall_id(printings: &[Printing]) -> Vec<u32> {
     ids
 }
 
+/// Printing indices ordered by `illustration_id`, for `find_printing_by_illustration_id`.
+///
+/// Same permutation trick and the same 4-bytes-a-row cost as `build_printing_by_scryfall_id`: the
+/// ids are already on the rows, so a table duplicating them would cost 16 bytes a row to save one
+/// indirection on a once-per-request lookup. `sort_unstable_by_key` is enough even though the ids
+/// are NOT unique -- ties inside a run are resolved by the caller, which takes the run's minimum.
+fn build_printing_by_illustration_id(printings: &[Printing]) -> Vec<u32> {
+    let mut ids: Vec<u32> = (0..printings.len() as u32).collect();
+    ids.sort_unstable_by_key(|&i| printings[i as usize].illustration_id);
+    ids
+}
+
 /// Card ids ordered by `oracle_id`, the same shape as `build_printing_by_scryfall_id`.
 fn build_oracle_by_oracle_id(cards: &[OracleCard]) -> Vec<u32> {
     let mut ids: Vec<u32> = (0..cards.len() as u32).collect();
@@ -3289,6 +3301,37 @@ fn find_by_sorted_id(perm: &Archived<Vec<u32>>, id: u128, key_of: impl Fn(u32) -
     }
     let found = perm.binary_search_by(|probe| key_of(u32::from(*probe)).cmp(&id)).ok()?;
     Some(u32::from(perm[found]))
+}
+
+/// The FIRST printing carrying this illustration id, or None.
+///
+/// Unlike `scryfall_id`, an illustration id is NOT unique -- every reprint sharing art carries the
+/// same one -- so the binary search lands somewhere inside a run rather than on a single row, and
+/// `find_by_sorted_id` cannot be reused. Printings sit in descending default-prefer order within a
+/// card, so the FIRST match in corpus order is the representative printing every other by-artwork
+/// path shows; this reproduces that by taking the minimum pid across the whole run rather than
+/// whichever member the search happened to hit.
+pub(crate) fn find_printing_by_illustration_id(
+    perm: &Archived<Vec<u32>>,
+    printings: &Archived<Vec<Printing>>,
+    id: u128,
+) -> Option<u32> {
+    if id == 0 {
+        return None;
+    }
+    let key_of = |i: u32| u128::from(printings[i as usize].illustration_id);
+    let hit = perm.binary_search_by(|probe| key_of(u32::from(*probe)).cmp(&id)).ok()?;
+    // Walk out to the run's edges. A run is one card's printings sharing an artwork, so this stays
+    // far cheaper than the scan it replaces.
+    let mut lo = hit;
+    while lo > 0 && key_of(u32::from(perm[lo - 1])) == id {
+        lo -= 1;
+    }
+    let mut hi = hit;
+    while hi + 1 < perm.len() && key_of(u32::from(perm[hi + 1])) == id {
+        hi += 1;
+    }
+    perm[lo..=hi].iter().map(|p| u32::from(*p)).min()
 }
 
 /// The printing with this Scryfall id, or None. O(log n) against a full scan.
@@ -4570,6 +4613,11 @@ struct CardIndexes {
     // Without them, every /cards/:id, /cards/collection and prints-of-this-card request is a full
     // scan, which is what pushed that whole surface onto SQL.
     printing_by_scryfall_id: Vec<u32>,        // printing space, ordered by scryfall_id
+    // Printing space, ordered by illustration_id. `/cards/collection` accepts an illustration_id
+    // identifier and was resolving it from SQL while every sibling in that same list -- id,
+    // oracle_id, mtgo_id, multiverse_id -- went through the engine. 380 KB buys it the same
+    // O(log n) the other ids have.
+    printing_by_illustration_id: Vec<u32>,
     oracle_by_oracle_id:     Vec<u32>,        // card space, ordered by oracle_id
     // (namespace, external id) -> printing, sorted. Answers /cards/multiverse|mtgo|arena|tcgplayer
     // |cardmarket/:id, none of which the store could address before.
@@ -13501,6 +13549,7 @@ impl QueryEngine {
             legal_divergent: build_divergent_ids(&cards),
             arith_tuple:    build_arith_tuple_index(&cards),
             printing_by_scryfall_id: build_printing_by_scryfall_id(&printings),
+            printing_by_illustration_id: build_printing_by_illustration_id(&printings),
             oracle_by_oracle_id:     build_oracle_by_oracle_id(&cards),
             external_id_index:       build_external_id_index(&printings),
         };
@@ -13823,6 +13872,44 @@ impl QueryEngine {
     /// (`Printing.scryfall_id` keeps the UUID's exact bits, deliberately) but only findable by
     /// scanning every printing. `printing_by_scryfall_id` makes it O(log n), which is what lets a
     /// by-id route be answered from memory instead of from Postgres.
+    /// The best printing carrying this illustration id, or None.
+    ///
+    /// `/cards/collection` accepts an `illustration_id` identifier, and it was the one entry in
+    /// that list still resolved from SQL while `id`, `oracle_id`, `mtgo_id` and `multiverse_id`
+    /// all went through the engine. The id is NOT unique, so the answer is the FIRST printing
+    /// carrying it in corpus order -- printings sit in descending default-prefer order within a
+    /// card, so that is the representative printing, and it is what the SQL's `prefer_score`
+    /// ordering returned.
+    #[pyo3(signature = (illustration_id, fields=None))]
+    fn card_by_illustration_id<'py>(
+        &self,
+        py: Python<'py>,
+        illustration_id: &str,
+        fields: Option<Vec<String>>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let resolved_fields = resolve_fields(fields)?;
+        let mmap = self.get_mmap()?;
+        // Safety: see the access_unchecked justification in query().
+        let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
+        let Some(pid) = find_printing_by_illustration_id(
+            &data.indexes.printing_by_illustration_id,
+            &data.printings,
+            parse_uuid_or_hash(illustration_id),
+        ) else {
+            return Ok(None);
+        };
+        let cid = u32::from(data.indexes.printing_to_card[pid as usize]) as usize;
+        let dict = card_to_pydict(
+            py,
+            &data.cards[cid],
+            &data.printings[pid as usize],
+            &data.strings,
+            &data.coll_vocab,
+            &resolved_fields,
+        )?;
+        Ok(Some(dict))
+    }
+
     #[pyo3(signature = (scryfall_id, fields=None))]
     fn card_by_scryfall_id<'py>(
         &self,
