@@ -11672,6 +11672,41 @@ fn cards_without_relations_carry_none() {
 
 // ─── Fuzzy name matching ──────────────────────────────────────────────────────
 
+/// `trigrams_into` is a hand-rolled restatement of `trigrams`'s padded-window definition that
+/// avoids materialising the `"  word "` buffer, so the two must agree EXACTLY — a single dropped
+/// or extra window would shift every fuzzy score without failing anything else.
+///
+/// The word lengths are the interesting axis: 1 and 2 bytes are the cases where the padded form is
+/// shorter than a full 3-window and the leading/trailing windows overlap, which is precisely where
+/// an off-by-one would hide.
+#[test]
+fn trigrams_into_matches_the_padded_definition() {
+    let mut buf = Vec::new();
+    for s in [
+        "",
+        "a",
+        "ab",
+        "abc",
+        "abcd",
+        "a b",
+        "a bc def",
+        "jace beleren",
+        "urza's bauble",
+        "  leading and trailing  ",
+        "!!! ??? ---",
+        "eowyn",
+        "\u{e9}owyn",
+        "fire // ice",
+        "x",
+        "aaaa aaaa",
+        "\u{c6}therling",
+    ] {
+        crate::trigrams_into(s, &mut buf);
+        let want: Vec<[u8; 3]> = crate::trigrams(s).into_iter().collect();
+        assert_eq!(buf, want, "trigrams_into disagrees with trigrams for {s:?}");
+    }
+}
+
 #[test]
 fn trigram_similarity_matches_pg_trgm() {
     // pg_trgm pads each word "  word " and windows over it, so "abc" yields exactly
