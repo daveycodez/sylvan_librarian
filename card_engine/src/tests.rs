@@ -11925,6 +11925,30 @@ fn autocomplete_matches_the_sql_routes_set_and_order() {
         let a2 = rkyv::access::<Archived<CardData>, Error>(&b2).expect("access");
         assert_eq!(autocomplete_names(a2, "eowyn", 20), vec!["Éowyn, Lady of Rohan"], "an ASCII needle reaches É");
         assert_eq!(autocomplete_names(a2, "jotun", 20), vec!["Jötun Grunt"], "an ASCII needle reaches ö");
+        // Ordered by CHARACTERS, as Postgres `length()` counts, not bytes as `str::len()` does.
+        // Both names are prefix matches for "e", so rank cannot separate them: "Éxx" is 3
+        // characters and 4 bytes, "Exxx" is 4 of each. By characters "Éxx" wins outright, which is
+        // what the SQL answers; by bytes they TIE at 4 and fall to alphabetical, where 'E' precedes
+        // 'É' and the answer flips.
+        {
+            let mut v3 = VocabInterner::new();
+            let mut i3 = Interner::new();
+            let mut tie = Vec::new();
+            for (n, (printed, folded)) in [("Exxx", "exxx"), ("Éxx", "exx")].iter().enumerate() {
+                let mut c = stub_card(n as u128 + 1, 0, &[], &mut v3);
+                c.card_name_lower = InlineStr::from_str(&printed.to_lowercase());
+                c.card_name_folded = InlineStr::from_str(folded);
+                c.card_name_id = i3.intern((*printed).to_string());
+                tie.push(c);
+            }
+            let n3 = tie.len();
+            let mut d3 = store_of(tie, &vec![1usize; n3], v3);
+            d3.strings = i3.strings;
+            let b3 = rkyv::to_bytes::<Error>(&d3).expect("serialize");
+            let a3 = rkyv::access::<Archived<CardData>, Error>(&b3).expect("access");
+            assert_eq!(autocomplete_names(a3, "e", 20), vec!["Éxx", "Exxx"], "shorter in CHARACTERS first");
+        }
+
         // And the accented spelling still works, which is what it did before.
         assert_eq!(autocomplete_names(a2, "jötun", 20), Vec::<&str>::new(), "the needle is folded by the caller");
     }

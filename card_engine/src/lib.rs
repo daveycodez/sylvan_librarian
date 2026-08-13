@@ -3197,7 +3197,14 @@ pub(crate) fn autocomplete_names<'a>(data: &'a Archived<CardData>, needle: &str,
         // Scryfall prints. This was invisible while the route went to SQL (which selects
         // card_name); wiring the route to this function is what puts it on the wire.
         let printed = str_at(strings, u32::from(card.card_name_id)).unwrap_or(folded);
-        hits.push((rank, printed.len(), printed));
+        // CHARACTERS, not bytes. The SQL orders by `length(card_name)`, which Postgres counts in
+        // characters, and this function's contract is to answer alike. `str::len()` is bytes, so
+        // "Éowyn, Shieldmaiden" measured 20 here against 19 there -- harmless while it shifted every
+        // accented name equally, and not harmless at a tie: "Éa" (2 chars, 3 bytes) sorts before
+        // "Aaa" (3 chars, 3 bytes) in SQL, and tied-then-alphabetical after it here. Only reachable
+        // at all since the catalog started matching folded names, which is what put accented names
+        // in front of a client.
+        hits.push((rank, printed.chars().count(), printed));
     }
     // GROUP BY card_name: several printings of one card are one suggestion. Deduped AFTER the sort
     // so the surviving entry is the first in the route's order, and by name alone -- two printings
