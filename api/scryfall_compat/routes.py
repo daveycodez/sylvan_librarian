@@ -650,7 +650,11 @@ class ScryfallCardsRoutes:
             return None
         if row is None:
             return None
-        return {"scryfall_id": row["id"], "card_name": row["name"]}
+        # Outside the except ON PURPOSE: a missing key is a SHAPE mismatch between this call and
+        # CARD_OBJECT_FIELDS, not an engine that cannot answer, and swallowing it would turn the
+        # fast path into a permanent silent fallback. See _fuzzy_similarity_candidate, where
+        # exactly that happened.
+        return {"scryfall_id": row["scryfall_id"], "card_name": row["name"]}
 
     def _cards_by_ids(self, scryfall_ids: Sequence[str]) -> list[dict[str, Any]]:
         """Fetch cards by scryfall id, preserving the order of the ids given.
@@ -1093,10 +1097,13 @@ class ScryfallCardsRoutes:
                     2,
                     list(CARD_OBJECT_FIELDS),
                 )
-                return [{"scryfall_id": row["id"], "card_name": row["name"]} for row in rows]
             # Any engine failure falls back to SQL; it never 500s.
             except Exception:
                 logger.exception("Engine containment match failed, falling back to SQL")
+            else:
+                # `else`, not the `try` body: a key error here is a shape mismatch, not an engine
+                # failure, and must not be swallowed into a silent fallback.
+                return [{"scryfall_id": row["scryfall_id"], "card_name": row["name"]} for row in rows]
 
         params = dict(base_params)
         clauses = list(base_clauses)
@@ -1151,15 +1158,21 @@ class ScryfallCardsRoutes:
                         FUZZY_SIMILARITY_LEAD,
                         list(CARD_OBJECT_FIELDS),
                     )
+                # Any engine failure falls back to SQL; it never 500s.
+                except Exception:
+                    logger.exception("Engine fuzzy match failed, falling back to SQL")
+                else:
+                    # The key is `scryfall_id`, which is what CARD_OBJECT_FIELDS asks for. It read
+                    # `id` before, so every hit raised KeyError INSIDE the try above, was logged as
+                    # an engine failure and fell through to SQL -- this fast path had never once
+                    # returned. Reading the row in `else` is what makes the next such mismatch a
+                    # test failure rather than a silent permanent fallback.
                     if status == "ambiguous":
                         return _AMBIGUOUS
                     if status == "miss":
                         return None
                     if row:
-                        return {"scryfall_id": row["id"], "card_name": row["name"]}
-                # Any engine failure falls back to SQL; it never 500s.
-                except Exception:
-                    logger.exception("Engine fuzzy match failed, falling back to SQL")
+                        return {"scryfall_id": row["scryfall_id"], "card_name": row["name"]}
 
         params = {**base_params, "needle": needle, "floor": FUZZY_SIMILARITY_FLOOR}
         # `%%` escapes psycopg's placeholder marker: the bare `%` operator would be read as the
