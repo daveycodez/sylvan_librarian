@@ -3167,19 +3167,27 @@ pub(crate) fn names_containing_all_words(
 ///     `length, card_name` is the SQL's stand-in and is kept, deliberately: matching the SQL keeps
 ///     the engine and fallback paths answering alike, which is a property this branch can hold,
 ///     where matching Scryfall's ranking is not.
-pub(crate) fn autocomplete_names<'a>(
-    cards: &'a Archived<Vec<OracleCard>>,
-    strings: &'a AStrings,
-    needle: &str,
-    limit: usize,
-) -> Vec<&'a str> {
+pub(crate) fn autocomplete_names<'a>(data: &'a Archived<CardData>, needle: &str, limit: usize) -> Vec<&'a str> {
     let needle = needle.to_lowercase();
+    let strings = &data.strings;
     let mut hits: Vec<(u8, usize, &str)> = Vec::new();
-    for card in cards.iter() {
-        let lower = card.card_name_lower.as_str();
-        let rank = if lower.starts_with(&needle) {
+    // FOLDED, not lower, and the caller folds the needle to match. Comparing the lowercase name
+    // meant an ASCII query could not reach a name carrying diacritics: `q=eowyn` returned NOTHING
+    // while `q=éowyn` returned three cards, and `jotun` and `lim-dul` returned nothing at all.
+    // api.scryfall.com answers all three (3, 3 and 8), and this corpus stores `card_name_folded`
+    // precisely so an ASCII query can reach "Éowyn". Nobody types the accent.
+    //
+    // Folding also makes the predicate answerable from `name_trigram`, which is built over this
+    // same field -- a prefix and a substring are both containments, so the index narrows both ranks
+    // soundly and the loop only re-verifies. That is why this function was left on a full scan when
+    // the other by-name lookups were narrowed: through a folded index a lower-name predicate would
+    // have dropped exactly these cards, so the speedup was unreachable until the bug was fixed.
+    for cid in name_scan_candidates(data, &needle) {
+        let card = &data.cards[cid as usize];
+        let folded = card.card_name_folded.as_str();
+        let rank = if folded.starts_with(&needle) {
             0u8
-        } else if lower.contains(&needle) {
+        } else if folded.contains(&needle) {
             1u8
         } else {
             continue;
@@ -3188,7 +3196,7 @@ pub(crate) fn autocomplete_names<'a>(
         // client hands straight back to /cards/named?exact=, and "lightning bolt" is not the name
         // Scryfall prints. This was invisible while the route went to SQL (which selects
         // card_name); wiring the route to this function is what puts it on the wire.
-        let printed = str_at(strings, u32::from(card.card_name_id)).unwrap_or(lower);
+        let printed = str_at(strings, u32::from(card.card_name_id)).unwrap_or(folded);
         hits.push((rank, printed.len(), printed));
     }
     // GROUP BY card_name: several printings of one card are one suggestion. Deduped AFTER the sort
@@ -13892,7 +13900,7 @@ impl QueryEngine {
         let mmap = self.get_mmap()?;
         // Safety: see the access_unchecked justification in query().
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
-        Ok(autocomplete_names(&data.cards, &data.strings, prefix, limit).into_iter().map(str::to_string).collect())
+        Ok(autocomplete_names(data, prefix, limit).into_iter().map(str::to_string).collect())
     }
 
     /// The printing carrying this external id, or None.

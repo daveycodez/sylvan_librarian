@@ -1227,6 +1227,11 @@ class ScryfallCardsRoutes:
         min_query_length = 2
         if len(needle) < min_query_length:
             return self._scryfall_respond(falcon_response, catalog_object([]), pretty=is_pretty)
+        # FOLDED, like `named?exact=` and the fuzzy stages above. Unfolded, an ASCII query could not
+        # reach a name with diacritics -- `q=eowyn` answered an empty catalog where Scryfall answers
+        # three Éowyn cards -- and nobody types the accent. Both paths below compare the folded name,
+        # so the engine and the SQL fallback keep answering alike.
+        needle = fold_accents(needle.lower())
 
         # The ENGINE first, for the same reason the fuzzy match above now does: `autocomplete` was
         # added by "Fuzzy Name Match and Autocomplete, Computed Not Stored" and nothing called it.
@@ -1241,11 +1246,12 @@ class ScryfallCardsRoutes:
 
         rows = self._run_query(
             query=(
-                "SELECT card_name, min(CASE WHEN lower(card_name) LIKE %(prefix)s THEN 0 ELSE 1 END) AS rank "
-                "FROM magic.cards AS card WHERE lower(card_name) LIKE %(needle)s "
+                "SELECT card_name, "
+                "min(CASE WHEN lower(card_name_folded) LIKE %(prefix)s THEN 0 ELSE 1 END) AS rank "
+                "FROM magic.cards AS card WHERE lower(card_name_folded) LIKE %(needle)s "
                 "GROUP BY card_name ORDER BY rank, length(card_name), card_name LIMIT %(limit)s"
             ),
-            params={"prefix": f"{needle.lower()}%", "needle": f"%{needle.lower()}%", "limit": MAX_AUTOCOMPLETE_VALUES},
+            params={"prefix": f"{needle}%", "needle": f"%{needle}%", "limit": MAX_AUTOCOMPLETE_VALUES},
             explain=False,
         )["result"]
         return self._scryfall_respond(falcon_response, catalog_object([row["card_name"] for row in rows]), pretty=is_pretty)

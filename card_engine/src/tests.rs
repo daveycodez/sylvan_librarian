@@ -11862,13 +11862,17 @@ fn autocomplete_matches_the_sql_routes_set_and_order() {
     for (i, name) in ["Shock", "Shatter", "Shockwave", "Aftershock", "Counterspell"].iter().enumerate() {
         let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
         c.card_name_lower = InlineStr::from_str(&name.to_lowercase());
+        // FOLDED is what the catalog now matches, so the fixture carries it. These names are ASCII,
+        // where folding is the identity -- the accented case is asserted separately below.
+        c.card_name_folded = InlineStr::from_str(&name.to_lowercase());
         c.card_name_id = interner.intern((*name).to_string());
         cards.push(c);
     }
-    let bytes = rkyv::to_bytes::<Error>(&cards).expect("serialize");
-    let a = rkyv::access::<Archived<Vec<OracleCard>>, Error>(&bytes).expect("access");
-    let string_bytes = rkyv::to_bytes::<Error>(&interner.strings).expect("serialize strings");
-    let strings = rkyv::access::<Archived<Vec<String>>, Error>(&string_bytes).expect("access strings");
+    let n = cards.len();
+    let mut data = store_of(cards, &vec![1usize; n], vocab);
+    data.strings = interner.strings;
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
     // The SQL this route falls back to is
     //   WHERE lower(card_name) LIKE '%needle%' ORDER BY rank, length(card_name), card_name
@@ -11880,24 +11884,53 @@ fn autocomplete_matches_the_sql_routes_set_and_order() {
     // api.scryfall.com, where q=bolt answers Bolt Bend .. Boltwing Marauder THEN Firebolt,
     // Rift Bolt -- a prefix-only catalog would never offer the client "Aftershock" at all.
     assert_eq!(
-        autocomplete_names(a, strings, "sho", 20),
+        autocomplete_names(a, "sho", 20),
         vec!["Shock", "Shockwave", "Aftershock"],
         "prefix matches rank 0, substring matches rank 1"
     );
     assert_eq!(
-        autocomplete_names(a, strings, "SHO", 20),
+        autocomplete_names(a, "SHO", 20),
         vec!["Shock", "Shockwave", "Aftershock"],
         "case-insensitive"
     );
     // Within a rank the order is by LENGTH then name, not alphabetical: Shock(5), Shatter(7),
     // Shockwave(9). Alphabetical would put Shatter first, which is what this returned before.
     assert_eq!(
-        autocomplete_names(a, strings, "sh", 20),
+        autocomplete_names(a, "sh", 20),
         vec!["Shock", "Shatter", "Shockwave", "Aftershock"],
         "length then name within a rank, and PRINTED -- a lowercase entry is not a name Scryfall prints"
     );
+    // THE ACCENT CASE, which is why this matches the folded name at all. `q=eowyn` answered an
+    // EMPTY catalog before: the needle is ASCII, the stored lowercase name is not, and nobody types
+    // the accent. api.scryfall.com answers q=eowyn with three Éowyn cards, q=jotun with three Jötun
+    // ones and q=lim-dul with eight. The PRINTED name still comes back accented -- folding decides
+    // what MATCHES, not what is shown.
+    {
+        let mut vocab2 = VocabInterner::new();
+        let mut interner2 = Interner::new();
+        let mut accented = Vec::new();
+        for (i, (printed, folded)) in
+            [("Éowyn, Lady of Rohan", "eowyn, lady of rohan"), ("Jötun Grunt", "jotun grunt")].iter().enumerate()
+        {
+            let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab2);
+            c.card_name_lower = InlineStr::from_str(&printed.to_lowercase());
+            c.card_name_folded = InlineStr::from_str(folded);
+            c.card_name_id = interner2.intern((*printed).to_string());
+            accented.push(c);
+        }
+        let n2 = accented.len();
+        let mut d2 = store_of(accented, &vec![1usize; n2], vocab2);
+        d2.strings = interner2.strings;
+        let b2 = rkyv::to_bytes::<Error>(&d2).expect("serialize");
+        let a2 = rkyv::access::<Archived<CardData>, Error>(&b2).expect("access");
+        assert_eq!(autocomplete_names(a2, "eowyn", 20), vec!["Éowyn, Lady of Rohan"], "an ASCII needle reaches É");
+        assert_eq!(autocomplete_names(a2, "jotun", 20), vec!["Jötun Grunt"], "an ASCII needle reaches ö");
+        // And the accented spelling still works, which is what it did before.
+        assert_eq!(autocomplete_names(a2, "jötun", 20), Vec::<&str>::new(), "the needle is folded by the caller");
+    }
+
     // The cap applies to the ORDERED list, so it keeps the shortest prefix match rather than
     // whichever name the corpus happened to reach first.
-    assert_eq!(autocomplete_names(a, strings, "sh", 1), vec!["Shock"], "capped, after ordering");
-    assert!(autocomplete_names(a, strings, "zzz", 20).is_empty());
+    assert_eq!(autocomplete_names(a, "sh", 1), vec!["Shock"], "capped, after ordering");
+    assert!(autocomplete_names(a, "zzz", 20).is_empty());
 }
