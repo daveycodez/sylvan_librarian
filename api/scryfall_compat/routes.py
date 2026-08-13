@@ -629,6 +629,29 @@ class ScryfallCardsRoutes:
         )["result"]
         return to_scryfall_card(sql_row_to_engine_row(rows[0])) if rows else None
 
+    def _engine_exact_name(self, folded: str, set_code: str | None) -> dict[str, Any] | None:
+        """The exact-name match from the engine, or None when it cannot answer.
+
+        Args:
+            folded: The accent-folded, lowercased name.
+            set_code: Restrict to this set, or None for any.
+
+        Returns:
+            `{"scryfall_id", "card_name"}` for the best match, or None to fall back to SQL.
+        """
+        engine = self._engine_for_lookup()
+        if engine is None:
+            return None
+        try:
+            row = engine.exact_card_by_name(folded, set_code, list(CARD_OBJECT_FIELDS))
+        # Any engine failure falls back to SQL; it never 500s.
+        except Exception:
+            logger.exception("Engine exact name match failed, falling back to SQL")
+            return None
+        if row is None:
+            return None
+        return {"scryfall_id": row["id"], "card_name": row["name"]}
+
     def _cards_by_ids(self, scryfall_ids: Sequence[str]) -> list[dict[str, Any]]:
         """Fetch cards by scryfall id, preserving the order of the ids given.
 
@@ -860,11 +883,20 @@ class ScryfallCardsRoutes:
             # `exact=Delver of Secrets` to the two-faced card -- but it is a fallback, not a peer:
             # on the current corpus `exact=Lightning Bolt` otherwise answers
             # "Emeritus of Conflict // Lightning Bolt", whose prefer_score is the higher of the two.
-            card = self._fetch_one_card(
-                " AND ".join(clauses),
-                params,
-                rank_first="(lower(card_name_folded) = %(folded)s) DESC, ",
-            )
+            # The ENGINE first, same as the fuzzy stages below and `_cards_by_ids`. This was the
+            # last by-name lookup still answering from SQL, and it is the one a scan hurts most:
+            # `named?exact=` is a single-card fetch that walked all ~31,700 folded names.
+            card = None
+            chosen = self._engine_exact_name(params["folded"], params.get("set_code"))
+            if chosen is not None:
+                found = self._cards_by_ids([str(chosen["scryfall_id"])])
+                card = found[0] if found else None
+            if card is None:
+                card = self._fetch_one_card(
+                    " AND ".join(clauses),
+                    params,
+                    rank_first="(lower(card_name_folded) = %(folded)s) DESC, ",
+                )
             if card is None:
                 return self._scryfall_respond(
                     falcon_response,
@@ -1024,6 +1056,12 @@ class ScryfallCardsRoutes:
         Returns:
             The matching printing, or None.
         """
+        # The ENGINE first, like every other lookup on this surface. Unlike `fuzzy_card_by_name`,
+        # `exact_card_by_name` takes the set code, so a set filter no longer forces SQL.
+        row = self._engine_exact_name(needle, base_params.get("set_code"))
+        if row is not None:
+            return row
+
         params = {**base_params, "needle": needle}
         clauses = [*base_clauses, "lower(card_name_folded) = %(needle)s"]
         return self._best_printing(" AND ".join(clauses), params)
@@ -1044,6 +1082,22 @@ class ScryfallCardsRoutes:
         Returns:
             Up to two rows -- enough to tell "one match" from "ambiguous" without fetching more.
         """
+        # The ENGINE first. A LIKE per word is a sequential scan of every folded name; the engine
+        # narrows the same predicate through `name_trigram` -- measured 1,303 us against 11 us.
+        engine = self._engine_for_lookup()
+        if engine is not None and words:
+            try:
+                rows = engine.cards_containing_all_words(
+                    list(words),
+                    base_params.get("set_code"),
+                    2,
+                    list(CARD_OBJECT_FIELDS),
+                )
+                return [{"scryfall_id": row["id"], "card_name": row["name"]} for row in rows]
+            # Any engine failure falls back to SQL; it never 500s.
+            except Exception:
+                logger.exception("Engine containment match failed, falling back to SQL")
+
         params = dict(base_params)
         clauses = list(base_clauses)
         for index, word in enumerate(words):

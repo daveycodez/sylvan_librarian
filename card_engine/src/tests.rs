@@ -20,6 +20,7 @@ use super::{
     build_printing_by_scryfall_id, build_oracle_by_oracle_id, find_printing_by_scryfall_id, find_oracle_by_oracle_id,
     build_external_id_index, find_printing_by_external_id, EXT_MULTIVERSE, EXT_MTGO, EXT_ARENA, EXT_TCGPLAYER,
     trigram_similarity, fuzzy_name_match, autocomplete_names, FuzzyOutcome,
+    exact_name_match, names_containing_all_words,
     VOCAB_NONE, COMPAT_PROMO, COMPAT_REPRINT, COMPAT_TEXTLESS, GAME_PAPER, GAME_ARENA, FINISH_FOIL, FINISH_NONFOIL,
     TextField, TextSearchField, Tri, SortedTrigramIndex, VocabInterner, ARTIST_NONE, NONE_STR, TYPE_ARTIFACT, TYPE_CREATURE,
     TYPE_ENCHANTMENT, TYPE_INSTANT, TYPE_LAND, TYPE_LEGENDARY, TYPE_PLANESWALKER, TYPE_SNOW, TYPE_SORCERY,
@@ -11727,6 +11728,74 @@ fn trigram_similarity_matches_pg_trgm() {
 
     // Symmetric, as Jaccard is.
     assert_eq!(trigram_similarity("lightning", "lightnin"), trigram_similarity("lightnin", "lightning"));
+}
+
+/// The by-name lookups narrow through `name_trigram`, and narrowing must not change the answer.
+///
+/// Asserted DIFFERENTIALLY, over the same store built twice: once with the index (the narrowed
+/// path) and once without it (the full scan, which `store_of` produces because it does not build
+/// `name_trigram`). Every probe must agree. A test that only exercised the fast path would pass
+/// just as happily if the narrowing were fast and wrong.
+#[test]
+fn name_lookups_agree_with_and_without_the_trigram_index() {
+    // Built twice rather than cloned: neither OracleCard nor VocabInterner is Clone.
+    let fixture = || {
+        let mut vocab = VocabInterner::new();
+        let names = [
+            "lightning bolt",
+            "emeritus of conflict // lightning bolt",
+            "delver of secrets // insectile aberration",
+            "shock",
+            "counterspell",
+        ];
+        let mut cards = Vec::new();
+        for (i, name) in names.iter().enumerate() {
+            let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
+            c.card_name_folded = InlineStr::from_str(name);
+            c.card_name_lower = InlineStr::from_str(name);
+            cards.push(c);
+        }
+        store_of(cards, &[1, 1, 1, 1, 1], vocab)
+    };
+    // `store_of` does not build `name_trigram`, so this one takes the full-scan path.
+    let scan_data = fixture();
+    let mut idx_data = fixture();
+    idx_data.indexes.name_trigram = build_trigram_index(&idx_data.cards, |c| c.card_name_folded.as_str());
+
+    let scan_bytes = rkyv::to_bytes::<Error>(&scan_data).expect("serialize");
+    let scan = rkyv::access::<Archived<CardData>, Error>(&scan_bytes).expect("access");
+    let idx_bytes = rkyv::to_bytes::<Error>(&idx_data).expect("serialize");
+    let idx = rkyv::access::<Archived<CardData>, Error>(&idx_bytes).expect("access");
+
+    for needle in [
+        "lightning bolt",
+        "delver of secrets",
+        "insectile aberration",
+        "emeritus of conflict",
+        "shock",
+        "no such card",
+        "li", // under 3 bytes: the index has nothing to say and both sides scan
+    ] {
+        assert_eq!(
+            exact_name_match(scan, needle, None),
+            exact_name_match(idx, needle, None),
+            "exact_name_match disagrees for {needle:?}"
+        );
+    }
+    for words in [vec!["lightning".to_owned()], vec!["of".to_owned(), "secrets".to_owned()], vec!["zzz".to_owned()]] {
+        assert_eq!(
+            names_containing_all_words(scan, &words, None, 2),
+            names_containing_all_words(idx, &words, None, 2),
+            "names_containing_all_words disagrees for {words:?}"
+        );
+    }
+
+    // And the ranking rule the SQL carried in its ORDER BY: a WHOLE-name match beats a face match,
+    // even when the face's card scores higher. `lightning bolt` is card 0 and also the BACK face of
+    // card 1, whose printing has the better prefer_score.
+    assert_eq!(exact_name_match(idx, "lightning bolt", None).map(|(cid, _)| cid), Some(0));
+    // A face match is still found when nothing carries the whole name.
+    assert_eq!(exact_name_match(idx, "insectile aberration", None).map(|(cid, _)| cid), Some(2));
 }
 
 #[test]

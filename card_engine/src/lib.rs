@@ -3053,6 +3053,120 @@ pub(crate) fn fuzzy_name_match(cards: &Archived<Vec<OracleCard>>, needle: &str, 
 ///     `length, card_name` is the SQL's stand-in and is kept, deliberately: matching the SQL keeps
 ///     the engine and fallback paths answering alike, which is a property this branch can hold,
 ///     where matching Scryfall's ranking is not.
+/// Card ids worth examining for a folded-name predicate, narrowed by `name_trigram`.
+///
+/// Every by-name lookup on the /cards/* surface walked all ~31,700 cards doing string work, while
+/// `name:` in the query language answers the same question -- "which cards' folded names contain
+/// this?" -- through this index. Measured on a ~31.7k-card corpus, the exact-name scan cost 884 us
+/// against 75 us for `name:ward`.
+///
+/// SOUND because the callers require the needle as a CONTIGUOUS SUBSTRING of the stored folded name
+/// (`folded_name_matches` accepts the whole name or one side of a " // " split; the containment
+/// stage uses `contains`), so a matching name holds every trigram of the needle and cannot lie
+/// outside the intersection. Callers still re-verify; this only decides who gets asked.
+///
+/// `None` from `trigram_candidates` means the needle is under 3 bytes, where the index has nothing
+/// to say and the full scan is the only answer. NOT usable for `autocomplete_names`, which matches
+/// `card_name_lower` while this index is built over `card_name_folded`.
+fn name_scan_candidates(data: &Archived<CardData>, needle: &str) -> Vec<u32> {
+    let idx = &data.indexes.name_trigram;
+    // APPLICABILITY CHECK, the same shape every other index gets (`sort_perms::order` length-checks
+    // its arrays, the planes compare `n_cards`). Narrowing through an index that was never built --
+    // or was built for a different card count -- would return NO candidates where the scan found
+    // matches, turning a stale index into silently wrong answers instead of slow ones. A fixture
+    // store that skips index construction is exactly that case.
+    if u32::from(idx.domain) as usize != data.cards.len() {
+        return (0..data.cards.len() as u32).collect();
+    }
+    trigram_candidates(idx, needle).unwrap_or_else(|| (0..data.cards.len() as u32).collect())
+}
+
+/// Scryfall's exact-name rule: the whole stored name, or either side of a " // " split.
+fn folded_name_matches(stored: &str, needle: &str) -> bool {
+    if stored == needle {
+        return true;
+    }
+    match stored.split_once(" // ") {
+        Some((front, back)) => front == needle || back == needle,
+        None => false,
+    }
+}
+
+/// The card's best printing, optionally restricted to a set.
+///
+/// Printings inside a card's range are stored in descending default-prefer order, so the first one
+/// that qualifies IS the best one and the walk stops there.
+fn best_printing_in_set(data: &Archived<CardData>, cid: usize, set_code: Option<&str>) -> Option<usize> {
+    let (from, to) = (u32::from(data.offsets[cid]) as usize, u32::from(data.offsets[cid + 1]) as usize);
+    match set_code {
+        None => (from < to).then_some(from),
+        Some(code) => (from..to).find(|&pid| data.printings[pid].card_set_code.as_str().eq_ignore_ascii_case(code)),
+    }
+}
+
+fn prefer_of(data: &Archived<CardData>, pid: usize) -> f32 {
+    data.printings[pid].prefer_score.as_ref().map_or(f32::MIN, |v| v.to_native())
+}
+
+/// `named?exact=`: the card whose folded name is exactly the needle, else one matching a FACE.
+///
+/// A whole-name match beats a face match rather than competing with it -- matching a face is right
+/// (Scryfall resolves `exact=Delver of Secrets` to the two-faced card) but on this corpus
+/// `exact=Lightning Bolt` would otherwise answer "Emeritus of Conflict // Lightning Bolt", whose
+/// prefer_score is the higher of the two. Ranked on (whole-name, prefer_score), in that order.
+pub(crate) fn exact_name_match(data: &Archived<CardData>, folded: &str, set_code: Option<&str>) -> Option<(usize, usize)> {
+    let mut best: Option<(bool, f32, usize, usize)> = None;
+    for cid in name_scan_candidates(data, folded) {
+        let cid = cid as usize;
+        let stored = data.cards[cid].card_name_folded.as_str();
+        if !folded_name_matches(stored, folded) {
+            continue;
+        }
+        let whole = stored == folded;
+        let Some(pid) = best_printing_in_set(data, cid, set_code) else { continue };
+        let score = prefer_of(data, pid);
+        if best.is_none_or(|(bw, bs, _, _)| (whole, score) > (bw, bs)) {
+            best = Some((whole, score, cid, pid));
+        }
+    }
+    best.map(|(_, _, cid, pid)| (cid, pid))
+}
+
+/// `named?fuzzy=`'s containment stage: one printing per DISTINCT card name whose folded name holds
+/// every query word. Two cards sharing a name are one answer, and more than one distinct name is
+/// what the caller reports as `ambiguous` rather than guessing between.
+pub(crate) fn names_containing_all_words(
+    data: &Archived<CardData>,
+    words: &[String],
+    set_code: Option<&str>,
+    limit: usize,
+) -> Vec<(usize, usize)> {
+    // Narrow on the LONGEST word: every word must be contained, so any one is a sound filter, and
+    // the longest has the most trigrams to intersect and so the fewest postings to survive them.
+    let longest = words.iter().max_by_key(|w| w.len()).map(String::as_str).unwrap_or("");
+    let mut by_name: Vec<(&str, f32, usize, usize)> = Vec::new();
+    for cid in name_scan_candidates(data, longest) {
+        let cid = cid as usize;
+        let name = data.cards[cid].card_name_folded.as_str();
+        if !words.iter().all(|w| name.contains(w.as_str())) {
+            continue;
+        }
+        let Some(pid) = best_printing_in_set(data, cid, set_code) else { continue };
+        let score = prefer_of(data, pid);
+        match by_name.iter_mut().find(|(n, _, _, _)| *n == name) {
+            Some(slot) if score > slot.1 => *slot = (name, score, cid, pid),
+            Some(_) => {}
+            None => by_name.push((name, score, cid, pid)),
+        }
+        // One past the limit distinguishes "one match" from "ambiguous"; the caller needs no more.
+        if by_name.len() > limit {
+            break;
+        }
+    }
+    by_name.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+    by_name.into_iter().take(limit).map(|(_, _, cid, pid)| (cid, pid)).collect()
+}
+
 pub(crate) fn autocomplete_names<'a>(
     cards: &'a Archived<Vec<OracleCard>>,
     strings: &'a AStrings,
@@ -13709,6 +13823,67 @@ impl QueryEngine {
                 Ok(("hit".to_string(), Some(dict)))
             }
         }
+    }
+
+    /// The card whose folded name is exactly `folded`, or one whose FACE is, restricted to `set`.
+    ///
+    /// `named?exact=` is the last lookup on this surface that answered from SQL. It is a scan of
+    /// every card's folded name, which is what `name_trigram` exists to avoid: measured on a
+    /// ~31.7k-card corpus, 884 us of scan against 4 us through the index.
+    #[pyo3(signature = (folded, set_code=None, fields=None))]
+    fn exact_card_by_name<'py>(
+        &self,
+        py: Python<'py>,
+        folded: &str,
+        set_code: Option<&str>,
+        fields: Option<Vec<String>>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let resolved_fields = resolve_fields(fields)?;
+        let mmap = self.get_mmap()?;
+        // Safety: see the access_unchecked justification in query().
+        let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
+        let Some((cid, pid)) = exact_name_match(data, folded, set_code) else { return Ok(None) };
+        Ok(Some(card_to_pydict(
+            py,
+            &data.cards[cid],
+            &data.printings[pid],
+            &data.strings,
+            &data.coll_vocab,
+            &resolved_fields,
+        )?))
+    }
+
+    /// One printing per DISTINCT card name whose folded name contains every one of `words`.
+    ///
+    /// The containment stage of `named?fuzzy=`, which ran as a LIKE per word. The caller asks for 2
+    /// and reads the count: more than one distinct name is `ambiguous`, which Scryfall reports
+    /// rather than guessing between. 1,303 us of scan against 11 us through the index.
+    #[pyo3(signature = (words, set_code=None, limit=2, fields=None))]
+    fn cards_containing_all_words<'py>(
+        &self,
+        py: Python<'py>,
+        words: Vec<String>,
+        set_code: Option<&str>,
+        limit: usize,
+        fields: Option<Vec<String>>,
+    ) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        let resolved_fields = resolve_fields(fields)?;
+        let mmap = self.get_mmap()?;
+        // Safety: see the access_unchecked justification in query().
+        let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
+        names_containing_all_words(data, &words, set_code, limit)
+            .into_iter()
+            .map(|(cid, pid)| {
+                card_to_pydict(
+                    py,
+                    &data.cards[cid],
+                    &data.printings[pid],
+                    &data.strings,
+                    &data.coll_vocab,
+                    &resolved_fields,
+                )
+            })
+            .collect()
     }
 
     /// Card names beginning with `prefix`, up to `limit`. Scryfall's autocomplete catalog.
