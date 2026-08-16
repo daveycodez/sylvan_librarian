@@ -284,8 +284,19 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
         return []
     if "playtest" in card.get("promo_types", []):
         return []
-    if "paper" not in card.get("games", []):
-        return []
+    # NOT FILTERED: a printing whose `games` omits "paper" (an Arena or MTGO exclusive) is
+    # imported. Scryfall serves every one of them from a bare `/cards/search` with default
+    # parameters — measured against api.scryfall.com 2026-08-16:
+    #
+    #   q=!"A-Tyvar Kell"                -> 200, khm/A-198        q=is:rebalanced -> 216 cards
+    #   q=!"Key to the Archive"          -> 200, ymid/59          game:arena -game:paper -> 3,550
+    #   e:khm&unique=prints              -> 425 (407 without)     game:mtgo  -game:paper -> 5,562
+    #   e:khm&include_multilingual=true  -> 4,035 (4,017 without)
+    #
+    # so refusing the row is the one filter here that makes an ORDINARY query disagree with
+    # Scryfall. The others stand in for Scryfall's own query-time `include_extras=false`, which
+    # returns those cards the moment the query asks; nothing analogous hides a digital printing.
+    # 9,119 printings on the 2026-08-16 all_cards bulk (517,746 -> 526,865, +1.76%).
     if card.get("set_type") == "funny":
         return []
 
