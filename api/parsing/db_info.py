@@ -184,6 +184,12 @@ DB_COLUMNS = [
         parser_class=ParserClass.TEXT,
     ),
     FieldInfo(
+        db_column_name="oracle_id",
+        field_type=FieldType.TEXT,
+        search_aliases=["oracleid", "oracle_id"],
+        parser_class=ParserClass.TEXT,
+    ),
+    FieldInfo(
         db_column_name="oracle_text",
         field_type=FieldType.TEXT,
         search_aliases=["oracle", "o"],

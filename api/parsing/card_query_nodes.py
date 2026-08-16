@@ -136,6 +136,11 @@ class CardAttributeNode(AttributeNode):
             SQL string for the attribute reference.
         """
         del context
+        # oracle_id is the one searchable UUID column; every bound parameter arrives as text, and
+        # `uuid = text` has no operator in Postgres. Comparing the column's canonical text form
+        # keeps the generic comparison path and never raises on an unparseable search value.
+        if self.attribute_name == "oracle_id":
+            return "card.oracle_id::text"
         # attribute_name is already set to the correct db_column_name in __init__
         return f"card.{self.attribute_name}"
 
@@ -161,6 +166,7 @@ class CardAttributeNode(AttributeNode):
             "type_line": "type line",
             "flavor_text": "flavor text",
             "card_keywords": "keyword",
+            "oracle_id": "oracle ID",
             "card_lang": "language",
             "card_layout": "layout",
             "card_border": "border",
@@ -807,13 +813,28 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         """Handle colon operator for different field types."""
         if field_type == FieldType.TEXT:
             # Handle fields that need exact matching instead of pattern matching
-            if attr in ("card_set_code", "card_lang", "card_layout", "card_border", "card_watermark", "collector_number"):
+            if attr in (
+                "card_set_code",
+                "card_lang",
+                "card_layout",
+                "card_border",
+                "card_watermark",
+                "collector_number",
+                "oracle_id",
+            ):
                 # set_code/lang/layout/border/watermark are lowercased at import, so lowercasing the
-                # search value gives case-insensitive matching with a plain equality.
+                # search value gives case-insensitive matching with a plain equality. oracle_id is a
+                # UUID rendered lowercase by ::text, so the same lowercasing makes the id
+                # case-insensitive the way Scryfall's oracleid: is.
                 # collector_number is stored raw and mixed-case (e.g. "10E-105"): compare exactly.
-                if attr in ("card_set_code", "card_lang", "card_layout", "card_border", "card_watermark") and hasattr(
-                    self.rhs, "value"
-                ):
+                if attr in (
+                    "card_set_code",
+                    "card_lang",
+                    "card_layout",
+                    "card_border",
+                    "card_watermark",
+                    "oracle_id",
+                ) and hasattr(self.rhs, "value"):
                     self.rhs.value = self.rhs.value.lower()
 
                 if self.operator == ":":
