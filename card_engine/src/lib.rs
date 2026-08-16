@@ -256,6 +256,12 @@ struct OracleCard {
     // values share one table entry; resolve with str_at()/the strings slice.
     card_name_id: u32,
     oracle_text_id: u32,
+    /// THE SEARCH FORM, and it is not merely `oracle_text_id.to_lowercase()`:
+    /// reminder text is stripped out of it first (`strip_reminder_text`), which
+    /// is what `o:` searches on Scryfall. Nothing emits this — the card object
+    /// writes `oracle_text_id` — so the two are free to differ, and the name is
+    /// kept only because `TextField::OracleTextLower` and every test that builds
+    /// a card by hand already spell it that way.
     oracle_text_lower_id: u32,
     card_layout_id: u32,
     mana_cost_text_id: u32,
@@ -415,6 +421,74 @@ pub(crate) const ARTIST_NONE: u16 = u16::MAX;
 /// Resolve an interned id against the archived string table; None for absent.
 pub(crate) fn str_at(strings: &AStrings, id: u32) -> Option<&str> {
     if id == NONE_STR { None } else { Some(strings[id as usize].as_str()) }
+}
+
+/// The SEARCHABLE form of an oracle text: reminder text removed.
+///
+/// `o:` does not search what the card object prints. MEASURED against
+/// api.scryfall.com on 2026-08-16:
+///
+///   o:"damage dealt by this creature also causes"    0   fo: same phrase   71
+///   o:"you may pay an additional"                    0   fo:              268
+///   o:"level up only as a sorcery"                   0   fo:               25
+///   o:/\(/                                           0   fo:/\(/ e:khm    148
+///   o:/lifelink$/ e:khm                              4   (Koma's Faithful reads
+///                                                        "Lifelink (Damage dealt…)\nWhen…"
+///                                                        and only the stripped form ends a
+///                                                        line on `lifelink`)
+///
+/// So EVERY parenthesized run is removed, not only the ones on their own line —
+/// `o:/\(/` returns zero rows across the whole corpus. `ft:` is NOT stripped
+/// (`ft:/\(/` returns 47), and neither is the emitted `oracle_text`; only the
+/// search form changes, which is why this is applied where
+/// `oracle_text_lower_id` is interned and nowhere else.
+///
+/// THE WHITESPACE RULE IS MEASURED TOO, and it is the reason this eats the
+/// space BEFORE the parenthesis rather than the one after:
+///
+///   - `\{e\}\sequal` matches Aetherflux Conduit ("…an amount of {E} (energy
+///     counters) equal to…") and `\{e\}\s\sequal` does not, so exactly one
+///     space survives a mid-line reminder;
+///   - `t:saga o:/^$/` returns 233 — every Saga — so the EMPTY LINE a
+///     leading reminder leaves behind is still there. Eating the whitespace
+///     after the `)` instead would have joined the Saga's first chapter onto
+///     the reminder's line and lost that empty line, and would also have
+///     joined `"Lifelink (…)\nWhen this creature dies"` into one line, which
+///     the `o:/lifelink$/` count above rules out directly.
+///
+/// An unclosed `(` — which no real card carries, and which `o:/\(/`'s zero
+/// rows says Scryfall does not leave standing either — strips to the end.
+pub(crate) fn strip_reminder_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('(') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    // Start of the run not yet copied out. Doubles as the floor for the
+    // whitespace walk-back, so one reminder can never eat into the previous.
+    let mut kept = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'(' {
+            i += 1;
+            continue;
+        }
+        // Walk back over the whitespace immediately before the parenthesis. Only
+        // ASCII bytes compare true here, and every byte of a multi-byte UTF-8
+        // sequence is >= 0x80, so `start` always lands on a char boundary.
+        let mut start = i;
+        while start > kept && bytes[start - 1].is_ascii_whitespace() {
+            start -= 1;
+        }
+        out.push_str(&text[kept..start]);
+        i = match text[i..].find(')') {
+            Some(off) => i + off + 1, // `)` is ASCII, so this is a char boundary
+            None => bytes.len(),
+        };
+        kept = i;
+    }
+    out.push_str(&text[kept..]);
+    std::borrow::Cow::Owned(out)
 }
 
 /// Build-time hash-consing interner; `strings` becomes CardData.strings.
@@ -727,7 +801,7 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
     // Already lowercased + accent-folded in Python (fold_accents(), #649); read as-is.
     let card_name_folded = InlineStr::<61>::from_str(&opt_str(d, "card_name_folded").unwrap_or_default());
     let oracle_text = opt_str(d, "oracle_text").unwrap_or_default();
-    let oracle_text_lower_id = it.intern(oracle_text.to_lowercase());
+    let oracle_text_lower_id = it.intern(strip_reminder_text(&oracle_text).to_lowercase());
     let flavor_text = opt_str(d, "flavor_text").unwrap_or_default();
     let flavor_text_lower_id = it.intern(flavor_text.to_lowercase());
     let card_artist_vid = match opt_str(d, "card_artist") {
@@ -11860,7 +11934,14 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 // per distinct line at bind time and expands to an exact card set. No struct size moves, so the
 // header cannot catch this on its own: a store without the index would answer every `t:` query
 // with zero rows.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026082301;
+
+//
+// 2026082302 — `o:` DROPS REMINDER TEXT. `oracle_text_lower_id` is now
+// `strip_reminder_text(...)` lowercased rather than a plain `to_lowercase()`, so the interned
+// strings, the oracle trigram index and its word dictionary are all different bytes for the same
+// card — and a reader pairing this code with a pre-strip archive would silently search reminder
+// text again. Nothing about the emitted `oracle_text` changes.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026082302;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {

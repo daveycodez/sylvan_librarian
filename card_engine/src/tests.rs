@@ -11619,6 +11619,36 @@ fn a_type_value_matches_the_type_line_as_a_substring() {
 }
 
 #[test]
+fn strip_reminder_text_matches_scryfalls_measured_rule() {
+    use super::strip_reminder_text as strip;
+
+    // `o:` searches oracle text with reminder text removed; `fo:` searches the full text.
+    // Measured against api.scryfall.com on 2026-08-16 — `o:"damage dealt by this creature also
+    // causes"` 0 / `fo:` 71, `o:/\(/` 0 across the whole corpus / `fo:/\(/ e:khm` 148.
+    assert_eq!(strip("Flying"), "Flying");
+    assert_eq!(
+        strip("Lifelink (Damage dealt by this creature also causes you to gain that much life.)\nWhen this creature dies, draw a card."),
+        "Lifelink\nWhen this creature dies, draw a card."
+    );
+    // EXACTLY ONE SPACE survives a mid-line reminder: `o:/\{e\}\sequal/` matches Aetherflux
+    // Conduit and `o:/\{e\}\s\sequal/` does not, so the space BEFORE the parenthesis is the one
+    // that goes.
+    assert_eq!(
+        strip("you get an amount of {E} (energy counters) equal to the mana spent"),
+        "you get an amount of {E} equal to the mana spent"
+    );
+    // ...and the EMPTY LINE a leading reminder leaves behind stays, which is why the whitespace
+    // after the `)` is not eaten: `t:saga o:/^$/` returns 233 — every Saga.
+    assert_eq!(strip("(As this Saga enters, add a lore counter.)\nI — Draw a card."), "\nI — Draw a card.");
+    // Every parenthesized run, not just the trailing one.
+    assert_eq!(strip("A (one) B (two) C"), "A B C");
+    // Unclosed: no real card carries one, and Scryfall leaves no `(` standing anywhere.
+    assert_eq!(strip("Flying (this never closes"), "Flying");
+    // Untouched input is borrowed, not copied — this runs on every card at load.
+    assert!(matches!(strip("Flying"), std::borrow::Cow::Borrowed(_)));
+}
+
+#[test]
 fn type_regex_no_longer_builds_a_vacuous_mask() {
     // Regression for the silent-empty-result bug this fix closes: `t:/…/` used
     // to reach the card_types branch, whose `rhs.as_array()` is None for a
