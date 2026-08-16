@@ -490,7 +490,8 @@ pub(crate) enum FilterExpr {
     /// Scryfall numeric color syntax (`id>=3`, `c=2`): compares the NUMBER of
     /// colors in the field (popcount over the WUBRG bits) against `count`.
     /// Only Colors/ColorIdentity reach here — the Python side rejects numeric
-    /// comparisons on produced_mana, whose C key is not a color.
+    /// comparisons on produced_mana, which Scryfall counts over SIX values
+    /// (colorless included) rather than the five this popcount reads.
     ColorCountCmp {
         field: ColorField,
         op: CmpOp,
@@ -1783,6 +1784,13 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
         // NUMBER of colors in the field. ":" behaves like "=" here (verified
         // against the live Scryfall API: id:2 and id=2 return identical sets),
         // which is exactly what str_op_to_cmp yields.
+        //
+        // produced_mana is refused, and it is a MEASUREMENT rather than caution:
+        // Scryfall counts six values on that column, colorless among them, so
+        // `produces=1 produces:c` is 481 -- the cards that produce colorless and
+        // nothing else -- where the popcount below masks C off and would call
+        // those zero. That is also why `produces:m`, which IS a count on
+        // Scryfall, is not lowered into this node by the parser.
         if rhs["node_type"].as_str() == Some("NumericValueNode") {
             if matches!(color_field, ColorField::ProducedMana) {
                 return Err("numeric comparison is not supported for produced_mana".to_string());

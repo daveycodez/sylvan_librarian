@@ -8351,10 +8351,57 @@ fn color_count_cmp_matches_popcount_oracle() {
     }
 }
 
+// The colour-COUNT names (`c:m`, `id:gold`, `c!=multicolored`) reach the engine
+// as the numeric comparison the parser lowered them to, and the operator
+// is NOT the one that was typed: `c>m` arrives as `>= 2` and `c!=m` as `< 2`.
+// This walks the wire JSON the parser now emits for each of them and pins the
+// matched rows on the plane fixture, so a lowering that drifts shows up as a
+// changed row set rather than as a filter that still builds.
+#[test]
+fn color_count_name_wire_shapes_select_expected_rows() {
+    let data = plane_fixture_store();
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+
+    let matched = |attr: &str, orig: &str, op: &str, n: u8| -> Vec<usize> {
+        let node = serde_json::json!({
+            "node_type": "CardBinaryOperatorNode",
+            "kwargs": {
+                "lhs": {"node_type": "CardAttributeNode", "kwargs": {"attribute_name": attr, "original_attribute": orig}},
+                "op": op,
+                "rhs": {"node_type": "NumericValueNode", "kwargs": {"value": n}},
+            },
+        });
+        let f = super::build_filter(&node).expect("colour-count node must build");
+        archived
+            .cards
+            .iter()
+            .enumerate()
+            .filter(|(_, card)| f.eval_card(card, &archived.strings) == Tri::True)
+            .map(|(cid, _)| cid)
+            .collect()
+    };
+
+    // colors popcounts on the fixture: [0, 1, 1, 2, 0, 5, 1, 2, 1, 0]
+    // c:m / c=m / c>m / c>=m -> ">= 2"
+    assert_eq!(matched("card_colors", "c", ">=", 2), vec![3, 5, 7]);
+    // c<m / c!=m -> "< 2", which is NOT "!= 2" (that would also take rows 3 and 7)
+    assert_eq!(matched("card_colors", "c", "<", 2), vec![0, 1, 2, 4, 6, 8, 9]);
+    // c<=m -> ">= 0", a tautology
+    assert_eq!(matched("card_colors", "c", ">=", 0), (0..10).collect::<Vec<_>>());
+
+    // identity popcounts: [0, 1, 1, 2, 2, 1, 2, 5, 1, 0] -- row 9's C-bit identity is zero colors
+    assert_eq!(matched("card_color_identity", "id", ">=", 2), vec![3, 4, 6, 7]);
+    assert_eq!(matched("card_color_identity", "id", "<", 2), vec![0, 1, 2, 5, 8, 9]);
+}
+
 // The Python side serializes a numeric color comparison as a raw
 // NumericValueNode rhs (not the usual color-letter list); build_binary must
 // turn that into ColorCountCmp — with ":" behaving as equality, matching the
-// live Scryfall API — and refuse produced_mana, whose C key is not a color.
+// live Scryfall API — and refuse produced_mana. That refusal is measured, not
+// cautious: Scryfall counts SIX values there (`produces=1 produces:c` = 481, the
+// cards that produce colorless and nothing else), which this five-key popcount
+// cannot express — so `produces:m` is not lowered into this node either.
 #[test]
 fn build_filter_numeric_color_rhs() {
     let node = |attr: &str, orig: &str, op: &str, n: u8| {

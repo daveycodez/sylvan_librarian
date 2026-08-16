@@ -24,6 +24,7 @@ from pyparsing import (
 
 from api.parsing.card_query_nodes import CardAttributeNode, ExactNameNode, to_card_query_ast
 from api.parsing.db_info import (
+    COLOR_COUNT_NAMES,
     COLOR_NAME_TO_CODE,
     NUMERIC_CARD_ATTRIBUTES,
     PARSER_CLASS_TO_FIELD_INFOS,
@@ -284,7 +285,7 @@ def create_color_parsers() -> dict[str, ParserElement]:
     Returns:
         Dictionary containing color parser elements
     """
-    color_word = make_regex_pattern(COLOR_NAME_TO_CODE)
+    color_word = make_regex_pattern({*COLOR_NAME_TO_CODE, *COLOR_COUNT_NAMES})
     color_letter_pattern = Regex(r"[wubrgcWUBRGC]+")
     # Scryfall numeric color syntax: id>=3 / c=2 compare the NUMBER of colors in
     # the field. A bare integer is a valid color value; the negative lookahead

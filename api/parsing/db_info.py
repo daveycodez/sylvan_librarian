@@ -332,6 +332,53 @@ COLOR_CODE_TO_NAME = {
 
 COLOR_NAME_TO_CODE = {v: k for k, v in COLOR_CODE_TO_NAME.items()}
 
+# The colour values that are a COUNT rather than a set of letters.
+#
+# `c:m` is not "the colour m" -- there is no such colour. It is Scryfall's word for MULTICOLOURED,
+# and it compares the NUMBER of colours in the column, which is why it cannot live in
+# COLOR_NAME_TO_CODE beside `white`: there are no letters to expand. `gold` and the
+# `multicolor` spellings are the same value under other names; every one of the six answers the
+# identical count (`c:m` = `c:gold` = `c:multicolor` = `c:multicolored` = `c:multicolour` =
+# `c:multicoloured` = 44 in Kaldheim, where `c:2` = 43 and `c>=2` = 44).
+#
+# THE OPERATOR TABLE IS MEASURED, and it is not "substitute the number 2". Corpus-wide against
+# api.scryfall.com, 2026-08-16:
+#
+#   c:m = c=m = c>m = c>=m = 4,607 = `c>=2`          (`c=2` is 3,811 and `c>2` is 796)
+#   c<m = c!=m           = 29,049 = `c<2`            (`c!=2` is 29,836)
+#   c<=m                 = 33,599 = EVERY CARD       (`c<=2` is 32,812)
+#
+# `>` is the surprise on the high side -- `c>m` is `c>=2`, not `c>2` -- and `!=` is the surprise on
+# the low side: `c!=m` is `c<2`, the negation of "is multicoloured", NOT `c!=2`, which would also
+# admit the 796 three-and-more-colour cards. `<=` is a tautology rather than `c<=2`, pinned against
+# a second term so it cannot be read as "the whole corpus": `c<=m t:creature` = `t:creature`
+# = `c<=5 t:creature` = 18,753 where `c<=2 t:creature` = 18,140.
+#
+# The identity spellings take the same table on their own column: `id:m` = `id=m` = `id>m` =
+# `id>=m` = 5,831 = `id>=2`, `id<m` = `id!=m` = 27,768 = `id<2` (`id!=2` is 28,824), and
+# `id<=m` = 33,599 = every card (`id<=2` is 32,543).
+#
+# `produces:` is DELIBERATELY NOT lowered, and the reason is a measurement rather than caution.
+# `produces:m` really is a count on Scryfall -- 1,460, which is `produces>=2` -- but it is a count
+# over SIX values, colorless among them: `produces=1 produces:c` = 481, exactly the cards that
+# produce colorless and nothing else, so a C-only producer counts ONE there. Both of this project's
+# count implementations read the five WUBRG keys and would call that card zero
+# (`magic.color_identity_mask` on the SQL side, the popcount in card_engine's ColorCountCmp on the
+# other), and the five-colour union agrees on both sides at 2,121 while Scryfall's `produces>=1` is
+# 2,603 -- the 482-card difference IS the colorless producers. So `produces:m` stays the error it
+# already was rather than a count that is quietly short by 481 cards; making it work is a
+# six-value count, which is its own change on both halves.
+COLOR_COUNT_NAMES = frozenset(
+    {
+        "m",
+        "gold",
+        "multicolor",
+        "multicolour",
+        "multicolored",
+        "multicoloured",
+    }
+)
+
 FORMAT_CODE_TO_NAME = {
     "m": "modern",
     "s": "standard",

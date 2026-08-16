@@ -13,6 +13,7 @@ from api.parsing.db_info import (
     CARD_SUPERTYPES,
     CARD_TYPES,
     COLOR_CODE_TO_NAME,
+    COLOR_COUNT_NAMES,
     COLOR_NAME_TO_CODE,
     DB_NAME_TO_FIELD_TYPE,
     FORMAT_CODE_TO_NAME,
@@ -560,8 +561,57 @@ class ExactNameNode(QueryNode):
         return f'exact name is "{self.value}"'
 
 
+# What a colour-COUNT name (`c:m`, `id:gold`) means, per operator, as the (operator, count) pair
+# the numeric colour-count comparison is built from. Measured; the evidence and the two surprises
+# in it are written out at db_info.COLOR_COUNT_NAMES.
+_COLOR_COUNT_BY_OPERATOR: typing.Final = {
+    ":": (">=", 2),
+    "=": (">=", 2),
+    ">": (">=", 2),
+    ">=": (">=", 2),
+    "<": ("<", 2),
+    "!=": ("<", 2),
+    "<=": (">=", 0),  # a tautology, spelled as a count so it stays one leaf
+}
+
+# produced_mana is NOT here, and the reason is measured rather than conservative: Scryfall counts
+# SIX values on that column, colorless among them. `produces=1 produces:c` is 481 -- exactly the
+# cards that produce colorless and nothing else -- so a C-only producer counts ONE there, where
+# `magic.color_identity_mask` and the engine's popcount both read the five WUBRG keys and would
+# call it zero. `produces:m` is therefore a count this column cannot answer yet, and it stays the
+# error it already was rather than becoming a silently different one.
+_COLOR_COUNT_ATTRIBUTES: typing.Final = ("card_colors", "card_color_identity")
+
+
 class CardBinaryOperatorNode(BinaryOperatorNode):
     """Card-specific binary operator node with custom SQL generation."""
+
+    def __init__(self, lhs: QueryNode, operator: str, rhs: QueryNode) -> None:
+        """Initialize the node, lowering a colour-COUNT name to a numeric colour-count comparison.
+
+        `c:m` and its five synonyms are a NUMBER of colours, not a set of them, so the value has no
+        letters to compare and the operator does not survive verbatim either (`c>m` is `c>=2` and
+        `c!=m` is `c<2`). Both parsers reach this constructor -- the hand parser builds the node
+        directly, the pyparsing one via `to_card_query_ast` -- so lowering it here is what keeps
+        them from disagreeing, and the node the rest of the pipeline sees is the ordinary numeric
+        one that `c>=2` already produces, on every path: engine JSON, SQL and explanation alike.
+
+        Args:
+            lhs: The left-hand side operand.
+            operator: The binary operator.
+            rhs: The right-hand side operand.
+        """
+        if (
+            isinstance(lhs, CardAttributeNode)
+            and isinstance(rhs, StringValueNode)
+            and lhs.attribute_name in _COLOR_COUNT_ATTRIBUTES
+            and rhs.value.strip().lower() in COLOR_COUNT_NAMES
+        ):
+            lowered = _COLOR_COUNT_BY_OPERATOR.get(operator)
+            if lowered is not None:
+                operator, count = lowered
+                rhs = NumericValueNode(count)
+        super().__init__(lhs, operator, rhs)
 
     def kwargs(self) -> dict:
         """Return this node's kwargs dict for Rust engine JSON serialization."""

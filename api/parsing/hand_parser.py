@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 
 from api.parsing.card_query_nodes import CardAttributeNode, CardBinaryOperatorNode, ExactNameNode
-from api.parsing.db_info import ALIAS_TO_FIELD_INFOS, COLOR_NAME_TO_CODE, ParserClass
+from api.parsing.db_info import ALIAS_TO_FIELD_INFOS, COLOR_COUNT_NAMES, COLOR_NAME_TO_CODE, ParserClass
 from api.parsing.nodes import (
     AndNode,
     BinaryOperatorNode,
@@ -47,7 +47,11 @@ _DUAL_NUM_TEXT: frozenset[str] = frozenset(
 
 _NUMERIC_ALIASES: frozenset[str] = frozenset(alias for alias, pc in _ALIAS_TO_PC.items() if pc == ParserClass.NUMERIC)
 
-_VALID_COLOR_NAMES: frozenset[str] = frozenset(COLOR_NAME_TO_CODE)
+# The colour NAMES (`white`, `red`) and the COUNT-valued ones (`m`, `gold`, `multicolored`) are
+# one vocabulary as far as the value parser is concerned: both are words rather than letter
+# strings. What separates them is what CardBinaryOperatorNode does with the result, not whether
+# this parser will accept it.
+_VALID_COLOR_NAMES: frozenset[str] = frozenset(COLOR_NAME_TO_CODE) | COLOR_COUNT_NAMES
 _COLOR_LETTERS: frozenset[str] = frozenset("wubrgcWUBRGC")
 _MIN_MTG_YEAR: int = 1992
 _MAX_YEAR: int = 2040
