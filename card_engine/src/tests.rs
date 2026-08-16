@@ -2,7 +2,7 @@ use super::{
     and_child_rank, assign_name_ranks,
     build_numeric_index, build_oracle_text_index, build_tag_index, build_trigram_index,
     build_rarity_index, build_flavor_index, build_hybrid_tag_index, bitmap_beats_postings, HybridTagIndex, build_sort_permutations,
-    assign_artwork_groups, assign_set_ranks, assign_foreign_artwork_groups, build_artwork_base_from, build_lang_index, build_printed_name_index, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
+    assign_artwork_groups, assign_set_ranks, assign_foreign_artwork_groups, build_artwork_base_from, build_lang_index, build_printed_name_index, drop_group_if_annex_only, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
     cards_of_printings, count_common_keywords, count_common_types,
     build_artist_index, build_printing_value_index, build_arith_tuple_index, is_arith_tuple_route, range_candidates, narrow_candidates, narrow_candidates_exact, rarity_candidates,
     range_too_broad_to_narrow, run_query, run_query_routed, run_query_widened, run_query_with_plan, explain, explain_analyze, AcquireFacts, PlanEstimate, PlanTrial,
@@ -11971,4 +11971,56 @@ fn a_foreign_printed_name_fuzzy_matches_to_its_printing() {
     }
     // The card's own English and foreign names are ONE answer, never ambiguous with each other.
     assert!(matches!(fuzzy_name_match(a, "lightning bolt", 0.4, 0.05), FuzzyOutcome::Hit { .. }));
+}
+
+#[test]
+fn an_annex_only_oracle_is_dropped_not_panicked() {
+    // The real-corpus trigger: the ja 4ED printings of the ante cards (Bronze Tablet, Rebirth,
+    // Tempest Efreet) alone carry `oldschool: legal`, so the never-legal import filter keeps only
+    // non-canonical rows and the oracle reaches grouping annex-only. Before the drop guard this
+    // PANICKED the build (`divergent_formats_of` on the zero-width canonical window). Both close
+    // sites take the guard: the interior group boundary and the end of the stream.
+    let mut vocab = VocabInterner::new();
+    let mut cards = vec![stub_card(1, 0, &[], &mut vocab)];
+    let mut printings: Vec<Printing> = Vec::new();
+    let mut offsets = vec![0u32];
+    let mut foreign = vec![stub_printing(11, 11, None)];
+    let mut foreign_offsets = vec![0u32];
+    let (mut dropped, mut rows_dropped) = (0usize, 0usize);
+
+    // Interior close: the first group ends with no canonical row — dropped whole, annex row too.
+    drop_group_if_annex_only(
+        &mut cards, &printings, &mut offsets, &mut foreign, &mut foreign_offsets, &mut dropped, &mut rows_dropped,
+    );
+    assert!(cards.is_empty(), "the annex-only oracle is gone, card and rows alike");
+    assert!(foreign.is_empty());
+    assert_eq!((dropped, rows_dropped), (1, 1));
+
+    // A group WITH a canonical row survives untouched, its annex rows with it.
+    cards.push(stub_card(2, 0, &[], &mut vocab));
+    offsets.push(0);
+    foreign_offsets.push(0);
+    printings.push(stub_printing(21, 21, Some(2.0)));
+    foreign.push(stub_printing(22, 22, None));
+    drop_group_if_annex_only(
+        &mut cards, &printings, &mut offsets, &mut foreign, &mut foreign_offsets, &mut dropped, &mut rows_dropped,
+    );
+    assert_eq!(cards.len(), 1, "a canonical row keeps the group");
+    assert_eq!((printings.len(), foreign.len()), (1, 1));
+    assert_eq!((dropped, rows_dropped), (1, 1));
+
+    // End-of-stream close: a trailing annex-only group (two annex rows) drops the same way.
+    cards.push(stub_card(3, 0, &[], &mut vocab));
+    offsets.push(printings.len() as u32);
+    foreign_offsets.push(foreign.len() as u32);
+    foreign.push(stub_printing(31, 31, None));
+    foreign.push(stub_printing(32, 32, None));
+    drop_group_if_annex_only(
+        &mut cards, &printings, &mut offsets, &mut foreign, &mut foreign_offsets, &mut dropped, &mut rows_dropped,
+    );
+    assert_eq!(cards.len(), 1);
+    assert_eq!(foreign.len(), 1, "only the surviving card's annex row remains");
+    assert_eq!((dropped, rows_dropped), (2, 3));
+    // The accounting invariant reload_commit asserts: canonical + annex + dropped == staged.
+    assert_eq!(printings.len() + foreign.len() + rows_dropped, 5);
 }

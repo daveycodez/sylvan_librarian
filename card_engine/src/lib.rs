@@ -13466,6 +13466,40 @@ fn acquire_facts_to_pydict<'py>(py: Python<'py>, f: &AcquireFacts) -> PyResult<B
     Ok(d)
 }
 
+/// Drop the just-closed oracle group if it holds ZERO canonical rows — annex rows included.
+///
+/// Reachable through a real Scryfall data quirk: the ja 4th Edition printings of the three
+/// ante cards (Bronze Tablet, Rebirth, Tempest Efreet) carry `legalities.oldschool = "legal"`
+/// while every OTHER printing is never-legal — so the never-legal import filter keeps only
+/// rows that are not in default_cards, and the oracle arrives here annex-only. An empty
+/// canonical range breaks the every-card-has-a-canonical-representative invariant the whole
+/// canonical space is built on (`divergent_formats_of`'s `printings[start]` walk panics on
+/// the zero-width window, and every default-lane representative read would be wrong even if
+/// it didn't). Dropping is the same policy the never-legal filter already applies to these
+/// cards' other printings — a documented deviation, counted so a build can report it.
+#[allow(clippy::too_many_arguments)]
+fn drop_group_if_annex_only(
+    cards: &mut Vec<OracleCard>,
+    printings: &[Printing],
+    offsets: &mut Vec<u32>,
+    foreign: &mut Vec<Printing>,
+    foreign_offsets: &mut Vec<u32>,
+    dropped: &mut usize,
+    rows_dropped: &mut usize,
+) {
+    if let Some(&start) = offsets.last()
+        && printings.len() as u32 == start
+    {
+        cards.pop();
+        offsets.pop();
+        let fstart = *foreign_offsets.last().expect("foreign_offsets opens with offsets") as usize;
+        *rows_dropped += foreign.len() - fstart;
+        foreign.truncate(fstart);
+        foreign_offsets.pop();
+        *dropped += 1;
+    }
+}
+
 #[pyclass]
 struct QueryEngine {
     shm_path: PathBuf,
@@ -13681,9 +13715,26 @@ impl QueryEngine {
         // each side's relative order). See CardData.foreign.
         let mut foreign: Vec<Printing> = Vec::new();
         let mut foreign_offsets: Vec<u32> = Vec::new();
+        // A group that closes with ZERO canonical rows is dropped whole, annex rows included —
+        // see drop_group_if_annex_only for the mechanism and the real-corpus trigger (the ja 4ED
+        // ante cards, whose every canonical printing the never-legal filter removes).
+        let mut annex_only_oracles_dropped = 0usize;
+        // The ROW count those drops removed, so the completeness assert below can account for
+        // every staged row exactly (canonical + annex + dropped == staged).
+        let mut annex_only_rows_dropped = 0usize;
+        let n_rows = rows.len();
         for mut row in rows {
             let is_new = cards.last().is_none_or(|c| c.oracle_id != row.oracle_id);
             if is_new {
+                drop_group_if_annex_only(
+                    &mut cards,
+                    &printings,
+                    &mut offsets,
+                    &mut foreign,
+                    &mut foreign_offsets,
+                    &mut annex_only_oracles_dropped,
+                    &mut annex_only_rows_dropped,
+                );
                 offsets.push(printings.len() as u32);
                 foreign_offsets.push(foreign.len() as u32);
                 cards.push(OracleCard {
@@ -13813,6 +13864,22 @@ impl QueryEngine {
                 foreign.push(printing);
             }
         }
+        drop_group_if_annex_only(
+            &mut cards,
+            &printings,
+            &mut offsets,
+            &mut foreign,
+            &mut foreign_offsets,
+            &mut annex_only_oracles_dropped,
+            &mut annex_only_rows_dropped,
+        );
+        // Every staged row is accounted for: canonical + annex + dropped-with-their-oracle. The
+        // drop is deliberate policy, not loss — asserted so it can never become loss silently.
+        assert_eq!(
+            printings.len() + foreign.len() + annex_only_rows_dropped,
+            n_rows,
+            "row accounting broke around {annex_only_oracles_dropped} annex-only oracle drop(s)"
+        );
         offsets.push(printings.len() as u32);
         foreign_offsets.push(foreign.len() as u32);
         assign_name_ranks(&mut cards);
