@@ -812,13 +812,13 @@ def test_set_search_sql_translation(parse_query, input_query: str, expected_sql:
         ),
         (
             "rarity:mythic",
-            "(card.card_rarity_int = %(p_int_Mw)s)",
-            {"p_int_Mw": 3},
+            "(card.card_rarity_int = %(p_int_NA)s)",
+            {"p_int_NA": 4},
         ),
         (
             "rarity:special",
-            "(card.card_rarity_int = %(p_int_NA)s)",
-            {"p_int_NA": 4},
+            "(card.card_rarity_int = %(p_int_Mw)s)",
+            {"p_int_Mw": 3},
         ),
         (
             "rarity:bonus",
@@ -833,8 +833,8 @@ def test_set_search_sql_translation(parse_query, input_query: str, expected_sql:
         ),
         (
             "r:mythic",
-            "(card.card_rarity_int = %(p_int_Mw)s)",
-            {"p_int_Mw": 3},
+            "(card.card_rarity_int = %(p_int_NA)s)",
+            {"p_int_NA": 4},
         ),
         # Short form rarity values (single-letter abbreviations)
         (
@@ -869,23 +869,23 @@ def test_set_search_sql_translation(parse_query, input_query: str, expected_sql:
         ),
         (
             "r:m",
-            "(card.card_rarity_int = %(p_int_Mw)s)",
-            {"p_int_Mw": 3},
+            "(card.card_rarity_int = %(p_int_NA)s)",
+            {"p_int_NA": 4},
         ),
         (
             "rarity:m",
+            "(card.card_rarity_int = %(p_int_NA)s)",
+            {"p_int_NA": 4},
+        ),
+        (
+            "r:s",
             "(card.card_rarity_int = %(p_int_Mw)s)",
             {"p_int_Mw": 3},
         ),
         (
-            "r:s",
-            "(card.card_rarity_int = %(p_int_NA)s)",
-            {"p_int_NA": 4},
-        ),
-        (
             "rarity:s",
-            "(card.card_rarity_int = %(p_int_NA)s)",
-            {"p_int_NA": 4},
+            "(card.card_rarity_int = %(p_int_Mw)s)",
+            {"p_int_Mw": 3},
         ),
         (
             "r:b",

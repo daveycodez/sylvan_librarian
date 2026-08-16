@@ -6878,22 +6878,33 @@ fn all_match_promotion_correct_for_card_space_exact_predicate() {
 /// group's internal order would come out reversed in one direction.
 fn tie_break_fixture() -> (Vec<OracleCard>, VocabInterner) {
     let mut vocab = VocabInterner::new();
-    let mut card0 = stub_card(1, TYPE_CREATURE, &[], &mut vocab); // cmc=3, edhrec=10
+    // The tied trio is ordered by NAME, which is the tiebreak `sort_key_bits` puts in its third
+    // lane (Scryfall's own; see `sort_key_bits`). The names are chosen so the intended tie order —
+    // card1, card0, card2 — is the same one the edhrec ranks used to give, so every expectation
+    // below still reads as it did; only the reason the order holds has changed.
+    let mut card0 = stub_card(1, TYPE_CREATURE, &[], &mut vocab); // cmc=3, name "btie" (middle)
     card0.cmc = Some(3);
     card0.edhrec_rank = Some(10);
-    let mut card1 = stub_card(2, TYPE_CREATURE, &[], &mut vocab); // cmc=3, edhrec=5 (lowest in the tie)
+    card0.card_name_folded = InlineStr::from_str("btie");
+    let mut card1 = stub_card(2, TYPE_CREATURE, &[], &mut vocab); // cmc=3, name "atie" (first)
     card1.cmc = Some(3);
     card1.edhrec_rank = Some(5);
-    let mut card2 = stub_card(3, TYPE_CREATURE, &[], &mut vocab); // cmc=3, edhrec=20 (highest in the tie)
+    card1.card_name_folded = InlineStr::from_str("atie");
+    let mut card2 = stub_card(3, TYPE_CREATURE, &[], &mut vocab); // cmc=3, name "ctie" (last)
     card2.cmc = Some(3);
     card2.edhrec_rank = Some(20);
+    card2.card_name_folded = InlineStr::from_str("ctie");
     let mut card3 = stub_card(4, TYPE_CREATURE, &[], &mut vocab); // cmc=1
     card3.cmc = Some(1);
     card3.edhrec_rank = Some(1);
+    card3.card_name_folded = InlineStr::from_str("dsolo");
     let mut card4 = stub_card(5, TYPE_CREATURE, &[], &mut vocab); // cmc=5
     card4.cmc = Some(5);
     card4.edhrec_rank = Some(1);
-    (vec![card0, card1, card2, card3, card4], vocab)
+    card4.card_name_folded = InlineStr::from_str("esolo");
+    let mut cards = vec![card0, card1, card2, card3, card4];
+    assign_name_ranks(&mut cards);
+    (cards, vocab)
 }
 
 /// Expected order, by oracle_id: ascending is [card3(1), card1(3,e5),
@@ -10238,8 +10249,14 @@ fn order_name_sorts_and_paginates() {
             .map(|(c, _)| u128::from(c.oracle_id))
             .collect()
     };
-    assert_eq!(ids("asc"), [4, 2], "within the tie: lower edhrec rank first");
-    assert_eq!(ids("desc"), [4, 2], "secondaries keep their order under desc");
+    // Two DISTINCT cards sharing a name tie all the way through the name lane, so the order falls
+    // to card order (oracle_id) — edhrec is no longer a tiebreak anywhere. Scryfall breaks this
+    // last tie by printing preference (measured: "Monster Mashup" tmc/117 2026 before "Monster
+    // Mash-Up" unk/RB15 2025, the two names being equal once collated); reproducing that would
+    // mean putting a printing-level value in a lane `page_cmp` deliberately keeps card-level, so
+    // it stays a recorded residual rather than a silent difference.
+    assert_eq!(ids("asc"), [2, 4], "within the tie: card order, edhrec no longer participating");
+    assert_eq!(ids("desc"), [2, 4], "secondaries keep their order under desc");
 }
 
 // ─── Verifier cost ordering ───────────────────────────────────────────────────
@@ -10659,21 +10676,29 @@ fn printing_range_fixture(seed: u64, n_cards: usize) -> CardData {
     use rand::SeedableRng;
     let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
     let mut vocab = VocabInterner::new();
-    // Distinct edhrec ranks (shuffled), as real data has — a rank is unique per card. This keeps
-    // any two cards from sharing a full (primary, edhrec) sort key, so the streamed/walk emission
-    // (per-card-contiguous) and a naive global (key, pid) sort agree; colliding ranks would let
-    // them legitimately differ on cross-card full ties, which never occur in practice.
+    // Distinct edhrec ranks AND distinct names (both shuffled), as real data has. The names are
+    // what matters now: `sort_key_bits`' tiebreak lane is `name_rank`, so distinct names are what
+    // keep any two cards from sharing a full (primary, tiebreak) sort key — which is what lets the
+    // streamed/walk emission (per-card-contiguous) and a naive global (key, pid) sort agree.
+    // Colliding names would let them legitimately differ on cross-card full ties, exactly as
+    // colliding edhrec ranks used to. edhrec stays distinct because it is still a sort COLUMN here.
     let mut ranks: Vec<u32> = (0..n_cards as u32).collect();
     for i in (1..n_cards).rev() {
         ranks.swap(i, rng.random_range(0..=i));
+    }
+    let mut names: Vec<u32> = (0..n_cards as u32).collect();
+    for i in (1..n_cards).rev() {
+        names.swap(i, rng.random_range(0..=i));
     }
     let mut cards = Vec::with_capacity(n_cards);
     for i in 0..n_cards {
         let mut c = stub_card(i as u128, 0, &[], &mut vocab);
         c.edhrec_rank = Some(ranks[i]);
         c.cmc = Some(rng.random_range(0..8u8));
+        c.card_name_folded = InlineStr::from_str(&format!("card{:05}", names[i]));
         cards.push(c);
     }
+    assign_name_ranks(&mut cards);
     let counts: Vec<usize> = (0..n_cards).map(|_| rng.random_range(1..=4)).collect();
     let mut data = store_of(cards, &counts, vocab);
     // cents; 5000 == $50.00, which usd<50 excludes (strict). Hot values 15/100 form big buckets.

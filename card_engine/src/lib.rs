@@ -2723,19 +2723,41 @@ struct SortOrder<'a> {
     inv:  &'a Archived<Vec<u32>>,
 }
 
-/// Dense byte-order rank of card_name_lower onto each card (equal names share
-/// a rank; the standard sort secondaries break their ties). Every card has a
-/// name, so unlike the other sort columns the rank is never absent.
+/// The string `order=name` compares: the accent-folded, lowercased name with every
+/// non-alphanumeric character removed.
+///
+/// Scryfall's name collation is neither byte order nor ICU. Measured on 2026-08-16 over 1,333
+/// adjacent pairs from eight `order=name` pages chosen to stress it — LTR (diacritics), Unstable
+/// and Unfinity (underscores, quotes, digits), planeswalkers (commas), khm, and a digits-and-letters
+/// mix — this rule has **0** violations, against 133 for raw lowercase bytes, 7 for stripping
+/// without folding first, and (per the sweep) 8/5/29 for `Intl.Collator("en")`. It is what puts
+/// `Binding the Old Gods` before `Bind the Monster` (spaces go), `Ajani, Caller of the Pride`
+/// before `Ajani Goldmane` (commas go), and `Éowyn, Lady of Rohan` before `Erebor Flamesmith`
+/// (É folds to e rather than sorting past z, or vanishing).
+///
+/// Fold FIRST, then strip: stripping first would delete a letter Scryfall keeps. And the filter is
+/// `char::is_alphanumeric`, not an ASCII class, for the same reason — a letter that survives NFKD
+/// with no ASCII equivalent must be kept, not dropped. The corpus cannot tell the two apart today
+/// (all 134 non-ASCII names fold to ASCII), so this is the choice that fails safe if one arrives.
+///
+/// ONE definition, called from both `assign_name_ranks` (which ranks it into the archive) and
+/// `encode_sort_key` (which writes it onto the wire). Those two must agree exactly or a partitioned
+/// merge orders differently from a single archive, which is precisely what the differential test
+/// exists to catch.
+pub(crate) fn collate_name(folded_lower: &str) -> String {
+    folded_lower.chars().filter(|c| c.is_alphanumeric()).collect()
+}
+
+/// Dense rank of `collate_name(folded name)` onto each card (equal collated names share a rank; the
+/// standard sort secondaries break their ties). Every card has a name, so unlike the other sort
+/// columns the rank is never absent.
 fn assign_name_ranks(cards: &mut [OracleCard]) {
+    let key = |c: &OracleCard| collate_name(c.card_name_folded.as_str());
     let mut ids: Vec<u32> = (0..cards.len() as u32).collect();
-    ids.sort_unstable_by(|&a, &b| {
-        cards[a as usize].card_name_lower.as_str().cmp(cards[b as usize].card_name_lower.as_str())
-    });
+    ids.sort_unstable_by(|&a, &b| key(&cards[a as usize]).cmp(&key(&cards[b as usize])));
     let mut rank = 0u32;
     for i in 0..ids.len() {
-        if i > 0
-            && cards[ids[i - 1] as usize].card_name_lower.as_str() != cards[ids[i] as usize].card_name_lower.as_str()
-        {
+        if i > 0 && key(&cards[ids[i - 1] as usize]) != key(&cards[ids[i] as usize]) {
             rank += 1;
         }
         cards[ids[i] as usize].name_rank = rank;
@@ -3563,7 +3585,7 @@ fn build_sort_permutations(cards: &[OracleCard]) -> SortPermutations {
         ids.sort_unstable_by_key(|&i| {
             let c = &cards[i as usize];
             let pk = perm_primary_key(get(c), descending);
-            let e = c.edhrec_rank.unwrap_or(u32::MAX);
+            let e = c.name_rank;
             // Canonical secondary: the first (store-preferred) printing's
             // default prefer score, matching sort_key_bits' third component
             // for the printing the default prefer chooses.
@@ -4407,12 +4429,12 @@ fn build_printing_value_index(
     get: impl Fn(&Printing) -> Option<u32>,
 ) -> PrintingValueIndex {
     let printing_to_card = build_printing_to_card(offsets);
+    // The SAME tiebreak `sort_key_bits` puts in lane 3, because a run of this index is walked as
+    // if it were already page-ordered. It was `edhrec_rank`; Scryfall's is the name (see
+    // `sort_key_bits`), and an index still grouped the old way would hand `walk_printing_page` a
+    // run in an order the gathered path no longer produces.
     let tiebreak = |pid: usize| -> u32 {
-        printing_to_card
-            .get(pid)
-            .and_then(|&cid| cards.get(cid as usize))
-            .and_then(|c| c.edhrec_rank)
-            .unwrap_or(u32::MAX)
+        printing_to_card.get(pid).and_then(|&cid| cards.get(cid as usize)).map_or(u32::MAX, |c| c.name_rank)
     };
     // (key, tiebreak rank, pid) — one `sort_unstable` on the lexicographic tuple establishes both
     // the value-major grouping and the within-value order at once.
@@ -6732,7 +6754,10 @@ fn f32_sort_bits(v: f32) -> u32 {
 /// any comparison, so their order is bit-for-bit what it was before this key existed.
 fn sort_col_secondary(p: &APrinting, sort_col: SortCol, descending: bool) -> u32 {
     match sort_col {
-        SortCol::Set => {
+        // `released` shares `set`'s second key, measured 2026-08-16: within one release date khm
+        // answers 407, 406, 405 … under `dir=desc` and 1, 2, 3 … under `dir=asc`, so the collector
+        // number follows the primary's direction here exactly as it does under `order=set`.
+        SortCol::Set | SortCol::Released => {
             let rank = u32::from(u16::from(p.collector_rank));
             if descending { !rank } else { rank }
         }
@@ -6743,7 +6768,7 @@ fn sort_col_secondary(p: &APrinting, sort_col: SortCol, descending: bool) -> u32
 /// Order-preserving integer sort key, computed once per match instead of inside the
 /// comparator: primary column (direction folded in by negation, missing sorts last),
 /// then the column's second key (direction folded in likewise; 0 where it has none),
-/// then edhrec rank ascending (missing last), then prefer score descending (missing
+/// then NAME rank ascending, then prefer score descending (missing
 /// last). Card-level columns read the OracleCard; printing-level columns (rarity,
 /// usd) read the chosen printing, matching the pre-split semantics where the
 /// group's representative printing supplied them. Full ties fall back to printing
@@ -6777,9 +6802,9 @@ fn sort_key_bits(card: &AOracleCard, p: &APrinting, sort_col: SortCol, descendin
     };
     let pk = primary.map_or(u32::MAX, |v| f32_sort_bits(if descending { -v } else { v }));
     let sk = sort_col_secondary(p, sort_col, descending);
-    let e = card.edhrec_rank.as_ref().map(|v| u32::from(*v)).unwrap_or(u32::MAX);
+    let n = u32::from(card.name_rank);
     let sc = p.prefer_score.as_ref().map_or(u32::MAX, |v| f32_sort_bits(-f32::from(*v)));
-    ((pk as u128) << 96) | ((sk as u128) << 64) | ((e as u128) << 32) | (sc as u128)
+    ((pk as u128) << 96) | ((sk as u128) << 64) | ((n as u128) << 32) | (sc as u128)
 }
 
 /// One query match: (sort key, card index, printing index). Ties on the sort key
@@ -13276,13 +13301,17 @@ const FIELD_TABLE: &[(&str, FieldExtractor)] = &[
 ];
 
 /// Mirror of magic.rarity_int_to_text -- the import stores 0-5, Scryfall speaks words.
+///
+/// The INVERSE of `rarity_text_to_int`, and it has to be turned over with it: the ints are an
+/// ordered ladder (`order=rarity`, `r>=rare`) and 3/4 were transposed against Scryfall's, so
+/// correcting the ladder without correcting this renders every mythic card as "special".
 fn rarity_int_to_text(value: u8) -> Option<&'static str> {
     match value {
         0 => Some("common"),
         1 => Some("uncommon"),
         2 => Some("rare"),
-        3 => Some("mythic"),
-        4 => Some("special"),
+        3 => Some("special"),
+        4 => Some("mythic"),
         5 => Some("bonus"),
         _ => None,
     }
@@ -13551,7 +13580,19 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 //                `OracleCard` also gains `color_indicator`, the printed colour dot Scryfall sends
 //                on 546 printings and the card object emitted on none; it lands in the padding
 //                beside `produced_mana`, so it moves no size either.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026081602;
+//   2026081603 — the ORDERING itself, from the broad differential sweep. Nothing about the row
+//                layout moves, which is exactly why the constant has to: every change here is a
+//                stored VALUE or a bucket assignment a stale reader would misread as still meaning
+//                what it used to. (1) `name_rank` now ranks `collate_name(folded name)` —
+//                accents folded, every non-alphanumeric dropped — which is Scryfall's collation
+//                and reorders the DEFAULT order of every query. (2) `sort_key_bits`' third lane is
+//                that name rank instead of `edhrec_rank`, and `build_sort_permutations` and
+//                `build_printing_value_index` follow it, so a store built before this has its
+//                orderby runs pre-sorted by a tiebreak the executors no longer use. (3)
+//                `rarity_text_to_int` puts `special`=3 below `mythic`=4, Scryfall's ladder rather
+//                than the transposed one, which moves both `order=rarity` and `r>=mythic`; the
+//                rarity plane prefix grew to five so `mythic` keeps its plane.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026081603;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {

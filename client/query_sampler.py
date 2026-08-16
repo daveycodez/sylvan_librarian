@@ -272,7 +272,7 @@ VOCAB_PREFIXES: dict[str, str] = {
     "watermark": "watermark",
 }
 # Indexed by the corpus's `card_rarity_int`; mirrors magic.rarity_int_to_text in the schema.
-RARITIES = ("common", "uncommon", "rare", "mythic", "special", "bonus")
+RARITIES = ("common", "uncommon", "rare", "special", "mythic", "bonus")
 # Rarity is ordered, so it gets the comparison forms too — `r>=rare` is a different plan from `r:rare`.
 RARITY_OPS = (":", ">=", "<=")
 # Corpus values carry apostrophes, parentheses and spaces ("O'Connor", "First Strike"), none of

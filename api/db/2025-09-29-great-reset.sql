@@ -43,8 +43,8 @@ BEGIN
         WHEN 0 THEN 'common'
         WHEN 1 THEN 'uncommon'
         WHEN 2 THEN 'rare'
-        WHEN 3 THEN 'mythic'
-        WHEN 4 THEN 'special'
+        WHEN 3 THEN 'special'
+        WHEN 4 THEN 'mythic'
         WHEN 5 THEN 'bonus'
         ELSE NULL
     END;
