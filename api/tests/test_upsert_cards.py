@@ -6,7 +6,7 @@ import logging
 import multiprocessing
 import uuid
 from typing import TYPE_CHECKING
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import psycopg
 
@@ -242,7 +242,7 @@ class TestRunImportUnderLockStreaming:
         api._conn_pool = MagicMock()
         return api
 
-    def test_calls_stream_data_for_key(self) -> None:
+    def test_streams_default_cards_for_the_canonical_set_then_all_cards(self) -> None:
         api = self._make_api()
         with (
             patch.object(api, "_import_recent", return_value=False),
@@ -254,18 +254,23 @@ class TestRunImportUnderLockStreaming:
             ),
             patch.object(api._bulk_data_fetcher, "stream_data_for_key") as mock_stream,
         ):
-            mock_stream.return_value = iter([])
+            mock_stream.side_effect = lambda _key: iter([])
             api._run_import_under_lock()
-        mock_stream.assert_called_once_with(BulkDataKey.DEFAULT_CARDS)
+        # default_cards is streamed only to collect the canonical id set; all_cards is the feed.
+        assert mock_stream.call_args_list == [call(BulkDataKey.DEFAULT_CARDS), call(BulkDataKey.ALL_CARDS)]
 
-    def test_stream_iterator_passed_directly_to_upsert_cards(self) -> None:
-        """The exact iterator returned by stream_data_for_key is forwarded to _upsert_cards."""
+    def test_all_cards_iterator_passed_directly_to_upsert_cards(self) -> None:
+        """The ALL_CARDS iterator is forwarded as-is, the DEFAULT_CARDS ids as the canonical set."""
         api = self._make_api()
         sentinel = iter([{"id": "sentinel"}])
+        streams = {
+            BulkDataKey.DEFAULT_CARDS: iter([{"id": "canonical-id"}]),
+            BulkDataKey.ALL_CARDS: sentinel,
+        }
         with (
             patch.object(api, "_import_recent", return_value=False),
             patch.object(api, "setup_schema"),
-            patch.object(api._bulk_data_fetcher, "stream_data_for_key", return_value=sentinel),
+            patch.object(api._bulk_data_fetcher, "stream_data_for_key", side_effect=streams.__getitem__),
             patch.object(
                 api,
                 "_upsert_cards",
@@ -273,8 +278,9 @@ class TestRunImportUnderLockStreaming:
             ) as mock_staging,
         ):
             api._run_import_under_lock()
-        args, _ = mock_staging.call_args
+        args, kwargs = mock_staging.call_args
         assert args[0] is sentinel
+        assert kwargs["canonical_ids"] == {"canonical-id"}
 
 
 # ---------------------------------------------------------------------------

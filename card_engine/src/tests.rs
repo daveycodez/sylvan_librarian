@@ -2,10 +2,10 @@ use super::{
     and_child_rank, assign_name_ranks,
     build_numeric_index, build_oracle_text_index, build_tag_index, build_trigram_index,
     build_rarity_index, build_flavor_index, build_hybrid_tag_index, bitmap_beats_postings, HybridTagIndex, build_sort_permutations,
-    assign_artwork_groups, assign_set_ranks, assign_foreign_artwork_groups, build_artwork_base_from, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
+    assign_artwork_groups, assign_set_ranks, assign_foreign_artwork_groups, build_artwork_base_from, build_lang_index, build_printed_name_index, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
     cards_of_printings, count_common_keywords, count_common_types,
     build_artist_index, build_printing_value_index, build_arith_tuple_index, is_arith_tuple_route, range_candidates, narrow_candidates, narrow_candidates_exact, rarity_candidates,
-    range_too_broad_to_narrow, run_query, run_query_routed, run_query_with_plan, explain, explain_analyze, AcquireFacts, PlanEstimate, PlanTrial,
+    range_too_broad_to_narrow, run_query, run_query_routed, run_query_widened, run_query_with_plan, explain, explain_analyze, AcquireFacts, PlanEstimate, PlanTrial,
     acquire_plan_features, take_phase_stats, PagingTaken, CountSource, NarrowedRepr,
     EXACT_VALUE_TOTALS, RangeCardCounts, narrow_rec, ValueTotals, PairTotals, build_all_value_totals, build_pair_totals, build_range_card_counts, exact_result_total,
     PhysicalPlan, PlanScope, CandidatePlan, ComposePaging, trigram_candidates, finalize_trigram_index, PrintingValueIndex, NARROW_FLOOR,
@@ -12047,4 +12047,84 @@ fn annex_artwork_groups_share_canonical_ids_and_extend_past_them() {
     // And the canonical side is untouched: same gids, same counts as before the annex existed.
     assert_eq!(printings[0].artwork_group_id, 0);
     assert_eq!(printings[1].artwork_group_id, 1);
+}
+
+/// One card, two printing spaces: a canonical English "lightning bolt" printing and a French
+/// annex printing carrying the printed name "eclair de foudre" — the widened driver's and the
+/// foreign fuzzy pass's minimal fixture.
+fn bilingual_store() -> (CardData, u16, u16) {
+    let mut vocab = VocabInterner::new();
+    let en = vocab.intern("en".to_string()).expect("intern en");
+    let fr = vocab.intern("fr".to_string()).expect("intern fr");
+    let mut card = stub_card(1, 0, &[], &mut vocab);
+    card.card_name_folded = InlineStr::from_str("lightning bolt");
+    card.card_name_lower = InlineStr::from_str("lightning bolt");
+    let mut data = store_of(vec![card], &[1], vocab);
+    data.printings[0].compat.lang_id = en;
+
+    let mut foreign = stub_printing(2, 2, None);
+    foreign.compat.lang_id = fr;
+    data.strings = vec!["eclair de foudre".to_string()];
+    foreign.printed_name_folded_id = 0;
+    data.foreign = vec![foreign];
+    data.foreign_offsets = vec![0, 1];
+    data.indexes.langs = build_lang_index(&data.printings, &data.coll_vocab);
+    data.indexes.foreign_langs = build_lang_index(&data.foreign, &data.coll_vocab);
+    data.indexes.foreign_to_card = build_printing_to_card(&data.foreign_offsets);
+    data.indexes.printed_names = build_printed_name_index(&data.printings, &data.foreign, &data.strings);
+    (data, en, fr)
+}
+
+#[test]
+fn a_lang_query_answers_the_foreign_printing_itself() {
+    let (data, _, fr) = bilingual_store();
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+
+    // lang:fr as the bound filter: unique=cards still answers with the French row — the mode
+    // picks the best MATCHING row, and no canonical row matches.
+    let filter = FilterExpr::LangMatch { value: "fr".to_string(), vid: Some(fr), any: false };
+    let params = QueryParams::from_strs("card", "default", "edhrec", "asc", 100, 0);
+    let (total, page) = run_query_widened(a, &params, &filter);
+    assert_eq!(total, 1);
+    assert_eq!(page.len(), 1);
+    assert_eq!(u128::from(page[0].1.scryfall_id), 2, "the annex row, not the canonical one");
+}
+
+#[test]
+fn include_multilingual_rolls_up_to_the_canonical_row() {
+    let (data, _, _) = bilingual_store();
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+
+    // No lang pinned (the include_multilingual trigger): every row matches, and under
+    // unique=cards the canonical row wins on prefer — foreign rows lack the English bonus.
+    let params = QueryParams::from_strs("card", "default", "edhrec", "asc", 100, 0);
+    let (total, page) = run_query_widened(a, &params, &FilterExpr::True);
+    assert_eq!(total, 1);
+    assert_eq!(u128::from(page[0].1.scryfall_id), 1, "rolls up to the canonical printing");
+
+    // unique=prints keeps both, canonical before annex within the card.
+    let params = QueryParams::from_strs("printing", "default", "edhrec", "asc", 100, 0);
+    let (total, page) = run_query_widened(a, &params, &FilterExpr::True);
+    assert_eq!(total, 2);
+    assert_eq!(u128::from(page[0].1.scryfall_id), 1);
+    assert_eq!(u128::from(page[1].1.scryfall_id), 2);
+}
+
+#[test]
+fn a_foreign_printed_name_fuzzy_matches_to_its_printing() {
+    let (data, _, _) = bilingual_store();
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+
+    match fuzzy_name_match(a, "eclair de fouder", 0.4, 0.05) {
+        FuzzyOutcome::Hit { cid, vpid } => {
+            assert_eq!(cid, 0);
+            assert_eq!(vpid, 1, "the annex printing (vpid = n_printings + 0), not the English row");
+        }
+        _ => panic!("expected a foreign-name hit"),
+    }
+    // The card's own English and foreign names are ONE answer, never ambiguous with each other.
+    assert!(matches!(fuzzy_name_match(a, "lightning bolt", 0.4, 0.05), FuzzyOutcome::Hit { .. }));
 }
