@@ -243,14 +243,42 @@ class TestWhatIsLeft:
         assert result.all_ignored is True
         assert result.warnings == []
 
-    def test_a_dangling_operator_leaves_quietly_and_is_not_the_400(self):
-        """`q=t:` is a 200 on Scryfall and `q=()` is a 400; only WHY the query emptied separates them."""
-        assert scryfall_term_policy("t: e:khm").query == "e:khm"
+    def test_a_dangling_operator_is_the_bare_keyword_searched_as_a_name(self):
+        """Not a dropped term and not a vacuous one: `t:` is `t`, and a bare word is `name:t`.
+
+        Sixteen live pairs pin it (see _dangling_operator_term); the ones asserted here are
+        `t: e:khm` = `t e:khm` = 215, `-t: e:khm` = 108, and `t:` alone = `name:t` = 22,261
+        rather than the 400 that "every term was ignored" would produce.
+        """
+        assert scryfall_term_policy("t: e:khm").query == "name:t e:khm"
         assert scryfall_term_policy("t: e:khm").warnings == []
+        assert scryfall_term_policy("-t: e:khm").query == "-name:t e:khm"
         alone = scryfall_term_policy("t:")
         assert alone.all_ignored is False
         assert alone.warnings == []
-        assert alone.query == "cmc>=0"
+        assert alone.query == "name:t"
+
+    @pytest.mark.parametrize(
+        ("query", "expected"),
+        [
+            # `t>` = `t<` = `t:` = 215 in Kaldheim; `t=`, `t>=`, `t<=` and `t!=` are all 404, the
+            # same answer `name:"t="` gives. The split is measured, not tidied.
+            ("t> e:khm", "name:t e:khm"),
+            ("t< e:khm", "name:t e:khm"),
+            ("t= e:khm", 'name:"t=" e:khm'),
+            ("t>= e:khm", 'name:"t>=" e:khm'),
+            ("t!= e:khm", 'name:"t!=" e:khm'),
+            # A keyword neither side knows is still a bare word once its value is gone:
+            # `nonsense:x` is "Unknown keyword" and `nonsense:` is the 404 `q=nonsense` gives.
+            ("nonsense: e:khm", "name:nonsense e:khm"),
+            ("cmc: e:khm", "name:cmc e:khm"),
+            ("subtype: e:khm", "name:subtype e:khm"),
+        ],
+    )
+    def test_the_operator_decides_how_much_of_the_token_becomes_the_word(self, query, expected):
+        result = scryfall_term_policy(query)
+        assert result.query == expected
+        assert result.warnings == []
 
     @pytest.mark.parametrize("query", ["e:khm (t:god", "e:khm t:god)", "(", ")", "((t:god)"])
     def test_parentheses_that_do_not_balance(self, query):

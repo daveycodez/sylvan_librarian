@@ -196,9 +196,15 @@ _SCRYFALL_RARITIES = frozenset({"common", "uncommon", "rare", "special", "mythic
 #
 # Measured one request each (`c:<value> e:khm`, 2026-08-16). The accepted names are exactly the ten
 # guilds, the ten shards and wedges, the five HYPHENATED four-colour names plus their five one-word
-# synonyms, `rainbow`, `brown`, and the British spellings -- while `yore`, `glint`, `dune`, `ink`,
-# `witch`, `five` and `mono` are all REJECTED, so the un-hyphenated four-colour nicknames are not in
-# Scryfall's table and this list is a boundary rather than a superset.
+# synonyms, `rainbow`, `all`, `gold`, `brown`, and the British spellings -- while `yore`, `glint`,
+# `dune`, `ink`, `witch`, `five` and `mono` are all REJECTED, so the un-hyphenated four-colour
+# nicknames are not in Scryfall's table and this list is a boundary rather than a superset.
+#
+# The `m` family -- `m`, `gold`, `multicolor(ed)`, `multicolour(ed)` -- is listed as accepted even
+# though this parser has no spelling for it: those are a colour COUNT (`c:m` = `c>=2` = 44 in
+# Kaldheim, where `c:2` = 43) rather than a set, and ignoring them would answer a wider result than
+# Scryfall while claiming to have dropped a term Scryfall applied. Left to fail loudly, like the
+# _SCRYFALL_ONLY_KEYWORDS above.
 _COLOR_NAMES = frozenset(
     {
         "white",
@@ -210,8 +216,13 @@ _COLOR_NAMES = frozenset(
         "colourless",
         "multicolor",
         "multicolour",
+        "multicolored",
+        "multicoloured",
+        "gold",
+        "m",
         "brown",
         "rainbow",
+        "all",
         "azorius",
         "dimir",
         "rakdos",
@@ -244,6 +255,12 @@ _COLOR_NAMES = frozenset(
         "growth",
     }
 )
+
+# `produces:` reads a NARROWER name table than the colour columns do: `produces:brown` comes back
+# "Unknown color \u201cn\u201d" and `produces:colorless` "Unknown color \u201ce\u201d", where
+# `c:brown` and `c:colorless` are both fine -- colorless is a producible VALUE there, spelled `c`,
+# and the words for it are simply not in that table.
+_PRODUCES_NAMES = _COLOR_NAMES - {"colorless", "colourless", "brown"}
 
 _COLOR_LETTERS = "wubrgcm"
 _COLORED_LETTERS = "wubrg"
@@ -301,19 +318,9 @@ _EXPRESSION_ECHO_LIMIT = 20
 # composes correctly under `-` and `or` the way a dropped term would not.
 _NEVER_MATCHES = "cmc<0"
 
-# A term that always matches -- the whole query when a dangling operator was all there was.
-#
-# Scryfall answers `q=t:` with a 200 over 22,261 cards and no warning: an operator with no value is
-# neither an error nor an ignored term there, it is a term that constrains nothing. Removing it is
-# right for `t: e:khm` and would be wrong for `t:` alone, which would become "every term was
-# ignored" and a 400 -- so the removal is remembered and, if nothing else survived, this stands in.
-#
-# Deliberately NOT a per-term substitution: `-t:` would then lose its negation, and carrying the
-# negation instead (`-(cmc>=0)`, matching nothing) would turn `-t: e:khm` into a 404 where Scryfall
-# answers 200. Scryfall reads the empty value as "this column is not null" -- `t:` is 22,261 cards
-# and `o:` is 22,111, so the two are different filters -- which this project has no per-column
-# predicate for either way. The STATUS is Scryfall's; the count is not.
-_ALWAYS_MATCHES = "cmc>=0"
+# The operators whose characters do NOT stay on the word when the value is missing. See
+# _dangling_operator_term.
+_BARE_WORD_OPERATORS = frozenset({":", ">", "<"})
 
 _CONNECTORS = frozenset({"and", "or"})
 
@@ -349,6 +356,59 @@ def fold_smart_quotes(query: str) -> str:
         The query with U+2018/U+2019 as `'` and U+201C/U+201D as `"`.
     """
     return query.translate(_SMART_QUOTES)
+
+
+def _dangling_operator_term(negated: bool, keyword: str, operator: str) -> str:
+    """Rewrite `t:` to the bare-word name search Scryfall reads it as.
+
+    A DANGLING OPERATOR IS NOT A TERM AT ALL: `t:` is the bare word `t`, and a bare word is a NAME
+    search.
+
+    This used to answer `q=t:` with every card, on the theory that an operator with no value
+    constrains nothing. Measured (api.scryfall.com, 2026-08-16), the theory is wrong twice over --
+    and so is the "this column is not null" reading it was replaced by, which fits `t:` = 22,261
+    and `o:` = 22,111 and then dies on `ft:` = 1,628 where "has flavor text" is 20,877. What
+    Scryfall does is simpler: the term fails to lex as a keyword expression, so the token falls
+    through to an ordinary bare word -- and `t` names cards whose NAME contains "t".
+
+    Sixteen pairs, one request each, and every one of them equal::
+
+        t:      = t      = name:t   22,261      cmc:  = cmc         404 (no card is named "cmc")
+        o:      = o                 22,111      layout: = layout    404
+        name:   = name                  33      nonsense: = nonsense 404
+        ft:     = ft     = name:ft   1,628      wm:   = wm           33
+        in:     = in                 7,878      st:   = st        5,556
+        t: e:khm  = t e:khm            215      -t: e:khm = -t e:khm  108
+        t: or e:khm                 22,369      t: o: = t o      15,057
+
+    `t: or e:khm` is the row that proves it composes as an ordinary leaf rather than as a
+    special-cased whole-query fallback: 22,261 + (323 - 215) = 22,369 exactly.
+
+    The OPERATOR decides how much of the token becomes the word. With `:`, `>` or `<` the bare word
+    is the keyword alone (`t>` = `t<` = `t:` = 215 in Kaldheim); with `=`, `>=`, `<=` or `!=` the
+    operator characters stay ON the word, which is why `t=` and `t>=` are 404 where `t:` is 22,261,
+    and `name:"t="` is 404 to match. Both branches were checked against their `name:` twin.
+
+    Rewriting to `name:...` rather than to a bare word keeps the substitution safe in every
+    position: a keyword is `[A-Za-z_][A-Za-z0-9_]*`, so `or:` would otherwise become the connector
+    `or`. Negation, grouping and `or` then compose for free, because the result is just a term.
+
+    UNQUOTED for the bare-word branch, and quoted only for the `=`-family, because Scryfall does
+    not read the two spellings alike: `name:ft` is 1,628 and `name:"ft"` is 362, and the measured
+    equality is with the UNQUOTED form (`ft:` = `ft` = `name:ft` = 1,628). The `=`-family has to
+    be quoted regardless -- its word carries the operator characters, and `name:"t="` is the 404
+    that matched `t=`.
+
+    Args:
+        negated: Whether the term carried a leading `-`.
+        keyword: The keyword text as the client wrote it.
+        operator: The comparison operator the value was missing from.
+
+    Returns:
+        The term to put in the rebuilt query in place of the dangling one.
+    """
+    value = keyword if operator in _BARE_WORD_OPERATORS else f'"{keyword}{operator}"'
+    return f"{'-' if negated else ''}name:{value}"
 
 
 def _ignored_warning(term: str, reason: str) -> str:
@@ -401,13 +461,32 @@ def _regex_reason(pattern: str) -> str:
     return "Invalid regular expression: invalid pattern."
 
 
-def _color_reason(value: str) -> str | None:
+def _color_reason(value: str, keyword: str) -> str | None:
     """Why Scryfall refuses a colour value, or None when it does not.
 
     THE ORDER OF THE THREE CHECKS IS MEASURED, not chosen: `c:witch` spells `w i t c h`, whose `i`,
     `t` and `h` are not colours, and Scryfall still answers "A card cannot be both colored and
     colorless" -- so the contradiction is decided on the letters it DID recognize, before it
-    complains about the ones it did not. `c:mono` behaves the same way for the `m` rule.
+    complains about the ones it did not.
+
+    The `m` rule is decided FIRST, ahead of the contradiction: `c:monocolor` and `c:chromatic` and
+    `c:spectrum` all spell a `c` alongside coloured letters AND contain an `m`, and Scryfall
+    answers the `m` sentence for every one of them. Reading the contradiction first got all three
+    wrong while still fitting `c:witch`, which is why the order is pinned by values that separate
+    the two rules rather than by values that satisfy either.
+
+    And the contradiction does not exist for `produces:` at all, because colorless is a genuine
+    producible value there: `produces:wubrgc` is honoured (it matches nothing), and
+    `produces:colorless` answers "Unknown color \u201ce\u201d" -- the unknown-letter sentence --
+    where `c:colorless` is simply a name.
+
+    The `m` rule reads the WHOLE value, not the letters it recognized, and stops at five
+    characters. Both halves were needed to fit the measurements, and the first reading of this rule
+    (recognized letters only, untruncated) got `c:mono` wrong in the loudest way available -- it
+    answered "Unknown color \u201cn\u201d" where Scryfall answers the `m` sentence. Each value is
+    `sorted(set(value) - {m, -})` cut to five: `mono`->no, `mm`->(empty), `mwu`->uw, `mzy`->yz,
+    `m1`->1, `mono-red`->denor, `monocolor`->clnor, `monocolored`->cdeln, `nephilim`->ehiln (not
+    "ehilnp"), `chromatic`->achio (not "achiort"), `spectrum`->ceprs, `prismatic`->acipr.
 
     And the letter it names is the ALPHABETICALLY FIRST unrecognized one, which took nine values to
     establish and no two of which agree on any simpler rule: `glint`->i, `yore`->e, `dune`->d,
@@ -416,20 +495,22 @@ def _color_reason(value: str) -> str | None:
 
     Args:
         value: The value after the operator, unquoted.
+        keyword: The keyword the value was written against -- `produces:` has its own table.
 
     Returns:
         Scryfall's sentence, or None when the value is one it accepts.
     """
     lower = value.lower()
-    if not lower or lower in _COLOR_NAMES or lower.isdigit():
+    names = _PRODUCES_NAMES if keyword == "produces" else _COLOR_NAMES
+    if not lower or lower in names or lower.isdigit():
         return None
     known = {ch for ch in lower if ch in _COLOR_LETTERS}
     unknown = {ch for ch in lower if ch not in _COLOR_LETTERS}
-    if "c" in known and any(ch in _COLORED_LETTERS for ch in known):
-        return "A card cannot be both colored and colorless."
-    if "m" in known and len(known) > 1:
-        rest = "".join(sorted(known - {"m"}))
+    if "m" in lower and len(lower) > 1:
+        rest = "".join(sorted(set(lower) - {"m", "-"}))[: len(_COLORED_LETTERS)]
         return f"Using \u201cm\u201d with other colors is no longer supported. Use c>{rest} instead."
+    if keyword != "produces" and "c" in known and any(ch in _COLORED_LETTERS for ch in known):
+        return "A card cannot be both colored and colorless."
     if unknown:
         return f"Unknown color \u201c{min(unknown)}\u201d"
     return None
@@ -594,12 +675,14 @@ def _classify_leaf(term: str) -> tuple[bool, str, str | None]:
     operator = match.group(3)
     raw_value = match.group(4)
 
+    # BEFORE the unknown-keyword rule, because a dangling operator never reaches Scryfall's keyword
+    # table at all: `nonsense:x` is "Unknown keyword" and `nonsense:` is a 404 for a card named
+    # "nonsense" -- the same 404 `q=nonsense` gives. See _dangling_operator_term.
+    if raw_value == "":
+        return True, _dangling_operator_term(negated, match.group(2), operator), None
+
     if _is_unknown_keyword(keyword):
         return False, term, f"Unknown keyword \u201c{'-' if negated else ''}{keyword}\u201d."
-
-    # A dangling operator constrains nothing (see _ALWAYS_MATCHES) and earns no warning.
-    if raw_value == "":
-        return False, term, None
 
     equality = operator in {":", "="}
 
@@ -652,7 +735,7 @@ def _value_reason(keyword: str, equality: bool, value: str, raw_value: str) -> s
     if keyword in _ORACLE_ID_KEYWORDS and not _UUID_V4_RE.match(value):
         return "You must provide a valid v4 UUID."
     if keyword in _COLOR_KEYWORDS:
-        color_reason = _color_reason(value)
+        color_reason = _color_reason(value, keyword)
         if color_reason is not None:
             return color_reason
     # A regex literal that will not compile. Validated here so the answer is Scryfall's 400 rather
@@ -691,8 +774,6 @@ class _Scan:
     """State threaded through the recursive walk."""
 
     warnings: list[str] = field(default_factory=list)
-    #: Set by a dangling operator, the one removal Scryfall does not treat as an ignored term.
-    vacuous_term: bool = False
 
 
 def _policy_level(source: str, scan: _Scan) -> str | None:
@@ -754,10 +835,7 @@ def _apply_to_piece(piece: _Piece, scan: _Scan) -> _Piece | None:
     keep, text, reason = _classify_leaf(piece.text)
     if keep:
         return _Piece(text=text, kind="leaf")
-    if reason is None:
-        scan.vacuous_term = True
-    else:
-        scan.warnings.append(_ignored_warning(piece.text, reason))
+    scan.warnings.append(_ignored_warning(piece.text, reason or ""))
     return None
 
 
@@ -804,8 +882,7 @@ def scryfall_term_policy(raw_query: str) -> TermPolicyResult:
     query = _policy_level(folded, scan)
     if query is not None and query.strip():
         return TermPolicyResult(query=query, warnings=scan.warnings)
-    # Nothing survived. `q=t:` is a 200 and `q=()` is a 400, and the only thing separating them is
-    # WHY the query emptied -- a dangling operator or a term Scryfall refused.
-    if scan.vacuous_term and not scan.warnings:
-        return TermPolicyResult(query=_ALWAYS_MATCHES, warnings=scan.warnings)
+    # Nothing survived, and now the only way that happens is a term Scryfall refused: a dangling
+    # operator is REWRITTEN rather than dropped (_dangling_operator_term), so `q=t:` no longer
+    # empties the query and no longer needs an always-true leaf standing in for it.
     return TermPolicyResult(query=folded, warnings=scan.warnings, all_ignored=True)
