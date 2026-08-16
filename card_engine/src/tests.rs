@@ -12197,7 +12197,8 @@ fn cross_set_language_store() -> (CardData, u16, u16) {
     let en = vocab.intern("en".to_string()).expect("intern en");
     let ja = vocab.intern("ja".to_string()).expect("intern ja");
     let mut card = stub_card(1, 0, &[], &mut vocab);
-    card.card_name_folded = InlineStr::from_str("maskwood nexus");
+    // `card_name_folded_id` stays NONE_STR, which is how the archive spells "read card_name_lower"
+    // — the two are identical for an unaccented name like this one.
     card.card_name_lower = InlineStr::from_str("maskwood nexus");
 
     // strings[0..] are the collector numbers the slots are keyed on.

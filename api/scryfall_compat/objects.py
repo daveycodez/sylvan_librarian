@@ -57,11 +57,52 @@ CARD_OBJECT_FIELDS = (
     "image_updated_at", "price_usd_foil", "price_usd_etched", "price_eur_foil", "multiverse_ids",
     "promo_types", "frame_effects", "games", "finishes", "booster", "digital", "foil", "nonfoil",
     "full_art", "highres_image", "oversized", "promo", "reprint", "story_spotlight", "textless",
-    "variation", "card_faces", "all_parts",
+    "variation", "card_faces", "all_parts", "produced_mana", "color_indicator",
 )  # fmt: skip
 
 # Scryfall's card back, one image for every normal card.
 CARD_BACK_ID = "0aeebaf5-8c7d-4636-9e82-8c27447861f7"
+
+# The layouts whose faces each get their OWN image -- and, with it, their own copy of every value
+# the one-image layouts keep at the top level.
+#
+# This is the single fact the whole multi-face branch turns on, and it is a property of the LAYOUT,
+# not of anything the row carries: a transform card's front and back are two photographs, so
+# Scryfall puts image_uris, colors, power, illustration_id, flavor_text and the rest on the faces
+# and sends NO top-level copy (and no card_back_id -- there is no shared back). A split or adventure
+# card is ONE photograph of one piece of cardboard, so Scryfall sends one top-level image_uris and
+# one top-level colors, and its faces carry only text.
+#
+# Verified exhaustively against the 2026-08-16 all_cards bulk: of 540,484 printings, every row of
+# these five layouts has per-face image_uris and no top-level one, and every row of every other
+# layout has the reverse -- zero exceptions in either direction.
+_TWO_IMAGE_LAYOUTS = frozenset({"art_series", "double_faced_token", "modal_dfc", "reversible_card", "transform"})
+
+# The multi-face layouts whose related_uris.edhrec link keeps the JOINED name.
+#
+# EDHREC files a transforming or adventuring card under its front face (cc=Delver+of+Secrets,
+# cc=Brazen+Borrower, cc=Erayo%2C+Soratami+Ascendant, cc=Agadeem%27s+Awakening) and a split or
+# double-backed card under both halves (cc=Fire+%2F%2F+Ice, cc=Wear+%2F%2F+Tear,
+# cc=Temple+Garden+%2F%2F+Temple+Garden, cc=Punchcard+%2F%2F+Punchcard) -- all eight verified
+# against api.scryfall.com. art_series sits with the front-face group, not with the other two-image
+# layouts. The tcgplayer_infinite_* links in the same object keep the joined name on EVERY layout,
+# split included, so this rule is deliberately scoped to edhrec alone.
+_EDHREC_JOINED_LAYOUTS = frozenset({"double_faced_token", "reversible_card", "split"})
+
+# Top-level keys a two-image layout does not carry, because they belong to a face there.
+_FACE_OWNED_KEYS = frozenset(
+    {
+        "colors",
+        "card_back_id",
+        "illustration_id",
+        "power",
+        "toughness",
+        "loyalty",
+        "flavor_text",
+        "watermark",
+        "color_indicator",
+    }
+)
 
 # The file extension each image size is served as.
 _IMAGE_EXTENSIONS = {"small": "jpg", "normal": "jpg", "large": "jpg", "png": "png", "art_crop": "jpg", "border_crop": "jpg"}
@@ -245,7 +286,7 @@ def _scryfall_uri(row: dict[str, Any], name: str, set_code: str, number: str, la
     return f"https://scryfall.com/card/{set_code}/{number}/{segment}{path}?utm_source=api"
 
 
-def _related_uris(name: str, multiverse_ids: list[int], lang: str) -> dict[str, str]:
+def _related_uris(name: str, edhrec_name: str, multiverse_ids: list[int], lang: str) -> dict[str, str]:
     """Scryfall's `related_uris`, pointing at the destinations directly.
 
     Scryfall wraps the TCGplayer entries in `partner.tcgplayer.com/...?u=<encoded real URL>` with
@@ -261,6 +302,9 @@ def _related_uris(name: str, multiverse_ids: list[int], lang: str) -> dict[str, 
 
     Args:
         name: The English card name.
+        edhrec_name: The name the edhrec link searches for -- the FRONT FACE's on most multi-face
+            layouts, the joined one on the split-likes (see _EDHREC_JOINED_LAYOUTS). The two
+            tcgplayer searches take the joined name on every layout.
         multiverse_ids: The printing's multiverse ids, possibly empty.
         lang: The printing's language.
 
@@ -274,7 +318,7 @@ def _related_uris(name: str, multiverse_ids: list[int], lang: str) -> dict[str, 
     quoted = urllib.parse.quote_plus(name)
     out["tcgplayer_infinite_articles"] = f"https://www.tcgplayer.com/search/articles?productLineName=magic&q={quoted}"
     out["tcgplayer_infinite_decks"] = f"https://www.tcgplayer.com/search/decks?productLineName=magic&q={quoted}"
-    out["edhrec"] = f"https://edhrec.com/route/?cc={quoted}"
+    out["edhrec"] = f"https://edhrec.com/route/?cc={urllib.parse.quote_plus(edhrec_name)}"
     return out
 
 
@@ -306,18 +350,64 @@ def _prices(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _faces(row: dict[str, Any]) -> list[dict[str, Any]]:
+def _joined_mana_cost(faces: list[dict[str, Any]]) -> str:
+    """The joined top-level `mana_cost` a one-image multi-face card carries.
+
+    Scryfall's rule, checked against all 3,654 split/flip/adventure/prepare printings in the
+    2026-08-16 bulk with zero misses: `" // "` between the faces that HAVE a cost, skipping the ones
+    that do not. Fire // Ice is `"{1}{R} // {1}{U}"`; flipped Erayo, whose back face carries
+    `"mana_cost": ""`, is `"{1}{U}"` and not `"{1}{U} // "`.
+
+    Derived rather than stored because the ingest cannot preserve it: card_processing overlays each
+    face onto the parent card, so the stored top-level cost is the FRONT face's alone.
+
+    Args:
+        faces: The stored face objects, front first.
+
+    Returns:
+        The joined cost, or "" when no face carries one.
+    """
+    return " // ".join(face["mana_cost"] for face in faces if face.get("mana_cost"))
+
+
+def _faces(row: dict[str, Any], two_image: bool) -> list[dict[str, Any]]:
     """The card's faces, with the two keys the engine deliberately does not store re-added.
 
     `object` is the constant "card_face", and a face's `image_uris` is the card's CDN function with
-    front/back swapped, so neither is worth archive space.
+    front/back swapped -- on the two-image layouts, which are the only ones whose faces have their
+    own picture.
+
+    Args:
+        row: The engine row.
+        two_image: Whether this printing's layout gives each face its own image.
+
+    Returns:
+        The face objects, front first.
     """
     faces = row.get("card_faces") or []
     out = []
     for index, face in enumerate(faces):
         built: dict[str, Any] = {"object": "card_face"}
-        built.update({key: value for key, value in face.items() if value not in (None, "", [])})
-        if len(faces) > 1:
+        for key, value in face.items():
+            # `colors` is a face key only where the faces own their own art: every face of every
+            # two-image printing carries one, empty included (Agadeem, the Undercrypt is colorless
+            # and still sends `"colors": []`), and no face of a split, flip, adventure or prepare
+            # printing carries one at all. The engine always writes the key, so both halves of that
+            # are decided here.
+            if key == "colors":
+                if two_image:
+                    built[key] = value
+                continue
+            # Absent stays absent -- EXCEPT for `mana_cost` and `oracle_text`, where "" is a value
+            # Scryfall does send. Every face of every multi-face printing in the corpus carries both
+            # keys (8,620 of 8,620 transform faces, 4,356 of them with an empty cost), so an empty
+            # string there is a costless back face, never an omission.
+            if value is None or value == []:
+                continue
+            if value == "" and key not in ("mana_cost", "oracle_text"):
+                continue
+            built[key] = value
+        if two_image:
             built["image_uris"] = _image_uris(
                 row.get("scryfall_id", ""),
                 row.get("image_updated_at"),
@@ -382,7 +472,13 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
     set_code = row.get("set_code") or ""
     number = row.get("collector_number") or ""
     lang = row.get("lang") or "en"
-    faces = _faces(row)
+    layout = row.get("card_layout") or row.get("layout")
+    has_faces = bool(row.get("card_faces"))
+    # Only ever true for a card that HAS faces: the two-image layouts are all multi-face.
+    two_image = has_faces and layout in _TWO_IMAGE_LAYOUTS
+    # The joined name everywhere except edhrec on the layouts EDHREC files by front face.
+    edhrec_name = name.split(" // ")[0] if has_faces and layout not in _EDHREC_JOINED_LAYOUTS else name
+    faces = _faces(row, two_image)
 
     card: dict[str, Any] = {
         "object": "card",
@@ -407,7 +503,9 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
         "type_line": row.get("type_line"),
         # Directly after the oracle `type_line` it translates, per the live objects.
         **({"printed_type_line": row["printed_type_line"]} if row.get("printed_type_line") else {}),
-        "colors": row.get("colors") or [],
+        # `colors` is one of the values a two-image layout keeps on its faces alone (see
+        # _TWO_IMAGE_LAYOUTS); `color_identity` is the card's and stays at top level on every layout.
+        **({} if two_image else {"colors": row.get("colors") or []}),
         "color_identity": row.get("color_identity") or [],
         "keywords": row.get("card_keywords") or [],
         "games": row.get("games") or [],
@@ -429,25 +527,40 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
         "collector_number": number,
         "digital": bool(row.get("digital")),
         "rarity": row.get("rarity"),
-        "card_back_id": CARD_BACK_ID,
+        # No shared card back on a two-image layout, and no card-level illustration: both belong to
+        # a face there, and Scryfall omits the top-level keys entirely.
+        **({} if two_image else {"card_back_id": CARD_BACK_ID}),
+        # An empty string is a VALUE here, not an absence: `artist` is `""` on 965 of the 540,484
+        # printings in the 2026-08-16 bulk (and present on all of them), the same distinction
+        # `mana_cost` and `oracle_text` draw below.
         "artist": row.get("artist"),
-        "illustration_id": str(row["illustration_id"]) if row.get("illustration_id") else None,
+        **({} if two_image else {"illustration_id": str(row["illustration_id"]) if row.get("illustration_id") else None}),
         "border_color": row.get("border_color"),
         "full_art": bool(row.get("full_art")),
         "textless": bool(row.get("textless")),
         "booster": bool(row.get("booster")),
         "story_spotlight": bool(row.get("story_spotlight")),
         "prices": _prices(row),
-        "related_uris": _related_uris(name, row.get("multiverse_ids") or [], lang),
+        "related_uris": _related_uris(name, edhrec_name, row.get("multiverse_ids") or [], lang),
         "purchase_uris": _purchase_uris(row),
     }
 
-    # A multi-face card carries its faces and NOT the top-level text they replace; a single-faced
-    # one carries the text and no `card_faces`. Which keys sit at top level varies by LAYOUT, which
-    # is why this is a branch rather than a fixed key set.
+    # A multi-face card carries its faces and NOT the top-level ORACLE TEXT they replace; a
+    # single-faced one carries the text and no `card_faces`. Which keys sit at top level varies by
+    # LAYOUT, which is why this is a branch rather than a fixed key set.
+    #
+    # `mana_cost` and `image_uris` are the two the multi-face branch keeps, on the one-image layouts
+    # only: one piece of cardboard has one picture and one printed cost, so Scryfall sends both at
+    # top level for split/flip/adventure/prepare -- and neither for transform/modal_dfc, where each
+    # face has its own.
     if faces:
         card["card_faces"] = faces
+        if not two_image:
+            card["mana_cost"] = _joined_mana_cost(row.get("card_faces") or [])
+            card["image_uris"] = _image_uris(scryfall_id, row.get("image_updated_at"))
     else:
+        # `""` is a value on both, and the row carries it verbatim: every basic land serves
+        # `"mana_cost": ""` (61,908 printings) and 7,266 printings serve `"oracle_text": ""`.
         card["mana_cost"] = row.get("mana_cost")
         card["oracle_text"] = row.get("oracle_text")
         # Directly after the `oracle_text` it translates — single-face only, like the text it
@@ -476,11 +589,21 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
         ("tcgplayer_etched_id", row.get("tcgplayer_etched_id")),
         ("cardmarket_id", row.get("cardmarket_id")),
         ("security_stamp", row.get("security_stamp")),
+        # `color_indicator` and `produced_mana`: the printed colour dot on a card whose mana cost
+        # cannot state its colours (a meld result, a coloured back), and the mana a card can make.
+        # Both were stored and neither was ever emitted, so every land and every meld result this
+        # service served was missing a key Scryfall sends.
+        ("color_indicator", row.get("color_indicator") or None),
+        ("produced_mana", row.get("produced_mana") or None),
         ("promo_types", row.get("promo_types") or None),
         ("frame_effects", row.get("frame_effects") or None),
         ("all_parts", row.get("all_parts") or None),
         ("legalities", row.get("legalities")),
     ):
+        # Five of the string keys above, and color_indicator, belong to a face on a two-image
+        # layout; `frame` is the printing's and stays. See _FACE_OWNED_KEYS.
+        if two_image and key in _FACE_OWNED_KEYS:
+            continue
         if value is not None:
             card[key] = value
 

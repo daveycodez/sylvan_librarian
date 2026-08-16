@@ -55,6 +55,22 @@ fn str_of<'a>(row: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     }
 }
 
+/// Like `str_of`, but an empty string is a VALUE rather than an absence.
+///
+/// Scryfall distinguishes the two and this port collapsed them: a basic land's `mana_cost` is `""`
+/// on 61,908 of the 540,484 printings in the 2026-08-16 bulk, its `oracle_text` is `""` on 7,266,
+/// and `artist` is `""` on 965 — and all three came out of here as `null`. The distinction is safe
+/// to draw because the three keys are always PRESENT where they are emitted at all: `mana_cost` is
+/// on every one of the 532,040 rows that is not a two-image layout, `oracle_text` on every one of
+/// the 528,386 that is not multi-faced, and `artist` on all 540,484. A `null` from this accessor is
+/// a row that carried no key at all, which only a hand-built one does.
+fn present_str_of<'a>(row: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    match row.get(key) {
+        Some(Value::String(s)) => Some(s),
+        _ => None,
+    }
+}
+
 fn num_of<'a>(row: &'a Map<String, Value>, key: &str) -> Option<&'a Value> {
     match row.get(key) {
         Some(v @ Value::Number(_)) => Some(v),
@@ -184,6 +200,51 @@ fn slug(name: &str) -> String {
     out
 }
 
+/// The layouts whose faces each get their OWN image — and, with it, their own copy of every value
+/// the one-image layouts keep at the top level.
+///
+/// This is the single fact the whole multi-face branch turns on, and it is a property of the
+/// LAYOUT, not of anything the row carries: a transform card's front and back are two photographs,
+/// so Scryfall puts `image_uris`, `colors`, `power`, `illustration_id`, `flavor_text` and the rest
+/// on the faces and sends NO top-level copy (and no `card_back_id` — there is no shared back). A
+/// split or adventure card is ONE photograph of one piece of cardboard, so Scryfall sends one
+/// top-level `image_uris` and one top-level `colors`, and its faces carry only text.
+///
+/// Verified exhaustively against the 2026-08-16 all_cards bulk: of 540,484 printings, every row of
+/// these five layouts has per-face `image_uris` and no top-level one, and every row of every other
+/// layout has the reverse — zero exceptions in either direction. The port used to serve per-face
+/// URLs for all multi-face cards, which invented a `.../back/...` URL with no image behind it on
+/// every split, flip, adventure and prepare printing.
+const TWO_IMAGE_LAYOUTS: [&str; 5] =
+    ["art_series", "double_faced_token", "modal_dfc", "reversible_card", "transform"];
+
+/// The multi-face layouts whose `related_uris.edhrec` link keeps the JOINED name.
+///
+/// EDHREC files a transforming or adventuring card under its front face (`cc=Delver+of+Secrets`,
+/// `cc=Brazen+Borrower`, `cc=Erayo%2C+Soratami+Ascendant`, `cc=Agadeem%27s+Awakening`) and a split
+/// or double-backed card under both halves (`cc=Fire+%2F%2F+Ice`, `cc=Wear+%2F%2F+Tear`,
+/// `cc=Temple+Garden+%2F%2F+Temple+Garden`, `cc=Punchcard+%2F%2F+Punchcard`) — all eight verified
+/// against api.scryfall.com. `art_series` sits with the front-face group, not with the other
+/// two-image layouts. The `tcgplayer_infinite_*` links in the same object keep the joined name on
+/// EVERY layout, split included, so this rule is deliberately scoped to `edhrec` alone.
+const EDHREC_JOINED_LAYOUTS: [&str; 3] = ["double_faced_token", "reversible_card", "split"];
+
+/// Top-level keys a two-image layout does not carry, because they belong to a face there.
+fn is_face_owned_key(key: &str) -> bool {
+    matches!(
+        key,
+        "colors"
+            | "card_back_id"
+            | "illustration_id"
+            | "power"
+            | "toughness"
+            | "loyalty"
+            | "flavor_text"
+            | "watermark"
+            | "color_indicator"
+    )
+}
+
 /// The languages Scryfall writes into the scryfall_uri path — its ten print localizations,
 /// exactly. The glyph and novelty languages (ph, qya, he, la, grc, ar, sa, dw) get NO path
 /// segment: a ph Elesh Norn lives at `/card/one/414/elesh-norn-mother-of-machines`, English form.
@@ -212,6 +273,15 @@ fn printed_full_name(row: &Map<String, Value>, lang: &str) -> Option<String> {
         })
         .collect();
     if parts.is_empty() { None } else { Some(parts.join(" // ")) }
+}
+
+/// The FRONT face's name — everything before the ` // ` a multi-faced card's name joins on.
+///
+/// `related_uris.edhrec` is built from this on most multi-face layouts: EDHREC files a
+/// transforming or adventuring card under its front face, never under the joined string. See
+/// EDHREC_JOINED_LAYOUTS for the three layouts that are the exception.
+fn front_face_name(name: &str) -> &str {
+    name.split_once(" // ").map_or(name, |(front, _)| front)
 }
 
 /// `scryfall_uri`: `https://scryfall.com/card/{set}/{number}[/{lang}]/{slug}?utm_source=api`.
@@ -304,7 +374,16 @@ fn write_prices(out: &mut Vec<u8>, row: &Map<String, Value>) {
 /// promos (dd2-ja, snc launch, one-ph, ltc-qya) whose Gatherer entries carry no translation; that
 /// fact lives on Scryfall's side of the wire and is not derivable from the row, so they stay a
 /// known limit rather than a rule.
-fn write_related_uris(out: &mut Vec<u8>, name: &str, multiverse_first: Option<u64>, lang: &str) {
+///
+/// `edhrec` takes `edhrec_name`, which is the front face's on most multi-face layouts — see
+/// EDHREC_JOINED_LAYOUTS. The two tcgplayer searches take the joined name on every layout.
+fn write_related_uris(
+    out: &mut Vec<u8>,
+    name: &str,
+    edhrec_name: &str,
+    multiverse_first: Option<u64>,
+    lang: &str,
+) {
     let quoted = quote_plus(name);
     out.push(b'{');
     let mut first = true;
@@ -325,7 +404,7 @@ fn write_related_uris(out: &mut Vec<u8>, name: &str, multiverse_first: Option<u6
             "tcgplayer_infinite_decks",
             format!("https://www.tcgplayer.com/search/decks?productLineName=magic&q={quoted}"),
         ),
-        ("edhrec", format!("https://edhrec.com/route/?cc={quoted}")),
+        ("edhrec", format!("https://edhrec.com/route/?cc={}", quote_plus(edhrec_name))),
     ] {
         write_key(out, &mut first, key);
         write_json_str(out, &url);
@@ -352,9 +431,30 @@ fn write_purchase_uris(out: &mut Vec<u8>, row: &Map<String, Value>) {
     out.push(b'}');
 }
 
+/// The joined top-level `mana_cost` a one-image multi-face card carries.
+///
+/// Scryfall's rule, checked against all 3,654 split/flip/adventure/prepare printings in the
+/// 2026-08-16 bulk with zero misses: `" // "` between the faces that HAVE a cost, skipping the
+/// ones that do not. Fire // Ice is `"{1}{R} // {1}{U}"`; flipped Erayo, whose back face carries
+/// `"mana_cost": ""`, is `"{1}{U}"` and not `"{1}{U} // "`.
+///
+/// Derived rather than stored because the ingest cannot preserve it: transform_row overlays each
+/// face onto the parent card, so the stored top-level cost is the FRONT face's alone.
+fn joined_mana_cost(faces: &[Value]) -> String {
+    faces
+        .iter()
+        .filter_map(|face| match face {
+            Value::Object(map) => str_of(map, "mana_cost"),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" // ")
+}
+
 /// The card's faces, with the two keys the engine deliberately does not store re-added: `object`
-/// is the constant, and a face's `image_uris` is the card's own CDN function with the face swapped.
-fn write_faces(out: &mut Vec<u8>, faces: &[Value], scryfall_id: &str, updated_at: Option<u64>) {
+/// is the constant, and a face's `image_uris` is the card's own CDN function with the face swapped
+/// — on the two-image layouts, which are the only ones whose faces have their own picture.
+fn write_faces(out: &mut Vec<u8>, faces: &[Value], scryfall_id: &str, updated_at: Option<u64>, two_image: bool) {
     out.push(b'[');
     for (index, face) in faces.iter().enumerate() {
         if index > 0 {
@@ -366,11 +466,25 @@ fn write_faces(out: &mut Vec<u8>, faces: &[Value], scryfall_id: &str, updated_at
         write_json_str(out, "card_face");
         if let Value::Object(map) = face {
             for (key, value) in map {
-                // Absent stays absent: null, "" and [] all mean Scryfall did not send this face
-                // that key, and emitting them would differ from Scryfall on most faces.
+                // `colors` is a face key only where the faces own their own art: every face of
+                // every two-image printing carries one, empty included (Agadeem, the Undercrypt is
+                // colorless and still sends `"colors": []`), and no face of a split, flip,
+                // adventure or prepare printing carries one at all. The engine always writes the
+                // key, so both halves of that are decided here.
+                if key == "colors" {
+                    if two_image {
+                        write_value(out, &mut first, key, value);
+                    }
+                    continue;
+                }
+                // Absent stays absent: null, "" and [] mean Scryfall did not send this face that
+                // key -- EXCEPT for `mana_cost` and `oracle_text`, where "" is a value Scryfall
+                // does send. Every face of every multi-face printing in the corpus carries both
+                // keys (8,620 of 8,620 transform faces, 4,356 of them with an empty cost), so an
+                // empty string there is a costless back face, never an omission.
                 let empty = match value {
                     Value::Null => true,
-                    Value::String(s) => s.is_empty(),
+                    Value::String(s) => s.is_empty() && !matches!(key.as_str(), "mana_cost" | "oracle_text"),
                     Value::Array(a) => a.is_empty(),
                     _ => false,
                 };
@@ -379,7 +493,7 @@ fn write_faces(out: &mut Vec<u8>, faces: &[Value], scryfall_id: &str, updated_at
                 }
             }
         }
-        if faces.len() > 1 {
+        if two_image {
             write_key(out, &mut first, "image_uris");
             write_image_uris(out, scryfall_id, updated_at, if index == 0 { "front" } else { "back" });
         }
@@ -404,6 +518,15 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     let lang = str_of(row, "lang").unwrap_or("en");
     let image_updated_at = u64_of(row, "image_updated_at");
     let faces = list_of(row, "card_faces").filter(|f| !f.is_empty());
+    let layout = str_of(row, "layout");
+    // Only ever true for a card that HAS faces: the two-image layouts are all multi-face.
+    let two_image = faces.is_some() && layout.is_some_and(|l| TWO_IMAGE_LAYOUTS.contains(&l));
+    // The joined name everywhere except edhrec on the layouts EDHREC files by front face.
+    let edhrec_name = if faces.is_some() && !layout.is_some_and(|l| EDHREC_JOINED_LAYOUTS.contains(&l)) {
+        front_face_name(name)
+    } else {
+        name
+    };
 
     out.push(b'{');
     let mut first = true;
@@ -447,7 +570,11 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     write_str_or_null(out, &mut first, "type_line", str_of(row, "type_line"));
     // Directly after the oracle `type_line` it translates, per the live objects.
     write_opt_str(out, &mut first, "printed_type_line", str_of(row, "printed_type_line"));
-    write_list(out, &mut first, "colors", list_of(row, "colors"));
+    // `colors` is one of the values a two-image layout keeps on its faces alone (see
+    // TWO_IMAGE_LAYOUTS); `color_identity` is the card's and stays at top level on every layout.
+    if !two_image {
+        write_list(out, &mut first, "colors", list_of(row, "colors"));
+    }
     write_list(out, &mut first, "color_identity", list_of(row, "color_identity"));
     write_list(out, &mut first, "keywords", list_of(row, "card_keywords"));
     write_list(out, &mut first, "games", list_of(row, "games"));
@@ -486,10 +613,16 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     write_json_str(out, number);
     write_bool(out, &mut first, "digital", bool_of(row, "digital"));
     write_str_or_null(out, &mut first, "rarity", str_of(row, "rarity"));
-    write_key(out, &mut first, "card_back_id");
-    write_json_str(out, CARD_BACK_ID);
-    write_str_or_null(out, &mut first, "artist", str_of(row, "artist"));
-    write_str_or_null(out, &mut first, "illustration_id", str_of(row, "illustration_id"));
+    // No shared card back on a two-image layout, and no card-level illustration: both belong to a
+    // face there, and Scryfall omits the top-level keys entirely.
+    if !two_image {
+        write_key(out, &mut first, "card_back_id");
+        write_json_str(out, CARD_BACK_ID);
+    }
+    write_str_or_null(out, &mut first, "artist", present_str_of(row, "artist"));
+    if !two_image {
+        write_str_or_null(out, &mut first, "illustration_id", str_of(row, "illustration_id"));
+    }
     write_str_or_null(out, &mut first, "border_color", str_of(row, "border_color"));
     write_bool(out, &mut first, "full_art", bool_of(row, "full_art"));
     write_bool(out, &mut first, "textless", bool_of(row, "textless"));
@@ -499,19 +632,33 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     write_prices(out, row);
     write_key(out, &mut first, "related_uris");
     let multiverse_first = list_of(row, "multiverse_ids").and_then(|ids| ids.first()).and_then(Value::as_u64);
-    write_related_uris(out, name, multiverse_first, lang);
+    write_related_uris(out, name, edhrec_name, multiverse_first, lang);
     write_key(out, &mut first, "purchase_uris");
     write_purchase_uris(out, row);
 
-    // A multi-face card carries its faces and NOT the top-level text they replace; a single-faced
-    // one carries the text and no `card_faces`. Which keys sit at top level varies by LAYOUT,
-    // which is why this is a branch rather than a fixed key set.
+    // A multi-face card carries its faces and NOT the top-level ORACLE TEXT they replace; a
+    // single-faced one carries the text and no `card_faces`. Which keys sit at top level varies by
+    // LAYOUT, which is why this is a branch rather than a fixed key set.
+    //
+    // `mana_cost` and `image_uris` are the two the multi-face branch keeps, on the one-image
+    // layouts only: one piece of cardboard has one picture and one printed cost, so Scryfall sends
+    // both at top level for split/flip/adventure/prepare — and neither for transform/modal_dfc,
+    // where each face has its own.
     if let Some(faces) = faces {
         write_key(out, &mut first, "card_faces");
-        write_faces(out, faces, scryfall_id, image_updated_at);
+        write_faces(out, faces, scryfall_id, image_updated_at, two_image);
+        if !two_image {
+            write_key(out, &mut first, "mana_cost");
+            write_json_str(out, &joined_mana_cost(faces));
+            write_key(out, &mut first, "image_uris");
+            write_image_uris(out, scryfall_id, image_updated_at, "front");
+        }
     } else {
-        write_str_or_null(out, &mut first, "mana_cost", str_of(row, "mana_cost"));
-        write_str_or_null(out, &mut first, "oracle_text", str_of(row, "oracle_text"));
+        // An empty string is a VALUE for both of these — every basic land carries
+        // `"mana_cost": ""` and 7,266 printings carry `"oracle_text": ""` — so they read through
+        // `present_str_of` rather than the empty-is-absent `str_of`.
+        write_str_or_null(out, &mut first, "mana_cost", present_str_of(row, "mana_cost"));
+        write_str_or_null(out, &mut first, "oracle_text", present_str_of(row, "oracle_text"));
         // Directly after the `oracle_text` it translates — single-face only, like the text it
         // shadows; a multi-face printing's printed text rides its face objects.
         write_opt_str(out, &mut first, "printed_text", str_of(row, "printed_text"));
@@ -531,6 +678,11 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
         ("watermark", str_of(row, "watermark")),
         ("frame", str_of(row, "frame")),
     ] {
+        // Five of these six belong to a face on a two-image layout; `frame` is the printing's and
+        // stays. See is_face_owned_key.
+        if two_image && is_face_owned_key(key) {
+            continue;
+        }
         if let Some(v) = value {
             write_key(out, &mut first, key);
             write_json_str(out, v);
@@ -556,7 +708,15 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
         write_key(out, &mut first, "security_stamp");
         write_json_str(out, v);
     }
-    for key in ["promo_types", "frame_effects", "all_parts"] {
+    // `produced_mana` joins them: the engine has always stored the mana a card can make (the
+    // `produces:` filter reads the same byte) and no card object ever carried it, so every land
+    // this port served was missing a key Scryfall sends. On a modal DFC it is the union over the
+    // faces, which is what the store already holds.
+    for key in ["color_indicator", "produced_mana", "promo_types", "frame_effects", "all_parts"] {
+        // `color_indicator` is the one of these five that belongs to a face on a two-image layout.
+        if two_image && is_face_owned_key(key) {
+            continue;
+        }
         if let Some(a) = list_of(row, key).filter(|a| !a.is_empty()) {
             write_value(out, &mut first, key, &Value::Array(a.clone()));
         }
@@ -635,14 +795,14 @@ mod tests {
         assert_eq!(card["card_back_id"], CARD_BACK_ID);
     }
 
-    /// A single-faced card carries the text and image_uris; a multi-faced one carries neither, and
-    /// each face gets its own front/back CDN URLs.
+    /// A single-faced card carries the text and image_uris; a multi-faced one carries the faces,
+    /// and WHERE the picture lives is the layout's answer, not the face count's.
     #[test]
     fn faces_replace_the_top_level_text_they_stand_in_for() {
         let base = json!({
             "name": "Delver of Secrets // Insectile Aberration",
             "scryfall_id": "cd000000-0000-0000-0000-000000000002",
-            "mana_cost": "{U}", "oracle_text": "top level",
+            "layout": "normal", "mana_cost": "{U}", "oracle_text": "top level",
         });
 
         let single = build(base.clone());
@@ -650,21 +810,103 @@ mod tests {
         assert!(single.get("card_faces").is_none());
         assert!(single["image_uris"]["small"].as_str().unwrap().contains("/front/"));
 
+        // A TWO-IMAGE layout: each face owns its picture, and the card carries neither the
+        // picture nor the values that ride with it.
         let mut two = base.clone();
+        two["layout"] = json!("transform");
+        two["colors"] = json!(["U"]);
+        two["power"] = json!("1");
+        two["illustration_id"] = json!("cd000000-0000-0000-0000-0000000000ff");
         two["card_faces"] = json!([
-            {"name": "Delver of Secrets", "mana_cost": "{U}"},
-            {"name": "Insectile Aberration", "mana_cost": "", "colors": []},
+            {"name": "Delver of Secrets", "mana_cost": "{U}", "colors": ["U"]},
+            {"name": "Insectile Aberration", "mana_cost": "", "colors": [], "watermark": ""},
         ]);
         let card = build(two);
-        assert!(card.get("mana_cost").is_none(), "a multi-faced card has no top-level mana_cost");
+        assert!(card.get("mana_cost").is_none(), "a two-image card has no top-level mana_cost");
         assert!(card.get("image_uris").is_none(), "...and no top-level image_uris");
+        for hoisted in ["colors", "power", "illustration_id", "card_back_id"] {
+            assert!(card.get(hoisted).is_none(), "{hoisted} belongs to a face on a transform");
+        }
         let faces = card["card_faces"].as_array().expect("faces");
         assert_eq!(faces[0]["object"], "card_face");
         assert!(faces[0]["image_uris"]["png"].as_str().unwrap().contains("/front/"));
         assert!(faces[1]["image_uris"]["png"].as_str().unwrap().contains("/back/"));
-        // Empty values inside a face are absent, not empty.
-        assert!(faces[1].get("mana_cost").is_none());
-        assert!(faces[1].get("colors").is_none());
+        // An empty mana cost is a VALUE on a costless back face, and an empty face colour list is
+        // one too — Scryfall sends `"mana_cost": ""` and `"colors": []` on both. An empty
+        // watermark is still an absence.
+        assert_eq!(faces[1]["mana_cost"], "");
+        assert_eq!(faces[1]["colors"], json!([]));
+        assert!(faces[1].get("watermark").is_none());
+
+        // A ONE-IMAGE multi-face layout: one picture, one joined cost, both at top level — and
+        // the faces carry no picture and no colours at all.
+        let mut split = base.clone();
+        split["layout"] = json!("split");
+        split["name"] = json!("Fire // Ice");
+        split["colors"] = json!(["R", "U"]);
+        split["card_faces"] = json!([
+            {"name": "Fire", "mana_cost": "{1}{R}", "colors": []},
+            {"name": "Ice", "mana_cost": "{1}{U}", "colors": []},
+        ]);
+        let card = build(split);
+        assert_eq!(card["mana_cost"], "{1}{R} // {1}{U}", "the faces' costs, joined");
+        assert!(card["image_uris"]["png"].as_str().unwrap().contains("/front/"));
+        assert_eq!(card["colors"], json!(["R", "U"]));
+        assert_eq!(card["card_back_id"], CARD_BACK_ID);
+        let faces = card["card_faces"].as_array().expect("faces");
+        assert!(faces[0].get("image_uris").is_none(), "a split's faces have no picture of their own");
+        assert!(faces[1].get("image_uris").is_none());
+        assert!(faces[0].get("colors").is_none(), "...and no colours of their own");
+    }
+
+    /// The joined top-level cost skips a face that has none, which is how a flip card reads.
+    #[test]
+    fn a_flipped_back_face_does_not_leave_a_dangling_separator() {
+        let card = build(json!({
+            "name": "Erayo, Soratami Ascendant // Erayo's Essence",
+            "scryfall_id": "cd000000-0000-0000-0000-000000000003",
+            "layout": "flip",
+            "card_faces": [
+                {"name": "Erayo, Soratami Ascendant", "mana_cost": "{1}{U}"},
+                {"name": "Erayo's Essence", "mana_cost": ""},
+            ],
+        }));
+        assert_eq!(card["mana_cost"], "{1}{U}");
+        assert_eq!(card["card_faces"][1]["mana_cost"], "", "the face still reports its empty cost");
+    }
+
+    /// EDHREC files most multi-face cards under the FRONT face and split-likes under both halves.
+    /// The tcgplayer searches beside it keep the joined name on every layout.
+    #[test]
+    fn edhrec_uses_the_front_face_name_except_on_the_split_like_layouts() {
+        let front = |layout: &str| {
+            let card = build(json!({
+                "name": "Delver of Secrets // Insectile Aberration",
+                "scryfall_id": "cd000000-0000-0000-0000-000000000004",
+                "layout": layout,
+                "card_faces": [{"name": "Delver of Secrets"}, {"name": "Insectile Aberration"}],
+            }));
+            card["related_uris"]["edhrec"].as_str().unwrap().to_owned()
+        };
+        for layout in ["transform", "modal_dfc", "flip", "adventure", "prepare", "art_series"] {
+            assert_eq!(front(layout), "https://edhrec.com/route/?cc=Delver+of+Secrets", "{layout}");
+        }
+        for layout in ["split", "reversible_card", "double_faced_token"] {
+            assert_eq!(
+                front(layout),
+                "https://edhrec.com/route/?cc=Delver+of+Secrets+%2F%2F+Insectile+Aberration",
+                "{layout}"
+            );
+        }
+        // The joined name on both tcgplayer searches, split included.
+        let card = build(json!({
+            "name": "Fire // Ice", "scryfall_id": "cd000000-0000-0000-0000-000000000005",
+            "layout": "split", "card_faces": [{"name": "Fire"}, {"name": "Ice"}],
+        }));
+        assert_eq!(
+            card["related_uris"]["tcgplayer_infinite_decks"],
+            "https://www.tcgplayer.com/search/decks?productLineName=magic&q=Fire+%2F%2F+Ice"
+        );
     }
 
     /// Prices format to two decimals; a missing price is null rather than "0.00", and zero is a
