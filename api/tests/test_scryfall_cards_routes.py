@@ -24,6 +24,7 @@ from api.enums import CardOrdering, SortDirection, UniqueOn, resolve_direction
 from api.parsing import parse_scryfall_query
 from api.scryfall_compat import routes as routes_module
 from api.scryfall_compat.objects import PAGE_SIZE
+from api.scryfall_compat.routes import _csv_cell, _csv_mana_cost, _csv_price
 from api.tests.helpers import make_raw_card
 from api.utils.generation_cache import GenerationCache
 
@@ -551,12 +552,64 @@ class TestSearch:
         resp = dispatch(compat_corpus, "/cards/search", "q=%21%22Compat+Bolt%22&pretty=true")
         assert resp.text.startswith('{\n  "object"')
 
-    def test_csv_format_has_a_stable_header(self, compat_corpus: APIResource):
+    def test_csv_format_is_scryfalls_eighteen_column_export(self, compat_corpus: APIResource):
+        """The header row's bytes are the contract, so they are asserted whole.
+
+        This used to assert `header.startswith("object,id,oracle_id,")` -- the flattened card object
+        this route invented. api.scryfall.com exports a SUMMARY instead: eighteen columns, several
+        named differently from the JSON keys behind them (`scryfall_id` not `id`, `usd_price` not
+        `prices.usd`, one `multiverse_id` rather than the array). Measured 2026-08-16.
+        """
         resp = dispatch(compat_corpus, "/cards/search", "q=%21%22Compat+Bolt%22&format=csv")
-        assert resp.content_type.startswith("text/csv")
+        # NO charset, unlike every JSON response here -- Scryfall's exactly.
+        assert resp.content_type == "text/csv"
+        assert resp.headers["content-disposition"] == 'attachment; filename="search.csv"'
+        # `has_more` has no envelope in a CSV body, so it rides a header.
+        assert resp.headers["x-scryfall-has-more"] == "false"
         header, row = resp.text.splitlines()[:2]
-        assert header.startswith("object,id,oracle_id,")
-        assert BOLT_ID in row
+        assert header == (
+            "multiverse_id,mtgo_id,set,collector_number,lang,rarity,name,mana_cost,cmc,type_line,"
+            "artist,usd_price,usd_foil_price,eur_price,tix_price,image_uri,scryfall_uri,scryfall_id"
+        )
+        assert row.endswith(BOLT_ID)
+        assert resp.text.endswith("\n")
+
+    def test_csv_is_case_sensitive_and_an_unknown_format_is_json(self, compat_corpus: APIResource):
+        """`format=CSV` and `format=bogus` both serve JSON on api.scryfall.com -- never an error."""
+        for spelling in ("CSV", "bogus", "text", "image"):
+            resp = dispatch(compat_corpus, "/cards/search", f"q=%21%22Compat+Bolt%22&format={spelling}")
+            assert resp.content_type.startswith("application/json"), spelling
+            assert payload(resp)["object"] == "list", spelling
+
+    def test_csv_quotes_only_what_rfc_4180_requires(self):
+        """Minimal quoting, and an EMPTY STRING is not the same cell as an absent value.
+
+        Every basic land is the proof: Scryfall's JSON gives it `"mana_cost": ""` and the CSV row
+        reads `...,"",0.0,Land,...` -- two bytes where the null price columns beside it have none.
+        """
+        assert _csv_cell("Lightning Bolt") == "Lightning Bolt"
+        assert _csv_cell("Legendary Creature — God // Legendary Creature — Bird") == (
+            "Legendary Creature — God // Legendary Creature — Bird"
+        )
+        assert _csv_cell("Alrund, God of the Cosmos") == '"Alrund, God of the Cosmos"'
+        assert _csv_cell('Henzie "Toolbox" Torre') == '"Henzie ""Toolbox"" Torre"'
+        assert _csv_cell("") == '""'
+        assert _csv_cell(None) == ""
+
+    def test_csv_prices_round_trip_through_float(self):
+        """The JSON carries two decimals always; the CSV does not, and a null price is empty."""
+        assert _csv_price("60.00") == "60.0"
+        assert _csv_price("0.10") == "0.1"
+        assert _csv_price("2.57") == "2.57"
+        assert _csv_price(None) is None
+        assert _csv_cell(_csv_price(None)) == ""
+
+    def test_csv_mana_cost_drops_the_empty_half_of_a_two_image_card(self):
+        """Measured: Delver of Secrets is `{U}`, not `{U} // `, and a free MDFC land is `""`."""
+        assert _csv_mana_cost({"mana_cost": "{1}{R} // {1}{U}"}) == "{1}{R} // {1}{U}"
+        assert _csv_mana_cost({"card_faces": [{"mana_cost": "{U}"}, {"mana_cost": ""}]}) == "{U}"
+        assert _csv_mana_cost({"card_faces": [{"mana_cost": ""}, {"mana_cost": ""}]}) == ""
+        assert _csv_mana_cost({}) is None
 
     def test_unparseable_query_is_a_scryfall_400(self, compat_corpus: APIResource):
         resp = dispatch(compat_corpus, "/cards/search", "q=%28cmc%3E1")

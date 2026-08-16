@@ -22,8 +22,6 @@ of Scryfall's, so a card this instance never imported 404s here and resolves the
 
 from __future__ import annotations
 
-import csv
-import io
 import logging
 import operator
 import re
@@ -51,7 +49,6 @@ from api.scryfall_compat import objects
 from api.scryfall_compat.objects import (
     CARD_OBJECT_FIELDS,
     DEFAULT_IMAGE_VERSION,
-    IMAGE_VERSIONS,
     MAX_AUTOCOMPLETE_VALUES,
     MAX_COLLECTION_IDENTIFIERS,
     PAGE_SIZE,
@@ -339,77 +336,48 @@ _RANDOM_NO_MATCH_DETAILS = "0 cards matched this search, a random card could not
 # Scryfall's wording for `/cards/named` with neither parameter -- backticks and no full stop.
 _NAMED_MISSING_PARAM_DETAILS = "You must provide a `fuzzy` or `exact` parameter"
 
-# CSV columns for `format=csv`. Fixed rather than derived from the page's cards so the header does
-# not change between pages of one result set. Nested objects are flattened with `_`, matching how
-# Scryfall spells `image_uris_normal` and `prices_usd` in its own export.
-_CSV_SCALAR_COLUMNS = (
-    "object",
-    "id",
-    "oracle_id",
-    "multiverse_ids",
+# `format=csv` -- MEASURED against api.scryfall.com on 2026-08-16, not derived from the card object.
+#
+# This used to flatten ~60 card-object fields onto `image_uris_normal` / `prices_usd`-style columns,
+# which is a reasonable-looking guess and is not what Scryfall exports. Scryfall's CSV is a SUMMARY:
+# eighteen columns, a mixture of identifiers, printed values and prices, several of them named
+# differently from the JSON keys they come from (`scryfall_id`, not `id`; `usd_price`, not
+# `prices.usd`; a single `multiverse_id`, not the `multiverse_ids` array). The header row's bytes are
+# the contract, so they are spelled out rather than built.
+_CSV_COLUMNS = (
+    "multiverse_id",
     "mtgo_id",
-    "mtgo_foil_id",
-    "tcgplayer_id",
-    "cardmarket_id",
-    "name",
+    "set",
+    "collector_number",
     "lang",
-    "released_at",
-    "uri",
-    "scryfall_uri",
-    "layout",
-    "highres_image",
-    "image_status",
+    "rarity",
+    "name",
     "mana_cost",
     "cmc",
     "type_line",
-    "oracle_text",
-    "power",
-    "toughness",
-    "loyalty",
-    "colors",
-    "color_identity",
-    "keywords",
-    "games",
-    "reserved",
-    "foil",
-    "nonfoil",
-    "finishes",
-    "oversized",
-    "promo",
-    "reprint",
-    "variation",
-    "set_id",
-    "set",
-    "set_name",
-    "set_type",
-    "set_uri",
-    "set_search_uri",
-    "scryfall_set_uri",
-    "rulings_uri",
-    "prints_search_uri",
-    "collector_number",
-    "digital",
-    "rarity",
-    "flavor_text",
-    "card_back_id",
     "artist",
-    "artist_ids",
-    "illustration_id",
-    "border_color",
-    "frame",
-    "full_art",
-    "textless",
-    "booster",
-    "story_spotlight",
-    "edhrec_rank",
-    "penny_rank",
+    "usd_price",
+    "usd_foil_price",
+    "eur_price",
+    "tix_price",
+    "image_uri",
+    "scryfall_uri",
+    "scryfall_id",
 )
-_CSV_NESTED_COLUMNS = (
-    ("image_uris", IMAGE_VERSIONS),
-    ("prices", ("usd", "usd_foil", "usd_etched", "eur", "eur_foil", "tix")),
-    ("related_uris", ("gatherer", "tcgplayer_infinite_articles", "tcgplayer_infinite_decks", "edhrec")),
-    ("purchase_uris", ("tcgplayer", "cardmarket", "cardhoarder")),
-)
+
+# The image size the CSV links to -- one row is one line and cannot carry a map of six.
+_CSV_IMAGE_VERSION = "large"
+
+# WITHOUT a charset, unlike every JSON response on this surface. Scryfall's exactly.
+_CSV_CONTENT_TYPE = "text/csv"
+
+# Scryfall names the download after the route, so a browser save-as lands on `search.csv`.
+_CSV_CONTENT_DISPOSITION = 'attachment; filename="search.csv"'
+
+# The header carrying the fact the CSV body cannot: is there another page? A JSON client reads
+# `has_more` out of the envelope; a CSV client has no envelope, so Scryfall hangs the same boolean
+# off a response header. Without it, paginating a CSV export means guessing.
+_CSV_HAS_MORE_HEADER = "x-scryfall-has-more"
 
 
 class _EngineMiss:
@@ -742,40 +710,167 @@ def _self_base_url(request: falcon.Request | None, request_host: str, path: str)
     return f"{scheme}://{host}{path}"
 
 
-def _flatten_for_csv(card: dict[str, Any]) -> dict[str, Any]:
-    """Flatten a card object onto the fixed CSV column set.
+def _csv_cell(value: str | None) -> str:
+    """Render one CSV cell, RFC 4180 with the MINIMAL quoting Scryfall emits.
+
+    Verified on real rows: `Alrund, God of the Cosmos // Hakka, Whispering Raven` is quoted (commas),
+    `Henzie ""Toolbox"" Torre` is quoted with its own quotes doubled, `Edward P. Beard, Jr.` is
+    quoted, `Legendary Creature — God // Legendary Creature — Bird` is NOT (the em dash and the
+    slashes are ordinary bytes), and `Volkan Baǵa` is not either -- non-ASCII is raw UTF-8.
+
+    None and the empty string are DIFFERENT cells, which is the rule a naive writer gets wrong: an
+    ABSENT value writes nothing at all (a null price, a printing with no multiverse id) while a value
+    that IS the empty string writes `""`. Every basic land is the proof -- Scryfall's JSON gives it
+    `"mana_cost": ""` and the CSV row reads `A-Bretagard Stronghold,"",0.0,Land`, two bytes where the
+    price columns beside it have none.
+
+    Args:
+        value: The cell's text, or None when the card does not carry one.
+
+    Returns:
+        The cell as it appears in the document.
+    """
+    if value is None:
+        return ""
+    if value == "":
+        return '""'
+    if not any(char in value for char in ',"\r\n'):
+        return value
+    escaped = value.replace('"', '""')
+    return f'"{escaped}"'
+
+
+def _csv_decimal(value: float | None) -> str | None:
+    """Render a decimal cell the way the CSV writes one: `60` is `60.0`, `0.5` stays `0.5`.
+
+    Args:
+        value: The number, or None.
+
+    Returns:
+        The cell text, or None when there is no value.
+    """
+    if value is None:
+        return None
+    return f"{value:.1f}" if float(value).is_integer() else str(value)
+
+
+def _csv_price(value: object) -> str | None:
+    """Render a price cell: the JSON string parsed as a float and printed back.
+
+    The JSON carries two decimal places always (`"60.00"`, `"0.10"`), the CSV does not (`60.0`,
+    `0.1`), so this is a float round-trip rather than the string. A null price is the EMPTY cell,
+    never `0`.
+
+    Args:
+        value: The price as the card object carries it.
+
+    Returns:
+        The cell text, or None when the card has no price.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return _csv_decimal(float(value))
+    except ValueError:
+        return None
+
+
+def _csv_mana_cost(card: dict[str, Any]) -> str | None:
+    """The printed cost, joined across faces when the card object keeps it there.
+
+    A one-image multi-face layout (split, flip, adventure) carries `mana_cost` at top level already
+    joined (`{1}{R} // {1}{U}`), so that value is used as it stands. A two-image layout (transform,
+    modal_dfc) has no top-level cost and each face carries its own -- and there the join DROPS THE
+    EMPTY ONES rather than leaving a separator with nothing after it. Measured 2026-08-16::
+
+        Delver of Secrets // Insectile Aberration   faces {U} + ""       cell `{U}`
+        Boggart Trawler // Boggart Bog             faces {2}{B} + ""    cell `{2}{B}`
+        Barkchannel Pathway // Tidechannel Pathway faces "" + ""        cell `""`
 
     Args:
         card: A Scryfall card object.
 
     Returns:
-        A mapping from column name to cell value; list values are joined on commas.
+        The cell text, or None when the card carries no printed cost at all.
     """
-    row: dict[str, Any] = {}
-    for column in _CSV_SCALAR_COLUMNS:
-        value = card.get(column)
-        row[column] = ",".join(str(item) for item in value) if isinstance(value, list) else value
-    for parent, children in _CSV_NESTED_COLUMNS:
-        nested = card.get(parent) or {}
-        for child in children:
-            row[f"{parent}_{child}"] = nested.get(child)
-    return row
+    top = card.get("mana_cost")
+    if isinstance(top, str):
+        return top
+    faces = card.get("card_faces") or []
+    if not faces:
+        return None
+    return " // ".join(cost for face in faces if (cost := face.get("mana_cost")))
 
 
-def _csv_columns() -> list[str]:
-    """Return the CSV header in column order.
+def _csv_image(card: dict[str, Any]) -> str | None:
+    """The `large` image, front face.
+
+    Top-level `image_uris` on every layout that has one; a two-image layout has none, and its FRONT
+    face's map is the one the CSV links to.
+
+    Args:
+        card: A Scryfall card object.
 
     Returns:
-        Every scalar column followed by the flattened nested columns.
+        The image URL, or None when the card has no image map.
     """
-    columns = list(_CSV_SCALAR_COLUMNS)
-    for parent, children in _CSV_NESTED_COLUMNS:
-        columns.extend(f"{parent}_{child}" for child in children)
-    return columns
+    top = card.get("image_uris") or {}
+    if isinstance(top, dict) and top.get(_CSV_IMAGE_VERSION):
+        return top[_CSV_IMAGE_VERSION]
+    faces = card.get("card_faces") or []
+    front = faces[0].get("image_uris") if faces else None
+    return front.get(_CSV_IMAGE_VERSION) if isinstance(front, dict) else None
+
+
+def _csv_row(card: dict[str, Any]) -> str:
+    """One card as its CSV row, without the trailing newline.
+
+    Args:
+        card: A Scryfall card object.
+
+    Returns:
+        The rendered row.
+    """
+    multiverse_ids = card.get("multiverse_ids") or []
+    prices = card.get("prices") or {}
+    set_code = card.get("set")
+    rarity = card.get("rarity")
+    # `scryfall_uri` WITHOUT the tracking query the JSON one carries. Cut at the first `?` rather
+    # than parsed: the slug is percent-encoded and may hold anything else, but a scryfall.com card
+    # URL has never carried a query of its own.
+    scryfall_uri = card.get("scryfall_uri")
+    values = (
+        str(multiverse_ids[0]) if multiverse_ids else None,
+        str(card["mtgo_id"]) if card.get("mtgo_id") is not None else None,
+        set_code.upper() if isinstance(set_code, str) else None,
+        card.get("collector_number"),
+        card.get("lang"),
+        # Rarity as its INITIAL, uppercased: common `C`, uncommon `U`, rare `R`, mythic `M`, special
+        # `S`, bonus `B`. Derived rather than tabled, so a rarity added later abbreviates the same
+        # way instead of silently emitting nothing.
+        rarity[0].upper() if isinstance(rarity, str) and rarity else None,
+        card.get("name"),
+        _csv_mana_cost(card),
+        _csv_decimal(card.get("cmc")),
+        card.get("type_line"),
+        card.get("artist"),
+        _csv_price(prices.get("usd")),
+        _csv_price(prices.get("usd_foil")),
+        _csv_price(prices.get("eur")),
+        _csv_price(prices.get("tix")),
+        _csv_image(card),
+        scryfall_uri.split("?")[0] if isinstance(scryfall_uri, str) else None,
+        card.get("id"),
+    )
+    return ",".join(_csv_cell(value) for value in values)
 
 
 def _cards_to_csv(cards: Sequence[dict[str, Any]]) -> str:
-    """Render a page of cards as CSV.
+    """Render a page of cards as Scryfall's CSV document.
+
+    LF line endings and a trailing newline, both measured. The header row is emitted even when the
+    page is short; it is never emitted for an empty result, because an empty result is a 404 decided
+    before the format is consulted.
 
     Args:
         cards: The card objects to render.
@@ -783,12 +878,8 @@ def _cards_to_csv(cards: Sequence[dict[str, Any]]) -> str:
     Returns:
         The CSV document, header row included.
     """
-    buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=_csv_columns(), extrasaction="ignore")
-    writer.writeheader()
-    for card in cards:
-        writer.writerow(_flatten_for_csv(card))
-    return buffer.getvalue()
+    lines = [",".join(_CSV_COLUMNS), *(_csv_row(card) for card in cards)]
+    return "\n".join(lines) + "\n"
 
 
 class ScryfallCardsRoutes:
@@ -1327,14 +1418,41 @@ class ScryfallCardsRoutes:
                 page_number + 1,
             )
 
-        if format.lower() == "csv":
-            self._respond_text(falcon_response, _cards_to_csv(cards), "text/csv; charset=utf-8")
+        # EXACTLY `csv`, lowercase: `format=CSV` serves JSON on api.scryfall.com (measured
+        # 2026-08-16), so this comparison is deliberately not case-folded -- the mirror image of the
+        # single-card routes, which honour `text`/`image` and ignore `csv`. A `format` a route does
+        # not implement is silently JSON there, never an error.
+        if format == "csv":
+            self._respond_csv(falcon_response, cards, has_more=has_more)
             return None
         return self._scryfall_respond(
             falcon_response,
             card_list(cards, total_cards=total_cards, has_more=has_more, next_page=next_page, warnings=warnings),
             pretty=is_pretty,
         )
+
+    def _respond_csv(
+        self,
+        falcon_response: falcon.Response | None,
+        cards: Sequence[dict[str, Any]],
+        *,
+        has_more: bool,
+    ) -> None:
+        """Write a page of cards as Scryfall's CSV document.
+
+        Args:
+            falcon_response: The response to write to.
+            cards: The page's card objects.
+            has_more: Whether another page follows, which the body has no envelope to carry.
+        """
+        if falcon_response is None:
+            return
+        falcon_response.content_type = _CSV_CONTENT_TYPE
+        falcon_response.set_header("Content-Disposition", _CSV_CONTENT_DISPOSITION)
+        # `has_more` has no envelope to live in, so it rides a header, exactly as Scryfall does it.
+        # Without it, paginating a CSV export means asking for the JSON first.
+        falcon_response.set_header(_CSV_HAS_MORE_HEADER, "true" if has_more else "false")
+        falcon_response.text = _cards_to_csv(cards)
 
     # ---------------------------------------------------------------- GET /cards/named
 
