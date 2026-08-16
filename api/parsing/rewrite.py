@@ -245,7 +245,12 @@ def _lower_regex_leaves(node: QueryNode) -> None:
             # bare word's separator/diacritic fold. Measured on api.scryfall.com 2026-08-16:
             # `name:/lim-dul/` answers 0 and `name:/Lim-D.l/` answers 8, so `/lim-dul/` is NOT
             # the fold that `name:limdul` (8) applies.
-            node.rhs = StringValueNode(literal, literal=True)
+            #
+            # `regex_derived` records that this leaf WAS a regex, because one consumer above the
+            # parser still has to tell the two spellings apart after this rewrite has made them
+            # identical: Scryfall forces `include_extras` on for a `name:` regex and not for a
+            # quoted literal. See `StringValueNode`.
+            node.rhs = StringValueNode(literal, literal=True, regex_derived=True)
 
 
 def lower_literal_regexes(query: Query) -> Query:

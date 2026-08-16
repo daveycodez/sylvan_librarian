@@ -172,10 +172,31 @@ _NO_EXTRAS_TRIGGERS = _ExtrasTriggers(forced=False, sets=())
 # `a:`, `wm:` and `layout:`.
 _UNCONDITIONAL_EXTRAS_ATTRIBUTES = frozenset({"card_artist", "card_watermark", "card_layout"})
 
-# The two VALUE-specific triggers -- `t:token` and `is:extra` -- as {attribute: triggering value}.
-# `t:` binds to `card_types` or `card_subtypes` depending on which vocabulary the value is in, and
-# "Token" is in both, so both spellings are listed.
-_VALUE_EXTRAS_TRIGGERS = {"card_types": "token", "card_subtypes": "token", "card_is_tags": EXTRA_IS_TAG}
+# The VALUE-specific triggers, as {attribute: triggering values}. `t:` binds to `card_types` or
+# `card_subtypes` depending on which vocabulary the value is in, and "Token" is in both, so both
+# spellings are listed.
+#
+# `is:` HAS FOUR OF THEM, not one. Every `is:` value the parser supports (32) was probed for the
+# `include_extras` echo on 2026-08-16, one query each: `is:extra` (10,818), `is:oversized` (726),
+# `is:reserved` (1,477) and `is:rebalanced` (221) echo true, and the other 28 echo false. The
+# negative half is the load-bearing one, because several of the values that echo FALSE plainly
+# contain extras and so would look like triggers to a count-based test: `is:variation` is 93 bare
+# against 97 with the flag, `is:convention` 63 against 67, `is:judge` 173 against 176, `is:league`
+# 6 against 18.
+#
+# `border:silver` is here for the same reason and has the cleanest control in the whole rule.
+# `border:gold` answers 0 bare and 1,373 with `include_extras=true` -- every gold border is a World
+# Championship card, so the whole population is memorabilia -- which is exactly what a NON-trigger
+# on this attribute looks like. `border:silver` answers 665 both ways and echoes true unsent, and
+# only 108 of those 665 are `is:extra`, so the counts are not coinciding by accident.
+# `border:black`, `border:white` and `border:borderless` echo false, as does `frame:` at every
+# value.
+_VALUE_EXTRAS_TRIGGERS = {
+    "card_types": frozenset({"token"}),
+    "card_subtypes": frozenset({"token"}),
+    "card_is_tags": frozenset({EXTRA_IS_TAG, "oversized", "reserved", "rebalanced"}),
+    "card_border": frozenset({"silver"}),
+}
 
 # The set-code attribute every spelling of the set operator (`e:`, `s:`, `set:`) rewrites to.
 _SET_CODE_ATTRIBUTE = "card_set_code"
@@ -292,16 +313,47 @@ def _extras_triggers_of_term(node: BinaryOperatorNode) -> _ExtrasTriggers:
         return _ExtrasTriggers(forced=True, sets=())
     # `name:/…/` triggers and `name:"…"` does not, so the VALUE NODE is what decides -- the
     # attribute is the same either way.
-    if attribute == "card_name" and isinstance(node.rhs, RegexValueNode):
+    #
+    # `regex_derived` is the second half of that test and not an optional refinement:
+    # `lower_literal_regexes` rewrites a metacharacter-free `name:/zzzqq/` into a quoted literal
+    # BEFORE this walk ever runs, so without the flag exactly the regexes with no metacharacters
+    # in them stop triggering. Measured 2026-08-16: `name:/bolt/` sent with `include_extras=false`
+    # answers 175 -- its extras-on count -- where `name:"bolt"` answers 157.
+    if attribute == "card_name" and (isinstance(node.rhs, RegexValueNode) or getattr(node.rhs, "regex_derived", False)):
         return _ExtrasTriggers(forced=True, sets=())
     if not isinstance(node.rhs, StringValueNode):
         return _NO_EXTRAS_TRIGGERS
     value = str(node.rhs.value).lower()
-    if _VALUE_EXTRAS_TRIGGERS.get(attribute) == value:
+    # THE OTHER DIRECTION OF THE SAME LOWERING, and the reason `regex_derived` is read twice here.
+    # A VALUE-specific trigger fires only when it was NOT written as a regex: `t:token cmc=3` is 6
+    # on api.scryfall.com (extras auto-enabled) where `t:/token/ cmc=3` is 0, and `is:/extra/
+    # cmc=3` and `border:/silver/ cmc=3` both answer plain `cmc=3` (22,832) echoing false. After
+    # `lower_literal_regexes` each regex form is the same node as its plain spelling, so without
+    # the flag this fires on all three.
+    if value in _VALUE_EXTRAS_TRIGGERS.get(attribute, frozenset()) and not node.rhs.regex_derived:
         return _ExtrasTriggers(forced=True, sets=())
     if attribute == _SET_CODE_ATTRIBUTE:
         return _ExtrasTriggers(forced=False, sets=(value,))
     return _NO_EXTRAS_TRIGGERS
+
+
+def _mentions_is_tag(node: object, tag: str) -> bool:
+    """Whether the parsed query names `is:<tag>` anywhere -- under `or`, `and` and negation alike.
+
+    The whole of `include_variations`'s auto-enable rule; see the call site for the measurements
+    that make it the whole of it.
+    """
+    if isinstance(node, Query):
+        return _mentions_is_tag(node.root, tag)
+    if isinstance(node, NaryOperatorNode):
+        return any(_mentions_is_tag(child, tag) for child in node.operands)
+    if isinstance(node, NotNode):
+        return _mentions_is_tag(node.operand, tag)
+    if isinstance(node, BinaryOperatorNode):
+        lhs = node.lhs
+        if isinstance(lhs, AttributeNode) and lhs.attribute_name == "card_is_tags":
+            return isinstance(node.rhs, StringValueNode) and str(node.rhs.value).lower() == tag
+    return False
 
 
 # Scryfall's own wording, down to the typographic apostrophe, so a client that string-matches on
@@ -1312,8 +1364,11 @@ class ScryfallCardsRoutes:
         whose parse tree syntactically carries a trigger term turns it on regardless of what the
         caller sent, in the results and in the `next_page` echo alike. See `_extras_triggers`.
 
-        `include_variations` is accepted and has no effect: the corpus holds every variation it
-        has imported, unconditionally.
+        `include_variations` is honored on the same terms, with a DIFFERENT auto-enable: the
+        default hides the printings Scryfall marks `variation` (`-is:variation`, applied in
+        `_search`), and the only term that forces it on is the caller's own `is:variation`. No
+        set term enables it, and nothing that enables extras does either -- the two gates are
+        independent, and a query may cross both.
 
         In-query directives (`unique:`, `order:`/`sort:`, `dir:`/`direction:`, `prefer:`) reach
         the search through `_search`'s own fold and override the query parameter of the same
@@ -1333,7 +1388,8 @@ class ScryfallCardsRoutes:
             pretty: Whether to indent JSON output.
             include_extras: Whether to include the extras class; a trigger term in `q` forces it.
             include_multilingual: Whether to widen the search to foreign printings.
-            include_variations: Accepted, ignored.
+            include_variations: Whether to include the variation class; `is:variation` in `q`
+                forces it.
 
         Returns:
             A List object of cards, or a Scryfall error object.
@@ -1433,6 +1489,20 @@ class ScryfallCardsRoutes:
             forced = not self._sets_with_extras().isdisjoint(triggers.sets)
         effective_extras = forced or _as_bool(include_extras)
 
+        # AND THE SAME STORY FOR `include_variations`, WITH A DIFFERENT TRIGGER RULE -- which is
+        # why this is its own walk and not a second reading of `triggers`. Every unconditional
+        # EXTRAS trigger was probed and echoes `include_variations=false`: `a:"rebecca guay"
+        # t:creature` and `layout:normal cmc=3` echo `extras=true variations=false`, and so do
+        # `wm:`, `name:/^z/`, `t:token`, `is:extra`, `is:oversized`, `is:reserved` and
+        # `is:rebalanced`. A SET term does not enable it either -- `e:hho` is 21 bare and 23 only
+        # once the parameter is sent, though hho auto-enables extras -- so there is no conditional
+        # arm here and nothing to ask the engine. The only trigger is the caller's own
+        # `is:variation`, and it is a FORCE like the extras ones: `t:creature or is:variation`
+        # sent with `include_variations=false` answers 51,566 and echoes true.
+        from api.api_resource import VARIATION_IS_TAG  # noqa: PLC0415
+
+        effective_variations = _mentions_is_tag(parsed, VARIATION_IS_TAG) or _as_bool(include_variations)
+
         try:
             result = self._search(
                 query=policy.query,
@@ -1448,6 +1518,7 @@ class ScryfallCardsRoutes:
                 # "absent" from meaning anything.
                 include_extras=effective_extras,
                 include_multilingual=_as_bool(include_multilingual),
+                include_variations=effective_variations,
             )
         except falcon.HTTPBadRequest as err:
             return self._scryfall_respond(
@@ -1484,7 +1555,7 @@ class ScryfallCardsRoutes:
                     # unconditional families: the echo agreed with what was served in every one.
                     "include_extras": str(effective_extras).lower(),
                     "include_multilingual": str(_as_bool(include_multilingual)).lower(),
-                    "include_variations": str(_as_bool(include_variations)).lower(),
+                    "include_variations": str(effective_variations).lower(),
                     # RESOLVED, not raw -- see _UNIQUE_ECHO. This is what keeps the link correct
                     # now that the in-query directives (#893) fold here: `q` echoes verbatim,
                     # directive included, so a `q` saying `order:cmc` next to an `order=name` in

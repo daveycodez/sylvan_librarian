@@ -104,12 +104,21 @@ class StringValueNode(ValueNode):
     `literal` is therefore true for a quoted value AND for a plain-literal regex lowered to a
     substring (``lower_literal_regexes``) -- ``name:/lim-dul/`` answers 0 on Scryfall, exactly as
     the quoted spelling does.
+
+    `regex_derived` is the second, narrower half of the same story, and it is not serialized
+    either. The two spellings match the same rows, so the wire tree is right to forget which one
+    was typed -- but Scryfall's ``include_extras`` auto-enable fires on ``name:/.../`` and NOT on
+    ``name:"..."``, and the lowering erases exactly that difference. Measured on api.scryfall.com
+    2026-08-16: ``name:/bolt/`` answers 175 with ``include_extras=false`` sent explicitly, which is
+    its ``include_extras=true`` count, while ``name:"bolt"`` answers 157 against the same 175. Set
+    by ``lower_literal_regexes``; read by ``_extras_triggers_of_term``.
     """
 
-    def __init__(self: StringValueNode, value: str, literal: bool = False) -> None:
+    def __init__(self: StringValueNode, value: str, literal: bool = False, regex_derived: bool = False) -> None:
         """Initialize a StringValueNode with a string value."""
         self.value = value
         self.literal = literal
+        self.regex_derived = regex_derived
 
     def kwargs(self) -> dict:
         """Return this node's kwargs dict for Rust engine JSON serialization."""

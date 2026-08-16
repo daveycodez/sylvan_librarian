@@ -477,6 +477,42 @@ def _extras_predicate() -> QueryNode:
     return parse_scryfall_query(f"is:{EXTRA_IS_TAG}").root
 
 
+# The `is:` value behind `include_variations`. Not beside EXTRA_IS_TAG in card_processing because
+# it is not the same kind of thing: `extra` is COMPUTED by the import, while `variation` is one of
+# Scryfall's own booleans synced straight off the bulk row.
+VARIATION_IS_TAG = "variation"
+
+
+@lru_cache(maxsize=1)
+def _variations_predicate() -> QueryNode:
+    """The `is:variation` filter node, parsed once and shared."""
+    return parse_scryfall_query(f"is:{VARIATION_IS_TAG}").root
+
+
+def _apply_variations_default(parsed_query: Query, *, include_variations: bool) -> None:
+    """Conjoin `-is:variation` onto a parsed query in place unless the caller asked for them.
+
+    THE THIRD OF SCRYFALL'S THREE SEARCH PARAMETERS, and the last one this API only echoed.
+    Measured on api.scryfall.com 2026-08-16 with queries that fire no auto-enable at all, so the
+    default is visible rather than overridden: `t:creature` answers 51,473 bare and 51,523 with
+    `include_variations=true`, `cmc=3` 22,832 against 22,854, `o:draw` 12,301 against 12,303.
+
+    Independent of the extras gate, and measurably so: `t:creature` is 55,454 with extras alone
+    and 55,506 with both, and the two classes overlap by only 4 printings (`is:variation` is 93
+    with variations forced on and 97 once extras are on as well). So the two conjuncts compose;
+    neither subsumes the other.
+
+    Same splice-not-append reasoning as `_apply_extras_default`, and the same TrueNode exemption.
+
+    Args:
+        parsed_query: The parsed query, whose root is replaced unless it is a TrueNode.
+        include_variations: True leaves the query exactly as written.
+    """
+    if include_variations or isinstance(parsed_query.root, TrueNode):
+        return
+    parsed_query.root = AndNode([parsed_query.root, NotNode(_variations_predicate())])
+
+
 def _apply_extras_default(parsed_query: Query, *, include_extras: bool) -> None:
     """Conjoin `-is:extra` onto a parsed query in place unless the caller asked for extras.
 
@@ -1507,6 +1543,7 @@ class APIResource(ScryfallCardsRoutes):
         fields: Sequence[str] | None = None,
         include_extras: bool = True,
         include_multilingual: bool = False,
+        include_variations: bool = True,
         limit: int = 100,
         offset: int = DEFAULT_OFFSET,
         orderby: CardOrdering = CardOrdering.EDHREC,
@@ -1533,6 +1570,7 @@ class APIResource(ScryfallCardsRoutes):
                 direction,
                 include_extras,
                 include_multilingual,
+                include_variations,
                 limit,
                 offset,
                 orderby,
@@ -1576,9 +1614,11 @@ class APIResource(ScryfallCardsRoutes):
             prefer=prefer,
         )
 
-        # Scryfall's `include_extras=false` default, spliced onto the tree UPSTREAM of the
-        # engine/SQL dispatch so both paths honor it by construction -- see the helper.
+        # Scryfall's `include_extras=false` and `include_variations=false` defaults, spliced onto
+        # the tree UPSTREAM of the engine/SQL dispatch so both paths honor them by construction --
+        # see the helpers. Two independent gates; a query may close both.
         _apply_extras_default(parsed_query, include_extras=include_extras)
+        _apply_variations_default(parsed_query, include_variations=include_variations)
 
         if not settings.enable_engine:
             pass  # feature-gated off: SQL serves everything, the store never loads

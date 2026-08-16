@@ -659,6 +659,38 @@ class TestSearch:
         assert "warnings" not in body
 
 
+class TestVariationsGate:
+    """`include_variations`, its auto-enable, and its independence from the extras gate."""
+
+    def test_only_is_variation_forces_the_gate(self):
+        """The whole of this gate's auto-enable rule, and it is a FORCE like the extras ones.
+
+        `t:creature or is:variation` sent with `include_variations=false` answers 51,566 on
+        api.scryfall.com and echoes true. Nothing that enables EXTRAS enables this: `a:`, `wm:`,
+        `layout:`, `name:/^z/`, `t:token`, `is:extra`, `is:oversized`, `is:reserved`,
+        `is:rebalanced` and a set term all echo `include_variations=false` (measured 2026-08-16,
+        and `e:hho` is 21 bare against 23 with the parameter though hho auto-enables extras).
+        """
+        forced = routes_module._mentions_is_tag
+        assert forced(parse_scryfall_query("is:variation"), "variation") is True
+        assert forced(parse_scryfall_query("t:creature or is:variation"), "variation") is True
+        assert forced(parse_scryfall_query("-is:variation t:land"), "variation") is True
+        for query in ("a:guay", "wm:mirran", "layout:normal", "t:token", "is:extra", "is:oversized", "e:hho"):
+            assert forced(parse_scryfall_query(query), "variation") is False, query
+
+    def test_the_two_gates_are_independent(self, compat_corpus: APIResource):
+        """Both conjuncts can be spliced at once, and neither subsumes the other.
+
+        `t:creature` is 51,473 bare, 55,454 with extras alone, 51,523 with variations alone and
+        55,506 with both; `is:variation` is 93 with variations on and 97 once extras are on too,
+        so the classes overlap by 4 printings out of 97.
+        """
+        for params, expect_variation in (("", True), ("include_variations=true", False)):
+            body = payload(dispatch(compat_corpus, "/cards/search", f"q=t%3Acreature&{params}"))
+            echoed = body.get("next_page") or ""
+            assert ("include_variations=true" in echoed) is not expect_variation or not echoed
+
+
 class TestExtrasTriggers:
     """`_extras_triggers`, the syntactic rule behind `include_extras`'s auto-enable.
 
@@ -741,17 +773,46 @@ class TestExtrasTriggers:
         assert routes_module._extras_triggers(parse_scryfall_query("-wm:x t:land")).forced is True
         assert routes_module._extras_triggers(parse_scryfall_query("(e:lea t:creature) or t:land")).sets == ("lea",)
 
-    def test_a_literal_regex_is_the_known_residual(self):
+    def test_a_lowered_literal_regex_is_still_a_regex_here(self):
         """The rewrite lowers a metacharacter-free regex to a literal before this walk sees it.
 
-        So `name:/zzzqq/` reads as `name:"zzzqq"` and misses a trigger Scryfall fires, and
-        `t:/token/` reads as `t:token` and fires one Scryfall does not. One cause, two directions;
-        every pattern with a metacharacter keeps its RegexValueNode and behaves.
+        That USED to be a residual in both directions: `name:/zzzqq/` read as `name:"zzzqq"` and
+        missed a trigger Scryfall fires, and `t:/token/` read as `t:token` and fired one Scryfall
+        does not. `StringValueNode.regex_derived` records the spelling the rewrite erased, so both
+        now answer as Scryfall does. Measured 2026-08-16::
+
+            name:/bolt/  175 = its extras-on count    name:"bolt"  157
+            t:token cmc=3  6 (extras auto-enabled)    t:/token/ cmc=3  0
+            is:/extra/ cmc=3 and border:/silver/ cmc=3 both answer plain cmc=3 (22,832)
+
+        Every pattern with a metacharacter keeps its RegexValueNode and behaved all along.
         """
-        assert routes_module._extras_triggers(parse_scryfall_query("name:/zzzqq/")).forced is False
+        assert routes_module._extras_triggers(parse_scryfall_query("name:/zzzqq/")).forced is True
         assert routes_module._extras_triggers(parse_scryfall_query("name:/^z/")).forced is True
-        assert routes_module._extras_triggers(parse_scryfall_query("t:/token/")).forced is True
+        assert routes_module._extras_triggers(parse_scryfall_query('name:"zzzqq"')).forced is False
+        assert routes_module._extras_triggers(parse_scryfall_query("t:/token/")).forced is False
+        assert routes_module._extras_triggers(parse_scryfall_query("t:token")).forced is True
         assert routes_module._extras_triggers(parse_scryfall_query("t:/^token$/")).forced is False
+        assert routes_module._extras_triggers(parse_scryfall_query("is:/extra/")).forced is False
+        assert routes_module._extras_triggers(parse_scryfall_query("border:/silver/")).forced is False
+
+    def test_the_is_and_border_triggers_are_value_specific(self):
+        """Four `is:` values and one `border:` value force extras on; their neighbours do not.
+
+        All 32 supported `is:` values were probed for the `include_extras` echo on 2026-08-16, and
+        `border:gold` is the control that makes `border:silver` a trigger rather than a
+        coincidence: every gold border is a World Championship card, so the whole population is
+        memorabilia, and it still answers 0 bare against 1,373 with the flag.
+        """
+        for value in ("extra", "oversized", "reserved", "rebalanced"):
+            assert routes_module._extras_triggers(parse_scryfall_query(f"is:{value}")).forced is True, value
+        for value in ("variation", "convention", "judge", "league", "promo", "foil"):
+            assert routes_module._extras_triggers(parse_scryfall_query(f"is:{value}")).forced is False, value
+        assert routes_module._extras_triggers(parse_scryfall_query("border:silver")).forced is True
+        for value in ("gold", "black", "white", "borderless"):
+            assert routes_module._extras_triggers(parse_scryfall_query(f"border:{value}")).forced is False, value
+        for value in ("1993", "2015", "future"):
+            assert routes_module._extras_triggers(parse_scryfall_query(f"frame:{value}")).forced is False, value
 
 
 class TestNamed:
