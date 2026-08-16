@@ -2,7 +2,7 @@ use super::{
     and_child_rank, assign_name_ranks,
     build_numeric_index, build_oracle_text_index, build_tag_index, build_trigram_index,
     build_rarity_index, build_flavor_index, build_hybrid_tag_index, bitmap_beats_postings, HybridTagIndex, build_sort_permutations,
-    assign_artwork_groups, assign_set_ranks, assign_foreign_artwork_groups, build_artwork_base_from, build_lang_index, build_printed_name_index, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
+    assign_artwork_groups, assign_collector_ranks, assign_set_ranks, assign_foreign_artwork_groups, build_artwork_base_from, build_lang_index, build_printed_name_index, drop_group_if_annex_only, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
     cards_of_printings, count_common_keywords, count_common_types,
     build_artist_index, build_printing_value_index, build_arith_tuple_index, is_arith_tuple_route, range_candidates, narrow_candidates, narrow_candidates_exact, rarity_candidates,
     range_too_broad_to_narrow, run_query, run_query_routed, run_query_widened, run_query_with_plan, explain, explain_analyze, AcquireFacts, PlanEstimate, PlanTrial,
@@ -200,6 +200,7 @@ fn stub_card(oracle_id: u128, card_types: u16, subtypes: &[&str], vocab: &mut Vo
         card_colors: 0,
         card_color_identity: 0,
         produced_mana: 0,
+        color_indicator: 0,
         card_types,
         legality_divergent: false,
         oracle_id,
@@ -218,6 +219,7 @@ fn stub_card(oracle_id: u128, card_types: u16, subtypes: &[&str], vocab: &mut Vo
         name_rank: 0,
         card_subtypes: subtypes.iter().map(|s| vocab.intern(s.to_string()).unwrap()).collect(),
         card_keywords: Vec::new(),
+        card_keywords_printed: Vec::new(),
         card_oracle_tags: Vec::new(),
         card_legalities: 0,
         mana_cost: ManaCost { core: 0, hybrids: Vec::new(), devotion: 0, cmc: 0.0 },
@@ -225,7 +227,6 @@ fn stub_card(oracle_id: u128, card_types: u16, subtypes: &[&str], vocab: &mut Vo
         creature_toughness_text_id: NONE_STR,
         planeswalker_loyalty_text_id: NONE_STR,
         faces: Vec::new(),
-        all_parts: Vec::new(),
     }
 }
 
@@ -248,6 +249,7 @@ fn stub_printing(scryfall_id: u128, illustration_id: u128, prefer_score: Option<
         released_at_int: None,
         card_rarity_int: None,
         collector_number_int: None,
+        collector_rank: 0,
         price_usd: None,
         price_eur: None,
         price_tix: None,
@@ -263,6 +265,7 @@ fn stub_printing(scryfall_id: u128, illustration_id: u128, prefer_score: Option<
         printed_text_id: NONE_STR,
         printed_name_folded_id: NONE_STR,
         printed_faces: Vec::new(),
+        all_parts: Vec::new(),
         compat: CompatFields::default(),
     }
 }
@@ -11503,6 +11506,43 @@ fn printings_are_findable_by_scryfall_id() {
     assert_eq!(find_printing_by_scryfall_id(aperm, aprint, 0), None, "null id");
 }
 
+/// `oracleid:<uuid>` — the query every Scryfall-compat card object puts in its
+/// `prints_search_uri` — selects exactly one card's printings, through the sorted oracle-id
+/// permutation rather than a scan, and answers an id this store does not hold with the empty set.
+#[test]
+fn an_oracle_id_filter_selects_one_cards_printings() {
+    let mut vocab = VocabInterner::new();
+    let (id_a, id_b) = (0x43fb_feec_u128, 0x21f4_5043_u128);
+    let cards = vec![stub_card(id_a, 0, &[], &mut vocab), stub_card(id_b, 0, &[], &mut vocab)];
+    let mut data = store_of(cards, &[2, 1], vocab);
+    // The permutation the narrowing binary-searches; store_of leaves the index defaulted.
+    data.indexes.oracle_by_oracle_id = build_oracle_by_oracle_id(&data.cards);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+
+    let run = |f: &mut FilterExpr, unique: &str| {
+        run_query(&QueryCtx::from(a), f, None, unique, "default", "edhrec", "asc", 100, 0).0
+    };
+
+    // Card A owns printings 1 and 2; card B owns printing 3. Neither of B's rows may appear.
+    let mut filter = FilterExpr::OracleIdMatch { id: id_a };
+    assert_eq!(run(&mut filter, "printing"), 2, "both of A's printings");
+    let mut filter = FilterExpr::OracleIdMatch { id: id_a };
+    assert_eq!(run(&mut filter, "card"), 1, "unique=cards rolls the same match up to one row");
+
+    // An id this store does not hold, and parse_uuid_or_hash's 0 for an unparseable value: both
+    // are the empty set, never an error — the parser deliberately does not validate the uuid.
+    for miss in [0xdead_beef_u128, 0] {
+        let mut filter = FilterExpr::OracleIdMatch { id: miss };
+        assert_eq!(run(&mut filter, "printing"), 0, "id {miss:#x} names no card");
+    }
+
+    // Negation complements the same exact set, which is only sound because the narrowing is
+    // tight (tight_narrow_space) — B's single row and nothing else.
+    let mut filter = FilterExpr::Not(Box::new(FilterExpr::OracleIdMatch { id: id_a }));
+    assert_eq!(run(&mut filter, "printing"), 1, "everything that is not card A");
+}
+
 #[test]
 fn cards_are_findable_by_oracle_id() {
     let mut vocab = VocabInterner::new();
@@ -11692,15 +11732,14 @@ fn related_cards_stand_alone_without_the_referenced_card() {
     // The reason all_parts carries its own name and type line: a `token` component references a
     // card the import FILTERS OUT (preprocess_card drops Token type lines), so an index into our
     // cards would resolve to nothing. The reference has to be self-contained.
-    let mut vocab = VocabInterner::new();
-    let mut card = stub_card(1, 0, &[], &mut vocab);
-    card.all_parts = vec![
+    let mut printing = stub_printing(1, 1, None);
+    printing.all_parts = vec![
         RelatedCard { id: 0xAAAA, name_id: 10, type_line_id: 11, component_id: 1 },
         RelatedCard { id: 0xBBBB, name_id: 20, type_line_id: 21, component_id: 2 },
     ];
 
-    let bytes = rkyv::to_bytes::<Error>(&card).expect("serialize");
-    let a = rkyv::access::<Archived<OracleCard>, Error>(&bytes).expect("access");
+    let bytes = rkyv::to_bytes::<Error>(&printing).expect("serialize");
+    let a = rkyv::access::<Archived<Printing>, Error>(&bytes).expect("access");
 
     assert_eq!(a.all_parts.len(), 2);
     // Order is meaningful for melds: the two parts, then the result.
@@ -11712,12 +11751,11 @@ fn related_cards_stand_alone_without_the_referenced_card() {
 }
 
 #[test]
-fn cards_without_relations_carry_none() {
-    let mut vocab = VocabInterner::new();
-    let card = stub_card(1, 0, &[], &mut vocab);
-    let bytes = rkyv::to_bytes::<Error>(&card).expect("serialize");
-    let a = rkyv::access::<Archived<OracleCard>, Error>(&bytes).expect("access");
-    assert!(a.all_parts.is_empty(), "~59% of cards have no relations");
+fn printings_without_relations_carry_none() {
+    let printing = stub_printing(1, 1, None);
+    let bytes = rkyv::to_bytes::<Error>(&printing).expect("serialize");
+    let a = rkyv::access::<Archived<Printing>, Error>(&bytes).expect("access");
+    assert!(a.all_parts.is_empty(), "~95% of printings have no relations");
 }
 
 // ─── Fuzzy name matching ──────────────────────────────────────────────────────
@@ -12114,6 +12152,112 @@ fn include_multilingual_rolls_up_to_the_canonical_row() {
     assert_eq!(u128::from(page[1].1.scryfall_id), 2);
 }
 
+/// `order=set`'s second key is the collector number, by Scryfall's own (int, string) rule.
+///
+/// Read off api.scryfall.com on 2026-08-16: khm answers `... 39, 40, A-40, 41 ... 378, A-378,
+/// 379 ...`, so an ARENA-rebalanced row sits with the paper number it was rebalanced from rather
+/// than past every number, and `e:unk` answers `CAa, CAb, UB, CA01, ...`, so a digit-free number
+/// leads. Three shapes, one rule: integer first (9 before 10 — not a string sort), raw string
+/// breaking equal integers ("40" before "A-40" — not an integer sort), absent integer first.
+#[test]
+fn assign_collector_ranks_follows_scryfalls_number_then_string() {
+    let numbers = ["41", "A-40", "40", "10", "9", "UB"];
+    let strings: Vec<String> = numbers.iter().map(|s| (*s).to_string()).collect();
+    let mut printings: Vec<Printing> = numbers
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let mut p = stub_printing(i as u128, i as u128, None);
+            p.collector_number_id = i as u32;
+            p.collector_number_int = n.chars().filter(char::is_ascii_digit).collect::<String>().parse().ok();
+            p
+        })
+        .collect();
+    let mut none: Vec<Printing> = Vec::new();
+    assign_collector_ranks(&mut printings, &mut none, &strings);
+
+    let mut order: Vec<(u16, &str)> = printings.iter().zip(numbers).map(|(p, n)| (p.collector_rank, n)).collect();
+    order.sort_by_key(|&(rank, _)| rank);
+    assert_eq!(
+        order.iter().map(|&(_, n)| n).collect::<Vec<_>>(),
+        ["UB", "9", "10", "40", "A-40", "41"],
+        "absent integer first, then integer, then the raw string"
+    );
+    // Dense and gapless, so the complement `sort_col_secondary` applies under `dir=desc` is an
+    // exact reversal rather than a reflection about an arbitrary point.
+    assert_eq!(order.iter().map(|&(r, _)| r).collect::<Vec<_>>(), [0, 1, 2, 3, 4, 5]);
+}
+
+/// One card, four sets' worth of rows: the Maskwood Nexus shape from the multilingual ledger.
+///
+/// The card's representative printing is in clb; the query asks for khm, where the English pair is
+/// #240 (better) and #369 (extended art), and the two Japanese rows sit at those same two slots.
+fn cross_set_language_store() -> (CardData, u16, u16) {
+    let mut vocab = VocabInterner::new();
+    let en = vocab.intern("en".to_string()).expect("intern en");
+    let ja = vocab.intern("ja".to_string()).expect("intern ja");
+    let mut card = stub_card(1, 0, &[], &mut vocab);
+    card.card_name_folded = InlineStr::from_str("maskwood nexus");
+    card.card_name_lower = InlineStr::from_str("maskwood nexus");
+
+    // strings[0..] are the collector numbers the slots are keyed on.
+    let numbers = ["865", "240", "369"];
+    let row = |scry: u128, set: &str, cn: u32, prefer: f32, lang: u16| {
+        let mut p = stub_printing(scry, scry, Some(prefer));
+        p.card_set_code = InlineStr::from_str(set);
+        p.collector_number_id = cn;
+        p.compat.lang_id = lang;
+        p
+    };
+    let canonical =
+        vec![row(1, "clb", 0, 240.0, en), row(2, "khm", 1, 197.36, en), row(3, "khm", 2, 191.36, en)];
+    let mut data = store_of(vec![card], &[3], vocab);
+    data.printings = canonical;
+    data.strings = numbers.iter().map(|s| (*s).to_string()).collect();
+    // The two Japanese rows, and the WRONG one scores higher — Scryfall's data gives the ja
+    // extended-art printing no frame_effects, so nothing in the rows themselves prefers #240.
+    data.foreign = vec![row(4, "khm", 1, 90.0, ja), row(5, "khm", 2, 95.0, ja)];
+    data.foreign_offsets = vec![0, 2];
+    data.indexes.langs = build_lang_index(&data.printings, &data.coll_vocab);
+    data.indexes.foreign_langs = build_lang_index(&data.foreign, &data.coll_vocab);
+    data.indexes.foreign_to_card = build_printing_to_card(&data.foreign_offsets);
+    data.indexes.printed_names = build_printed_name_index(&data.printings, &data.foreign, &data.strings);
+    (data, en, ja)
+}
+
+/// `lang:` + `unique=cards` follows the query's OWN English pick, not the card's global one.
+///
+/// api.scryfall.com answers khm ja #240 for `e:khm lang:ja unique=cards`, even though the card's
+/// representative printing lives in clb and so no khm row carries the representative bonus. The
+/// fixture makes the wrong answer the easy one: ja #369 outscores ja #240 on its own prefer, so a
+/// per-row rule picks #369. Only reading the canonical row at each SLOT, under the query with its
+/// language lifted, gets #240.
+#[test]
+fn a_language_pick_follows_the_english_row_in_the_querys_own_set() {
+    let (data, _, ja) = cross_set_language_store();
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+
+    let khm = FilterExpr::TextExact { field: TextField::SetCode, op: CmpOp::Eq, value: "khm".to_string() };
+    let lang = FilterExpr::LangMatch { value: "ja".to_string(), vid: Some(ja), any: false };
+    let scoped = FilterExpr::And(vec![khm, lang]);
+
+    let params = QueryParams::from_strs("card", "default", "edhrec", "asc", 100, 0);
+    let (total, page) = run_query_widened(a, &params, &scoped);
+    assert_eq!(total, 1, "one card");
+    assert_eq!(u128::from(page[0].1.scryfall_id), 4, "the ja row at #240, the best khm ENGLISH slot");
+
+    // The row that outscores it is still there — this reorders the representative, it drops nothing.
+    let params = QueryParams::from_strs("printing", "default", "edhrec", "asc", 100, 0);
+    let (total, _) = run_query_widened(a, &params, &scoped);
+    assert_eq!(total, 2, "both ja rows still match");
+
+    // And the English lane is unmoved: bare widening rolls up to the card's own representative.
+    let params = QueryParams::from_strs("card", "default", "edhrec", "asc", 100, 0);
+    let (_, page) = run_query_widened(a, &params, &FilterExpr::True);
+    assert_eq!(u128::from(page[0].1.scryfall_id), 1, "clb 865 is still the card's own pick");
+}
+
 #[test]
 fn a_foreign_printed_name_fuzzy_matches_to_its_printing() {
     let (data, _, _) = bilingual_store();
@@ -12129,4 +12273,56 @@ fn a_foreign_printed_name_fuzzy_matches_to_its_printing() {
     }
     // The card's own English and foreign names are ONE answer, never ambiguous with each other.
     assert!(matches!(fuzzy_name_match(a, "lightning bolt", 0.4, 0.05), FuzzyOutcome::Hit { .. }));
+}
+
+#[test]
+fn an_annex_only_oracle_is_dropped_not_panicked() {
+    // The real-corpus trigger: the ja 4ED printings of the ante cards (Bronze Tablet, Rebirth,
+    // Tempest Efreet) alone carry `oldschool: legal`, so the never-legal import filter keeps only
+    // non-canonical rows and the oracle reaches grouping annex-only. Before the drop guard this
+    // PANICKED the build (`divergent_formats_of` on the zero-width canonical window). Both close
+    // sites take the guard: the interior group boundary and the end of the stream.
+    let mut vocab = VocabInterner::new();
+    let mut cards = vec![stub_card(1, 0, &[], &mut vocab)];
+    let mut printings: Vec<Printing> = Vec::new();
+    let mut offsets = vec![0u32];
+    let mut foreign = vec![stub_printing(11, 11, None)];
+    let mut foreign_offsets = vec![0u32];
+    let (mut dropped, mut rows_dropped) = (0usize, 0usize);
+
+    // Interior close: the first group ends with no canonical row — dropped whole, annex row too.
+    drop_group_if_annex_only(
+        &mut cards, &printings, &mut offsets, &mut foreign, &mut foreign_offsets, &mut dropped, &mut rows_dropped,
+    );
+    assert!(cards.is_empty(), "the annex-only oracle is gone, card and rows alike");
+    assert!(foreign.is_empty());
+    assert_eq!((dropped, rows_dropped), (1, 1));
+
+    // A group WITH a canonical row survives untouched, its annex rows with it.
+    cards.push(stub_card(2, 0, &[], &mut vocab));
+    offsets.push(0);
+    foreign_offsets.push(0);
+    printings.push(stub_printing(21, 21, Some(2.0)));
+    foreign.push(stub_printing(22, 22, None));
+    drop_group_if_annex_only(
+        &mut cards, &printings, &mut offsets, &mut foreign, &mut foreign_offsets, &mut dropped, &mut rows_dropped,
+    );
+    assert_eq!(cards.len(), 1, "a canonical row keeps the group");
+    assert_eq!((printings.len(), foreign.len()), (1, 1));
+    assert_eq!((dropped, rows_dropped), (1, 1));
+
+    // End-of-stream close: a trailing annex-only group (two annex rows) drops the same way.
+    cards.push(stub_card(3, 0, &[], &mut vocab));
+    offsets.push(printings.len() as u32);
+    foreign_offsets.push(foreign.len() as u32);
+    foreign.push(stub_printing(31, 31, None));
+    foreign.push(stub_printing(32, 32, None));
+    drop_group_if_annex_only(
+        &mut cards, &printings, &mut offsets, &mut foreign, &mut foreign_offsets, &mut dropped, &mut rows_dropped,
+    );
+    assert_eq!(cards.len(), 1);
+    assert_eq!(foreign.len(), 1, "only the surviving card's annex row remains");
+    assert_eq!((dropped, rows_dropped), (2, 3));
+    // The accounting invariant reload_commit asserts: canonical + annex + dropped == staged.
+    assert_eq!(printings.len() + foreign.len() + rows_dropped, 5);
 }

@@ -487,19 +487,33 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
     return card
 
 
-def error_object(*, code: str, status: int, details: str, warnings: list[str] | None = None) -> dict[str, Any]:
+def error_object(
+    *,
+    code: str,
+    status: int,
+    details: str,
+    error_type: str | None = None,
+    warnings: list[str] | None = None,
+) -> dict[str, Any]:
     """Build Scryfall's error object.
 
     Args:
         code: Scryfall's machine-readable error slug, e.g. "not_found".
         status: The HTTP status the response carries.
         details: Human-readable explanation.
+        error_type: Scryfall's refinement of `code`, when it sends one -- `ambiguous` on a
+            `/cards/named?fuzzy=` that resolved to more than one card. Emitted between `code` and
+            `status`, which is where api.scryfall.com puts it.
         warnings: Non-fatal notes about the request, when there are any.
 
     Returns:
-        The error object, with `warnings` present only when non-empty.
+        The error object, with `type` and `warnings` present only when supplied.
     """
-    error: dict[str, Any] = {"object": "error", "code": code, "status": status, "details": details}
+    error: dict[str, Any] = {"object": "error", "code": code}
+    if error_type is not None:
+        error["type"] = error_type
+    error["status"] = status
+    error["details"] = details
     if warnings:
         error["warnings"] = warnings
     return error

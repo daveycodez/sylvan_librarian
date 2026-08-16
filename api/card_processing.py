@@ -105,6 +105,9 @@ def extract_collector_number_int(collector_number: str | int | float | None) -> 
 # own top-level fields, verified on its card objects.
 _FACE_LIST_UNIONS = ("card_types", "card_subtypes")
 _FACE_FLAG_UNIONS = ("card_colors", "card_keywords", "produced_mana")
+# The printed keyword list is a LIST, so its face merge is an order-preserving union rather than a
+# dict update.
+_FACE_PRINTED_LIST_UNIONS = ("card_keywords_printed",)
 _FACE_JOINED_TEXTS = ("oracle_text", "flavor_text", "type_line")
 # Copied per GROUP from the first face that has any of the group, so the numeric columns and
 # their _text twins always describe the same face (the schema's check constraints couple them).
@@ -256,6 +259,9 @@ def _merge_processed_faces(faces: list[dict[str, Any]]) -> dict[str, Any]:
             seen.extend(value for value in face[key] if value not in seen)
         for key in _FACE_FLAG_UNIONS:
             merged[key].update(face[key])
+        for key in _FACE_PRINTED_LIST_UNIONS:
+            seen = merged[key]
+            seen.extend(value for value in face[key] if value not in seen)
         for key in _FACE_JOINED_TEXTS:
             parts = [part for part in (merged.get(key), face.get(key)) if part]
             merged[key] = (" // " if key == "type_line" else _FACE_TEXT_SEPARATOR).join(parts)
@@ -396,7 +402,19 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
     # inconsistently cased ("First strike", "Doctor's companion"), and lowercase is the same
     # normalization the oracle/art/is tag collections already use on both sides.
     card["card_keywords"] = dict.fromkeys((keyword.lower() for keyword in card.get("keywords", [])), True)
+    # ...and again AS PRINTED, for the card object. The fold above is not invertible: only 455 of
+    # the 885 distinct keywords in the 2026-08-16 all_cards bulk come back from capitalizing the
+    # folded form ("Battle Cry", "AV Bead", "Bio-plasmic Barrage" do not), and Scryfall's order is
+    # neither the folded dict's nor alphabetical ("Flying" before "Flash" on Brazen Borrower). A
+    # LIST, not a {key: true} object, because it exists for its order. `keyword:` keeps binding the
+    # folded keys; this one is only ever emitted.
+    card["card_keywords_printed"] = list(dict.fromkeys(card.get("keywords", [])))
     card["produced_mana"] = dict.fromkeys(card.get("produced_mana", []), True)
+    # Scryfall's TOP-LEVEL color_indicator -- the printed colour dot a card whose mana cost cannot
+    # state its colours carries (a meld result, a coloured back). 546 printings in the bulk have
+    # one and no column held it, so the card object emitted it on none of them. Not face-merged:
+    # the two-image layouts keep theirs on the faces and send no top-level copy at all.
+    card["color_indicator"] = dict.fromkeys(card.get("color_indicator", []), True)
 
     card["edhrec_rank"] = card.get("edhrec_rank")
 
@@ -480,7 +498,8 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
     card.setdefault("card_legalities", card.get("legalities", {}))
 
     # Ensure all NOT NULL DEFAULT fields are set to avoid constraint violations
-    for key in ["produced_mana", "card_oracle_tags", "card_art_tags", "card_is_tags"]:
+    for key in ["produced_mana", "color_indicator", "card_oracle_tags", "card_art_tags", "card_is_tags"]:
         card.setdefault(key, {})
+    card.setdefault("card_keywords_printed", [])
 
     return [card]

@@ -328,6 +328,24 @@ class TestNamed:
         body = payload(dispatch(compat_corpus, "/cards/named", "fuzzy=compat+bears"))
         assert body["name"] == "Compat Bears"
 
+    def test_fuzzy_containment_ignores_the_names_separators(self, compat_corpus: APIResource):
+        """Scryfall matches a word against the name with its separators gone (measured 2026-08-16).
+
+        `fuzzy=redgoad` answers not_found there while `fuzzy=red goad` resolves, so this is one
+        word matched against one unseparated name -- not the query being rejoined.
+        """
+        body = payload(dispatch(compat_corpus, "/cards/named", "fuzzy=compatbolt"))
+        assert body["name"] == "Compat Bolt"
+
+    def test_fuzzy_ambiguity_is_a_not_found_carrying_a_type(self, compat_corpus: APIResource):
+        """api.scryfall.com sends code=not_found with type=ambiguous, not code=ambiguous."""
+        resp = dispatch(compat_corpus, "/cards/named", "fuzzy=compat")
+        assert resp.status == falcon.HTTP_404
+        body = payload(resp)
+        assert body["code"] == "not_found"
+        assert body["type"] == "ambiguous"
+        assert "Too many cards match ambiguous name" in body["details"]
+
     def test_fuzzy_tolerates_a_typo(self, compat_corpus: APIResource):
         body = payload(dispatch(compat_corpus, "/cards/named", "fuzzy=Compat+Bolzt"))
         assert body["name"] == "Compat Bolt"
