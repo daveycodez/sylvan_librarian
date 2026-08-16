@@ -530,6 +530,25 @@ struct Printing {
 
     card_rarity_int: Option<u8>,       // 0-5
     collector_number_int: Option<u16>, // some sets exceed i8::MAX
+    // Dense rank of (collector_number_int, collector_number) in that order, assigned post-load by
+    // assign_collector_ranks; `order=set`'s SECOND key. Scryfall orders a set by collector number
+    // and this engine had no component for it at all, so `order=set&q=e:khm` was unordered within
+    // the set — 0 of 175 rows on page 1 agreed with api.scryfall.com, English included.
+    //
+    // The pair and not the int alone: khm carries both "40" and "A-40" and Scryfall answers
+    // ... 39, 40, A-40, 41 ... (measured over the whole set, 2026-08-16), so equal ints break by
+    // the raw string. A RANK rather than the values because the pair does not fit the 32 bits
+    // `sort_key_bits` has for it — the same argument that made set_rank a rank, and safe for the
+    // same reason: dense ranks over a superset preserve every relative order within it.
+    //
+    // u16, and HERE rather than beside set_rank/artist_rank, for one reason each. 16,293 distinct
+    // collector numbers across the whole 540,484-row all_cards corpus (measured 2026-08-16) leaves
+    // 65,535 four times the headroom, and `assign_collector_ranks` converts with `try_from`, so
+    // outgrowing it is a loud build failure rather than a wrapped rank. And this slot rides the
+    // padding already sitting after `collector_number_int` — declared up beside the other two
+    // ranks it opened a fresh 16-byte lane in `APrinting` instead, ~8.6MB of archive for a number
+    // that never needed the width. `the_archived_row_sizes_stay_pinned` is what holds that.
+    collector_rank: u16,
     // Integer cents, not f32 dollars: every real price is exactly cent-precise (checked against
     // the corpus, 0 of 81,540 priced printings differ from their rounded-to-cent value by more
     // than 0.001), and storing the lossy f32 approximation instead of the exact integer caused
@@ -2731,6 +2750,31 @@ fn assign_printing_ranks<K: Ord>(
 /// Rank printings by set code, the sort key for `order=set`.
 fn assign_set_ranks(printings: &mut [Printing], foreign: &mut [Printing]) {
     assign_printing_ranks(printings, foreign, |p| p.card_set_code.as_str().to_owned(), |p, r| p.set_rank = r);
+}
+
+/// Rank printings by collector number, `order=set`'s second key.
+///
+/// The key is `(collector_number_int, collector_number)` — the extracted integer first, the raw
+/// string breaking its ties. That is Scryfall's own rule, read off the whole of khm on 2026-08-16:
+/// its ARENA-rebalanced rows sit immediately after the paper row they were rebalanced from
+/// (`... 39, 40, A-40, 41 ... 378, A-378, 379 ...`), which is what an integer-first order with a
+/// bytewise tiebreak produces and what a plain string order does not ("A-40" would land past
+/// every number).
+///
+/// `Option<u16>`'s own `Ord` puts a numberless collector number first ascending, which is where
+/// Scryfall puts the corpus's five digit-free numbers: `e:unk order=set` answers CAa, CAb, UB and
+/// only then CA01.
+fn assign_collector_ranks(printings: &mut [Printing], foreign: &mut [Printing], strings: &[String]) {
+    let text_of = |p: &Printing| strings.get(p.collector_number_id as usize).cloned().unwrap_or_default();
+    assign_printing_ranks(
+        printings,
+        foreign,
+        |p| (p.collector_number_int, text_of(p)),
+        |p, r| {
+            p.collector_rank =
+                u16::try_from(r).expect("collector_rank outgrew u16 — widen the field and bump ARCHIVE_FORMAT_VERSION");
+        },
+    );
 }
 
 /// Rank printings by artist name, the sort key for `order=artist`.
@@ -6606,13 +6650,39 @@ fn f32_sort_bits(v: f32) -> u32 {
     if b & (1 << 31) != 0 { !b } else { b | (1 << 31) }
 }
 
+/// The sort column's SECOND key, where the column has one: today only `order=set`, whose second
+/// key is the collector number (see `assign_collector_ranks`).
+///
+/// Direction is folded in here as it is in the primary, because the second key belongs to the
+/// primary ordering rather than to the tiebreaks below it — `order=set&dir=desc&q=e:khm` answers
+/// 407, 406, 405 … (measured 2026-08-16), so reversing the set without reversing the number
+/// inside it would be a third order Scryfall never serves. Complement rather than `MAX - rank`:
+/// the ranks are dense from 0, so the two agree.
+///
+/// Every other column returns 0, which costs those keys nothing: a constant segment cannot change
+/// any comparison, so their order is bit-for-bit what it was before this key existed.
+fn sort_col_secondary(p: &APrinting, sort_col: SortCol, descending: bool) -> u32 {
+    match sort_col {
+        SortCol::Set => {
+            let rank = u32::from(u16::from(p.collector_rank));
+            if descending { !rank } else { rank }
+        }
+        _ => 0,
+    }
+}
+
 /// Order-preserving integer sort key, computed once per match instead of inside the
 /// comparator: primary column (direction folded in by negation, missing sorts last),
+/// then the column's second key (direction folded in likewise; 0 where it has none),
 /// then edhrec rank ascending (missing last), then prefer score descending (missing
 /// last). Card-level columns read the OracleCard; printing-level columns (rarity,
 /// usd) read the chosen printing, matching the pre-split semantics where the
 /// group's representative printing supplied them. Full ties fall back to printing
 /// store order in `select_page`.
+///
+/// Four 32-bit lanes fill the u128 exactly. `page_cmp` compares the top THREE (`>> 32` drops
+/// prefer_score, and only prefer_score) — which is why the second key had to go between the
+/// primary and edhrec rather than into the spare room that used to sit above the primary.
 fn sort_key_bits(card: &AOracleCard, p: &APrinting, sort_col: SortCol, descending: bool) -> u128 {
     let primary: Option<f32> = match sort_col {
         SortCol::Cmc        => card.cmc.as_ref().map(|v| f32::from(*v)),
@@ -6637,9 +6707,10 @@ fn sort_key_bits(card: &AOracleCard, p: &APrinting, sort_col: SortCol, descendin
         SortCol::Artist     => Some(u32::from(p.artist_rank) as f32),
     };
     let pk = primary.map_or(u32::MAX, |v| f32_sort_bits(if descending { -v } else { v }));
+    let sk = sort_col_secondary(p, sort_col, descending);
     let e = card.edhrec_rank.as_ref().map(|v| u32::from(*v)).unwrap_or(u32::MAX);
     let sc = p.prefer_score.as_ref().map_or(u32::MAX, |v| f32_sort_bits(-f32::from(*v)));
-    ((pk as u128) << 64) | ((e as u128) << 32) | (sc as u128)
+    ((pk as u128) << 96) | ((sk as u128) << 64) | ((e as u128) << 32) | (sc as u128)
 }
 
 /// One query match: (sort key, card index, printing index). Ties on the sort key
@@ -6650,7 +6721,9 @@ type Match = (u128, u32, u32);
 /// The page comparator (`select_page`'s order): sort key, then pid. pid is unique,
 /// so this is a total order over `Match`.
 fn page_cmp(a: &Match, b: &Match) -> std::cmp::Ordering {
-    // Keys 1-2 only (`>> 32` drops key 3, prefer_score), then CARD, then printing.
+    // Keys 1-3 only (`>> 32` drops the last lane, prefer_score), then CARD, then printing.
+    // "Keys 1-3" is primary, the column's second key (0 for every column but `set`), and edhrec
+    // rank — see `sort_key_bits` for the lane layout.
     //
     // Key 3 must not decide across cards, because the two sides cannot agree on it. The prebuilt
     // permutation bakes in `printings[offsets[i]]`'s prefer_score -- the first STORED printing, chosen
@@ -13229,7 +13302,14 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 // lowercased search form — production served "fumes" for Franz Vohwinkel. The printed string now
 // has its own interned id. `size_of::<APrinting>` moves, so the header would catch the row change
 // on its own; the constant moves because the CardData/CardIndexes additions would not.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026081501;
+//   2026081601 — `Printing` gains `collector_rank`, the dense rank of
+//                (collector_number_int, collector_number) that gives `order=set` the collector-number
+//                key Scryfall orders by and this engine had none of (see assign_collector_ranks).
+//                `size_of::<APrinting>` is unchanged — the u16 rides padding that was already
+//                there — so the header canNOT catch a stale archive here, which is exactly why the
+//                constant has to move: a reader that skipped it would sort `order=set` by a field
+//                of zeroes and answer a plausible, wrong page order.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026081601;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -13829,6 +13909,7 @@ impl QueryEngine {
                 released_at_int: row.released_at_int,
                 card_rarity_int: row.card_rarity_int,
                 collector_number_int: row.collector_number_int,
+                collector_rank: 0, // placeholder; assign_collector_ranks fills it below
                 price_usd: row.price_usd,
                 price_eur: row.price_eur,
                 price_tix: row.price_tix,
@@ -13899,6 +13980,7 @@ impl QueryEngine {
         // necessary for the widened one.
         assign_set_ranks(&mut printings, &mut foreign);
         assign_artist_ranks(&mut printings, &mut foreign, &artist_vocab);
+        assign_collector_ranks(&mut printings, &mut foreign, &strings);
         let mana_vocab = mana.strings;
         drop(mana.map);
         // String-sorted permutation of the vocab ids; VocabInterner caps the

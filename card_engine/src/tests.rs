@@ -2,7 +2,7 @@ use super::{
     and_child_rank, assign_name_ranks,
     build_numeric_index, build_oracle_text_index, build_tag_index, build_trigram_index,
     build_rarity_index, build_flavor_index, build_hybrid_tag_index, bitmap_beats_postings, HybridTagIndex, build_sort_permutations,
-    assign_artwork_groups, assign_set_ranks, assign_foreign_artwork_groups, build_artwork_base_from, build_lang_index, build_printed_name_index, drop_group_if_annex_only, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
+    assign_artwork_groups, assign_collector_ranks, assign_set_ranks, assign_foreign_artwork_groups, build_artwork_base_from, build_lang_index, build_printed_name_index, drop_group_if_annex_only, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
     cards_of_printings, count_common_keywords, count_common_types,
     build_artist_index, build_printing_value_index, build_arith_tuple_index, is_arith_tuple_route, range_candidates, narrow_candidates, narrow_candidates_exact, rarity_candidates,
     range_too_broad_to_narrow, run_query, run_query_routed, run_query_widened, run_query_with_plan, explain, explain_analyze, AcquireFacts, PlanEstimate, PlanTrial,
@@ -247,6 +247,7 @@ fn stub_printing(scryfall_id: u128, illustration_id: u128, prefer_score: Option<
         released_at_int: None,
         card_rarity_int: None,
         collector_number_int: None,
+        collector_rank: 0,
         price_usd: None,
         price_eur: None,
         price_tix: None,
@@ -11954,6 +11955,42 @@ fn include_multilingual_rolls_up_to_the_canonical_row() {
     assert_eq!(total, 2);
     assert_eq!(u128::from(page[0].1.scryfall_id), 1);
     assert_eq!(u128::from(page[1].1.scryfall_id), 2);
+}
+
+/// `order=set`'s second key is the collector number, by Scryfall's own (int, string) rule.
+///
+/// Read off api.scryfall.com on 2026-08-16: khm answers `... 39, 40, A-40, 41 ... 378, A-378,
+/// 379 ...`, so an ARENA-rebalanced row sits with the paper number it was rebalanced from rather
+/// than past every number, and `e:unk` answers `CAa, CAb, UB, CA01, ...`, so a digit-free number
+/// leads. Three shapes, one rule: integer first (9 before 10 — not a string sort), raw string
+/// breaking equal integers ("40" before "A-40" — not an integer sort), absent integer first.
+#[test]
+fn assign_collector_ranks_follows_scryfalls_number_then_string() {
+    let numbers = ["41", "A-40", "40", "10", "9", "UB"];
+    let strings: Vec<String> = numbers.iter().map(|s| (*s).to_string()).collect();
+    let mut printings: Vec<Printing> = numbers
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let mut p = stub_printing(i as u128, i as u128, None);
+            p.collector_number_id = i as u32;
+            p.collector_number_int = n.chars().filter(char::is_ascii_digit).collect::<String>().parse().ok();
+            p
+        })
+        .collect();
+    let mut none: Vec<Printing> = Vec::new();
+    assign_collector_ranks(&mut printings, &mut none, &strings);
+
+    let mut order: Vec<(u16, &str)> = printings.iter().zip(numbers).map(|(p, n)| (p.collector_rank, n)).collect();
+    order.sort_by_key(|&(rank, _)| rank);
+    assert_eq!(
+        order.iter().map(|&(_, n)| n).collect::<Vec<_>>(),
+        ["UB", "9", "10", "40", "A-40", "41"],
+        "absent integer first, then integer, then the raw string"
+    );
+    // Dense and gapless, so the complement `sort_col_secondary` applies under `dir=desc` is an
+    // exact reversal rather than a reflection about an arbitrary point.
+    assert_eq!(order.iter().map(|&(r, _)| r).collect::<Vec<_>>(), [0, 1, 2, 3, 4, 5]);
 }
 
 #[test]
