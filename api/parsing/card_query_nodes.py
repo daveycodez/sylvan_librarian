@@ -161,6 +161,7 @@ class CardAttributeNode(AttributeNode):
             "type_line": "type line",
             "flavor_text": "flavor text",
             "card_keywords": "keyword",
+            "card_lang": "language",
             "card_layout": "layout",
             "card_border": "border",
             "card_watermark": "watermark",
@@ -806,11 +807,13 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         """Handle colon operator for different field types."""
         if field_type == FieldType.TEXT:
             # Handle fields that need exact matching instead of pattern matching
-            if attr in ("card_set_code", "card_layout", "card_border", "card_watermark", "collector_number"):
-                # set_code/layout/border/watermark are lowercased at import, so lowercasing the
+            if attr in ("card_set_code", "card_lang", "card_layout", "card_border", "card_watermark", "collector_number"):
+                # set_code/lang/layout/border/watermark are lowercased at import, so lowercasing the
                 # search value gives case-insensitive matching with a plain equality.
                 # collector_number is stored raw and mixed-case (e.g. "10E-105"): compare exactly.
-                if attr in ("card_set_code", "card_layout", "card_border", "card_watermark") and hasattr(self.rhs, "value"):
+                if attr in ("card_set_code", "card_lang", "card_layout", "card_border", "card_watermark") and hasattr(
+                    self.rhs, "value"
+                ):
                     self.rhs.value = self.rhs.value.lower()
 
                 if self.operator == ":":

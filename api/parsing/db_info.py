@@ -254,6 +254,12 @@ DB_COLUMNS = [
         parser_class=ParserClass.LEGALITY,
     ),
     FieldInfo(
+        db_column_name="card_lang",
+        field_type=FieldType.TEXT,
+        search_aliases=["lang", "language"],
+        parser_class=ParserClass.TEXT,
+    ),
+    FieldInfo(
         db_column_name="card_layout",
         field_type=FieldType.TEXT,
         search_aliases=["layout"],
