@@ -312,6 +312,8 @@ fn store_of(cards: Vec<OracleCard>, printing_counts: &[usize], vocab: VocabInter
     // reload_commit builds (type narrowing goes through the planes since #637).
     let indexes = CardIndexes {
         flavor_names: Default::default(),
+        flavor_names_collated: Default::default(),
+        sets_with_extras: Default::default(),
         artwork_base,
         // No printing sets card_border_id away from NONE_STR at this point (any
         // border values a fixture wants get set after store_of returns, same as
@@ -339,7 +341,7 @@ fn store_of(cards: Vec<OracleCard>, printing_counts: &[usize], vocab: VocabInter
         coll_vocab_sorted: sorted_vocab_ids(&vocab.strings),
         coll_vocab: vocab.strings,
         artist_vocab: vec![],
-        artist_vocab_folded: vec![],
+        artist_vocab_collated: vec![],
         mana_vocab: vec![],
         indexes,
         format_shifts: HashMap::new(),
@@ -1016,7 +1018,7 @@ fn collection_cmp_binds_vocab_ids_and_matches() {
             value: value.to_string(),
             value_id: None,
         };
-        f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+        f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
         archived.cards.iter().map(|c| f.eval_card(c, &archived.strings) == Tri::True).collect()
     };
 
@@ -1046,7 +1048,7 @@ fn printing_level_predicates_are_printing_dep_in_card_pass() {
         value: "wolf".to_string(),
         value_id: None,
     };
-    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
 
     let card = &archived.cards[0];
     // Card pass can't decide an art-tag predicate...
@@ -1894,7 +1896,7 @@ fn fuzz_text_needle(rng: &mut rand::rngs::SmallRng, field: TextSearchField) -> S
             TextSearchField::NameLower | TextSearchField::NameCollated => t.0,
             TextSearchField::OracleTextLower => t.1,
             TextSearchField::FlavorTextLower => t.2,
-            TextSearchField::ArtistLower => t.0, // artist has its own leaf; not reached here
+            TextSearchField::ArtistLower | TextSearchField::ArtistCollated => t.0, // artist has its own leaf; not reached here
         };
         let words: Vec<&str> = text
             .split_whitespace()
@@ -2153,7 +2155,7 @@ fn fuzz_bound_filter(spec: &FuzzSpec, archived: &Archived<CardData>) -> FilterEx
     let mut f = fuzz_build_filter(spec);
     f.bind(
         &archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab,
-        &archived.mana_vocab, &archived.indexes.flavor, &archived.strings,
+        &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings,
     );
     f
 }
@@ -2213,7 +2215,7 @@ fn fuzz_describe(spec: &FuzzSpec) -> String {
                 TextSearchField::NameLower => "name",
                 TextSearchField::OracleTextLower => "oracle",
                 TextSearchField::FlavorTextLower => "flavor",
-                TextSearchField::ArtistLower => "artist",
+                TextSearchField::ArtistLower | TextSearchField::ArtistCollated => "artist",
             };
             format!("{f}:{needle}")
         }
@@ -3446,7 +3448,7 @@ fn a_dense_but_not_broad_frame_value_narrows_without_broad_ok() {
         };
         f.bind(
             &archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab,
-            &archived.mana_vocab, &archived.indexes.flavor, &archived.strings,
+            &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings,
         );
         let got = narrow_rec(&f, &archived.indexes, offsets, cards, false);
         if range_too_broad_to_narrow(k, n_printings) {
@@ -3527,7 +3529,7 @@ fn value_totals_are_exact_in_all_three_spaces() {
         let mut f = leaf.clone();
         f.bind(
             &archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab,
-            &archived.mana_vocab, &archived.indexes.flavor, &archived.strings,
+            &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings,
         );
         for (mode_label, mode) in [("printing", Mode::Printing), ("card", Mode::Card), ("artwork", Mode::Artwork)] {
             let got = exact_result_total(&f, &archived.indexes, mode)
@@ -6446,6 +6448,8 @@ fn bench_checked_vs_unchecked_access() {
 
     let indexes = CardIndexes {
         flavor_names: Default::default(),
+        flavor_names_collated: Default::default(),
+        sets_with_extras: Default::default(),
         artwork_base,
         name_trigram:   build_trigram_index(&cards, |c| crate::collated_name_of(c, &[])),
         name_unigrams:  build_name_unigram_index(&cards, &[]),
@@ -6511,7 +6515,7 @@ fn bench_checked_vs_unchecked_access() {
         coll_vocab_sorted: sorted_vocab_ids(&vocab.strings),
         coll_vocab: vocab.strings,
         artist_vocab: vec![],
-        artist_vocab_folded: vec![],
+        artist_vocab_collated: vec![],
         mana_vocab: vec![],
         indexes,
         format_shifts: HashMap::new(),
@@ -6558,7 +6562,7 @@ fn card_pass_extracts_residual_and_matches() {
         value: "wolf".to_string(),
         value_id: None,
     };
-    wolf.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    wolf.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     let creature = || FilterExpr::TypeCmp { mask: TYPE_CREATURE, op: CmpOp::Ge };
 
     // And[t:creature, art:wolf]: the type check is proven at card level and
@@ -6586,7 +6590,7 @@ fn card_pass_extracts_residual_and_matches() {
         value: "wolf".to_string(),
         value_id: None,
     };
-    wolf2.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    wolf2.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     let or = FilterExpr::Or(vec![creature(), wolf2]);
     let t = or.card_pass(&archived.cards[0], &archived.strings, &mut residual, &mut is_or, 0);
     assert!(t == Tri::True && residual.is_empty());
@@ -6617,7 +6621,7 @@ fn artist_predicates_bind_to_vocab_ids_and_narrow() {
         field: super::TextSearchField::ArtistLower,
         word: "rebecca".to_string(),
     };
-    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     // bind rewrites the contains into an id-set match
     let FilterExpr::ArtistMatch { ref ids } = f else { panic!("expected ArtistMatch after bind") };
     assert_eq!(ids, &vec![rebecca]);
@@ -6640,7 +6644,7 @@ fn artist_predicates_bind_to_vocab_ids_and_narrow() {
         field: super::TextSearchField::ArtistLower,
         word: "zzz".to_string(),
     };
-    g.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    g.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     match narrow_candidates(&g, &archived.indexes, &archived.offsets, &archived.cards) {
         Some(Candidates::Printings(v)) => assert!(v.is_empty()),
         _ => panic!("empty artist match must narrow to the empty set"),
@@ -6685,7 +6689,7 @@ fn flavor_match_bind_eval_and_narrow() {
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
     let bound = |f: &mut FilterExpr| {
-        f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+        f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     };
 
     let mut f = FilterExpr::TextContains {
@@ -8560,7 +8564,7 @@ fn usd_inside_arithmetic_evaluates_in_dollars_not_cents() {
         op: CmpOp::Lt,
         rhs: NumExpr::Field(NumField::Power),
     };
-    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     assert!(f.matches(card, printing, &archived.strings), "usd+1<power must evaluate in dollars: 50+1=51 < 52");
 }
 
@@ -8583,7 +8587,7 @@ fn usd_compared_directly_against_another_field_evaluates_in_dollars() {
 
     // usd<cmc: $2.00 < cmc(3) -- must match.
     let mut f = FilterExpr::NumericCmp { lhs: NumExpr::Field(NumField::PriceUsd), op: CmpOp::Lt, rhs: NumExpr::Field(NumField::Cmc) };
-    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     assert!(f.matches(card, printing, &archived.strings), "usd<cmc must evaluate in dollars: 2.00 < 3");
 }
 
@@ -11801,7 +11805,7 @@ fn set_type_matches_through_the_compat_vocab() {
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
     let bind = |f: &mut FilterExpr| {
-        f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+        f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     };
 
     let mut hit = leaf("masterpiece");
@@ -12300,7 +12304,10 @@ fn include_multilingual_rolls_up_to_the_canonical_row() {
 #[test]
 fn assign_artist_ranks_collates_like_a_name() {
     let vocab_names = ["alex konstad", "alexander mokhov", "steve prescott", "steven belledin"];
-    let artist_vocab: Vec<String> = vocab_names.iter().map(|s| (*s).to_string()).collect();
+    // `CardData.artist_vocab_collated` is collated at BUILD now — `a:` matches against it as well
+    // as `order=artist` ranking on it — so the collation happens here rather than inside
+    // assign_artist_ranks. The ordering this asserts is unchanged.
+    let artist_vocab: Vec<String> = vocab_names.iter().map(|s| crate::collate_name(s)).collect();
     let mut vocab = VocabInterner::new();
     let mut printings: Vec<Printing> = (0..4)
         .map(|i| {

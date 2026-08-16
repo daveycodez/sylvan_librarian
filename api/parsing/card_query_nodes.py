@@ -636,7 +636,11 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
             # 1,109 against `name:"ofthe"` 0, `name:limdul` 8 against `name:"limdul"` 0.
             # Comparison ops (name=, name!=) keep the literal value on both sides,
             # accent-sensitive, exactly as before.
-            if attr == "card_name" and self.operator == ":" and not self.rhs.literal:
+            # `a:` gets the SAME split, on the same kind of evidence (api.scryfall.com, 2026-08-16):
+            # `a:gawel` answers 10 exactly as `a:gaweł` does, `a:rebecca-guay` answers
+            # `a:"rebecca guay"`'s 166, and `a:gu*ay` answers `a:guay`'s 197. An artist could only be
+            # found under their own diacritics and punctuation before this.
+            if attr in ("card_name", "card_artist") and self.operator == ":" and not self.rhs.literal:
                 return {"node_type": "CollatedNameValueNode", "kwargs": {"value": collate_name(fold_accents(value))}}
             return {"node_type": "StringValueNode", "kwargs": {"value": value}}
 

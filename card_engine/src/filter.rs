@@ -1,7 +1,7 @@
 use memchr::memmem;
 use regex::Regex;
 use serde_json::Value;
-use super::{AOracleCard, APrinting, AStrings, str_at, mana_lane, lane_add, lanes_ge, LANES6_HI, LANES8_HI, mana_pip_counts, mana_cmc, color_list_to_mask, card_type_str_to_bit, trigram_candidates, trigram_min_posting, ARTIST_NONE, NONE_STR, FlavorIndex, NameBigramIndex, OracleTextIndex, SortedTrigramIndex, flavor_fingerprint, flavor_match_sets};
+use super::{AOracleCard, APrinting, AStrings, str_at, mana_lane, lane_add, lanes_ge, LANES6_HI, LANES8_HI, mana_pip_counts, mana_cmc, color_list_to_mask, card_type_str_to_bit, trigram_candidates, trigram_min_posting, ARTIST_NONE, NONE_STR, FlavorIndex, NameBigramIndex, PrintedNameIndex, OracleTextIndex, SortedTrigramIndex, flavor_fingerprint, flavor_match_sets};
 use super::legality::{LEGALITY_LEGAL, LEGALITY_BANNED, LEGALITY_RESTRICTED, format_shift};
 
 // ─── Comparison / arithmetic operators ───────────────────────────────────────
@@ -347,7 +347,13 @@ pub(crate) enum TextSearchField {
     NameCollated,
     OracleTextLower,
     FlavorTextLower,
+    /// `a:"quoted"` — the raw lowercase artist string, matched literally.
     ArtistLower,
+    /// `a:word` — the COLLATED artist (diacritics folded, every non-alphanumeric character gone),
+    /// which is what Scryfall compares a bare artist word against. Same split as
+    /// `NameLower`/`NameCollated`, on the same kind of evidence: `a:gawel` answers 10 there and
+    /// `a:rebecca-guay` answers 166, neither of which the raw string can reach.
+    ArtistCollated,
 }
 
 /// Text operand during evaluation; PDep only in the card-level pass.
@@ -378,7 +384,7 @@ fn text_search_field_value<'a>(
         TextSearchField::OracleTextLower => opt_sv(str_at(strings, u32::from(card.oracle_text_lower_id))),
         TextSearchField::FlavorTextLower => printing.map_or(StrVal::PDep, |p| opt_sv(str_at(strings, u32::from(p.flavor_text_lower_id)))),
         // Rewritten to ArtistMatch by bind(); printings carry no artist strings.
-        TextSearchField::ArtistLower     => StrVal::Null,
+        TextSearchField::ArtistLower | TextSearchField::ArtistCollated => StrVal::Null,
     }
 }
 
@@ -561,6 +567,24 @@ pub(crate) enum FilterExpr {
     /// Its presence WIDENS the query — see `widens_to_annex`, and the count that proves it.
     PrintedNamePresent,
 
+    /// A PRINTING whose `flavor_name` satisfies the `name:` predicate that produced this leaf.
+    ///
+    /// `name:` reaches a printing's alternate SOLD-AS name, not just its oracle name. Measured on
+    /// api.scryfall.com 2026-08-16: `name:croft` answers 2 — Lara Croft, and **Command Tower**,
+    /// which is 2 of 112 printings there because two of them are sold as "Croft Manor";
+    /// `name:godzilla` is 8 cards / 14 printings; `!"croft manor"` is 1. It is printing-scoped in
+    /// both directions: `unique=prints` returns only the printings that carry the name.
+    ///
+    /// `ids` are interned `CardData.strings` ids of `Printing.flavor_name_folded_id`, sorted — a
+    /// printing matches iff its own id is in the set. Compiled by `bind_flavor_names` from the
+    /// ~546-record `flavor_names` index, and ONLY when the needle actually hits one of those
+    /// records: a `name:` query that matches no flavor name never grows this arm at all, so the
+    /// hottest predicate in the language pays a bounded scan of a table two orders of magnitude
+    /// smaller than the corpus and nothing else.
+    FlavorNameIn {
+        ids: Vec<u32>,
+    },
+
     /// `is:unique` — the owning CARD has been printed in exactly one SET. Card-level and total, off
     /// `OracleCard.single_set`, which the build computes over the canonical printings AND the annex
     /// (`assign_single_set_flags`); nothing here to bind and nothing per printing to consult.
@@ -695,6 +719,8 @@ pub(crate) fn verify_cost_tier(f: &FilterExpr) -> u32 {
         FilterExpr::ArtistMatch { .. }
         | FilterExpr::FlavorMatch { .. }
         | FilterExpr::NameMatch { .. }
+        // A binary search over the compiled flavor-name ids, against a u32 already on the printing.
+        | FilterExpr::FlavorNameIn { .. }
         | FilterExpr::OracleMatch { .. }
         | FilterExpr::CollectionCmp { .. } => SET_LOOKUP_NS100,
         FilterExpr::And(children) | FilterExpr::Or(children) => {
@@ -833,7 +859,11 @@ fn leaf_compares_printing_field(f: &FilterExpr) -> bool {
         // Exhaustive over TextSearchField (no `matches!`), same reason as num_pdep.
         FilterExpr::TextContains { field, .. } => match field {
             TextSearchField::FlavorTextLower => true,
-            TextSearchField::NameLower | TextSearchField::NameCollated | TextSearchField::OracleTextLower | TextSearchField::ArtistLower => false,
+            TextSearchField::NameLower
+            | TextSearchField::NameCollated
+            | TextSearchField::OracleTextLower
+            | TextSearchField::ArtistLower
+            | TextSearchField::ArtistCollated => false,
         },
         // Exhaustive over TextField (no `matches!`), same reason as num_pdep.
         FilterExpr::TextExact { field, .. } | FilterExpr::TextRegex { field, .. } => match field {
@@ -857,6 +887,9 @@ fn leaf_compares_printing_field(f: &FilterExpr) -> bool {
         // The printed name is a per-printing fact (Printing.printed_name_folded_id) — an English
         // row and its Japanese sibling answer differently.
         FilterExpr::PrintedNamePresent => true,
+        // A flavor name is printed on the PRINTING; two printings of one card differ on it, which
+        // is the whole reason `name:croft` returns 2 of Command Tower's 112.
+        FilterExpr::FlavorNameIn { .. } => true,
         // Composites are composed by the two callers, which differ on `all` vs `any`; reaching here with
         // one is a bug in whichever caller forgot to handle it, not a case to answer silently.
         FilterExpr::And(_) | FilterExpr::Or(_) | FilterExpr::Not(_) => {
@@ -969,6 +1002,25 @@ fn hybrids_eq(card: &AHybrids, query: &[(u8, u8)]) -> bool {
     card.len() == query.len() && card.iter().zip(query).all(|(c, q)| c.0 == q.0 && c.1 == q.1)
 }
 
+/// Interned name ids (ascending, deduplicated) of the `flavor_names` records satisfying `pred`.
+///
+/// `pred` sees the record's COLLATED name, which is the form both `name:` predicates compare in.
+fn flavor_name_ids(
+    idx: &rkyv::Archived<PrintedNameIndex>,
+    collated: &AStrings,
+    pred: impl Fn(&str) -> bool,
+) -> Vec<u32> {
+    let mut ids: Vec<u32> = collated
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| pred(s.as_str()))
+        .map(|(rec, _)| u32::from(idx.name_ids[rec]))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 /// Vocab ids (ascending) whose artist string satisfies `pred`.
 fn artist_match_ids(artist_vocab: &AStrings, pred: impl Fn(&str) -> bool) -> Vec<u16> {
     artist_vocab
@@ -999,11 +1051,60 @@ impl FilterExpr {
     /// here: their rewrite is only profitable when the query full-scans, which
     /// isn't known until run_query computes candidates — see
     /// memoize_text_predicates().
+    /// Grow the FLAVOR-NAME arm of a `name:` predicate — but only when a flavor name answers it.
+    ///
+    /// Scryfall's `name:` reads a printing's alternate SOLD-AS name as well as its oracle name:
+    /// `name:croft` answers 2 there, because Command Tower is sold as "Croft Manor" on 2 of its 112
+    /// printings; `name:godzilla` is 8 cards / 14 printings; `!"croft manor"` is 1.
+    ///
+    /// THE COST ARGUMENT IS THE DESIGN. Answering that unconditionally would make `name:` — the
+    /// most common predicate in the language and the one the perf gate holds to <3% of a full scan
+    /// — printing-dependent for every query, which costs the card-level settle on all of them. So
+    /// the needle is put to the ~546-record `flavor_names` table FIRST, against the pre-collated
+    /// strings beside it, and the arm is added only on a hit. A needle that matches nothing there
+    /// leaves the tree byte-identical to what it was, which is the overwhelmingly common case; the
+    /// scan itself is one `memmem::Finder` over ~9 KB of short strings, built once per predicate.
+    ///
+    /// Both name predicates that Scryfall reaches flavor names through are handled — the bare
+    /// `name:word` (collated on both sides) and `!"…"` (collated, and matching either half of a
+    /// `A // B` name, exactly as the oracle-name arm does).
+    pub(crate) fn bind_flavor_names(&mut self, idx: &rkyv::Archived<PrintedNameIndex>, collated: &AStrings) {
+        match self {
+            FilterExpr::And(children) | FilterExpr::Or(children) => {
+                for c in children {
+                    c.bind_flavor_names(idx, collated);
+                }
+            }
+            FilterExpr::Not(inner) => inner.bind_flavor_names(idx, collated),
+            FilterExpr::TextContains { field: TextSearchField::NameCollated, word } => {
+                let finder = memmem::Finder::new(word.as_bytes());
+                let ids = flavor_name_ids(idx, collated, |s| finder.find(s.as_bytes()).is_some());
+                if !ids.is_empty() {
+                    let original = std::mem::replace(self, FilterExpr::True);
+                    *self = FilterExpr::Or(vec![original, FilterExpr::FlavorNameIn { ids }]);
+                }
+            }
+            FilterExpr::ExactName(needle) => {
+                let needle = needle.clone();
+                let ids = flavor_name_ids(idx, collated, |s| exact_name_matches(s, &needle));
+                if !ids.is_empty() {
+                    let original = std::mem::replace(self, FilterExpr::True);
+                    *self = FilterExpr::Or(vec![original, FilterExpr::FlavorNameIn { ids }]);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn bind(
         &mut self,
         vocab: &AStrings,
         sorted_ids: &rkyv::Archived<Vec<u16>>,
         artist_vocab: &AStrings,
+        // artist_vocab_collated: the same artists, `collate_name(fold_accents(...))` — the string
+        // `a:word` matches against (see TextSearchField::ArtistCollated).
+        artist_vocab_collated: &AStrings,
         mana_vocab: &AStrings,
         flavor: &rkyv::Archived<FlavorIndex>,
         strings: &AStrings,
@@ -1011,10 +1112,10 @@ impl FilterExpr {
         match self {
             FilterExpr::And(children) | FilterExpr::Or(children) => {
                 for c in children {
-                    c.bind(vocab, sorted_ids, artist_vocab, mana_vocab, flavor, strings);
+                    c.bind(vocab, sorted_ids, artist_vocab, artist_vocab_collated, mana_vocab, flavor, strings);
                 }
             }
-            FilterExpr::Not(inner) => inner.bind(vocab, sorted_ids, artist_vocab, mana_vocab, flavor, strings),
+            FilterExpr::Not(inner) => inner.bind(vocab, sorted_ids, artist_vocab, artist_vocab_collated, mana_vocab, flavor, strings),
             FilterExpr::ManaCostCmp { hybrids, hybrid_ids, .. } if !hybrids.is_empty() => {
                 *hybrid_ids = bind_mana_hybrids(hybrids, mana_vocab);
             }
@@ -1048,6 +1149,14 @@ impl FilterExpr {
                 // rebuilding str::contains's searcher per entry (~1.3x, bench_substring_finders). #734.
                 let finder = memmem::Finder::new(word.as_bytes());
                 let ids = artist_match_ids(artist_vocab, |s| finder.find(s.as_bytes()).is_some());
+                *self = FilterExpr::ArtistMatch { ids };
+            }
+            FilterExpr::TextContains { field: TextSearchField::ArtistCollated, word } => {
+                // The needle arrives already folded and collated from the parser (the artist twin
+                // of CollatedNameValueNode), so both sides of this compare are the same string
+                // shape and the vocab needs no per-query work.
+                let finder = memmem::Finder::new(word.as_bytes());
+                let ids = artist_match_ids(artist_vocab_collated, |s| finder.find(s.as_bytes()).is_some());
                 *self = FilterExpr::ArtistMatch { ids };
             }
             FilterExpr::TextExact { field: TextField::ArtistLower, op, value } => {
@@ -1566,6 +1675,12 @@ impl FilterExpr {
             FilterExpr::PrintedNamePresent => {
                 let Some(p) = printing else { return Tri::PrintingDep };
                 tri_bool(p.printed_name_folded_id != super::NONE_STR)
+            }
+
+            FilterExpr::FlavorNameIn { ids } => {
+                let Some(p) = printing else { return Tri::PrintingDep };
+                let id = u32::from(p.flavor_name_folded_id);
+                tri_bool(id != super::NONE_STR && ids.binary_search(&id).is_ok())
             }
 
             FilterExpr::SingleSet => tri_bool(card.single_set),
@@ -2171,6 +2286,19 @@ fn build_text_filter(attr: &str, op: &str, rhs: &Value) -> Result<FilterExpr, St
 
     let raw_value = rhs["kwargs"]["value"].as_str().unwrap_or("");
 
+    // `name!=x`, `o!=x`, `a!=x`, `set!=x` — Scryfall answers NOTHING, for every value and every
+    // string column, and that is a statement about the OPERATOR rather than about the value.
+    // Measured 2026-08-16: `name!="lightning bolt"` 404 where `name="lightning bolt"` answers 2,
+    // `name!=bolt` 404 where `name=bolt` answers 41; `o!="draw a card"`, `a!="rebecca guay"`,
+    // `t!=creature` and `set!=khm` all 404 — while the NUMERIC `cmc!=3` answers 25,522, so this is
+    // not "`!=` is unsupported". It is the empty set, and it composes as one: `name!=ft or
+    // t:creature` answers exactly `t:creature`'s 18,753 and `-name!=ft` answers the whole corpus.
+    // This port answered a not-equal SUPERSET (33,751 for `name!=ft`), which is the one shape a
+    // client cannot recover from — a filter that silently widens rather than narrows.
+    if op == "!=" {
+        return Ok(FilterExpr::Not(Box::new(FilterExpr::True)));
+    }
+
     if matches!(attr, "card_set_code" | "card_layout" | "card_border" | "card_watermark" | "collector_number") {
         // collector_number_id is stored raw and mixed-case (e.g. "10E-105"); compare exactly,
         // matching the SQL path. The other four are lowercased at import, so lowercasing
@@ -2199,10 +2327,20 @@ fn build_text_filter(attr: &str, op: &str, rhs: &Value) -> Result<FilterExpr, St
             "card_name"   => TextSearchField::NameLower,
             "oracle_text" => TextSearchField::OracleTextLower,
             "flavor_text" => TextSearchField::FlavorTextLower,
+            // Same split as `card_name`: a bare word arrives as a CollatedNameValueNode and is
+            // matched against the collated artist vocab, a quoted one stays literal.
+            "card_artist" if rhs_node_type == "CollatedNameValueNode" => TextSearchField::ArtistCollated,
             "card_artist" => TextSearchField::ArtistLower,
             _ => return Err(format!("text substring not supported on {attr}")),
         };
-        return Ok(FilterExpr::TextContains { field: tsf, word: lower_word });
+        // `æ` expands, and ONLY in the text columns — see `crate::fold_ae` for the per-character
+        // probe. The name and artist needles are already fully transliterated by the parser's
+        // `fold_accents`, and a literal `name:"…"` deliberately keeps its spelling.
+        let word = match tsf {
+            TextSearchField::OracleTextLower | TextSearchField::FlavorTextLower => crate::fold_ae(&lower_word),
+            _ => lower_word,
+        };
+        return Ok(FilterExpr::TextContains { field: tsf, word });
     }
 
     let field = match attr {
@@ -2213,5 +2351,9 @@ fn build_text_filter(attr: &str, op: &str, rhs: &Value) -> Result<FilterExpr, St
         _ => return Err(format!("unknown text field: {attr}")),
     };
     let cmp_op = str_op_to_cmp(op)?;
-    Ok(FilterExpr::TextExact { field, op: cmp_op, value: raw_value.to_lowercase() })
+    let value = match field {
+        TextField::OracleTextLower | TextField::FlavorTextLower => crate::fold_ae(&raw_value.to_lowercase()),
+        _ => raw_value.to_lowercase(),
+    };
+    Ok(FilterExpr::TextExact { field, op: cmp_op, value })
 }

@@ -703,7 +703,7 @@ struct CardRow {
     // The original-case artist string (see Printing.card_artist_name_id).
     card_artist_name_id: u32,
     // The accent-folded lowercase artist, interned. Transient (CardRow is never archived): the
-    // commit pass reads it once to fill `CardData.artist_vocab_folded` at this row's vid.
+    // commit pass reads it once to fill `CardData.artist_vocab_collated` at this row's vid.
     card_artist_folded_id: u32,
     card_set_code: InlineStr<8>,
     card_layout_id: u32,
@@ -2828,6 +2828,33 @@ pub(crate) fn collate_name(folded_lower: &str) -> String {
     folded_lower.chars().filter(|c| c.is_alphanumeric()).collect()
 }
 
+/// The `is:` value that carries the extras class, as `preprocess_card`'s `_is_extra` writes it.
+/// Spelled once there, once in the TypeScript parser's COMPUTED_IS_TAGS, and once here, where
+/// `sets_with_extras` folds it; the three must agree or the fold silently comes back empty.
+pub(crate) const EXTRA_IS_TAG: &str = "extra";
+
+/// `æ` expanded to `ae`, and nothing else — the fold the NON-collated text columns get.
+///
+/// `name:` and `a:` compare a fully transliterated string (`fold_accents`, which expands æ œ ß ø ł
+/// đ þ ð ħ ŋ ŧ ı ĸ); `o:`, `t:`, `fo:` and `ft:` do not, and the difference is MEASURED rather than
+/// assumed. On api.scryfall.com, 2026-08-16: `o:æther` and `o:aether` both answer 9, `t:"æ"` and
+/// `t:"ae"` both answer 213, `ft:æther` and `ft:aether` both answer 80 — while `o:ø`, `o:ł`,
+/// `o:þ`, `o:đ`, `o:ß`, `o:ĳ`, `t:œ`, `t:ø`, `t:ß`, `t:þ`, `t:đ`, `t:ł`, `ft:ß` and `ft:ø` each
+/// answer 404 against five-figure totals for their expanded spellings.
+///
+/// Magic's own text is the reason there is exactly one character here: the game printed "Æther"
+/// for a decade, 33 English flavor texts in the current bulk still carry it, and Scryfall reads
+/// the two spellings as one word in the text columns while leaving every other letter alone.
+///
+/// QUERY SIDE ONLY, which is measured rather than assumed: `ft:æther` answers 80 on Scryfall and
+/// `ft:aether` answers 80 too, but folding the STORED flavor text as well made this port answer
+/// 94 — it started matching the 33 English flavor texts that still spell the word "Æther", which
+/// Scryfall does not. `ft:œ` answering 1 there (a literal œ in Bloodletter's flavor text) is the
+/// same fact from the other side: the stored text is compared as printed.
+pub(crate) fn fold_ae(value: &str) -> String {
+    if value.contains(['æ', 'Æ']) { value.replace('æ', "ae").replace('Æ', "AE") } else { value.to_owned() }
+}
+
 /// Dense rank of `collate_name(folded name)` onto each card (equal collated names share a rank; the
 /// standard sort secondaries break their ties). Every card has a name, so unlike the other sort
 /// columns the rank is never absent.
@@ -3009,10 +3036,10 @@ fn assign_collector_ranks(printings: &mut [Printing], foreign: &mut [Printing], 
 /// 2,540 artists carry one (`Volkan Baǵa`, `Tomáš Honz`, `Loïc Canavaggia`). Closing it means the
 /// builder supplying a folded artist alongside the vocab; the sample above cannot see it, because
 /// no adjacent pair in it is decided by an accent.
-fn assign_artist_ranks(printings: &mut [Printing], foreign: &mut [Printing], artist_vocab_folded: &[String]) {
+fn assign_artist_ranks(printings: &mut [Printing], foreign: &mut [Printing], artist_vocab_collated: &[String]) {
     let name_of = |p: &Printing| match p.card_artist_vid {
         ARTIST_NONE => None,
-        vid => artist_vocab_folded.get(vid as usize).map(|n| collate_name(n)),
+        vid => artist_vocab_collated.get(vid as usize).map(ToOwned::to_owned),
     };
     assign_printing_ranks(printings, foreign, |p| (name_of(p).is_none(), name_of(p)), |p, r| p.artist_rank = r);
 }
@@ -5070,6 +5097,18 @@ struct CardIndexes {
     artists:        ArtistIndex,     // printing space (CSR by artist vocab id)
     flavor:         FlavorIndex,     // printing space (CSR by dense flavor text id)
     set_codes:      TagIndex,        // printing space
+    /// The set codes holding at least one `is:extra` printing, sorted — a build-time fold of
+    /// `is_tags` over `set_codes`, ~1 KB.
+    ///
+    /// It exists because Scryfall's `include_extras` AUTO-ENABLE asks exactly this question. A
+    /// query naming a set turns the flag on — overriding an explicit `include_extras=false`, in
+    /// the echo and in the results — if and only if that set contains an extra. Measured over 18
+    /// sets on 2026-08-16 and the split is perfect: lea/leb/2ed/3ed/sum 1, 4ed/5ed/6ed 2, leg 4,
+    /// j21 16, hbg 122, unk 506 all enable; ust/ice/war/unf/por/7ed are 0 and none of them does.
+    /// A route cannot answer that from the query text, and asking the engine per request would be
+    /// a second round trip on the hottest path — so the answer is folded once, here, and read as
+    /// a table.
+    sets_with_extras: Vec<String>,
     watermarks:     TagIndex,        // printing space
     released_at:    PrintingValueIndex,       // printing space
     price_usd:      PrintingValueIndex,       // printing space (integer cents, already order-preserving)
@@ -5163,6 +5202,18 @@ struct CardIndexes {
     ///
     /// ~546 records at full corpus scale, so its trigram index is noise next to `printed_names`'s.
     flavor_names: PrintedNameIndex,
+    /// Parallel to `flavor_names.name_ids`: each record's name `collate_name`d, so `name:` can be
+    /// answered against it with no per-query allocation.
+    ///
+    /// `name:` REACHES A PRINTING'S FLAVOR NAME. Measured on api.scryfall.com 2026-08-16:
+    /// `name:croft` answers 2 (Lara Croft AND Command Tower, whose "Croft Manor" printings are 2
+    /// of its 112), `name:godzilla` is 8 cards / 14 printings, `!"croft manor"` is 1. That makes
+    /// `name:` — the hottest predicate there is — printing-dependent, which is exactly what the
+    /// query plan must not become for the 99.9% of needles that hit no flavor name. This table is
+    /// the escape: `bind_flavor_names` scans these ~546 short strings once per name predicate and
+    /// grows the printing-dependent arm ONLY on a hit. Interning would not help — the collated
+    /// forms are distinct from the folded ones and there are 546 of them, ~9 KB.
+    flavor_names_collated: Vec<String>,
 }
 
 
@@ -5199,10 +5250,14 @@ struct CardData {
     // Artist predicates (contains/exact/regex) evaluate against these ~2.2k
     // strings once per query instead of per printing.
     artist_vocab: Vec<String>,
-    // Parallel to `artist_vocab` BY VID: the same artist, accent-folded, as the builder folded it.
-    // `order=artist` collates on this (see assign_artist_ranks); `a:` predicates keep binding
-    // against `artist_vocab`, so search semantics are untouched. ~2.5k strings, ~40KB.
-    artist_vocab_folded: Vec<String>,
+    // Parallel to `artist_vocab` BY VID: the same artist, accent-folded AND separator-folded —
+    // `collate_name(fold_accents(lower))`, the string Scryfall compares an artist against.
+    // `order=artist` ranks on it (assign_artist_ranks) and `a:word` MATCHES on it: measured
+    // 2026-08-16, `a:gawel` answers 10 there exactly as `a:gaweł` does, `a:rebecca-guay` answers
+    // `a:"rebecca guay"`'s 166, and `a:gu*ay` answers `a:guay`'s 197 — the same collation `name:`
+    // gets, on the same evidence. `a=`, `a!=` and `a:/…/` keep binding against the raw
+    // `artist_vocab`: a regex is compared as written. ~2.5k strings, ~35KB.
+    artist_vocab_collated: Vec<String>,
     // Distinct hybrid mana symbols, indexed by ManaCost.hybrids ids (~29
     // entries). ManaCostCmp binds query symbols against these (see
     // MANA_SYM_UNKNOWN for symbols no card carries).
@@ -13892,14 +13947,14 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 //                rather than prefer-desc, because that is the order Scryfall serves a slot's
 //                languages in and `page_cmp` reaches it as the (cid, vpid) tiebreak — a stored
 //                ORDER, so nothing about the layout moves and only this constant can catch it.
-//   2026081605 — `CardData` gains `artist_vocab_folded`, the artist vocab accent-folded and
+//   2026081605 — `CardData` gains `artist_vocab_collated`, the artist vocab accent-folded and
 //                parallel BY VID, so `order=artist` can collate the way `order=name` does. The
 //                engine has no NFKD -- the builder owns folding, which is why `card_name_folded`
 //                arrives pre-folded -- so the fold now arrives with the row (`card_artist_folded`)
 //                and the commit pass fills the vocab from it. `a:` predicates keep binding against
 //                the UNFOLDED `artist_vocab`, so search semantics are untouched; only the sort
 //                moves. ~2.5k strings, ~40KB. No struct size changes, so only this constant can
-//                catch a stale archive -- one whose `artist_vocab_folded` is empty would rank
+//                catch a stale archive -- one whose `artist_vocab_collated` is empty would rank
 //                every artist as the empty string and answer one arbitrary order for `order=artist`.
 //
 //                The deployment's vendored copy carries this as 2026081607; the two trees'
@@ -14069,7 +14124,8 @@ fn bind_and_split_filter(
     sync_format_shifts(&data.format_shifts);
     let mut filter_expr = build_filter(&json_val)
         .map_err(|e| QueryError::new_err(format!("build_filter: {e}")))?;
-    filter_expr.bind(&data.coll_vocab, &data.coll_vocab_sorted, &data.artist_vocab, &data.mana_vocab, &data.indexes.flavor, &data.strings);
+    filter_expr.bind(&data.coll_vocab, &data.coll_vocab_sorted, &data.artist_vocab, &data.artist_vocab_collated, &data.mana_vocab, &data.indexes.flavor, &data.strings);
+    filter_expr.bind_flavor_names(&data.indexes.flavor_names, &data.indexes.flavor_names_collated);
 
     // Read before the split consumes the tree.
     let sort_bound = sort_col_bound(&filter_expr, sort_col);
@@ -14411,7 +14467,7 @@ impl QueryEngine {
         // disagree gets legality_divergent set, deferring legality filters to
         // each printing's own word.
         // Parallel to `artist_vocab` BY VID, filled from each row's fold as the commit loop walks them.
-        let mut artist_vocab_folded: Vec<String> = Vec::new();
+        let mut artist_vocab_collated: Vec<String> = Vec::new();
         let mut cards: Vec<OracleCard> = Vec::new();
         let mut printings: Vec<Printing> = Vec::with_capacity(rows.len());
         let mut offsets: Vec<u32> = Vec::new();
@@ -14559,16 +14615,16 @@ impl QueryEngine {
             } else {
                 Vec::new()
             };
-            // `artist_vocab_folded[vid]`, filled the first time a row names that vid. Grown here
+            // `artist_vocab_collated[vid]`, filled the first time a row names that vid. Grown here
             // rather than pre-sized because the artist vocab is not final until the loop ends; it
             // is squared up to the vocab's length right after.
             if row.card_artist_vid != ARTIST_NONE && row.card_artist_folded_id != NONE_STR {
                 let vid = row.card_artist_vid as usize;
-                if artist_vocab_folded.len() <= vid {
-                    artist_vocab_folded.resize(vid + 1, String::new());
+                if artist_vocab_collated.len() <= vid {
+                    artist_vocab_collated.resize(vid + 1, String::new());
                 }
-                if artist_vocab_folded[vid].is_empty() {
-                    artist_vocab_folded[vid].clone_from(&interner.strings[row.card_artist_folded_id as usize]);
+                if artist_vocab_collated[vid].is_empty() {
+                    artist_vocab_collated[vid] = collate_name(&interner.strings[row.card_artist_folded_id as usize]);
                 }
             }
             let is_canonical = row.is_canonical;
@@ -14661,10 +14717,10 @@ impl QueryEngine {
         let artist_vocab = artists.strings;
         // Square up to the vocab: a vid whose rows all lacked a fold keeps the unfolded string,
         // which is the pre-fold behaviour rather than an empty sort key.
-        artist_vocab_folded.resize(artist_vocab.len(), String::new());
-        for (vid, folded) in artist_vocab_folded.iter_mut().enumerate() {
-            if folded.is_empty() {
-                folded.clone_from(&artist_vocab[vid]);
+        artist_vocab_collated.resize(artist_vocab.len(), String::new());
+        for (vid, collated) in artist_vocab_collated.iter_mut().enumerate() {
+            if collated.is_empty() {
+                *collated = collate_name(&artist_vocab[vid]);
             }
         }
         drop(artists.map);
@@ -14677,7 +14733,7 @@ impl QueryEngine {
     // passes because it is one, and stored on the card because `tri()` sees one card and one
     // printing -- never the card's other rows, and never the annex.
     assign_single_set_flags(&mut cards, &printings, &offsets, &foreign, &foreign_offsets);
-        assign_artist_ranks(&mut printings, &mut foreign, &artist_vocab_folded);
+        assign_artist_ranks(&mut printings, &mut foreign, &artist_vocab_collated);
         assign_collector_ranks(&mut printings, &mut foreign, &strings);
         order_annex_by_language(&mut foreign, &foreign_offsets, &coll_vocab);
         let mana_vocab = mana.strings;
@@ -14735,6 +14791,8 @@ impl QueryEngine {
         let foreign_langs_idx = build_lang_index(&foreign, &coll_vocab);
         let printed_names_idx = build_printed_name_index(&printings, &foreign, &strings, |p| p.printed_name_folded_id);
     let flavor_names_idx = build_printed_name_index(&printings, &foreign, &strings, |p| p.flavor_name_folded_id);
+    let flavor_names_collated: Vec<String> =
+        flavor_names_idx.name_ids.iter().map(|&id| collate_name(&strings[id as usize])).collect();
         let indexes = CardIndexes {
             // COLLATED, and so are the bigram and unigram tiers below: all three narrow `name:`,
             // and a needle collated by the query side has no window in common with a folded name
@@ -14764,6 +14822,25 @@ impl QueryEngine {
                     }
                 }
                 idx
+            },
+            sets_with_extras: {
+                // The fold that answers `include_extras`'s auto-enable — see the field's own comment.
+                // Canonical printings only: `e:X` is an English/canonical query unless the caller
+                // widens it, and the annex rows share their set codes with the canonical ones anyway.
+                let mut codes: Vec<String> = match coll_vocab.iter().position(|s| s == EXTRA_IS_TAG) {
+                    None => Vec::new(),
+                    Some(pos) => {
+                        let extra_vid = pos as u16;
+                        printings
+                            .iter()
+                            .filter(|p| !p.card_set_code.as_str().is_empty() && p.card_is_tags.contains(&extra_vid))
+                            .map(|p| p.card_set_code.as_str().to_owned())
+                            .collect()
+                    }
+                };
+                codes.sort_unstable();
+                codes.dedup();
+                codes
             },
             watermarks:     {
                 let mut idx: TagIndex = HashMap::new();
@@ -14816,7 +14893,8 @@ impl QueryEngine {
             foreign_by_scryfall_id: build_printing_by_scryfall_id(&foreign),
             foreign_external_ids: build_external_id_index(&foreign),
             printed_names: printed_names_idx,
-        flavor_names: flavor_names_idx,
+            flavor_names: flavor_names_idx,
+            flavor_names_collated,
         };
 
         #[cfg(feature = "alloc-counter")]
@@ -14836,7 +14914,7 @@ impl QueryEngine {
             coll_vocab,
             coll_vocab_sorted,
             artist_vocab,
-            artist_vocab_folded,
+            artist_vocab_collated,
             mana_vocab,
             indexes,
             format_shifts: format_shifts_snapshot,

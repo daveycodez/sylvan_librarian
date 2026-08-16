@@ -295,9 +295,13 @@ def _merge_processed_faces(faces: list[dict[str, Any]]) -> dict[str, Any]:
 # non-layout signals that do the same job. Scryfall's own `is:extra` is 6,054 cards; this reaches
 # 5,873 distinct English cards, within 3% of it — and, unlike a playability filter, it is a
 # statement about the PRINTING, which is what the hiding actually tracks.
-_EXTRA_LAYOUTS = frozenset(
-    {"token", "double_faced_token", "emblem", "planar", "scheme", "vanguard", "art_series", "front_card", "host", "augment"}
-)
+#
+# `host` AND `augment` WERE HERE AND ARE WRONG. Unstable's Hosts and Augments are ORDINARY search
+# results: `is:extra e:ust` answers 0 on api.scryfall.com while this set counted 32, and bare
+# `e:ust` answers Unstable's full English count either way. The two layouts are unusual card FACES,
+# not printings Scryfall hides — which is the distinction this set is supposed to draw. Measured
+# 2026-08-16; 46 printings across ust/und/ulst stop carrying `is:extra`.
+_EXTRA_LAYOUTS = frozenset({"token", "double_faced_token", "emblem", "planar", "scheme", "vanguard", "art_series", "front_card"})
 
 
 def _is_extra(card: dict[str, Any]) -> bool:
@@ -314,6 +318,14 @@ def _is_extra(card: dict[str, Any]) -> bool:
     if card.get("layout") in _EXTRA_LAYOUTS:
         return True
     if card.get("set_type") == "memorabilia":
+        return True
+    # `content_warning` — the flag Scryfall sets on the printings it will not show unasked. It is an
+    # EXTRAS signal and nothing else here catches it: 91 printings across the bulk (25 English), all
+    # layout `normal`, all ordinary type lines, all legal somewhere. Missing it made nine sets look
+    # extras-free that Scryfall auto-enables `include_extras` for — lea's only extra IS a
+    # content-warning card (Crusade), and 2ed/3ed/4ed/5ed/6ed/sum/leg/arn/ddf/me1/me3/ced/cei/prm
+    # are the same story. Measured 2026-08-16: `is:extra e:lea` answers 1.
+    if card.get("content_warning") is True:
         return True
     # A "Card"/"Token" TYPE LINE, for the printings whose layout does not already say so: the
     # checklist and substitute-card family ships as layout `normal` in some sets.

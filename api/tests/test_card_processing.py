@@ -131,6 +131,10 @@ class TestCardProcessing:
         assert "extra" not in tags(set_type="funny"), "e:ust answers 249 with and without the flag"
         assert "extra" not in tags(layout="reversible_card", name="Echo // Echo"), "tdm/380 is 200 bare"
         assert "extra" not in tags(promo_types=["sldbonus", "playtest"]), "sld/SCTLR is legal and served"
+        # Unstable's Hosts and Augments: `is:extra e:ust` answers 0, and both layouts were in
+        # _EXTRA_LAYOUTS until 2026-08-16. Asserted as a pair so re-adding either fails here.
+        assert "extra" not in tags(layout="host", set_type="funny"), "is:extra e:ust is 0"
+        assert "extra" not in tags(layout="augment", set_type="funny"), "is:extra e:ust is 0"
 
         # EXTRA — 404 bare, 200 with include_extras=true.
         assert "extra" in tags(set_type="memorabilia"), "ced/78 appears only with extras"
@@ -139,6 +143,9 @@ class TestCardProcessing:
         assert "extra" in tags(layout="planar"), "opc2/38"
         assert "extra" in tags(layout="art_series", name="Echo // Echo"), "unlike its reversible cousin"
         assert "extra" in tags(promo_types=["playtest"], legalities={"vintage": "not_legal"}), "mb2/536"
+        # `content_warning`, the flag with no other signal behind it: layout `normal`, an ordinary
+        # type line, legal somewhere. `is:extra e:lea` answers 1 and that one card is Crusade.
+        assert "extra" in tags(content_warning=True), "lea/61 Crusade"
 
     def test_preprocess_card_keeps_non_paper_cards(self) -> None:
         """A digital-only printing is IMPORTED: Scryfall serves it with default parameters.
