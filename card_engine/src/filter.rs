@@ -347,12 +347,14 @@ pub(crate) enum TextSearchField {
     NameCollated,
     OracleTextLower,
     FlavorTextLower,
-    /// `a:"quoted"` — the raw lowercase artist string, matched literally.
+    /// `a:"quoted"` — the value as written, still UNfolded by the parser.
+    ///
+    /// Kept as its own variant only because the parser distinguishes the two node shapes; both
+    /// arms bind through `artist_contains_ids`, because Scryfall draws no quoted/bare line for
+    /// artists the way it does for `name:` — `a:"rebeccaguay"` answers `a:rebecca-guay`'s 399.
     ArtistLower,
     /// `a:word` — the COLLATED artist (diacritics folded, every non-alphanumeric character gone),
-    /// which is what Scryfall compares a bare artist word against. Same split as
-    /// `NameLower`/`NameCollated`, on the same kind of evidence: `a:gawel` answers 10 there and
-    /// `a:rebecca-guay` answers 166, neither of which the raw string can reach.
+    /// which is what Scryfall compares EVERY artist value against, bare or quoted, `:` or `=`.
     ArtistCollated,
 }
 
@@ -1031,6 +1033,45 @@ fn artist_match_ids(artist_vocab: &AStrings, pred: impl Fn(&str) -> bool) -> Vec
         .collect()
 }
 
+/// Vocab ids (ascending) whose artist CONTAINS `needle`, collated on both sides.
+///
+/// THE ONE COMPARISON EVERY ARTIST PREDICATE MAKES. On api.scryfall.com there is no `a:` / `a=`
+/// distinction and no quoted / bare distinction — measured 2026-08-16, every pair answers the same
+/// number:
+///
+///   a:"rebecca guay" 399   a="rebecca guay" 399   a:rebecca-guay 399   a=rebecca-guay 399
+///   a:gaweł           23   a=gaweł           23   a:gawel         23   a="gawel"       23
+///
+/// and it is a CONTAINS rather than an equality: `a="rebecca"` answers 405 exactly as `a:rebecca`
+/// does, and `a="guay"` answers 462 exactly as `a:guay` does. This port had `a=` as a full-string
+/// compare against the unfolded vocab, so `a="greg hildebrandt"` answered 0 where Scryfall answers
+/// 6, and a quoted `a:"…"` stayed literal, so `a:"rebeccaguay"` answered 0 against Scryfall's 399.
+///
+/// The needle arrives accent-folded ONLY when the parser built a CollatedNameValueNode (a bare
+/// `a:` word); the quoted and `=` forms keep their spelling. Rather than teach the engine a second
+/// copy of `fold_accents`, a NON-ASCII needle is compared against the unfolded vocab collated on
+/// the fly as well as the stored folded one — the union is exactly Scryfall's behaviour, which
+/// answers 23 for `gaweł` and `gawel` alike. An ASCII needle skips that pass entirely and cannot
+/// need it: folding only ever maps non-ASCII to ASCII, so the stored folded vocab is already the
+/// more permissive target. That keeps the common path allocation-free, as it was.
+fn artist_contains_ids(artist_vocab: &AStrings, artist_vocab_collated: &AStrings, needle: &str) -> Vec<u16> {
+    let collated = crate::collate_name(needle);
+    // memmem::Finder built once, reused across the vocab scan — its SIMD prefilter beats
+    // rebuilding str::contains's searcher per entry (~1.3x, bench_substring_finders). #734.
+    let finder = memmem::Finder::new(collated.as_bytes());
+    let also_unfolded = !collated.is_ascii();
+    artist_vocab_collated
+        .iter()
+        .enumerate()
+        .filter(|(vid, folded)| {
+            finder.find(folded.as_str().as_bytes()).is_some()
+                || (also_unfolded
+                    && finder.find(crate::collate_name(artist_vocab[*vid].as_str()).as_bytes()).is_some())
+        })
+        .map(|(vid, _)| vid as u16)
+        .collect()
+}
+
 impl FilterExpr {
     /// Per-query binding against the store's vocab tables, called once before
     /// matching. Two rewrites happen here:
@@ -1145,30 +1186,37 @@ impl FilterExpr {
                     .filter(|&id| vocab[id as usize].as_str() == value.as_str());
             }
             FilterExpr::TextContains { field: TextSearchField::ArtistLower, word } => {
-                // memmem::Finder built once, reused across the vocab scan — its SIMD prefilter beats
-                // rebuilding str::contains's searcher per entry (~1.3x, bench_substring_finders). #734.
-                let finder = memmem::Finder::new(word.as_bytes());
-                let ids = artist_match_ids(artist_vocab, |s| finder.find(s.as_bytes()).is_some());
+                // A QUOTED `a:"…"` reaches this arm, and it is collated too — Scryfall draws no
+                // quoted/bare line for artists, unlike `name:`. See `artist_contains_ids`.
+                let ids = artist_contains_ids(artist_vocab, artist_vocab_collated, word.as_str());
                 *self = FilterExpr::ArtistMatch { ids };
             }
             FilterExpr::TextContains { field: TextSearchField::ArtistCollated, word } => {
-                // The needle arrives already folded and collated from the parser (the artist twin
-                // of CollatedNameValueNode), so both sides of this compare are the same string
-                // shape and the vocab needs no per-query work.
-                let finder = memmem::Finder::new(word.as_bytes());
-                let ids = artist_match_ids(artist_vocab_collated, |s| finder.find(s.as_bytes()).is_some());
+                // A BARE `a:word`, already folded and collated by the parser. Collating an
+                // already-collated needle is idempotent, so it shares the one comparison.
+                let ids = artist_contains_ids(artist_vocab, artist_vocab_collated, word.as_str());
                 *self = FilterExpr::ArtistMatch { ids };
             }
             FilterExpr::TextExact { field: TextField::ArtistLower, op, value } => {
                 let (op, value) = (*op, std::mem::take(value));
-                let ids = artist_match_ids(artist_vocab, |s| match op {
-                    CmpOp::Eq => s == value,
-                    CmpOp::Ne => s != value,
-                    CmpOp::Lt => s < value.as_str(),
-                    CmpOp::Le => s <= value.as_str(),
-                    CmpOp::Gt => s > value.as_str(),
-                    CmpOp::Ge => s >= value.as_str(),
-                });
+                // `a=` IS `a:` on Scryfall — a contains, not an equality (see
+                // `artist_contains_ids` for the measurements). The ordering comparisons keep the
+                // full-string compare against the unfolded vocab: Scryfall answers 0 for every one
+                // of them (`a>"rebecca guay"` measured 2026-08-16), so there is no behaviour there
+                // to match, and `a!=` already agrees with it at 0 — changing either would be
+                // inventing semantics rather than reproducing them.
+                let ids = if matches!(op, CmpOp::Eq) {
+                    artist_contains_ids(artist_vocab, artist_vocab_collated, &value)
+                } else {
+                    artist_match_ids(artist_vocab, |s| match op {
+                        CmpOp::Eq => s == value,
+                        CmpOp::Ne => s != value,
+                        CmpOp::Lt => s < value.as_str(),
+                        CmpOp::Le => s <= value.as_str(),
+                        CmpOp::Gt => s > value.as_str(),
+                        CmpOp::Ge => s >= value.as_str(),
+                    })
+                };
                 *self = FilterExpr::ArtistMatch { ids };
             }
             FilterExpr::TextRegex { field: TextField::ArtistLower, regex } => {

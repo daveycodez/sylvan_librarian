@@ -6613,6 +6613,9 @@ fn artist_predicates_bind_to_vocab_ids_and_narrow() {
     data.printings[1].card_artist_vid = avon;
     data.printings[2].card_artist_vid = rebecca;
     data.artist_vocab = artists.strings;
+    // Parallel BY VID, exactly as the commit pass backfills it — every artist predicate compares
+    // against this, so leaving it empty would make the fixture answer nothing.
+    data.artist_vocab_collated = data.artist_vocab.iter().map(|a| super::collate_name(a)).collect();
     data.indexes.artists = build_artist_index(&data.printings, data.artist_vocab.len());
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
@@ -6649,6 +6652,90 @@ fn artist_predicates_bind_to_vocab_ids_and_narrow() {
         Some(Candidates::Printings(v)) => assert!(v.is_empty()),
         _ => panic!("empty artist match must narrow to the empty set"),
     }
+}
+
+/// Every artist form is ONE comparison: a collated contains, `a:` and `a=` alike.
+///
+/// api.scryfall.com draws no `:`/`=` and no quoted/bare line for artists the way it does for
+/// `name:` — measured 2026-08-16, `a="rebecca"` answers `a:rebecca`'s 405, `a="guay"` answers
+/// `a:guay`'s 462, and `a:"rebeccaguay"` answers `a:rebecca-guay`'s 399. This port had `a=` as a
+/// full-string compare and a quoted `a:"…"` as a literal one, so both answered 0 on values
+/// Scryfall answers in the hundreds.
+#[test]
+fn every_artist_form_is_a_collated_contains() {
+    let mut vocab = VocabInterner::new();
+    let cards = vec![stub_card(1, TYPE_CREATURE, &[], &mut vocab), stub_card(2, TYPE_CREATURE, &[], &mut vocab)];
+    let mut data = store_of(cards, &[2, 2], vocab);
+    let mut artists = VocabInterner::new();
+    // A solo credit, a JOINED two-artist credit (generation 27 stores Scryfall's own string), and
+    // an accented name, whose folded twin is what the collated vocab carries.
+    let guay = artists.intern("rebecca guay".to_string()).unwrap();
+    let joined = artists.intern("david martin & franz vohwinkel".to_string()).unwrap();
+    let gawel = artists.intern("jakub gaweł".to_string()).unwrap();
+    data.printings[0].card_artist_vid = guay;
+    data.printings[1].card_artist_vid = joined;
+    data.printings[2].card_artist_vid = gawel;
+    data.artist_vocab = artists.strings;
+    // The stored fold: `collate_name(fold_accents(lower))`. Only the accented name differs, and
+    // this fixture spells its fold out rather than importing the builder's `fold_accents`.
+    data.artist_vocab_collated = data
+        .artist_vocab
+        .iter()
+        .map(|a| super::collate_name(&a.replace('ł', "l")))
+        .collect();
+    data.indexes.artists = build_artist_index(&data.printings, data.artist_vocab.len());
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+
+    let bind = |mut f: FilterExpr| -> Vec<u16> {
+        f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+        let FilterExpr::ArtistMatch { ids } = f else { panic!("artist predicate must bind to ArtistMatch") };
+        ids
+    };
+    let quoted = |w: &str| FilterExpr::TextContains { field: super::TextSearchField::ArtistLower, word: w.to_string() };
+    let bare = |w: &str| FilterExpr::TextContains { field: super::TextSearchField::ArtistCollated, word: w.to_string() };
+    let eq = |v: &str| FilterExpr::TextExact {
+        field: super::TextField::ArtistLower,
+        op: super::CmpOp::Eq,
+        value: v.to_string(),
+    };
+
+    // `a=` is a CONTAINS, not an equality: a fragment of a name finds it.
+    assert_eq!(bind(eq("rebecca")), vec![guay]);
+    assert_eq!(bind(eq("guay")), vec![guay]);
+    // ...and it agrees with `a:` in both spellings, which is the whole claim.
+    assert_eq!(bind(eq("rebecca")), bind(bare("rebecca")));
+    assert_eq!(bind(eq("rebecca")), bind(quoted("rebecca")));
+
+    // A QUOTED value is collated too — punctuation and spacing are dropped from both sides.
+    assert_eq!(bind(quoted("rebecca-guay")), vec![guay]);
+    assert_eq!(bind(quoted("rebeccaguay")), vec![guay]);
+    assert_eq!(bind(eq("rebecca guay")), vec![guay]);
+
+    // The joined two-artist credit is reachable under EITHER artist, because collation drops the
+    // " & " and leaves each name a substring. This is what makes `a:"franz vohwinkel"` return
+    // Fire // Ice, as it does on Scryfall.
+    assert_eq!(bind(eq("franz vohwinkel")), vec![joined]);
+    assert_eq!(bind(quoted("david martin")), vec![joined]);
+    assert_eq!(bind(bare("vohwinkel")), vec![joined]);
+
+    // An accented needle reaches the artist through the UNFOLDED vocab collated on the fly, and
+    // the unaccented spelling reaches them through the stored fold. Scryfall answers both.
+    assert_eq!(bind(quoted("gaweł")), vec![gawel]);
+    assert_eq!(bind(quoted("gawel")), vec![gawel]);
+    assert_eq!(bind(eq("jakub gaweł")), vec![gawel]);
+
+    // A needle in nobody's name still proves the empty set.
+    assert!(bind(eq("zzz")).is_empty());
+
+    // The ORDERING comparisons keep the full-string compare against the unfolded vocab: Scryfall
+    // answers 0 for all of them, so there is nothing to reproduce and nothing is changed here.
+    let ids = bind(FilterExpr::TextExact {
+        field: super::TextField::ArtistLower,
+        op: super::CmpOp::Ne,
+        value: "rebecca guay".to_string(),
+    });
+    assert_eq!(ids, vec![joined, gawel]);
 }
 
 // The fingerprint is a sound necessary-condition filter: a text containing the
