@@ -105,6 +105,8 @@ pub(crate) fn has_printing_varying_leaf(f: &FilterExpr) -> bool {
             matches!(field, CollField::ArtTags | CollField::IsTags | CollField::FrameData)
         }
         FilterExpr::Legality { .. } => true,
+        // The language is a per-printing fact (CompatFields.lang_id).
+        FilterExpr::LangMatch { .. } => true,
         FilterExpr::And(children) | FilterExpr::Or(children) => children.iter().any(has_printing_varying_leaf),
         FilterExpr::Not(inner) => has_printing_varying_leaf(inner),
         // Exhaustive, not `_ => false`: a new variant must get a considered
@@ -456,6 +458,11 @@ fn estimate_leaf(f: &FilterExpr, indexes: &Archived<CardIndexes>, n_cards: u32, 
             }
         }
         FilterExpr::CollectionCmp { .. } => unknown(n),
+
+        // Unreachable on the routed path — a LangMatch anywhere in the filter sends the whole
+        // query to the widened (multilingual) driver, which does not consult the estimator.
+        // "Unknown" is the sound answer if that ever changes.
+        FilterExpr::LangMatch { .. } => unknown(n),
 
         // Printing-space CSR width sums → project (varying).
         FilterExpr::ArtistMatch { ids } => {

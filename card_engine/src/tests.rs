@@ -2,7 +2,7 @@ use super::{
     and_child_rank, assign_name_ranks,
     build_numeric_index, build_oracle_text_index, build_tag_index, build_trigram_index,
     build_rarity_index, build_flavor_index, build_hybrid_tag_index, bitmap_beats_postings, HybridTagIndex, build_sort_permutations,
-    assign_artwork_groups, build_artwork_base_from, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
+    assign_artwork_groups, assign_set_ranks, assign_foreign_artwork_groups, build_artwork_base_from, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
     cards_of_printings, count_common_keywords, count_common_types,
     build_artist_index, build_printing_value_index, build_arith_tuple_index, is_arith_tuple_route, range_candidates, narrow_candidates, narrow_candidates_exact, rarity_candidates,
     range_too_broad_to_narrow, run_query, run_query_routed, run_query_with_plan, explain, explain_analyze, AcquireFacts, PlanEstimate, PlanTrial,
@@ -237,6 +237,7 @@ fn stub_printing(scryfall_id: u128, illustration_id: u128, prefer_score: Option<
         flavor_text_id: NONE_STR,
         flavor_text_lower_id: NONE_STR,
         card_artist_vid: ARTIST_NONE,
+        card_artist_name_id: NONE_STR,
         card_set_code: InlineStr::from_str(""),
         set_rank: 0,
         artist_rank: 0,
@@ -257,6 +258,11 @@ fn stub_printing(scryfall_id: u128, illustration_id: u128, prefer_score: Option<
         card_frame_data: Vec::new(),
         artwork_group_id: 0, // placeholder; store_of overwrites via assign_artwork_groups
         faces: Vec::new(),
+        printed_name_id: NONE_STR,
+        printed_type_line_id: NONE_STR,
+        printed_text_id: NONE_STR,
+        printed_name_folded_id: NONE_STR,
+        printed_faces: Vec::new(),
         compat: CompatFields::default(),
     }
 }
@@ -315,10 +321,13 @@ fn store_of(cards: Vec<OracleCard>, printing_counts: &[usize], vocab: VocabInter
         printing_to_card: build_printing_to_card(&offsets),
         ..Default::default()
     };
+    let foreign_offsets = vec![0u32; cards.len() + 1];
     CardData {
         cards,
         printings,
         offsets,
+        foreign: vec![],
+        foreign_offsets,
         strings: vec![],
         coll_vocab_sorted: sorted_vocab_ids(&vocab.strings),
         coll_vocab: vocab.strings,
@@ -6446,11 +6455,20 @@ fn bench_checked_vs_unchecked_access() {
         printing_by_illustration_id: crate::build_printing_by_illustration_id(&printings),
         oracle_by_oracle_id:     build_oracle_by_oracle_id(&cards),
         external_id_index:       build_external_id_index(&printings),
+        langs: HybridTagIndex::default(),
+        foreign_langs: HybridTagIndex::default(),
+        foreign_to_card: vec![],
+        foreign_by_scryfall_id: vec![],
+        foreign_external_ids: vec![],
+        printed_names: crate::PrintedNameIndex::default(),
     };
+    let foreign_offsets = vec![0u32; cards.len() + 1];
     let data = CardData {
         cards,
         printings,
         offsets,
+        foreign: vec![],
+        foreign_offsets,
         strings,
         coll_vocab_sorted: sorted_vocab_ids(&vocab.strings),
         coll_vocab: vocab.strings,
@@ -11402,8 +11420,8 @@ fn two_faces() -> (Vec<OracleFace>, Vec<PrintingFace>) {
         },
     ];
     let printing = vec![
-        PrintingFace { illustration_id: 0xAAAA, card_artist_vid: 1, flavor_text_id: 7 },
-        PrintingFace { illustration_id: 0xBBBB, card_artist_vid: 2, flavor_text_id: NONE_STR },
+        PrintingFace { illustration_id: 0xAAAA, card_artist_vid: 1, card_artist_name_id: NONE_STR, flavor_text_id: 7 },
+        PrintingFace { illustration_id: 0xBBBB, card_artist_vid: 2, card_artist_name_id: NONE_STR, flavor_text_id: NONE_STR },
     ];
     (oracle, printing)
 }
@@ -11828,69 +11846,55 @@ fn name_lookups_agree_with_and_without_the_trigram_index() {
     assert_eq!(exact_name_match(idx, "insectile aberration", None).map(|(cid, _)| cid), Some(2));
 }
 
-#[test]
-fn a_typo_resolves_to_the_intended_card() {
+/// A CardData whose cards carry the given names, one printing each — the fuzzy scan's minimal
+/// fixture. The printed-name index stays empty, which is every pre-multilingual store.
+fn named_cards_store(names: &[&str]) -> CardData {
     let mut vocab = VocabInterner::new();
     let mut cards = Vec::new();
-    for (i, name) in ["lightning bolt", "shock", "counterspell"].iter().enumerate() {
+    for (i, name) in names.iter().enumerate() {
         let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
         c.card_name_lower = InlineStr::from_str(name);
         cards.push(c);
     }
-    let bytes = rkyv::to_bytes::<Error>(&cards).expect("serialize");
-    let a = rkyv::access::<Archived<Vec<OracleCard>>, Error>(&bytes).expect("access");
-    // Every card here carries NONE_STR (folded == lower), so an EMPTY table is the right one:
-    // `folded_name` never reaches it, and a populated one would prove nothing extra.
-    let sbytes = rkyv::to_bytes::<Error>(&Vec::<String>::new()).expect("serialize strings");
-    let strs = rkyv::access::<Archived<Vec<String>>, Error>(&sbytes).expect("access strings");
+    let counts = vec![1usize; names.len()];
+    store_of(cards, &counts, vocab)
+}
 
-    match fuzzy_name_match(a, strs, "lightnig bolt", 0.4, 0.05) {
-        FuzzyOutcome::Hit(cid) => assert_eq!(cid, 0, "a one-letter typo still finds Lightning Bolt"),
+#[test]
+fn a_typo_resolves_to_the_intended_card() {
+    let data = named_cards_store(&["lightning bolt", "shock", "counterspell"]);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+
+    match fuzzy_name_match(a, "lightnig bolt", 0.4, 0.05) {
+        FuzzyOutcome::Hit { cid, vpid } => {
+            assert_eq!(cid, 0, "a one-letter typo still finds Lightning Bolt");
+            assert_eq!(vpid, 0, "an English hit carries the card's preferred printing");
+        }
         _ => panic!("expected a hit"),
     }
     // Nothing close enough clears the floor.
-    assert!(matches!(fuzzy_name_match(a, strs, "zzzzzzzz", 0.4, 0.05), FuzzyOutcome::Miss));
+    assert!(matches!(fuzzy_name_match(a, "zzzzzzzz", 0.4, 0.05), FuzzyOutcome::Miss));
 }
 
 #[test]
 fn two_close_names_are_ambiguous_not_a_guess() {
     // Scryfall reports `ambiguous` rather than picking, and collapsing that to "not found" would
     // tell the client the card does not exist.
-    let mut vocab = VocabInterner::new();
-    let mut cards = Vec::new();
-    for (i, name) in ["fire dragon", "fire dragoon"].iter().enumerate() {
-        let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
-        c.card_name_lower = InlineStr::from_str(name);
-        cards.push(c);
-    }
-    let bytes = rkyv::to_bytes::<Error>(&cards).expect("serialize");
-    let a = rkyv::access::<Archived<Vec<OracleCard>>, Error>(&bytes).expect("access");
-    // Every card here carries NONE_STR (folded == lower), so an EMPTY table is the right one:
-    // `folded_name` never reaches it, and a populated one would prove nothing extra.
-    let sbytes = rkyv::to_bytes::<Error>(&Vec::<String>::new()).expect("serialize strings");
-    let strs = rkyv::access::<Archived<Vec<String>>, Error>(&sbytes).expect("access strings");
-    assert!(matches!(fuzzy_name_match(a, strs, "fire dragen", 0.4, 0.05), FuzzyOutcome::Ambiguous));
+    let data = named_cards_store(&["fire dragon", "fire dragoon"]);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    assert!(matches!(fuzzy_name_match(a, "fire dragen", 0.4, 0.05), FuzzyOutcome::Ambiguous));
 }
 
 #[test]
 fn printings_of_one_card_do_not_look_ambiguous() {
     // Several cards sharing a NAME are one answer, not competing ones. Without the distinct-name
     // rule they would tie with themselves and every fuzzy lookup would report ambiguous.
-    let mut vocab = VocabInterner::new();
-    let mut cards = Vec::new();
-    for i in 0..3u128 {
-        let mut c = stub_card(i + 1, 0, &[], &mut vocab);
-        // `card_name_folded_id` defaults to NONE_STR, i.e. "same as card_name_lower".
-        c.card_name_lower = InlineStr::from_str("lightning bolt");
-        cards.push(c);
-    }
-    let bytes = rkyv::to_bytes::<Error>(&cards).expect("serialize");
-    let a = rkyv::access::<Archived<Vec<OracleCard>>, Error>(&bytes).expect("access");
-    // Every card here carries NONE_STR (folded == lower), so an EMPTY table is the right one:
-    // `folded_name` never reaches it, and a populated one would prove nothing extra.
-    let sbytes = rkyv::to_bytes::<Error>(&Vec::<String>::new()).expect("serialize strings");
-    let strs = rkyv::access::<Archived<Vec<String>>, Error>(&sbytes).expect("access strings");
-    assert!(matches!(fuzzy_name_match(a, strs, "lightning bolt", 0.4, 0.05), FuzzyOutcome::Hit(_)));
+    let data = named_cards_store(&["lightning bolt", "lightning bolt", "lightning bolt"]);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    assert!(matches!(fuzzy_name_match(a, "lightning bolt", 0.4, 0.05), FuzzyOutcome::Hit { .. }));
 }
 
 #[test]
@@ -12000,4 +12004,47 @@ fn autocomplete_matches_the_sql_routes_set_and_order() {
     // whichever name the corpus happened to reach first.
     assert_eq!(autocomplete_names(a, "sh", 1), vec!["Shock"], "capped, after ordering");
     assert!(autocomplete_names(a, "zzz", 20).is_empty());
+}
+
+#[test]
+fn printing_ranks_run_over_the_canonical_and_annex_union() {
+    // Set codes: canonical rows in "aaa" and "ccc"; annex rows in "bbb" (annex-only) and "ccc"
+    // (shared). Dense over the union: aaa=0, bbb=1, ccc=2 — the annex-only code takes a rank of
+    // its own WITHOUT reordering the canonical codes around it.
+    let mut canonical = vec![stub_printing(1, 1, None), stub_printing(2, 2, None)];
+    canonical[0].card_set_code = InlineStr::from_str("aaa");
+    canonical[1].card_set_code = InlineStr::from_str("ccc");
+    let mut foreign = vec![stub_printing(3, 3, None), stub_printing(4, 4, None)];
+    foreign[0].card_set_code = InlineStr::from_str("bbb");
+    foreign[1].card_set_code = InlineStr::from_str("ccc");
+
+    assign_set_ranks(&mut canonical, &mut foreign);
+
+    assert_eq!(canonical[0].set_rank, 0);
+    assert_eq!(canonical[1].set_rank, 2);
+    assert_eq!(foreign[0].set_rank, 1);
+    assert_eq!(foreign[1].set_rank, 2, "a shared set code ties across the two spaces");
+    // The canonical ORDER is what the union must preserve: dense ranks over a superset never
+    // reorder the subset.
+    assert!(canonical[0].set_rank < canonical[1].set_rank);
+}
+
+#[test]
+fn annex_artwork_groups_share_canonical_ids_and_extend_past_them() {
+    // One card: canonical printings with illustrations 10 and 20 (gids 0 and 1); annex rows with
+    // illustration 20 (shares gid 1) and 30 (annex-only, continues at gid 2).
+    let mut printings = vec![stub_printing(1, 10, Some(2.0)), stub_printing(2, 20, Some(1.0))];
+    let offsets = vec![0u32, 2];
+    let counts = assign_artwork_groups(&mut printings, &offsets);
+    assert_eq!(counts, vec![2]);
+
+    let mut foreign = vec![stub_printing(3, 20, Some(0.5)), stub_printing(4, 30, Some(0.4))];
+    let foreign_offsets = vec![0u32, 2];
+    assign_foreign_artwork_groups(&mut foreign, &foreign_offsets, &printings, &offsets);
+
+    assert_eq!(foreign[0].artwork_group_id, 1, "shared artwork shares the canonical gid");
+    assert_eq!(foreign[1].artwork_group_id, 2, "a foreign-only illustration continues after the canonical count");
+    // And the canonical side is untouched: same gids, same counts as before the annex existed.
+    assert_eq!(printings[0].artwork_group_id, 0);
+    assert_eq!(printings[1].artwork_group_id, 1);
 }

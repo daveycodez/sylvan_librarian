@@ -504,6 +504,19 @@ pub(crate) enum FilterExpr {
         value_id: Option<u16>,
     },
 
+    /// `lang:xx` — a printing's language equals `value` (`card_lang`, stored as
+    /// `CompatFields.lang_id`). `lang:any` matches every printing: its whole effect is the one
+    /// every LangMatch leaf has, widening the query to the foreign annex (the presence of this
+    /// variant in a bound filter is one of the two widening triggers; `include_multilingual` is
+    /// the other). Detected here, in the engine, so the flag and the operator cannot drift.
+    LangMatch {
+        value: String,
+        /// `value` resolved to its coll_vocab id by bind(), the CollectionCmp shape exactly:
+        /// None means no loaded printing carries the language, which matches nothing.
+        vid: Option<u16>,
+        any: bool,
+    },
+
     Legality {
         shift: Option<u8>, // None: format absent from all loaded data — matches nothing
         expected: u64,
@@ -632,6 +645,8 @@ pub(crate) fn verify_cost_tier(f: &FilterExpr) -> u32 {
         | FilterExpr::ColorCmp { .. }
         | FilterExpr::TypeCmp { .. }
         | FilterExpr::Legality { .. }
+        // A LangMatch is one integer equality against a resolved vocab id.
+        | FilterExpr::LangMatch { .. }
         | FilterExpr::DateCmp { .. }
         | FilterExpr::YearCmp { .. } => MASK_COMPARE_NS100,
     }
@@ -762,6 +777,8 @@ fn leaf_compares_printing_field(f: &FilterExpr) -> bool {
         // Divergent-legality cards defer to the printing, but they are a rare
         // exception (non-tournament reprints); rank by the common card-level case.
         FilterExpr::Legality { .. } => false,
+        // The language is a per-printing fact (CompatFields.lang_id).
+        FilterExpr::LangMatch { .. } => true,
         // Composites are composed by the two callers, which differ on `all` vs `any`; reaching here with
         // one is a bug in whichever caller forgot to handle it, not a case to answer silently.
         FilterExpr::And(_) | FilterExpr::Or(_) | FilterExpr::Not(_) => {
@@ -921,6 +938,15 @@ impl FilterExpr {
             FilterExpr::CollectionCmp { value, value_id, .. } => {
                 let i = sorted_ids.partition_point(|id| vocab[u16::from(*id) as usize].as_str() < value.as_str());
                 *value_id = sorted_ids
+                    .get(i)
+                    .map(|id| u16::from(*id))
+                    .filter(|&id| vocab[id as usize].as_str() == value.as_str());
+            }
+            // The language lives in the same vocab the collection values do (CompatFields.lang_id
+            // interns into coll_vocab), so this is CollectionCmp's resolution verbatim.
+            FilterExpr::LangMatch { value, vid, any: false } => {
+                let i = sorted_ids.partition_point(|id| vocab[u16::from(*id) as usize].as_str() < value.as_str());
+                *vid = sorted_ids
                     .get(i)
                     .map(|id| u16::from(*id))
                     .filter(|&id| vocab[id as usize].as_str() == value.as_str());
@@ -1275,6 +1301,37 @@ impl FilterExpr {
         }
     }
 
+    /// True iff any leaf of this (bound) filter is a `LangMatch` — one of the two triggers that
+    /// send a query to the widened (multilingual) driver instead of `run_query_routed`. Detected
+    /// here, on the compiled tree, so the `lang:` operator and the `include_multilingual` flag
+    /// cannot widen differently.
+    pub(crate) fn mentions_lang(&self) -> bool {
+        match self {
+            FilterExpr::LangMatch { .. } => true,
+            FilterExpr::And(children) | FilterExpr::Or(children) => children.iter().any(Self::mentions_lang),
+            FilterExpr::Not(inner) => inner.mentions_lang(),
+            _ => false,
+        }
+    }
+
+    /// A language every match MUST carry, when the filter pins one: a `LangMatch` that is the
+    /// whole filter or a direct conjunct of a top-level `And`. Conjuncts only — under `Or` or
+    /// `Not` a language constrains nothing on its own, and several conjuncts can only tighten,
+    /// so answering with the FIRST is a sound (superset) narrowing either way. `lang:any`
+    /// requires nothing.
+    pub(crate) fn required_lang_value(&self) -> Option<&str> {
+        fn leaf(f: &FilterExpr) -> Option<&str> {
+            match f {
+                FilterExpr::LangMatch { value, any: false, .. } => Some(value.as_str()),
+                _ => None,
+            }
+        }
+        match self {
+            FilterExpr::And(children) => children.iter().find_map(leaf),
+            other => leaf(other),
+        }
+    }
+
     /// Four-valued evaluation. True/False/Null mirror SQL ternary logic: Null is
     /// SQL's NULL ("unknown"), produced when a compared field is missing from the
     /// card, and NOT/AND/OR propagate it exactly like SQL — so -power>2 excludes
@@ -1346,6 +1403,21 @@ impl FilterExpr {
                     Tri::Null // no artist: SQL NULL, like the missing-string case before
                 } else {
                     tri_bool(ids.binary_search(&vid).is_ok())
+                }
+            }
+
+            FilterExpr::LangMatch { vid, any, .. } => {
+                // `lang:any` is True for every printing — its whole effect is the widening its
+                // presence triggers, so as a predicate it must reject nothing.
+                if *any {
+                    return Tri::True;
+                }
+                let Some(p) = printing else { return Tri::PrintingDep };
+                if u16::from(p.compat.lang_id) == super::VOCAB_NONE {
+                    Tri::Null // no lang recorded: SQL NULL, like the missing-string cases above
+                } else {
+                    // `vid` None = the language exists on no loaded printing; matches nothing.
+                    tri_bool(vid.is_some_and(|v| u16::from(p.compat.lang_id) == v))
                 }
             }
 
@@ -1792,6 +1864,18 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
             .map(|a| a.iter().fold(0u16, |acc, v| acc | card_type_str_to_bit(v.as_str().unwrap_or(""))))
             .unwrap_or(0);
         return Ok(FilterExpr::TypeCmp { mask, op: op_to_collection_cmp(op) });
+    }
+
+    if attr == "card_lang" {
+        // Equality only, plus the `any` widener — the same surface upstream's parser grants
+        // `lang:` (string-order comparisons error there like on the other string columns, so a
+        // non-equality op reaching here is defense in depth, not a reachable path).
+        if !matches!(op, ":" | "=") {
+            return Err(format!("operator {op:?} is not supported on lang"));
+        }
+        let value = rhs_value_str(rhs).to_lowercase();
+        let any = value == "any";
+        return Ok(FilterExpr::LangMatch { value, vid: None, any });
     }
 
     if attr == "card_subtypes" {

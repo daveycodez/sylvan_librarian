@@ -284,6 +284,26 @@ struct PrintingFace {
     illustration_id: u128,
     card_artist_vid: u16,
     flavor_text_id: u32,
+    // The face's artist AS SCRYFALL PRINTS IT (interned; NONE_STR = absent) — the string a card
+    // object emits. `card_artist_vid` above cannot stand in for it twice over: it indexes the
+    // ARTIST vocab, not the collection vocab a coll_str lookup reads, and that vocab holds only
+    // the lowercased search form ("milivoj ćeran", not "Milivoj Ćeran").
+    card_artist_name_id: u32,
+}
+
+/// One face's printed-language text, which varies per printing where `OracleFace`'s
+/// (always-English) text does not — the per-face half of Scryfall's `printed_name` /
+/// `printed_type_line` / `printed_text`.
+///
+/// NONE_STR means Scryfall omitted that key on that face, and the absence must round-trip
+/// exactly: a prepare-layout Spanish printing localizes the front face's name and type line
+/// and NOTHING else, and filling the gaps with English would fabricate keys Scryfall never
+/// sent. Never English-filled, never empty-string-filled.
+#[derive(Archive, Serialize, Deserialize)]
+struct PrintedFaceText {
+    printed_name_id: u32,
+    printed_type_line_id: u32,
+    printed_text_id: u32,
 }
 
 // Bit positions in `CompatFields.flags`. Twelve booleans Scryfall sends on every card object; a
@@ -498,8 +518,12 @@ struct Printing {
     // Interned id into CardData.artist_vocab (~2.2k distinct lowercase artist
     // names); ARTIST_NONE = absent. Artist predicates resolve their match set
     // against the vocab once per query (FilterExpr::ArtistMatch), so no artist
-    // strings live on the printing.
+    // strings live on the printing... for SEARCH. The card object needs the
+    // artist as Scryfall prints it, which the lowercased vocab cannot recover:
     card_artist_vid: u16,
+    // ...so the original-case string is interned into CardData.strings under its own id
+    // (NONE_STR = absent). Emission-only; every predicate and rank keeps using the vid.
+    card_artist_name_id: u32,
     card_set_code: InlineStr<8>,
     // Dense ranks of card_set_code and the artist name in byte order, assigned post-load by
     // assign_set_ranks / assign_artist_ranks; the sort keys for SortCol::Set and SortCol::Artist.
@@ -546,6 +570,23 @@ struct Printing {
     // single-faced cards, and empty when a multi-face card's printing carries no per-face art.
     faces: Vec<PrintingFace>,
 
+    // The printing's printed-language text — Scryfall's top-level `printed_name` /
+    // `printed_type_line` / `printed_text`, present on (most) non-English printings while the
+    // oracle fields above stay English on every row. Interned; NONE_STR = Scryfall omitted the
+    // key, and the absence round-trips exactly (see PrintedFaceText).
+    printed_name_id: u32,
+    printed_type_line_id: u32,
+    printed_text_id: u32,
+    // Search-only: the printed FULL name ("Front // Back" joined), lowercased and accent-folded
+    // by the importer with the same fold card_name_folded uses; NONE_STR when no face of this
+    // printing carries a printed name. Backs PrintedNameIndex and is never rendered into a card
+    // object — the display values are the three ids above.
+    printed_name_folded_id: u32,
+    // Parallel to the owning OracleCard's `faces` when ANY face carries a printed key; empty
+    // otherwise (single-faced cards, and the all-English common case, where per-row Vec contents
+    // would buy nothing).
+    printed_faces: Vec<PrintedFaceText>,
+
     // The card_compat_blob residue, packed. Printing-level: every field here varies by printing
     // (ids, prices, finishes) or is set-level and therefore constant across a set's printings.
     compat: CompatFields,
@@ -572,6 +613,8 @@ struct CardRow {
     flavor_text_id: u32,
     flavor_text_lower_id: u32,
     card_artist_vid: u16,
+    // The original-case artist string (see Printing.card_artist_name_id).
+    card_artist_name_id: u32,
     card_set_code: InlineStr<8>,
     card_layout_id: u32,
     card_border_id: u32,
@@ -609,6 +652,17 @@ struct CardRow {
     creature_toughness_text_id: u32,
     planeswalker_loyalty_text_id: u32,
 
+    // The printed-language triple plus the importer-folded full printed name — see the same
+    // fields on Printing. NONE_STR = key absent, and absence must survive to the archive.
+    printed_name_id: u32,
+    printed_type_line_id: u32,
+    printed_text_id: u32,
+    printed_name_folded_id: u32,
+    // Whether this row is one of Scryfall's canonical (default_cards) printings. Canonical rows
+    // become `CardData.printings`; the rest become the `foreign` annex. Decided by the importer
+    // (id-membership in default_cards), never re-derived here.
+    is_canonical: bool,
+
     // Both halves of each face, together, until the commit pass splits them the same way it splits
     // the row itself: text to the OracleCard, art to the Printing.
     card_faces: Vec<FaceRow>,
@@ -634,7 +688,13 @@ struct FaceRow {
     color_indicator: u8,
     illustration_id: u128,
     card_artist_vid: u16,
+    // The face's original-case artist string (see PrintingFace.card_artist_name_id).
+    card_artist_name_id: u32,
     flavor_text_id: u32,
+    // The per-face printed-language triple (PrintedFaceText before the commit pass splits it).
+    printed_name_id: u32,
+    printed_type_line_id: u32,
+    printed_text_id: u32,
 }
 
 // Type aliases for the archived (mmap-backed) store types
@@ -1138,11 +1198,16 @@ fn faces_from_pydict(d: &Bound<PyDict>, it: &mut Interner, artists: &mut VocabIn
         let Ok(face) = item.cast::<PyDict>() else {
             continue;
         };
-        let card_artist_vid = match opt_str(face, "artist") {
+        // Lowercased into the artist vocab for search, original case into the string table for
+        // the card object — the vocab alone loses the printed capitalization.
+        let artist = opt_str(face, "artist");
+        let card_artist_name_id = it.intern_opt(artist.clone());
+        let card_artist_vid = match artist {
             Some(a) => artists.intern(a.to_lowercase())?,
             None => ARTIST_NONE,
         };
         faces.push(FaceRow {
+            card_artist_name_id,
             card_name_id: it.intern(opt_str(face, "name").unwrap_or_default()),
             mana_cost_text_id: it.intern_opt(opt_str(face, "mana_cost")),
             type_line_id: it.intern(opt_str(face, "type_line").unwrap_or_default()),
@@ -1156,6 +1221,9 @@ fn faces_from_pydict(d: &Bound<PyDict>, it: &mut Interner, artists: &mut VocabIn
             illustration_id: opt_str(face, "illustration_id").map_or(0, |s| parse_uuid_or_hash(&s)),
             card_artist_vid,
             flavor_text_id: it.intern_opt(opt_str(face, "flavor_text")),
+            printed_name_id: it.intern_opt(opt_str(face, "printed_name")),
+            printed_type_line_id: it.intern_opt(opt_str(face, "printed_type_line")),
+            printed_text_id: it.intern_opt(opt_str(face, "printed_text")),
         });
     }
     Ok(faces)
@@ -1173,13 +1241,18 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
     let oracle_text_lower_id = it.intern(oracle_text.to_lowercase());
     let flavor_text = opt_str(d, "flavor_text").unwrap_or_default();
     let flavor_text_lower_id = it.intern(flavor_text.to_lowercase());
-    let card_artist_vid = match opt_str(d, "card_artist") {
+    // Lowercased into the artist vocab for search, original case into the string table for the
+    // card object — see Printing.card_artist_name_id.
+    let card_artist = opt_str(d, "card_artist");
+    let card_artist_name_id = it.intern_opt(card_artist.clone());
+    let card_artist_vid = match card_artist {
         Some(a) => artists.intern(a.to_lowercase())?,
         None => ARTIST_NONE,
     };
     let card_types = card_types_list_to_bits(&str_list(d, "card_types"));
 
     Ok(CardRow {
+        card_artist_name_id,
         scryfall_id: opt_uuid(d, "scryfall_id"),
         oracle_id: opt_uuid(d, "oracle_id"),
         illustration_id: opt_uuid(d, "illustration_id"),
@@ -1233,6 +1306,20 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
         creature_power_text_id: it.intern_opt(opt_str(d, "creature_power_text")),
         creature_toughness_text_id: it.intern_opt(opt_str(d, "creature_toughness_text")),
         planeswalker_loyalty_text_id: it.intern_opt(opt_str(d, "planeswalker_loyalty_text")),
+
+        printed_name_id: it.intern_opt(opt_str(d, "printed_name")),
+        printed_type_line_id: it.intern_opt(opt_str(d, "printed_type_line")),
+        printed_text_id: it.intern_opt(opt_str(d, "printed_text")),
+        // Already lowercased + accent-folded by the importer, like card_name_folded above.
+        printed_name_folded_id: it.intern_opt(opt_str(d, "printed_name_folded")),
+        // An ABSENT key reads canonical: every pre-multilingual feed is canonical-only, so
+        // absence means "there is no annex", not "this row belongs in it".
+        is_canonical: d
+            .get_item("is_canonical")
+            .ok()
+            .flatten()
+            .and_then(|v| v.extract::<bool>().ok())
+            .unwrap_or(true),
 
         card_faces: faces_from_pydict(d, it, artists)?,
         all_parts: all_parts_from_pydict(d, it, vocab)?,
@@ -2246,16 +2333,40 @@ fn bitmap_beats_postings(k: usize, n_rows: usize) -> bool {
 }
 
 fn build_hybrid_tag_index<T>(rows: &[T], vocab: &[String], get_ids: impl Fn(&T) -> &Vec<u16>) -> HybridTagIndex {
-    let n = rows.len();
+    hybrid_from_tag_index(build_tag_index(rows, vocab, get_ids), rows.len())
+}
+
+/// Bucket a value → postings map into `HybridTagIndex`'s two tiers. Split out of
+/// `build_hybrid_tag_index` so single-valued fields (`lang`, whose postings come off a scalar
+/// rather than a collection) share the exact same crossover and storage.
+fn hybrid_from_tag_index(map: TagIndex, n_rows: usize) -> HybridTagIndex {
     let mut out = HybridTagIndex::default();
-    for (value, postings) in build_tag_index(rows, vocab, get_ids) {
-        if bitmap_beats_postings(postings.len(), n) {
-            out.dense.insert(value, scatter_bits(postings, n));
+    for (value, postings) in map {
+        if bitmap_beats_postings(postings.len(), n_rows) {
+            out.dense.insert(value, scatter_bits(postings, n_rows));
         } else {
             out.sparse.insert(value, postings);
         }
     }
     out
+}
+
+/// One posting list per language over `rows` (each printing's `compat.lang_id`), hybrid-stored
+/// like the collection indexes. Built twice, over disjoint spaces: `langs` posts canonical
+/// printing ids and `foreign_langs` posts annex ids, so `lang:` narrowing never touches the
+/// space a query did not ask about — the annex stays free for the default (English) lane.
+fn build_lang_index(rows: &[Printing], vocab: &[String]) -> HybridTagIndex {
+    let mut by_id: HashMap<u16, Vec<u32>> = HashMap::new();
+    for (i, p) in rows.iter().enumerate() {
+        if p.compat.lang_id != VOCAB_NONE {
+            by_id.entry(p.compat.lang_id).or_default().push(i as u32);
+        }
+    }
+    let map: TagIndex = by_id
+        .into_iter()
+        .map(|(id, postings)| (vocab[id as usize].clone(), postings))
+        .collect();
+    hybrid_from_tag_index(map, rows.len())
 }
 
 impl ArchivedHybridTagIndex {
@@ -2281,6 +2392,25 @@ impl ArchivedHybridTagIndex {
             return Some(b.iter().map(|w| u64::from(*w).count_ones() as usize).sum());
         }
         self.sparse.get(value).map(|v| v.len())
+    }
+
+    /// The value's ids as a materialized posting list, whichever tier stores it. `None` only when
+    /// the value is absent from the store entirely (same proof as `bits`). The widened driver's
+    /// card-space narrowing wants ids to project through `printing_to_card`/`foreign_to_card`,
+    /// not a bitmap over a space it is about to leave.
+    fn ids_of(&self, value: &str) -> Option<Vec<u32>> {
+        if let Some(b) = self.dense.get(value) {
+            let mut out = Vec::new();
+            for (wi, word) in b.iter().enumerate() {
+                let mut w = u64::from(*word);
+                while w != 0 {
+                    out.push((wi * 64) as u32 + w.trailing_zeros());
+                    w &= w - 1;
+                }
+            }
+            return Some(out);
+        }
+        self.sparse.get(value).map(|v| v.iter().map(|x| u32::from(*x)).collect())
     }
 }
 
@@ -2593,37 +2723,57 @@ fn assign_name_ranks(cards: &mut [OracleCard]) {
 /// The shape `assign_name_ranks` uses, lifted out because set code and artist need the same thing:
 /// sort an index permutation by the key, then walk it assigning a rank that advances only when the
 /// key changes, so equal keys tie and the sort secondaries decide between them.
+///
+/// Ranks over the UNION of the canonical printings and the foreign annex, one number line across
+/// both spaces: a rank is a sort key, and a foreign printing ranked in a separate space would
+/// interleave wrongly the moment a widened query sorts the two together. Ranking over the union
+/// cannot reorder the canonical space — dense ranks over a superset preserve every relative order
+/// within the subset — so default queries sort exactly as before.
 fn assign_printing_ranks<K: Ord>(
     printings: &mut [Printing],
+    foreign: &mut [Printing],
     key: impl Fn(&Printing) -> K,
     set: impl Fn(&mut Printing, u32),
 ) {
-    let mut ids: Vec<u32> = (0..printings.len() as u32).collect();
-    ids.sort_unstable_by(|&a, &b| key(&printings[a as usize]).cmp(&key(&printings[b as usize])));
+    let n = printings.len();
+    let mut ids: Vec<u32> = (0..(n + foreign.len()) as u32).collect();
+    {
+        let at = |i: u32| -> &Printing {
+            if (i as usize) < n { &printings[i as usize] } else { &foreign[i as usize - n] }
+        };
+        ids.sort_unstable_by_key(|&a| key(at(a)));
+    }
     let mut rank = 0u32;
     for i in 0..ids.len() {
-        if i > 0 && key(&printings[ids[i - 1] as usize]) != key(&printings[ids[i] as usize]) {
-            rank += 1;
+        if i > 0 {
+            let (a, b) = (ids[i - 1] as usize, ids[i] as usize);
+            let prev = if a < n { &printings[a] } else { &foreign[a - n] };
+            let cur = if b < n { &printings[b] } else { &foreign[b - n] };
+            if key(prev) != key(cur) {
+                rank += 1;
+            }
         }
-        set(&mut printings[ids[i] as usize], rank);
+        let j = ids[i] as usize;
+        let row = if j < n { &mut printings[j] } else { &mut foreign[j - n] };
+        set(row, rank);
     }
 }
 
 /// Rank printings by set code, the sort key for `order=set`.
-fn assign_set_ranks(printings: &mut [Printing]) {
-    assign_printing_ranks(printings, |p| p.card_set_code.as_str().to_owned(), |p, r| p.set_rank = r);
+fn assign_set_ranks(printings: &mut [Printing], foreign: &mut [Printing]) {
+    assign_printing_ranks(printings, foreign, |p| p.card_set_code.as_str().to_owned(), |p, r| p.set_rank = r);
 }
 
 /// Rank printings by artist name, the sort key for `order=artist`.
 ///
 /// Resolved through the vocab rather than sorting on `card_artist_vid`, which is intern order.
 /// A printing with no artist ranks last, matching how the absent side of every other order sorts.
-fn assign_artist_ranks(printings: &mut [Printing], artist_vocab: &[String]) {
+fn assign_artist_ranks(printings: &mut [Printing], foreign: &mut [Printing], artist_vocab: &[String]) {
     let name_of = |p: &Printing| match p.card_artist_vid {
         ARTIST_NONE => None,
         vid => artist_vocab.get(vid as usize).cloned(),
     };
-    assign_printing_ranks(printings, |p| (name_of(p).is_none(), name_of(p)), |p, r| p.artist_rank = r);
+    assign_printing_ranks(printings, foreign, |p| (name_of(p).is_none(), name_of(p)), |p, r| p.artist_rank = r);
 }
 
 /// `inv[perm[i]] == i` — the position of each card within the permutation.
@@ -2879,6 +3029,100 @@ pub(crate) fn find_printing_by_external_id(
     Some(u32::from(index[i].2))
 }
 
+// ─── Printed-name index ──────────────────────────────────────────────────────
+
+/// Printed-name lookup across BOTH printing spaces: one record per distinct
+/// (folded printed full name, lang), each expanding to the printings that carry it.
+///
+/// Records are sorted by (name bytes, lang id), so an exact (name, lang) lookup is a binary
+/// search and one name's languages sit contiguously — a name-only probe is a range, not a scan.
+/// Each record's printings come back best `prefer_score` first (build-order tiebreaks:
+/// illustration_id, then scryfall_id), so "the printing for this printed name" is the first
+/// element, deterministically. The trigram index narrows fuzzy/containment probes to candidate
+/// RECORDS (~247k at corpus scale) instead of candidate printings (~426k).
+///
+/// A VIRTUAL printing id addresses both spaces: `vpid < n_printings` is an index into
+/// `CardData.printings`, anything else is `vpid - n_printings` into `CardData.foreign`. Canonical
+/// rows participate too — default_cards names a non-English printing as canonical for cards that
+/// were never printed in English, and those carry printed names like any annex row.
+#[derive(Archive, Serialize, Deserialize, Default)]
+struct PrintedNameIndex {
+    /// Interned id (CardData.strings) of each record's folded printed full name; records sorted
+    /// by (resolved name bytes, lang id). Ids rather than a second string table: the names are
+    /// already interned, and ~247k duplicated strings would be the largest new section for no
+    /// new information.
+    name_ids: Vec<u32>,
+    /// Parallel: each record's language, as the coll_vocab id `CompatFields.lang_id` uses.
+    lang_ids: Vec<u16>,
+    /// CSR row boundaries into `vpids`, length `name_ids.len() + 1`.
+    offsets: Vec<u32>,
+    /// Virtual printing ids per record, best prefer first (see the struct doc).
+    vpids: Vec<u32>,
+    /// Trigram narrowing over the record names; `domain` = record count.
+    trigrams: SortedTrigramIndex,
+}
+
+/// Build the printed-name records from both spaces. One temporary entry per printing carrying a
+/// folded printed name — annex-proportional, not corpus-proportional: an all-English build
+/// contributes nothing here.
+fn build_printed_name_index(printings: &[Printing], foreign: &[Printing], strings: &[String]) -> PrintedNameIndex {
+    let n_printings = printings.len() as u32;
+    // (name_id, lang_id, vpid) per participating printing, either space.
+    let mut entries: Vec<(u32, u16, u32)> = Vec::new();
+    for (space, base) in [(printings, 0u32), (foreign, n_printings)] {
+        for (i, p) in space.iter().enumerate() {
+            if p.printed_name_folded_id != NONE_STR {
+                entries.push((p.printed_name_folded_id, p.compat.lang_id, base + i as u32));
+            }
+        }
+    }
+    let of = |vpid: u32| -> &Printing {
+        if vpid < n_printings { &printings[vpid as usize] } else { &foreign[(vpid - n_printings) as usize] }
+    };
+    // (name bytes, lang id), then best prefer first within a record — the same
+    // prefer-desc/illustration/scryfall order the row sort gives a card's printings, so "best"
+    // here and the store's own within-card order can never disagree.
+    entries.sort_unstable_by(|a, b| {
+        strings[a.0 as usize]
+            .cmp(&strings[b.0 as usize])
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| {
+                let (pa, pb) = (of(a.2), of(b.2));
+                let (sa, sb) = (pa.prefer_score.unwrap_or(0.0), pb.prefer_score.unwrap_or(0.0));
+                sb.total_cmp(&sa)
+                    .then_with(|| pa.illustration_id.cmp(&pb.illustration_id))
+                    .then_with(|| pa.scryfall_id.cmp(&pb.scryfall_id))
+            })
+    });
+
+    // Same open-a-row-then-terminate CSR shape the card grouping loop uses: push each record's
+    // start when it opens, one terminator at the end.
+    let mut idx = PrintedNameIndex::default();
+    let mut trigram_map: HashMap<[u8; 3], Vec<u32>> = HashMap::new();
+    for (name_id, lang_id, vpid) in entries {
+        let is_new = match (idx.name_ids.last(), idx.lang_ids.last()) {
+            (Some(&n), Some(&l)) => n != name_id || l != lang_id,
+            _ => true,
+        };
+        if is_new {
+            idx.offsets.push(idx.vpids.len() as u32);
+            let record = idx.name_ids.len() as u32;
+            idx.name_ids.push(name_id);
+            idx.lang_ids.push(lang_id);
+            for w in strings[name_id as usize].as_bytes().windows(3) {
+                let list = trigram_map.entry([w[0], w[1], w[2]]).or_default();
+                if list.last() != Some(&record) {
+                    list.push(record);
+                }
+            }
+        }
+        idx.vpids.push(vpid);
+    }
+    idx.offsets.push(idx.vpids.len() as u32);
+    idx.trigrams = finalize_trigram_index(trigram_map, idx.name_ids.len());
+    idx
+}
+
 // ─── Fuzzy name matching ─────────────────────────────────────────────────────
 // A reimplementation of pg_trgm's similarity(), because the SQL path is a FALLBACK and the engine
 // has to answer `?fuzzy=` itself. Matching pg_trgm exactly matters: if the two paths scored
@@ -2956,100 +3200,50 @@ pub(crate) fn trigram_similarity(a: &str, b: &str) -> f32 {
 
 /// What a `?fuzzy=` lookup resolved to.
 pub(crate) enum FuzzyOutcome {
-    /// The card index that won outright.
-    Hit(u32),
-    /// Two distinct names scored too close to choose between; Scryfall answers `ambiguous`.
+    /// The card that won outright, and the printing that carries the matched name: the card's
+    /// preferred printing for an English-name hit, the best printing of the matched printed
+    /// name for a foreign hit — which is how "ego à deriva" materializes the Portuguese
+    /// printing object rather than the English card.
+    Hit { cid: u32, vpid: u32 },
+    /// Two distinct names on two distinct CARDS scored too close to choose between; Scryfall
+    /// answers `ambiguous`. A card's own English and foreign names never read ambiguous, and
+    /// neither do two cards sharing one name (they are one answer, the pre-multilingual rule).
     Ambiguous,
     /// Nothing cleared the floor.
     Miss,
 }
 
-/// The typo-tolerant name match, with #912's thresholds.
-///
-/// A candidate must clear `floor`, and the best must lead the next DISTINCT name by `lead`. The
-/// distinctness matters: several printings of one card would otherwise look like a tie with
-/// themselves and report ambiguous.
-pub(crate) fn fuzzy_name_match(
-    cards: &Archived<Vec<OracleCard>>,
-    strings: &AStrings,
-    needle: &str,
-    floor: f32,
-    lead: f32,
-) -> FuzzyOutcome {
-    let needle = needle.to_lowercase();
-    // The needle's trigrams are LOOP-INVARIANT, and a sorted Vec is the shape this scan wants
-    // rather than the BTreeSet `trigram_similarity` returns. Calling that helper per card rebuilt
-    // this set 31,724 times and heap-allocated a fresh BTreeSet (plus a padded Vec per word) for
-    // every name besides — on a path that is one linear pass over every card in the corpus.
-    // Measured on the real corpus: 25,350 us for one `?fuzzy=` lookup before this.
-    //
-    // `trigram_similarity` itself is deliberately untouched: it is pinned to pg_trgm's definition
-    // by `trigram_similarity_matches_pg_trgm`, and this computes the identical Jaccard ratio by a
-    // different route (two sorted runs merged, instead of two sets intersected).
-    let mut needle_tg: Vec<[u8; 3]> = trigrams(&needle).into_iter().collect();
-    needle_tg.sort_unstable();
-    needle_tg.dedup();
-    if needle_tg.is_empty() {
-        return FuzzyOutcome::Miss;
-    }
-    // Reused across every card, so the scan allocates once rather than per name. Card names are
-    // InlineStr<61>, so a name yields at most ~64 trigrams and this never grows after the first.
-    let mut name_tg: Vec<[u8; 3]> = Vec::with_capacity(64);
-    let mut best: Option<(f32, u32, &str)> = None;
-    let mut runner_up: Option<f32> = None;
-    for (cid, card) in cards.iter().enumerate() {
-        let name = folded_name(card, strings);
-        trigrams_into(name, &mut name_tg);
-        if name_tg.is_empty() {
-            continue;
-        }
-        // Jaccard is bounded by the size ratio: `shared <= min(|a|,|b|)` and
-        // `union >= max(|a|,|b|)`, so `score <= min/max`. When that ceiling is already under the
-        // floor the merge below cannot change the outcome, and skipping it is exact rather than
-        // approximate — no candidate that could clear `floor` is dropped.
-        let (la, lb) = (name_tg.len(), needle_tg.len());
-        if (la.min(lb) as f32) < floor * la.max(lb) as f32 {
-            continue;
-        }
-        // Two sorted runs merged: no set, no allocation, no hashing.
-        let (mut i, mut j, mut shared) = (0usize, 0usize, 0usize);
-        while i < la && j < lb {
-            match name_tg[i].cmp(&needle_tg[j]) {
-                std::cmp::Ordering::Less => i += 1,
-                std::cmp::Ordering::Greater => j += 1,
-                std::cmp::Ordering::Equal => {
-                    shared += 1;
-                    i += 1;
-                    j += 1;
-                }
-            }
-        }
-        let union = la + lb - shared;
-        let score = if union == 0 { 0.0 } else { shared as f32 / union as f32 };
-        if score < floor {
-            continue;
-        }
-        match best {
-            Some((best_score, _, best_name)) if score <= best_score => {
-                // Only a DIFFERENT name can be the runner-up; other printings of the same card are
-                // the same answer, not a competing one.
-                if name != best_name && runner_up.is_none_or(|r| score > r) {
-                    runner_up = Some(score);
+/// The running best and runner-up of the fuzzy scan, under the competition rule above: a
+/// candidate threatens the leader only when BOTH its name and its oracle card differ.
+struct FuzzyRace<'a> {
+    best: Option<(f32, u32, u32, &'a str)>, // (score, cid, vpid, name)
+    runner_up: Option<f32>,
+}
+
+impl<'a> FuzzyRace<'a> {
+    fn offer(&mut self, score: f32, cid: u32, vpid: u32, name: &'a str) {
+        match self.best {
+            Some((best_score, best_cid, _, best_name)) if score <= best_score => {
+                if name != best_name && cid != best_cid && self.runner_up.is_none_or(|r| score > r) {
+                    self.runner_up = Some(score);
                 }
             }
             _ => {
-                if let Some((prev_score, _, prev_name)) = best
-                    && prev_name != name && runner_up.is_none_or(|r| prev_score > r) {
-                        runner_up = Some(prev_score);
+                if let Some((prev_score, prev_cid, _, prev_name)) = self.best
+                    && prev_name != name && prev_cid != cid && self.runner_up.is_none_or(|r| prev_score > r) {
+                        self.runner_up = Some(prev_score);
                     }
-                best = Some((score, cid as u32, name));
+                self.best = Some((score, cid, vpid, name));
             }
         }
     }
-    match (best, runner_up) {
-        (None, _) => FuzzyOutcome::Miss,
-        (Some((score, _, _)), Some(second)) if score - second < lead => FuzzyOutcome::Ambiguous,
-        (Some((_, cid, _)), _) => FuzzyOutcome::Hit(cid),
+
+    fn outcome(self, lead: f32) -> FuzzyOutcome {
+        match (self.best, self.runner_up) {
+            (None, _) => FuzzyOutcome::Miss,
+            (Some((score, _, _, _)), Some(second)) if score - second < lead => FuzzyOutcome::Ambiguous,
+            (Some((_, cid, vpid, _)), _) => FuzzyOutcome::Hit { cid, vpid },
+        }
     }
 }
 
@@ -3165,6 +3359,137 @@ pub(crate) fn names_containing_all_words(
     }
     by_name.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
     by_name.into_iter().take(limit).map(|(_, _, cid, pid)| (cid, pid)).collect()
+}
+
+/// The owning card of a virtual printing id, via the direct arrays of whichever space it is in.
+pub(crate) fn card_of_vpid(data: &Archived<CardData>, vpid: u32) -> u32 {
+    let n = data.printings.len() as u32;
+    if vpid < n {
+        u32::from(data.indexes.printing_to_card[vpid as usize])
+    } else {
+        u32::from(data.indexes.foreign_to_card[(vpid - n) as usize])
+    }
+}
+
+/// pg_trgm's Jaccard over two sorted, deduped trigram runs, or None when it cannot clear
+/// `floor`. The size-ratio ceiling (`shared <= min(|a|,|b|)`, `union >= max`) makes the skip
+/// exact rather than approximate — no candidate that could clear the floor is dropped.
+fn jaccard_cleared(name_tg: &[[u8; 3]], needle_tg: &[[u8; 3]], floor: f32) -> Option<f32> {
+    let (la, lb) = (name_tg.len(), needle_tg.len());
+    if la == 0 || (la.min(lb) as f32) < floor * la.max(lb) as f32 {
+        return None;
+    }
+    // Two sorted runs merged: no set, no allocation, no hashing.
+    let (mut i, mut j, mut shared) = (0usize, 0usize, 0usize);
+    while i < la && j < lb {
+        match name_tg[i].cmp(&needle_tg[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                shared += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    let union = la + lb - shared;
+    let score = if union == 0 { 0.0 } else { shared as f32 / union as f32 };
+    (score >= floor).then_some(score)
+}
+
+/// Printed-name records worth scoring against `needle`: the union of the trigram index's
+/// postings over the needle's raw 3-byte windows — any record sharing NO window with the
+/// needle is skipped without being resolved or scored, which is what keeps the foreign pass
+/// at candidate scale (~a few posting lists) instead of ~247k Jaccard evaluations.
+///
+/// Union, not intersection: fuzzy tolerates typos, so requiring EVERY window (the containment
+/// rule `trigram_candidates` enforces) would drop real matches. A needle under 3 bytes has no
+/// windows and falls back to every record, like the English scan's own short-needle behavior.
+/// KNOWN EDGE: a record whose folded name is under 3 bytes contributes no windows at build and
+/// is unreachable here — printed names that short do not occur in the real corpus, and the
+/// English pass (which scans) is unaffected.
+fn printed_record_candidates(pn: &Archived<PrintedNameIndex>, needle: &str) -> Vec<u32> {
+    let n_records = pn.name_ids.len();
+    // Applicability check, same shape as name_scan_candidates: an index built for a different
+    // record count (a hand-built fixture) must widen to a scan, never silently drop candidates.
+    if u32::from(pn.trigrams.domain) as usize != n_records || needle.len() < 3 {
+        return (0..n_records as u32).collect();
+    }
+    let mut bits = vec![0u64; n_records.div_ceil(64)];
+    let mut seen: Vec<[u8; 3]> = needle.as_bytes().windows(3).map(|w| [w[0], w[1], w[2]]).collect();
+    seen.sort_unstable();
+    seen.dedup();
+    for tri in seen {
+        match lookup_trigram(&pn.trigrams, tri) {
+            Some(TriOperand::Posting(ids)) => {
+                for id in ids {
+                    bits[(id >> 6) as usize] |= 1u64 << (id & 63);
+                }
+            }
+            Some(TriOperand::Plane(words)) => or_bits_into(&mut bits, &words),
+            None => {}
+        }
+    }
+    let mut out = Vec::new();
+    for (wi, word) in bits.iter().enumerate() {
+        let mut w = *word;
+        while w != 0 {
+            out.push((wi as u32) << 6 | w.trailing_zeros());
+            w &= w - 1;
+        }
+    }
+    out
+}
+
+/// The typo-tolerant name match, with Scryfall's thresholds, over BOTH name spaces: every
+/// card's folded English name (a scan, as ever) plus every distinct (folded printed name, lang)
+/// record, trigram-narrowed to the records sharing a window with the needle.
+///
+/// A candidate must clear `floor`, and the best must lead the runner-up by `lead`. The
+/// runner-up rule is FuzzyRace's: only a different name on a different CARD competes — several
+/// printings of one card are the same answer, a card's own foreign and English names are too,
+/// and two cards sharing a name stay one answer.
+pub(crate) fn fuzzy_name_match(data: &Archived<CardData>, needle: &str, floor: f32, lead: f32) -> FuzzyOutcome {
+    let needle = needle.to_lowercase();
+    // The needle's trigrams are LOOP-INVARIANT, and a sorted Vec is the shape this scan wants
+    // rather than the BTreeSet `trigram_similarity` returns. Calling that helper per card rebuilt
+    // this set 31,724 times and heap-allocated a fresh BTreeSet (plus a padded Vec per word) for
+    // every name besides — on a path that is one linear pass over every card in the corpus.
+    // Measured on the real corpus: 25,350 us for one `?fuzzy=` lookup before this.
+    //
+    // `trigram_similarity` itself is deliberately untouched: it is pinned to pg_trgm's definition
+    // by `trigram_similarity_matches_pg_trgm`, and jaccard_cleared computes the identical ratio
+    // by a different route (two sorted runs merged, instead of two sets intersected).
+    let mut needle_tg: Vec<[u8; 3]> = trigrams(&needle).into_iter().collect();
+    needle_tg.sort_unstable();
+    needle_tg.dedup();
+    if needle_tg.is_empty() {
+        return FuzzyOutcome::Miss;
+    }
+    // Reused across every candidate, so the scan allocates once rather than per name.
+    let mut name_tg: Vec<[u8; 3]> = Vec::with_capacity(64);
+    let mut race = FuzzyRace { best: None, runner_up: None };
+    for (cid, card) in data.cards.iter().enumerate() {
+        let name = folded_name(card, &data.strings);
+        trigrams_into(name, &mut name_tg);
+        if let Some(score) = jaccard_cleared(&name_tg, &needle_tg, floor) {
+            // An English-name hit materializes what it always has: the card's preferred printing.
+            race.offer(score, cid as u32, u32::from(data.offsets[cid]), name);
+        }
+    }
+    let pn = &data.indexes.printed_names;
+    for rec in printed_record_candidates(pn, &needle) {
+        let rec = rec as usize;
+        let Some(name) = str_at(&data.strings, u32::from(pn.name_ids[rec])) else { continue };
+        trigrams_into(name, &mut name_tg);
+        if let Some(score) = jaccard_cleared(&name_tg, &needle_tg, floor) {
+            // The record's first vpid is its best-prefer printing — the object a foreign hit
+            // materializes.
+            let vpid = u32::from(pn.vpids[u32::from(pn.offsets[rec]) as usize]);
+            race.offer(score, card_of_vpid(data, vpid), vpid, name);
+        }
+    }
+    race.outcome(lead)
 }
 
 /// Card names MATCHING `needle`, case-insensitively, in the SQL route's own order, up to `limit`.
@@ -3432,6 +3757,54 @@ fn assign_artwork_groups(printings: &mut [Printing], offsets: &[u32]) -> Vec<u16
         counts.push(ills.len() as u16);
     }
     counts
+}
+
+/// Extend each card's artwork grouping over its annex printings: a foreign printing sharing a
+/// canonical illustration takes that illustration's existing group id, and a foreign-only
+/// illustration opens the next id after the card's canonical distinct count.
+///
+/// The canonical arrays derived from `assign_artwork_groups` — `artwork_groups` counts,
+/// `artwork_base`, `artwork_group_col`, `max_artwork_groups` — keep their canonical-only meaning
+/// unchanged: this replays the canonical first-seen walk read-only to reproduce the exact same
+/// ids, then continues over the annex. Annex ids exist for the widened (multilingual) plan;
+/// nothing the default plans read moves.
+fn assign_foreign_artwork_groups(
+    foreign: &mut [Printing],
+    foreign_offsets: &[u32],
+    printings: &[Printing],
+    offsets: &[u32],
+) {
+    debug_assert_eq!(foreign_offsets.len(), offsets.len());
+    let mut ills: Vec<u128> = Vec::new();
+    for (card, w) in foreign_offsets.windows(2).enumerate() {
+        if w[0] == w[1] {
+            continue; // no annex rows for this card, and no reason to replay its canonical walk
+        }
+        ills.clear();
+        for p in &printings[offsets[card] as usize..offsets[card + 1] as usize] {
+            if !ills.contains(&p.illustration_id) {
+                ills.push(p.illustration_id);
+            }
+        }
+        for p in &mut foreign[w[0] as usize..w[1] as usize] {
+            let gid = match ills.iter().position(|&x| x == p.illustration_id) {
+                Some(pos) => pos,
+                None => {
+                    ills.push(p.illustration_id);
+                    ills.len() - 1
+                }
+            };
+            p.artwork_group_id = gid as u16;
+        }
+        // The union bound, same reasoning as the canonical assert above: the widened plan's
+        // grouping walk uses the same fixed-size seen bitmask.
+        assert!(
+            ills.len() <= ARTWORK_GROUP_WORDS * 64,
+            "card has {} distinct artwork groups across canonical+annex, exceeds ARTWORK_GROUP_WORDS bound ({})",
+            ills.len(),
+            ARTWORK_GROUP_WORDS * 64
+        );
+    }
 }
 
 /// Direct `printing_id -> card_id` lookup, one linear pass over `offsets`.
@@ -4622,6 +4995,21 @@ struct CardIndexes {
     // (namespace, external id) -> printing, sorted. Answers /cards/multiverse|mtgo|arena|tcgplayer
     // |cardmarket/:id, none of which the store could address before.
     external_id_index:       Vec<(u8, u64, u32)>,
+    // ── The foreign-printing annex (multilingual store) ──────────────────────
+    // Everything below either lives in ANNEX space (indexes into CardData.foreign) or, for
+    // `langs`, is a new plane over the canonical space that no existing query path reads. The
+    // canonical indexes above are untouched by the annex's existence — that separation is the
+    // whole design: default (English) queries never read these, and `lang:` /
+    // include_multilingual queries pay for the annex only when they ask for it.
+    langs:         HybridTagIndex,            // canonical printing space: postings per language (compat.lang_id)
+    foreign_langs: HybridTagIndex,            // annex space: same shape over CardData.foreign
+    foreign_to_card: Vec<u32>,                // annex space: annex index -> card id (twin of printing_to_card)
+    foreign_by_scryfall_id: Vec<u32>,         // annex space, ordered by scryfall_id (twin of printing_by_scryfall_id)
+    /// Annex twin of `external_id_index`: a foreign printing's own multiverse/mtgo/arena/
+    /// tcgplayer/cardmarket ids (346k multiverse ids at corpus scale live only on foreign rows).
+    foreign_external_ids: Vec<(u8, u64, u32)>,
+    /// (folded printed name, lang) -> virtual printing ids, both spaces — see PrintedNameIndex.
+    printed_names: PrintedNameIndex,
 }
 
 
@@ -4635,6 +5023,17 @@ struct CardData {
     printings: Vec<Printing>,
     // CSR boundary table, length cards.len() + 1.
     offsets:   Vec<u32>,
+    // The foreign-printing ANNEX: non-canonical rows (not in Scryfall's default_cards), grouped
+    // by the same cards in the same prefer-desc order — card i's foreign printings are
+    // foreign[foreign_offsets[i]..foreign_offsets[i + 1]]. A separate range rather than a suffix
+    // inside `printings` so the canonical space — every index above `printings`, every physical
+    // plan, every `0..n_printings` loop — is provably untouched: default queries never read
+    // these two vectors. A VIRTUAL pid addresses both spaces (vpid < printings.len() is
+    // canonical; anything else is `vpid - printings.len()` into the annex).
+    foreign:   Vec<Printing>,
+    // CSR boundary table for `foreign`, length cards.len() + 1 (empty ranges for the many cards
+    // with no foreign printings in the feed).
+    foreign_offsets: Vec<u32>,
     // Hash-consed table for the interned-string fields (see Interner).
     strings: Vec<String>,
     // Vocab table for the collection fields, indexed by their u16 ids
@@ -11506,6 +11905,152 @@ fn acquire_plan_features(
 /// estimate, so if a *materializing* plan wins there — or `PrintingRangeScan` wins
 /// but its fastpath declines — dispatch materializes lazily and re-chooses on exact
 /// features. That deferral is the "don't pay to materialize a plan you won't run".
+/// Resolve a VIRTUAL printing id: `vpid < printings.len()` is a canonical index, anything
+/// else addresses the foreign annex at `vpid - printings.len()`. The single addressing rule
+/// for both spaces — every widened-path emitter and every by-printed-name path goes through
+/// here, so the split can never be interpreted two ways.
+pub(crate) fn printing_at(data: &Archived<CardData>, vpid: u32) -> &APrinting {
+    let n = data.printings.len() as u32;
+    if vpid < n { &data.printings[vpid as usize] } else { &data.foreign[(vpid - n) as usize] }
+}
+
+/// One card's rows across BOTH printing spaces as `(vpid, row)`: the canonical range first,
+/// then the annex range, each already in prefer-desc store order. That order is load-bearing
+/// twice over — ties in every "best row" selection resolve to the earlier row, and
+/// `select_page`'s vpid tiebreak keeps canonical rows ahead of annex rows of the same card.
+fn widened_rows(data: &Archived<CardData>, cid: usize) -> impl Iterator<Item = (u32, &APrinting)> {
+    let n = data.printings.len() as u32;
+    let (cs, ce) = (u32::from(data.offsets[cid]) as usize, u32::from(data.offsets[cid + 1]) as usize);
+    let (fs, fe) =
+        (u32::from(data.foreign_offsets[cid]) as usize, u32::from(data.foreign_offsets[cid + 1]) as usize);
+    data.printings[cs..ce]
+        .iter()
+        .enumerate()
+        .map(move |(i, p)| ((cs + i) as u32, p))
+        .chain(data.foreign[fs..fe].iter().enumerate().map(move |(i, p)| (n + (fs + i) as u32, p)))
+}
+
+/// The multilingual (widened) query driver: both printing spaces, full-filter verify, no plans.
+///
+/// Runs instead of `run_query_routed` when `include_multilingual` is set or the bound filter
+/// carries a `LangMatch` leaf; with neither trigger the routed driver runs bit-for-bit as before
+/// and never reads the annex — that separation is the annex's whole design (see CardData.foreign),
+/// and it is why this driver affords to be simple. The six physical plans, the narrowing
+/// machinery, and the estimator are all built over canonical-space indexes; rather than teach
+/// each of them a second space, this verifies the FULL bound filter per row over both ranges of
+/// each candidate card and feeds the same `sort_key_bits`/`GatherSelect`/`select_page` selection
+/// the gathered plan uses. `set_rank`/`artist_rank` are assigned over the canonical+annex union
+/// at build time, so every sort key is comparable across the two spaces.
+///
+/// Candidate cards: a language pinned as a top-level conjunct (`lang:ja …`) narrows to the cards
+/// owning a printing in that language — both lang indexes projected to card space, ~62k rows'
+/// cards for `lang:ja` at corpus scale instead of the corpus. Anything else (bare
+/// `include_multilingual`, `lang:` under Or/Not, `lang:any`) verifies every card, which is the
+/// full-scan cost class the routed path's GatheredScan already accepts as its floor.
+///
+/// Mode semantics (verified against the live Scryfall API):
+/// - `unique=cards`: one row per card — the best MATCHING row by the request's prefer across
+///   both spaces. `lang:ja` therefore answers with the Japanese printing itself, while
+///   `include_multilingual` rolls up to the English row (every row matches, and foreign rows
+///   lack the English prefer bonus — no prefer change needed).
+/// - `unique=prints`: every matching row, canonical before annex within a card.
+/// - `unique=art`: one row per distinct artwork group with a matching row; annex rows share
+///   canonical group ids where they share the illustration (assign_foreign_artwork_groups).
+fn run_query_widened<'a>(
+    data: &'a Archived<CardData>,
+    params: &QueryParams,
+    filter: &FilterExpr,
+) -> (usize, Vec<(&'a AOracleCard, &'a APrinting)>) {
+    let candidates: Vec<u32> = match filter.required_lang_value() {
+        Some(value) => {
+            let mut cards: Vec<u32> = Vec::new();
+            if let Some(pids) = data.indexes.langs.ids_of(value) {
+                cards.extend(pids.iter().map(|&p| u32::from(data.indexes.printing_to_card[p as usize])));
+            }
+            if let Some(fids) = data.indexes.foreign_langs.ids_of(value) {
+                cards.extend(fids.iter().map(|&f| u32::from(data.indexes.foreign_to_card[f as usize])));
+            }
+            cards.sort_unstable();
+            cards.dedup();
+            cards
+        }
+        None => (0..data.cards.len() as u32).collect(),
+    };
+
+    let residual: [&FilterExpr; 1] = [filter];
+    let matches = |card: &AOracleCard, p: &APrinting| {
+        FilterExpr::residual_matches(card, p, &data.strings, &residual, false)
+    };
+    let mut sel = GatherSelect::new(params.page_offset, params.limit);
+    // Artwork scratch, reused across cards: group ids are bounded by the same
+    // ARTWORK_GROUP_WORDS invariant the canonical walk relies on — asserted over the
+    // canonical+annex UNION at build time (assign_foreign_artwork_groups).
+    let mut group_best: Vec<Option<(u32, f64)>> = vec![None; ARTWORK_GROUP_WORDS * 64];
+    let mut touched: Vec<usize> = Vec::new();
+    for &cid in &candidates {
+        let card = &data.cards[cid as usize];
+        let before = sel.buf().len();
+        match params.mode {
+            Mode::Card => {
+                // Strict > keeps the earlier row on ties, so with the default prefer this picks
+                // exactly what the stored order encodes: the best canonical row, then the best
+                // annex row only when no canonical row matched (or genuinely outscores).
+                let mut best: Option<(u32, f64)> = None;
+                for (vpid, p) in widened_rows(data, cid as usize) {
+                    if !matches(card, p) {
+                        continue;
+                    }
+                    let score = prefer_score(card, p, params.prefer);
+                    if best.is_none_or(|(_, s)| score > s) {
+                        best = Some((vpid, score));
+                    }
+                }
+                if let Some((vpid, _)) = best {
+                    let p = printing_at(data, vpid);
+                    sel.buf().push((sort_key_bits(card, p, params.sort_col, params.descending), cid, vpid));
+                }
+            }
+            Mode::Printing => {
+                for (vpid, p) in widened_rows(data, cid as usize) {
+                    if matches(card, p) {
+                        sel.buf().push((sort_key_bits(card, p, params.sort_col, params.descending), cid, vpid));
+                    }
+                }
+            }
+            Mode::Artwork => {
+                touched.clear();
+                for (vpid, p) in widened_rows(data, cid as usize) {
+                    if !matches(card, p) {
+                        continue;
+                    }
+                    let gid = u16::from(p.artwork_group_id) as usize;
+                    let score = prefer_score(card, p, params.prefer);
+                    match group_best[gid] {
+                        None => {
+                            group_best[gid] = Some((vpid, score));
+                            touched.push(gid);
+                        }
+                        Some((_, s)) if score > s => group_best[gid] = Some((vpid, score)),
+                        Some(_) => {}
+                    }
+                }
+                for &gid in &touched {
+                    if let Some((vpid, _)) = group_best[gid].take() {
+                        let p = printing_at(data, vpid);
+                        sel.buf().push((sort_key_bits(card, p, params.sort_col, params.descending), cid, vpid));
+                    }
+                }
+            }
+        }
+        sel.absorb(before);
+    }
+    let (total, page) = sel.finish(params.page_offset, params.limit);
+    (
+        total,
+        page.into_iter().map(|(cid, vpid)| (&data.cards[cid as usize], printing_at(data, vpid))).collect(),
+    )
+}
+
 fn run_query_routed<'a>(
     ctx: &QueryCtx<'a>,
     params: &QueryParams,
@@ -12604,6 +13149,11 @@ const FIELD_TABLE: &[(&str, FieldExtractor)] = &[
     // value for, and a card that sprouts nulls Scryfall never sent differs from Scryfall on
     // every row.
     ("lang", |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.lang_id)).into_pyobject(py)?.into_any())),
+    // The printing's printed-language text (top-level; the per-face halves ride card_faces
+    // below). None = Scryfall omitted the key, same absence rule as every entry in this block.
+    ("printed_name", |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.printed_name_id)).into_pyobject(py)?.into_any())),
+    ("printed_type_line", |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.printed_type_line_id)).into_pyobject(py)?.into_any())),
+    ("printed_text", |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.printed_text_id)).into_pyobject(py)?.into_any())),
     ("image_status", |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.image_status_id)).into_pyobject(py)?.into_any())),
     ("set_type", |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.set_type_id)).into_pyobject(py)?.into_any())),
     ("security_stamp", |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.security_stamp_id)).into_pyobject(py)?.into_any())),
@@ -12642,7 +13192,7 @@ const FIELD_TABLE: &[(&str, FieldExtractor)] = &[
     ("variation", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_VARIATION).into_pyobject(py)?.to_owned().into_any())),
     // Each face as its own dict, front first, in Scryfall's key names. Empty list for a
     // single-faced card, which is how Scryfall omits card_faces entirely.
-    ("card_faces", |py, c, p, s, v| Ok(faces_to_pylist(py, c, p, s, v)?.into_any())),
+    ("card_faces", |py, c, p, s, _v| Ok(faces_to_pylist(py, c, p, s)?.into_any())),
     // Scryfall's related-card list. Each entry carries its own id/name/type_line because most
     // point outside the corpus -- a `token` component references a card the import filters out.
     ("all_parts", |py, c, _p, s, v| {
@@ -12670,7 +13220,10 @@ const FIELD_TABLE: &[(&str, FieldExtractor)] = &[
     // ── The remaining fields a card object needs ─────────────────────────────────────────────
     ("oracle_id", |py, c, _p, _s, _v| Ok(uuid_from_u128(u128::from(c.oracle_id)).into_pyobject(py)?.into_any())),
     ("flavor_text", |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.flavor_text_id)).into_pyobject(py)?.into_any())),
-    ("artist", |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.card_artist_vid)).into_pyobject(py)?.into_any())),
+    // The ORIGINAL-CASE string, from its own interned id. Resolving `card_artist_vid` here served
+    // garbage twice over: the vid indexes the ARTIST vocab, not the collection vocab this arm was
+    // reading, and even the right vocab only holds the lowercased search form.
+    ("artist", |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.card_artist_name_id)).into_pyobject(py)?.into_any())),
     ("watermark", |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.card_watermark_id)).into_pyobject(py)?.into_any())),
     ("edhrec_rank", |py, c, _p, _s, _v| Ok(c.edhrec_rank.as_ref().copied().map(u32::from).into_pyobject(py)?.into_any())),
     ("price_eur", |py, _c, p, _s, _v| Ok(p.price_eur.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).into_pyobject(py)?.into_any())),
@@ -12758,7 +13311,6 @@ fn faces_to_pylist<'py>(
     card: &AOracleCard,
     printing: &APrinting,
     strings: &AStrings,
-    vocab: &AStrings,
 ) -> PyResult<Bound<'py, PyList>> {
     let mut out: Vec<Bound<PyDict>> = Vec::with_capacity(card.faces.len());
     for (i, face) in card.faces.iter().enumerate() {
@@ -12776,9 +13328,24 @@ fn faces_to_pylist<'py>(
         // Art is per printing, and a printing may carry fewer face-art records than the card has
         // faces; those faces simply have no art rather than borrowing the wrong face's.
         if let Some(art) = printing.faces.get(i) {
-            d.set_item("artist", coll_str_opt(vocab, u16::from(art.card_artist_vid)))?;
+            // Original case from the string table — see FIELD_TABLE's `artist` arm.
+            d.set_item("artist", str_at(strings, u32::from(art.card_artist_name_id)))?;
             d.set_item("illustration_id", uuid_from_u128(u128::from(art.illustration_id)))?;
             d.set_item("flavor_text", str_at(strings, u32::from(art.flavor_text_id)))?;
+        }
+        // The printed-language triple, inserted only when this printing's face carries the key:
+        // absence is exact per face (a prepare-layout Spanish printing localizes the front
+        // face's name and type line and nothing else), so an absent key never becomes a null.
+        if let Some(printed) = printing.printed_faces.get(i) {
+            if let Some(v) = str_at(strings, u32::from(printed.printed_name_id)) {
+                d.set_item("printed_name", v)?;
+            }
+            if let Some(v) = str_at(strings, u32::from(printed.printed_type_line_id)) {
+                d.set_item("printed_type_line", v)?;
+            }
+            if let Some(v) = str_at(strings, u32::from(printed.printed_text_id)) {
+                d.set_item("printed_text", v)?;
+            }
         }
         out.push(d);
     }
@@ -12863,7 +13430,19 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 //                corpus — so 61 bytes a card bought 88 exceptions. The header catches this one on
 //                its own (`size_of::<AOracleCard>` moves), but the constant moves too so the
 //                reason is recorded where the other layout changes are.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026081401;
+//
+// 2026081501: the multilingual foreign-printing annex, plus the original-case artist. `CardData`
+// gains `foreign` + `foreign_offsets` (non-canonical printings, CSR by card, same prefer-desc
+// order); `Printing` gains the printed-language triple, `printed_name_folded_id` and
+// `printed_faces` (`PrintedFaceText` is a new archived type); `CardIndexes` gains
+// `langs`/`foreign_langs`, `foreign_to_card`, `foreign_by_scryfall_id`, `foreign_external_ids`
+// and `printed_names` (`PrintedNameIndex`, new too). `Printing` and `PrintingFace` also gain
+// `card_artist_name_id`: the card-object emitters resolved `card_artist_vid` against the WRONG
+// vocab (the collection table, not the artist table), and even the right table holds only the
+// lowercased search form — production served "fumes" for Franz Vohwinkel. The printed string now
+// has its own interned id. `size_of::<APrinting>` moves, so the header would catch the row change
+// on its own; the constant moves because the CardData/CardIndexes additions would not.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026081501;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -13310,10 +13889,16 @@ impl QueryEngine {
         let mut cards: Vec<OracleCard> = Vec::new();
         let mut printings: Vec<Printing> = Vec::with_capacity(rows.len());
         let mut offsets: Vec<u32> = Vec::new();
+        // The foreign annex: non-canonical rows land here instead of `printings`, CSR'd by the
+        // same cards in the same build order (the sort interleaves the two; the split preserves
+        // each side's relative order). See CardData.foreign.
+        let mut foreign: Vec<Printing> = Vec::new();
+        let mut foreign_offsets: Vec<u32> = Vec::new();
         for mut row in rows {
             let is_new = cards.last().is_none_or(|c| c.oracle_id != row.oracle_id);
             if is_new {
                 offsets.push(printings.len() as u32);
+                foreign_offsets.push(foreign.len() as u32);
                 cards.push(OracleCard {
                     card_name_lower: row.card_name_lower,
                     // Only names that actually fold differently reach the table; the rest carry
@@ -13377,12 +13962,31 @@ impl QueryEngine {
             } else if row.card_legalities != cards.last().map(|c| c.card_legalities).unwrap_or(0) {
                 cards.last_mut().unwrap().legality_divergent = true;
             }
-            printings.push(Printing {
+            // The per-face printed triple, parallel to `faces` — but only materialized when some
+            // face actually carries a printed key, so the all-English common case stores an empty
+            // Vec rather than a run of all-NONE_STR entries. Read before `faces` consumes the rows.
+            let printed_faces: Vec<PrintedFaceText> = if row.card_faces.iter().any(|f| {
+                f.printed_name_id != NONE_STR || f.printed_type_line_id != NONE_STR || f.printed_text_id != NONE_STR
+            }) {
+                row.card_faces
+                    .iter()
+                    .map(|f| PrintedFaceText {
+                        printed_name_id: f.printed_name_id,
+                        printed_type_line_id: f.printed_type_line_id,
+                        printed_text_id: f.printed_text_id,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let is_canonical = row.is_canonical;
+            let printing = Printing {
                 scryfall_id: row.scryfall_id,
                 illustration_id: row.illustration_id,
                 flavor_text_id: row.flavor_text_id,
                 flavor_text_lower_id: row.flavor_text_lower_id,
                 card_artist_vid: row.card_artist_vid,
+                card_artist_name_id: row.card_artist_name_id,
                 card_set_code: row.card_set_code,
                 // Both assigned once the whole printing list exists, by assign_set_ranks /
                 // assign_artist_ranks -- a dense rank cannot be known one row at a time.
@@ -13412,14 +14016,26 @@ impl QueryEngine {
                     .map(|f| PrintingFace {
                         illustration_id: f.illustration_id,
                         card_artist_vid: f.card_artist_vid,
+                        card_artist_name_id: f.card_artist_name_id,
                         flavor_text_id: f.flavor_text_id,
                     })
                     .collect(),
-            
+                printed_name_id: row.printed_name_id,
+                printed_type_line_id: row.printed_type_line_id,
+                printed_text_id: row.printed_text_id,
+                printed_name_folded_id: row.printed_name_folded_id,
+                printed_faces,
+
                 compat: row.compat,
-            });
+            };
+            if is_canonical {
+                printings.push(printing);
+            } else {
+                foreign.push(printing);
+            }
         }
         offsets.push(printings.len() as u32);
+        foreign_offsets.push(foreign.len() as u32);
         assign_name_ranks(&mut cards);
 
         #[cfg(feature = "alloc-counter")]
@@ -13432,9 +14048,11 @@ impl QueryEngine {
         let artist_vocab = artists.strings;
         drop(artists.map);
         // After the vocab is final, before the printings are archived: both ranks are stored on the
-        // printing and must be in place when it is written out.
-        assign_set_ranks(&mut printings);
-        assign_artist_ranks(&mut printings, &artist_vocab);
+        // printing and must be in place when it is written out. Both rank over the canonical+annex
+        // union — see assign_printing_ranks for why that is safe for the canonical sort order and
+        // necessary for the widened one.
+        assign_set_ranks(&mut printings, &mut foreign);
+        assign_artist_ranks(&mut printings, &mut foreign, &artist_vocab);
         let mana_vocab = mana.strings;
         drop(mana.map);
         // String-sorted permutation of the vocab ids; VocabInterner caps the
@@ -13445,6 +14063,9 @@ impl QueryEngine {
         // feed CardIndexes.artwork_groups below. Must run before printings is
         // borrowed by the builders in the CardIndexes literal.
         let artwork_group_counts = assign_artwork_groups(&mut printings, &offsets);
+        // Annex rows join the same per-card group-id space (shared artwork shares the id); the
+        // canonical counts above are NOT extended — see assign_foreign_artwork_groups.
+        assign_foreign_artwork_groups(&mut foreign, &foreign_offsets, &printings, &offsets);
         // Before the counts are moved into the struct below.
         let artwork_base = build_artwork_base_from(&artwork_group_counts);
         // The range indexes and their exact card-count tables come out here rather than inside the
@@ -13481,6 +14102,11 @@ impl QueryEngine {
             &coll_vocab,
             usize::from(artwork_group_counts.iter().copied().max().unwrap_or(0)),
         );
+        // The annex's own indexes plus the two language planes. All annex-proportional: an
+        // all-canonical feed builds empty structures here.
+        let langs_idx = build_lang_index(&printings, &coll_vocab);
+        let foreign_langs_idx = build_lang_index(&foreign, &coll_vocab);
+        let printed_names_idx = build_printed_name_index(&printings, &foreign, &strings);
         let indexes = CardIndexes {
             name_trigram:   build_trigram_index(&cards, |c| folded_name_of(c, &strings)),
             oracle_trigram: build_oracle_text_index(&cards, &strings),
@@ -13552,6 +14178,12 @@ impl QueryEngine {
             printing_by_illustration_id: build_printing_by_illustration_id(&printings),
             oracle_by_oracle_id:     build_oracle_by_oracle_id(&cards),
             external_id_index:       build_external_id_index(&printings),
+            langs: langs_idx,
+            foreign_langs: foreign_langs_idx,
+            foreign_to_card: build_printing_to_card(&foreign_offsets),
+            foreign_by_scryfall_id: build_printing_by_scryfall_id(&foreign),
+            foreign_external_ids: build_external_id_index(&foreign),
+            printed_names: printed_names_idx,
         };
 
         #[cfg(feature = "alloc-counter")]
@@ -13565,6 +14197,8 @@ impl QueryEngine {
             cards,
             printings,
             offsets,
+            foreign,
+            foreign_offsets,
             strings,
             coll_vocab,
             coll_vocab_sorted,
@@ -13643,7 +14277,7 @@ impl QueryEngine {
     }
 
     #[allow(clippy::too_many_arguments)] // the PyO3 keyword surface; `run_query` behind it takes 9
-    #[pyo3(signature = (*, filters, unique="card", prefer="default", orderby="edhrec", direction="asc", limit=100, offset=0, fields=None))]
+    #[pyo3(signature = (*, filters, unique="card", prefer="default", orderby="edhrec", direction="asc", limit=100, offset=0, fields=None, include_multilingual=false))]
     fn query<'py>(
         &self,
         py: Python<'py>,
@@ -13655,6 +14289,7 @@ impl QueryEngine {
         limit: usize,
         offset: usize,
         fields: Option<Vec<String>>,
+        include_multilingual: bool,
     ) -> PyResult<Bound<'py, PyTuple>> {
         let resolved_fields = resolve_fields(fields)?;
         // get_mmap() remaps automatically if the on-disk inode has changed since
@@ -13697,8 +14332,16 @@ impl QueryEngine {
         let ctx = QueryCtx::from(data);
         // `run_query`'s string→enum adaptation, done here so the filter's sort-column bound can ride on
         // the params: `from_strs` is still the single interpretation of the four strings.
-        let (total, page) =
-            run_query_routed(&ctx, &params.with_sort_bound(sort_bound), &mut filter_expr, Some(&unsplit), plane_expr.as_ref());
+        //
+        // Scryfall's `include_multilingual`, or a `lang:` leaf anywhere in the bound filter
+        // (detected on the compiled tree, so the flag and the operator cannot widen differently),
+        // sends the query to the widened multilingual driver over both printing spaces. With
+        // neither trigger the routed driver runs bit-for-bit as before and never reads the annex.
+        let (total, page) = if include_multilingual || unsplit.mentions_lang() {
+            run_query_widened(data, &params.with_sort_bound(sort_bound), &unsplit)
+        } else {
+            run_query_routed(&ctx, &params.with_sort_bound(sort_bound), &mut filter_expr, Some(&unsplit), plane_expr.as_ref())
+        };
 
         let matches: Vec<Bound<PyDict>> = page
             .iter()
@@ -13958,17 +14601,16 @@ impl QueryEngine {
         let mmap = self.get_mmap()?;
         // Safety: see the access_unchecked justification in query().
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
-        match fuzzy_name_match(&data.cards, &data.strings, name, floor, lead) {
+        match fuzzy_name_match(data, name, floor, lead) {
             FuzzyOutcome::Miss => Ok(("miss".to_string(), None)),
             FuzzyOutcome::Ambiguous => Ok(("ambiguous".to_string(), None)),
-            FuzzyOutcome::Hit(cid) => {
-                let cid = cid as usize;
-                // The card's default-preferred printing, the same one every other by-name path shows.
-                let preferred = u32::from(data.offsets[cid]) as usize;
+            FuzzyOutcome::Hit { cid, vpid } => {
+                // The card's preferred printing for an English hit; the matched printed name's
+                // best printing for a foreign one — the vpid encodes which.
                 let dict = card_to_pydict(
                     py,
-                    &data.cards[cid],
-                    &data.printings[preferred],
+                    &data.cards[cid as usize],
+                    printing_at(data, vpid),
                     &data.strings,
                     &data.coll_vocab,
                     &resolved_fields,
