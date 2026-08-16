@@ -275,11 +275,11 @@ class TestRequestDispatch(TestBaseAPIResourceTest):
         # should 404 like any other unmatched path.
         self._assert_scryfall_not_found(self._dispatch("/get_pid/extra"))
 
-    def test_positional_route_with_too_many_segments_raises_not_found(self) -> None:
+    def test_positional_route_with_too_many_segments_is_not_found(self) -> None:
         # card() accepts exactly 2 positional args (set_code, collector_number); a 3rd segment
-        # should 404 rather than reach the handler.
-        with pytest.raises(falcon.HTTPNotFound):
-            self._dispatch("/card/eoc/104/extra")
+        # should 404 rather than reach the handler. The path identifies nothing, so it gets the
+        # Scryfall-shaped 404 every unresolved path now gets, whatever surface it looks like.
+        self._assert_scryfall_not_found(self._dispatch("/card/eoc/104/extra"))
 
     @pytest.mark.parametrize(argnames=["path"], argvalues=[(url,) for url in REAL_ASSET_URLS])
     def test_static_asset_is_registered_at_its_real_url(self, path: str) -> None:
@@ -307,8 +307,7 @@ class TestRequestDispatch(TestBaseAPIResourceTest):
     )
     def test_underscore_spelling_is_no_longer_a_route(self, path: str) -> None:
         # Artifacts of deriving route keys from Python identifiers. Nothing ever linked to them.
-        with pytest.raises(falcon.HTTPNotFound):
-            self._dispatch(path)
+        self._assert_scryfall_not_found(self._dispatch(path))
 
     def test_one_handler_two_paths_shares_a_single_entry(self) -> None:
         # The favicon is requested at the root by browser convention and under /static/ by the
@@ -344,8 +343,7 @@ class TestRequestDispatch(TestBaseAPIResourceTest):
         # While it was positional the segment was absorbed and then silently overwritten by the
         # injected response, so a path identifying nothing still returned 200.
         assert self.api_resource.routes["get_catalog"].positional_capacity == 0
-        with pytest.raises(falcon.HTTPNotFound):
-            self._dispatch("/get_catalog/foo")
+        self._assert_scryfall_not_found(self._dispatch("/get_catalog/foo"))
 
     def test_unconvertible_enum_query_value_is_rejected(self) -> None:
         # orderby is annotated CardOrdering. The raw string used to reach the handler unconverted;

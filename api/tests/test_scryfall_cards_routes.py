@@ -524,8 +524,21 @@ class TestCollection:
         assert resp.status == falcon.HTTP_422
 
     def test_get_is_not_allowed(self, compat_corpus: APIResource):
-        with pytest.raises(falcon.HTTPMethodNotAllowed):
-            dispatch(compat_corpus, "/cards/collection")
+        """Still 405, but answered rather than raised — the body follows the Scryfall surface now.
+
+        The status is kept where api.scryfall.com answers 404: it is the correct HTTP answer and
+        strictly more informative. Only the shape changed, from falcon's `{title, description}` to
+        the error object a client pointed at this service actually parses.
+        """
+        resp = dispatch(compat_corpus, "/cards/collection")
+        assert resp.status == falcon.HTTP_405
+        assert resp.headers["allow"] == "POST"
+        assert payload(resp) == {
+            "object": "error",
+            "code": "method_not_allowed",
+            "status": 405,
+            "details": "Allowed methods: POST",
+        }
 
 
 class TestRulings:
