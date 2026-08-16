@@ -20,7 +20,7 @@ import orjson
 import pytest
 from cachebox import LRUCache
 
-from api.enums import SortDirection, resolve_direction
+from api.enums import CardOrdering, SortDirection, UniqueOn, resolve_direction
 from api.parsing import parse_scryfall_query
 from api.scryfall_compat import routes as routes_module
 from api.scryfall_compat.objects import PAGE_SIZE
@@ -495,6 +495,54 @@ class TestSearch:
         monkeypatch.setattr("api.scryfall_compat.routes.PAGE_SIZE", 1)
         body = payload(dispatch(compat_corpus, "/cards/search", "q=t%3Acreature&include_extras=false"))
         assert "include_extras=false" in body["next_page"]
+
+    # ── in-query directives ──────────────────────────────────────────────────
+
+    def test_a_directive_reaches_the_search(self, compat_corpus: APIResource, monkeypatch):
+        """#893's fold runs inside `_search`, so this surface gets it by calling the same method."""
+        seen = {}
+        original = compat_corpus._search
+        monkeypatch.setattr(compat_corpus, "_search", lambda **kw: (seen.update(kw), original(**kw))[1])
+        dispatch(compat_corpus, "/cards/search", urlencode({"q": "t:creature unique:prints order:cmc dir:desc"}))
+        assert seen["unique"] is UniqueOn.PRINTING
+        assert seen["orderby"] is CardOrdering.CMC
+        assert seen["direction"] is SortDirection.DESC
+
+    def test_a_directive_beats_the_query_parameter(self, compat_corpus: APIResource, monkeypatch):
+        """The directive wins, which is measured rather than assumed.
+
+        api.scryfall.com 2026-08-16, in both directions: `unique:prints&unique=cards` answers 387
+        and `unique:cards&unique=prints` answers 285.
+        """
+        seen = {}
+        original = compat_corpus._search
+        monkeypatch.setattr(compat_corpus, "_search", lambda **kw: (seen.update(kw), original(**kw))[1])
+        dispatch(compat_corpus, "/cards/search", urlencode({"q": "t:creature unique:prints", "unique": "cards"}))
+        assert seen["unique"] is UniqueOn.PRINTING
+
+    def test_next_page_echoes_the_values_the_directives_decided(self, compat_corpus: APIResource, monkeypatch):
+        """`q` echoes VERBATIM, directive and all, so the parameters beside it must agree with it.
+
+        A link carrying `order=name` next to a `q` saying `order:cmc` pages a different result set
+        on page 2 than the one page 1 came from.
+        """
+        monkeypatch.setattr("api.scryfall_compat.routes.PAGE_SIZE", 1)
+        body = payload(
+            dispatch(
+                compat_corpus,
+                "/cards/search",
+                urlencode({"q": "t:creature order:cmc unique:prints dir:desc"}),
+            ),
+        )
+        assert body["has_more"] is True
+        assert "order=cmc" in body["next_page"]
+        assert "unique=prints" in body["next_page"]
+        assert "dir=desc" in body["next_page"]
+
+    def test_a_directive_warning_is_reported_once(self, compat_corpus: APIResource):
+        """The route folds for the echo and `_search` folds for the search; only one may speak."""
+        body = payload(dispatch(compat_corpus, "/cards/search", urlencode({"q": "t:creature unique:bogus"})))
+        assert body["warnings"] == ['Unknown unique mode "bogus" was ignored']
 
     def test_page_size_matches_scryfall(self):
         assert PAGE_SIZE == 175

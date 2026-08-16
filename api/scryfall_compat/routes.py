@@ -184,6 +184,49 @@ _VALUE_EXTRAS_TRIGGERS = {"card_types": "token", "card_subtypes": "token", "card
 _SET_CODE_ATTRIBUTE = "card_set_code"
 
 
+def _fold_directives_for_echo(
+    parsed: Query,
+    *,
+    unique: UniqueOn,
+    orderby: CardOrdering,
+    direction: SortDirection,
+    prefer: PreferOrder,
+) -> tuple[UniqueOn, CardOrdering, SortDirection, PreferOrder]:
+    """The effective result shape after the query's own directives, warnings discarded.
+
+    THE SAME FOLD `_search` RUNS, reached through the same helper rather than reimplemented --
+    a second copy of Scryfall's precedence rules is exactly the thing that drifts. It is run
+    twice per request (here for the `next_page` echo, and again inside `_search` for the search
+    itself) and that is safe because folding is idempotent: a directive SETS a value, so folding
+    it over a value it already set changes nothing.
+
+    Warnings are dropped here and taken from the search result instead, so the response reports
+    each one once.
+
+    Args:
+        parsed: The parsed query, read for its directives.
+        unique: The unique mode from the query parameters.
+        orderby: The ordering from the query parameters.
+        direction: The sort direction from the query parameters.
+        prefer: The prefer order from the query parameters.
+
+    Returns:
+        The effective (unique, orderby, direction, prefer).
+    """
+    # Imported at call time, not at module scope: this module is a MIXIN on `APIResource` and is
+    # imported by `api_resource` on the way up, so a top-level import here would be a cycle.
+    from api.api_resource import _fold_directives  # noqa: PLC0415
+
+    unique, orderby, direction, prefer, _warnings = _fold_directives(
+        parsed.directives,
+        unique=unique,
+        orderby=orderby,
+        direction=direction,
+        prefer=prefer,
+    )
+    return unique, orderby, direction, prefer
+
+
 def _extras_triggers(node: object) -> _ExtrasTriggers:
     """Read Scryfall's `include_extras` auto-enable off a parsed query.
 
@@ -1103,6 +1146,11 @@ class ScryfallCardsRoutes:
         `include_variations` is accepted and has no effect: the corpus holds every variation it
         has imported, unconditionally.
 
+        In-query directives (`unique:`, `order:`/`sort:`, `dir:`/`direction:`, `prefer:`) reach
+        the search through `_search`'s own fold and override the query parameter of the same
+        meaning, and `next_page` echoes the values that were SERVED rather than the ones that were
+        sent -- so a client following the link verbatim pages the same result set.
+
         Args:
             falcon_response: The Falcon response to write to.
             request: The Falcon request, read for the scheme `next_page` should use.
@@ -1184,6 +1232,26 @@ class ScryfallCardsRoutes:
                 pretty=is_pretty,
             )
 
+        # THE VALUES THAT WILL BE SERVED. `_search` folds the same directives over the same
+        # parameters with the same helper -- deliberately not a second implementation -- so
+        # re-folding here is idempotent and exists only because the ECHO needs the answer before
+        # the search runs. The fold's warnings are dropped on this side and taken from the search
+        # result below, so they are reported exactly once.
+        #
+        # PRECEDENCE IS MEASURED (api.scryfall.com, 2026-08-16): the DIRECTIVE WINS over the query
+        # parameter, in both directions and for every directive -- `q=… unique:prints&unique=cards`
+        # answers 387 (prints) and `q=… unique:cards&unique=prints` answers 285 (cards);
+        # `q=… order:cmc&order=name` sorts by cmc; `q=… dir:desc&dir=asc` sorts descending. That is
+        # `_fold_directives`' documented rule, which is why this is the shared implementation
+        # rather than a second one that could drift from `/search`.
+        unique_on, orderby, direction, prefer = _fold_directives_for_echo(
+            parsed,
+            unique=unique_on,
+            orderby=orderby,
+            direction=direction,
+            prefer=PreferOrder.DEFAULT,
+        )
+
         # SCRYFALL FORCES `include_extras`, it does not merely default it: a parse tree carrying a
         # trigger term overrides an explicit `include_extras=false`, in the rows AND in the echo.
         # See `_extras_triggers` for the rule and the measurements behind it.
@@ -1205,7 +1273,7 @@ class ScryfallCardsRoutes:
                 limit=PAGE_SIZE,
                 offset=(page_number - 1) * PAGE_SIZE,
                 unique=unique_on,
-                prefer=PreferOrder.DEFAULT,
+                prefer=prefer,
                 # RESOLVED, never left to a default downstream: false IS Scryfall's default and the
                 # auto-enable above is what can override it. Fixing both on the way in keeps
                 # "absent" from meaning anything.
@@ -1235,7 +1303,9 @@ class ScryfallCardsRoutes:
             next_page = objects.build_page_url(
                 _self_base_url(request, request_host, "/cards/search"),
                 {
-                    "dir": dir,
+                    # RESOLVED like the rest: `q=… dir:desc` with no `dir` parameter must echo
+                    # `dir=desc`, or page 2 sorts the other way from the page that linked to it.
+                    "dir": str(direction),
                     "format": format,
                     # THE RESOLVED VALUE, not the parameter as sent -- the same rule `order` and
                     # `unique` follow below. `q=e:lea&include_extras=false` echoes
@@ -1246,8 +1316,8 @@ class ScryfallCardsRoutes:
                     "include_extras": str(effective_extras).lower(),
                     "include_multilingual": str(_as_bool(include_multilingual)).lower(),
                     "include_variations": str(_as_bool(include_variations)).lower(),
-                    # RESOLVED, not raw -- see _UNIQUE_ECHO. This is also what makes the link
-                    # correct once the in-query directives (#893) fold here: `q` echoes verbatim,
+                    # RESOLVED, not raw -- see _UNIQUE_ECHO. This is what keeps the link correct
+                    # now that the in-query directives (#893) fold here: `q` echoes verbatim,
                     # directive included, so a `q` saying `order:cmc` next to an `order=name` in
                     # the same URL would page a different result set on page 2 than on page 1.
                     "order": _echo_order(orderby, order),
