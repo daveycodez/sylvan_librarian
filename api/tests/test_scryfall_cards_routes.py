@@ -280,6 +280,29 @@ class TestSearch:
     def test_next_page_is_absent_when_the_page_is_the_last(self, compat_corpus: APIResource):
         assert "next_page" not in payload(dispatch(compat_corpus, "/cards/search", "q=%21%22Compat+Bolt%22"))
 
+    def test_next_page_lowercases_q_and_collapses_its_whitespace(self, compat_corpus: APIResource, monkeypatch):
+        """Scryfall's own echo, measured 2026-08-16.
+
+        `E:KHM T:Creature OR T:Land` comes back as `e:khm t:creature or t:land`,
+        `a:"Rebecca Guay"` as `a:"rebecca guay"` (inside the quotes), `o:/^Whenever/` as
+        `o:/^whenever/`, `name:Éowyn` as `name:éowyn`, and edge or doubled whitespace is trimmed
+        and collapsed. All are the same query to this parser, so the echo changes only spelling.
+        """
+        monkeypatch.setattr("api.scryfall_compat.routes.PAGE_SIZE", 1)
+        body = payload(dispatch(compat_corpus, "/cards/search", "q=++T%3ACreature++OR+T%3ALand+"))
+        assert body["has_more"] is True
+        assert "q=t%3Acreature+or+t%3Aland&" in body["next_page"]
+
+    def test_an_order_scryfall_serves_and_this_server_cannot_keeps_its_spelling(self, compat_corpus: APIResource, monkeypatch):
+        """`penny` and `review` fall back to `name` here and Scryfall sorts by them.
+
+        Scryfall's echo therefore says `order=penny`. Echoing `name` would round-trip fine (page 2
+        falls back the same way) but differ from Scryfall for nothing.
+        """
+        monkeypatch.setattr("api.scryfall_compat.routes.PAGE_SIZE", 1)
+        body = payload(dispatch(compat_corpus, "/cards/search", "q=t%3Acreature&order=penny"))
+        assert "order=penny" in body["next_page"]
+
     def test_next_page_echoes_the_resolved_order_and_unique(self, compat_corpus: APIResource, monkeypatch):
         """Scryfall echoes what it DECIDED, not what it was sent.
 

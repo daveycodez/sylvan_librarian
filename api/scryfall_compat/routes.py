@@ -112,6 +112,35 @@ _UNIQUE_MAP: dict[str, UniqueOn] = {
 # shown. Echoing the raw parameter hands it a link whose ordering the server already declined.
 _UNIQUE_ECHO: dict[UniqueOn, str] = {member: spelling for spelling, member in _UNIQUE_MAP.items()}
 
+
+def _echo_query(query: str) -> str:
+    """`q` as Scryfall echoes it: lowercased, whitespace runs collapsed, ends trimmed.
+
+    Measured on api.scryfall.com 2026-08-16 -- `E:KHM T:Creature OR T:Land` comes back as
+    `e:khm t:creature or t:land`, `a:"Rebecca Guay"` as `a:"rebecca guay"` (inside the quotes
+    too), `o:/^Whenever/` as `o:/^whenever/`, `name:Éowyn` as `name:éowyn` (so not ASCII-only),
+    and a query with doubled or edge whitespace comes back collapsed and trimmed.
+
+    Every one of those is the SAME query to this parser as well: set codes and names are folded,
+    and the query regexes are case-insensitive. The echo changes the spelling and never the page.
+    """
+    return " ".join(query.lower().split())
+
+
+def _echo_order(orderby: CardOrdering, raw_order: str) -> str:
+    """`order` as Scryfall echoes it: the ordering that was SERVED.
+
+    One exception, and it is measured: an ordering Scryfall recognizes and this server does not
+    (`penny`, `review`) comes back spelled as the client sent it, because Scryfall did sort by it.
+    Echoing `name` there still round-trips here -- page 2 falls back exactly as page 1 did -- but
+    it differs from Scryfall for no gain.
+    """
+    lowered = raw_order.lower()
+    if lowered in _SCRYFALL_ONLY_ORDERS and lowered not in _ORDER_MAP:
+        return lowered
+    return str(orderby)
+
+
 # Scryfall's own wording, down to the typographic apostrophe, so a client that string-matches on
 # `details` behaves the same.
 _NO_MATCH_DETAILS = (
@@ -940,8 +969,8 @@ class ScryfallCardsRoutes:
                     # correct once the in-query directives (#893) fold here: `q` echoes verbatim,
                     # directive included, so a `q` saying `order:cmc` next to an `order=name` in
                     # the same URL would page a different result set on page 2 than on page 1.
-                    "order": str(orderby),
-                    "q": q,
+                    "order": _echo_order(orderby, order),
+                    "q": _echo_query(q),
                     "unique": _UNIQUE_ECHO[unique_on],
                 },
                 page_number + 1,
