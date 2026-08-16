@@ -291,6 +291,44 @@ def _merge_processed_faces(faces: list[dict[str, Any]]) -> dict[str, Any]:
     return merged
 
 
+# The `layout` values whose printings Scryfall hides from a default `/cards/search`, plus the two
+# non-layout signals that do the same job. Scryfall's own `is:extra` is 6,054 cards; this reaches
+# 5,873 distinct English cards, within 3% of it — and, unlike a playability filter, it is a
+# statement about the PRINTING, which is what the hiding actually tracks.
+_EXTRA_LAYOUTS = frozenset(
+    {"token", "double_faced_token", "emblem", "planar", "scheme", "vanguard", "art_series", "front_card", "host", "augment"}
+)
+
+
+def _is_extra(card: dict[str, Any]) -> bool:
+    """Whether Scryfall hides this printing from a default `/cards/search` — the `is:extra` class.
+
+    See `preprocess_card` for the per-class probe that decided each half of this.
+
+    Args:
+        card: The bulk card object.
+
+    Returns:
+        True when the printing should carry `is:extra`.
+    """
+    if card.get("layout") in _EXTRA_LAYOUTS:
+        return True
+    if card.get("set_type") == "memorabilia":
+        return True
+    # A "Card"/"Token" TYPE LINE, for the printings whose layout does not already say so: the
+    # checklist and substitute-card family ships as layout `normal` in some sets.
+    type_line = card.get("type_line")
+    if type_line:
+        card_types, _ = parse_type_line(type_line)
+        if any(t in {"Card", "Token"} for t in card_types):
+            return True
+    # A playtest promo, EXCEPT where the printing is otherwise playable: sld/SCTLR Counterspell
+    # carries `playtest`, is legal in modern, and is returned by a bare
+    # `!"Counterspell"&unique=prints` — so the flag alone hides nothing.
+    never_legal = not set(card["legalities"].values()) & {"legal", "restricted"}
+    return "playtest" in card.get("promo_types", []) and never_legal
+
+
 def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0915,C901,PLR0912
     """Preprocess a card to remove invalid cards and add necessary fields.
 
@@ -299,39 +337,42 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
     `_merge_processed_faces`. Single-faced cards return a list with one dictionary.
     Returns an empty list for invalid/filtered cards.
     """
-    if not set(card["legalities"].values()) & {"legal", "restricted"}:
-        return []
-    if "playtest" in card.get("promo_types", []):
-        return []
-    # NOT FILTERED: a printing whose `games` omits "paper" (an Arena or MTGO exclusive) is
-    # imported. Scryfall serves every one of them from a bare `/cards/search` with default
-    # parameters — measured against api.scryfall.com 2026-08-16:
+    # NOTHING IS FILTERED OUT HERE ANY MORE, and the seven clauses that used to be are the
+    # `is:extra` predicate `_is_extra` answers instead.
     #
-    #   q=!"A-Tyvar Kell"                -> 200, khm/A-198        q=is:rebalanced -> 216 cards
-    #   q=!"Key to the Archive"          -> 200, ymid/59          game:arena -game:paper -> 3,550
-    #   e:khm&unique=prints              -> 425 (407 without)     game:mtgo  -game:paper -> 5,562
-    #   e:khm&include_multilingual=true  -> 4,035 (4,017 without)
+    # Every class this function refused is SERVED by api.scryfall.com, and four of them are hidden
+    # from a default `/cards/search` behind `include_extras=false` — a QUERY-TIME gate. Refusing
+    # the row cannot reproduce a query-time gate in either direction: `/cards/named?exact=`
+    # answered 200 for every single one of them, and `include_extras=true` had nothing to include.
+    # Probed one class at a time on 2026-08-16 (`q=!"<name>"` bare, then with the flag):
     #
-    # so refusing the row is the one filter here that makes an ORDINARY query disagree with
-    # Scryfall. The others stand in for Scryfall's own query-time `include_extras=false`, which
-    # returns those cards the moment the query asks; nothing analogous hides a digital printing.
-    # 9,119 printings on the 2026-08-16 all_cards bulk (517,746 -> 526,865, +1.76%).
-    if card.get("set_type") == "funny":
-        return []
-
-    # Filter out unplayable cards: Cards and Tokens
-    type_line = card.get("type_line")
-    if type_line:
-        card_types, card_subtypes = parse_type_line(type_line)
-        if "Card" in card_types or "Token" in card_types:
-            return []
-
-    # Filter out "X // X" cards (same name on both faces, e.g. "Name // Name")
-    card_name = card.get("name", "")
-    if "//" in card_name:
-        left_name, _, right_name = card_name.partition("//")
-        if left_name.strip() == right_name.strip():
-            return []
+    #   never-legal    !"Hold the Perimeter" (cn2/6)      200 bare       ORDINARY
+    #   funny          !"Bamboozling Beeble" (unf/37)     200 bare       ORDINARY
+    #                  !"Goblin Bowling Team" (ugl/44)    200 bare       ORDINARY (silver, never-legal)
+    #   "X // X"       !"Magmatic Hellkite // …" (tdm)    200 bare       ORDINARY (reversible_card)
+    #   playtest+legal sld/SCTLR Counterspell             in bare prints ORDINARY
+    #   memorabilia    !"Siren's Call"&unique=prints      8 bare, 12 with extras  EXTRA
+    #   type "Card"    !"The Monarch" (tmkc/31)           404 bare, 200 with      EXTRA
+    #   type "Token"   !"Goblin Army" (thob/4)            404 bare, 200 with      EXTRA
+    #   planar         !"Truga Jungle" (opc2/38)          404 bare, 200 with      EXTRA
+    #   playtest       !"Subgoyf" (mb2/536)               404 bare, 200 with      EXTRA
+    #
+    # The `games`-without-paper clause went the same way one commit earlier, for the stronger
+    # reason that nothing hides those at all: `q=!"A-Tyvar Kell"` answers khm/A-198 bare.
+    #
+    # +13,619 printings on the 2026-08-16 all_cards bulk (526,865 -> 540,484, +2.58%) and 2,986
+    # new oracle cards. It also empties the annex-only drop the engine carries: the three ja-4ED
+    # ante printings whose `oldschool: legal` left their oracle group with no canonical row now
+    # arrive as ordinary cards.
+    #
+    # DIVERGENCE FROM UPSTREAM'S IMPORT POLICY, ON PURPOSE — see the PR description. Upstream's
+    # corpus is the one its own SQL serves; this port's has to answer as Scryfall does.
+    # `is:extra` is a COMPUTED tag: no Scryfall field says "this printing is an extra", so it
+    # cannot ride BOOLEAN_IS_TAGS' one-shot sync from raw_card_blob (api_resource.py) the way
+    # `reserved` and `gamechanger` do. It is set here, on the row, and the merge below preserves
+    # it through the NOT NULL default.
+    if _is_extra(card):
+        card["card_is_tags"] = {**card.get("card_is_tags", {}), "extra": True}
 
     if "raw_card_blob" in card:
         # Already processed, don't need to re-process

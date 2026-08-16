@@ -112,6 +112,34 @@ def create_test_card(  # noqa: PLR0913, PLR0917
 class TestCardProcessing:
     """Test card processing functions."""
 
+    def test_preprocess_card_tags_extras_instead_of_dropping_them(self) -> None:
+        """Nothing is filtered out any more; the classes that were become `is:extra`.
+
+        api.scryfall.com serves every class this function used to refuse, and hides four of them
+        from a default `/cards/search` behind `include_extras=false` — a query-time gate an absent
+        row cannot reproduce in either direction (`/cards/named?exact=` answers all of them, and
+        `include_extras=true` has nothing to include). Probed one class at a time, 2026-08-16.
+        """
+
+        def tags(**overrides: object) -> dict[str, object]:
+            rows = preprocess_card(create_test_card(**overrides))
+            assert len(rows) == 1, "every row is imported now"
+            return rows[0].get("card_is_tags", {})
+
+        # ORDINARY — served by a bare `/cards/search`.
+        assert "extra" not in tags(legalities={"vintage": "not_legal"}), "!\"Hold the Perimeter\" is 200"
+        assert "extra" not in tags(set_type="funny"), "e:ust answers 249 with and without the flag"
+        assert "extra" not in tags(layout="reversible_card", name="Echo // Echo"), "tdm/380 is 200 bare"
+        assert "extra" not in tags(promo_types=["sldbonus", "playtest"]), "sld/SCTLR is legal and served"
+
+        # EXTRA — 404 bare, 200 with include_extras=true.
+        assert "extra" in tags(set_type="memorabilia"), "ced/78 appears only with extras"
+        assert "extra" in tags(type_line="Card"), "tmkc/31"
+        assert "extra" in tags(type_line="Token Creature — Goblin"), "thob/4"
+        assert "extra" in tags(layout="planar"), "opc2/38"
+        assert "extra" in tags(layout="art_series", name="Echo // Echo"), "unlike its reversible cousin"
+        assert "extra" in tags(promo_types=["playtest"], legalities={"vintage": "not_legal"}), "mb2/536"
+
     def test_preprocess_card_keeps_non_paper_cards(self) -> None:
         """A digital-only printing is IMPORTED: Scryfall serves it with default parameters.
 
