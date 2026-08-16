@@ -280,6 +280,22 @@ class TestSearch:
     def test_next_page_is_absent_when_the_page_is_the_last(self, compat_corpus: APIResource):
         assert "next_page" not in payload(dispatch(compat_corpus, "/cards/search", "q=%21%22Compat+Bolt%22"))
 
+    def test_next_page_echoes_the_resolved_order_and_unique(self, compat_corpus: APIResource, monkeypatch):
+        """Scryfall echoes what it DECIDED, not what it was sent.
+
+        Measured against api.scryfall.com 2026-08-16: `?order=cubecobra` -- an ordering it does not
+        recognize -- comes back as `order=name` in `next_page`. A client follows that URL verbatim,
+        so echoing the raw parameter hands it a link whose ordering the server already declined,
+        and page 2 then pages a different result set than page 1.
+
+        Page size shrunk to 1 so a second page exists over the session's corpus.
+        """
+        monkeypatch.setattr("api.scryfall_compat.routes.PAGE_SIZE", 1)
+        body = payload(dispatch(compat_corpus, "/cards/search", "q=t%3Acreature&order=nosuchorder&unique=nosuchmode"))
+        assert body["has_more"] is True
+        assert "order=name" in body["next_page"]
+        assert "unique=cards" in body["next_page"]
+
     def test_page_size_matches_scryfall(self):
         assert PAGE_SIZE == 175
 

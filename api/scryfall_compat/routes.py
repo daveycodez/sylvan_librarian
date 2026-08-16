@@ -106,6 +106,12 @@ _UNIQUE_MAP: dict[str, UniqueOn] = {
     "prints": UniqueOn.PRINTING,
 }
 
+# The same mapping backwards, for the `next_page` echo. Scryfall echoes the RESOLVED mode and
+# ordering rather than the raw parameters -- `?order=cubecobra` comes back as `order=name`,
+# measured 2026-08-16 -- so a client following the link verbatim pages the SAME result set it was
+# shown. Echoing the raw parameter hands it a link whose ordering the server already declined.
+_UNIQUE_ECHO: dict[UniqueOn, str] = {member: spelling for spelling, member in _UNIQUE_MAP.items()}
+
 # Scryfall's own wording, down to the typographic apostrophe, so a client that string-matches on
 # `details` behaves the same.
 _NO_MATCH_DETAILS = (
@@ -930,9 +936,13 @@ class ScryfallCardsRoutes:
                     "include_extras": str(_as_bool(include_extras)).lower(),
                     "include_multilingual": str(_as_bool(include_multilingual)).lower(),
                     "include_variations": str(_as_bool(include_variations)).lower(),
-                    "order": order,
+                    # RESOLVED, not raw -- see _UNIQUE_ECHO. This is also what makes the link
+                    # correct once the in-query directives (#893) fold here: `q` echoes verbatim,
+                    # directive included, so a `q` saying `order:cmc` next to an `order=name` in
+                    # the same URL would page a different result set on page 2 than on page 1.
+                    "order": str(orderby),
                     "q": q,
-                    "unique": unique,
+                    "unique": _UNIQUE_ECHO[unique_on],
                 },
                 page_number + 1,
             )
