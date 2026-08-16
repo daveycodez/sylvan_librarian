@@ -263,6 +263,11 @@ struct OracleCard {
     /// kept only because `TextField::OracleTextLower` and every test that builds
     /// a card by hand already spell it that way.
     oracle_text_lower_id: u32,
+    /// `fo:`/`fulloracle:` — the same text lowercased but NOT stripped. A card
+    /// with no reminder text interns to the id above and costs nothing extra;
+    /// measured over the 2026-08-16 corpus only 9,769 of 30,259 distinct oracle
+    /// texts differ, 2.17 MB of new strings for the whole store.
+    oracle_full_lower_id: u32,
     card_layout_id: u32,
     mana_cost_text_id: u32,
     type_line_id: u32,
@@ -364,6 +369,10 @@ struct CardRow {
     card_name_id: u32,
     oracle_text_id: u32,
     oracle_text_lower_id: u32,
+    /// The `fo:` twin of the field above, carried through the spill so the build
+    /// interns it once. Same id as `oracle_text_lower_id` for a card with no
+    /// reminder text.
+    oracle_full_lower_id: u32,
     flavor_text_id: u32,
     flavor_text_lower_id: u32,
     card_artist_vid: u16,
@@ -802,6 +811,7 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
     let card_name_folded = InlineStr::<61>::from_str(&opt_str(d, "card_name_folded").unwrap_or_default());
     let oracle_text = opt_str(d, "oracle_text").unwrap_or_default();
     let oracle_text_lower_id = it.intern(strip_reminder_text(&oracle_text).to_lowercase());
+    let oracle_full_lower_id = it.intern(oracle_text.to_lowercase());
     let flavor_text = opt_str(d, "flavor_text").unwrap_or_default();
     let flavor_text_lower_id = it.intern(flavor_text.to_lowercase());
     let card_artist_vid = match opt_str(d, "card_artist") {
@@ -819,6 +829,7 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
         card_name_folded,
         card_name_id: it.intern(card_name),
         oracle_text_lower_id,
+        oracle_full_lower_id,
         oracle_text_id: it.intern(oracle_text),
         flavor_text_lower_id,
         flavor_text_id: it.intern(flavor_text),
@@ -11941,7 +11952,16 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 // strings, the oracle trigram index and its word dictionary are all different bytes for the same
 // card — and a reader pairing this code with a pre-strip archive would silently search reminder
 // text again. Nothing about the emitted `oracle_text` changes.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026082302;
+
+//
+// 2026082303 — `fo:`/`fulloracle:` gets the text `o:` stopped searching. `OracleCard`
+// gains `oracle_full_lower_id`, the lowercase oracle text WITHOUT the reminder strip, so the two
+// operators can differ — which is the point of patch 02. Deliberately index-free (a second oracle
+// trigram index would cost ~5 MB for a rare operator); `fo:` scans, exactly as `o:` did before its
+// index existed. Only 9,769 of 30,259 distinct oracle texts differ from their stripped form, so
+// the interner charges 2.17 MB for the whole store. `size_of::<AOracleCard>` moves, so the header
+// catches a stale archive on its own; the constant moves so the reason is written down.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026082303;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -12393,6 +12413,7 @@ impl QueryEngine {
                     card_name_id: row.card_name_id,
                     oracle_text_id: row.oracle_text_id,
                     oracle_text_lower_id: row.oracle_text_lower_id,
+                    oracle_full_lower_id: row.oracle_full_lower_id,
                     card_layout_id: row.card_layout_id,
                     mana_cost_text_id: row.mana_cost_text_id,
                     type_line_id: row.type_line_id,

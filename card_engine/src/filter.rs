@@ -337,6 +337,12 @@ fn collection<'a>(
 pub(crate) enum TextSearchField {
     NameLower,
     OracleTextLower,
+    /// `fo:`/`fulloracle:` — oracle text WITH reminder text, the form Scryfall's
+    /// full-oracle operator searches and the one `OracleTextLower` stopped being.
+    /// Deliberately index-free: `o:` carries the trigram index because it is the
+    /// common operator, and `fo:` is rare enough that a card-level scan over the
+    /// distinct texts is the right trade against a second ~5 MB index.
+    FullOracleTextLower,
     FlavorTextLower,
     ArtistLower,
 }
@@ -363,6 +369,8 @@ fn text_search_field_value<'a>(
         // before it reaches TextContains/NameMatch, so this must match.
         TextSearchField::NameLower       => StrVal::Known(card.card_name_folded.as_str()),
         TextSearchField::OracleTextLower => opt_sv(str_at(strings, u32::from(card.oracle_text_lower_id))),
+        // `fo:` -- the text WITH its reminder text, which `OracleTextLower` no longer has.
+        TextSearchField::FullOracleTextLower => opt_sv(str_at(strings, u32::from(card.oracle_full_lower_id))),
         TextSearchField::FlavorTextLower => printing.map_or(StrVal::PDep, |p| opt_sv(str_at(strings, u32::from(p.flavor_text_lower_id)))),
         // Rewritten to ArtistMatch by bind(); printings carry no artist strings.
         TextSearchField::ArtistLower     => StrVal::Null,
@@ -376,6 +384,7 @@ fn text_search_field_value<'a>(
 pub(crate) enum TextField {
     NameLower,
     OracleTextLower,
+    FullOracleTextLower,
     FlavorTextLower,
     ArtistLower,
     SetCode,
@@ -395,6 +404,7 @@ fn text_field_value<'a>(
     match field {
         TextField::NameLower       => StrVal::Known(card.card_name_lower.as_str()),
         TextField::OracleTextLower => opt_sv(str_at(strings, u32::from(card.oracle_text_lower_id))),
+        TextField::FullOracleTextLower => opt_sv(str_at(strings, u32::from(card.oracle_full_lower_id))),
         TextField::Layout          => opt_sv(str_at(strings, u32::from(card.card_layout_id))),
         TextField::FlavorTextLower => printing.map_or(StrVal::PDep, |p| opt_sv(str_at(strings, u32::from(p.flavor_text_lower_id)))),
         // Rewritten to ArtistMatch by bind(); printings carry no artist strings.
@@ -789,14 +799,22 @@ fn leaf_compares_printing_field(f: &FilterExpr) -> bool {
         // Exhaustive over TextSearchField (no `matches!`), same reason as num_pdep.
         FilterExpr::TextContains { field, .. } => match field {
             TextSearchField::FlavorTextLower => true,
-            TextSearchField::NameLower | TextSearchField::OracleTextLower | TextSearchField::ArtistLower => false,
+            TextSearchField::NameLower
+            | TextSearchField::OracleTextLower
+            | TextSearchField::FullOracleTextLower
+            | TextSearchField::ArtistLower => false,
         },
         // Exhaustive over TextField (no `matches!`), same reason as num_pdep.
         FilterExpr::TextExact { field, .. } | FilterExpr::TextRegex { field, .. } => match field {
             TextField::FlavorTextLower | TextField::SetCode | TextField::Border | TextField::Watermark | TextField::CollectorNumber => {
                 true
             }
-            TextField::NameLower | TextField::OracleTextLower | TextField::ArtistLower | TextField::Layout | TextField::TypeLine => false,
+            TextField::NameLower
+            | TextField::OracleTextLower
+            | TextField::FullOracleTextLower
+            | TextField::ArtistLower
+            | TextField::Layout
+            | TextField::TypeLine => false,
         },
         // Exhaustive over CollField (no `matches!`), same reason as num_pdep.
         FilterExpr::CollectionCmp { field, .. } => match field {
@@ -1851,7 +1869,7 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
     // saw it either. The SQL path answers the same query with
     // `type_line ~* 'dragon'`.
     if rhs["node_type"].as_str() == Some("RegexValueNode") {
-        return build_text_filter(attr, op, rhs);
+        return build_text_filter(attr, op, rhs, orig);
     }
 
     if attr == "released_at" {
@@ -2020,15 +2038,22 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
         return Ok(FilterExpr::CollectionCmp { field: coll_field, op: cmp_op, value, value_id: None });
     }
 
-    build_text_filter(attr, op, rhs)
+    build_text_filter(attr, op, rhs, orig)
 }
 
 fn rhs_value_str(rhs: &Value) -> &str {
     rhs["kwargs"]["value"].as_str().unwrap_or("")
 }
 
-fn build_text_filter(attr: &str, op: &str, rhs: &Value) -> Result<FilterExpr, String> {
+fn build_text_filter(attr: &str, op: &str, rhs: &Value, orig: &str) -> Result<FilterExpr, String> {
     let rhs_node_type = rhs["node_type"].as_str().unwrap_or("");
+    // `fo:`/`fulloracle:` share `oracle_text`'s COLUMN — upstream's Postgres copy is the full
+    // text, so the SQL path answers both from it and needs no second column — and are told
+    // apart here by the spelling the user typed. Measured on api.scryfall.com 2026-08-16:
+    // `fo:lifelink` 713 against `o:lifelink`'s stripped answer, `fo:draw e:khm` 57 against
+    // `o:draw e:khm` 39, and `fo:` takes a regex like `o:` does (`fo:/\(this creature/` 1,098 —
+    // a pattern that cannot match the stripped form at all).
+    let full_oracle = attr == "oracle_text" && matches!(orig, "fo" | "fulloracle");
 
     if rhs_node_type == "RegexValueNode" {
         let pattern  = rhs["kwargs"]["value"].as_str().unwrap_or("");
@@ -2040,6 +2065,7 @@ fn build_text_filter(attr: &str, op: &str, rhs: &Value) -> Result<FilterExpr, St
         // through the same StrVal::PDep path their exact-match twins use.
         let field = match attr {
             "card_name"        => TextField::NameLower,
+            "oracle_text" if full_oracle => TextField::FullOracleTextLower,
             "oracle_text"      => TextField::OracleTextLower,
             "flavor_text"      => TextField::FlavorTextLower,
             "card_artist"      => TextField::ArtistLower,
@@ -2080,6 +2106,7 @@ fn build_text_filter(attr: &str, op: &str, rhs: &Value) -> Result<FilterExpr, St
     if op == ":" {
         let tsf = match attr {
             "card_name"   => TextSearchField::NameLower,
+            "oracle_text" if full_oracle => TextSearchField::FullOracleTextLower,
             "oracle_text" => TextSearchField::OracleTextLower,
             "flavor_text" => TextSearchField::FlavorTextLower,
             "card_artist" => TextSearchField::ArtistLower,
@@ -2090,6 +2117,7 @@ fn build_text_filter(attr: &str, op: &str, rhs: &Value) -> Result<FilterExpr, St
 
     let field = match attr {
         "card_name"   => TextField::NameLower,
+        "oracle_text" if full_oracle => TextField::FullOracleTextLower,
         "oracle_text" => TextField::OracleTextLower,
         "flavor_text" => TextField::FlavorTextLower,
         "card_artist" => TextField::ArtistLower,

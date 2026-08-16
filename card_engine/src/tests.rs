@@ -200,6 +200,7 @@ fn stub_card(oracle_id: u128, card_types: u16, subtypes: &[&str], vocab: &mut Vo
         card_name_id: NONE_STR,
         oracle_text_id: NONE_STR,
         oracle_text_lower_id: NONE_STR,
+        oracle_full_lower_id: NONE_STR,
         card_layout_id: NONE_STR,
         mana_cost_text_id: NONE_STR,
         type_line_id: NONE_STR,
@@ -1840,7 +1841,7 @@ fn fuzz_text_needle(rng: &mut rand::rngs::SmallRng, field: TextSearchField) -> S
         let t = corpus[rng.random_range(0..corpus.len())];
         let text = match field {
             TextSearchField::NameLower => t.0,
-            TextSearchField::OracleTextLower => t.1,
+            TextSearchField::OracleTextLower | TextSearchField::FullOracleTextLower => t.1,
             TextSearchField::FlavorTextLower => t.2,
             TextSearchField::ArtistLower => t.0, // artist has its own leaf; not reached here
         };
@@ -2157,6 +2158,9 @@ fn fuzz_describe(spec: &FuzzSpec) -> String {
             let f = match field {
                 TextSearchField::NameLower => "name",
                 TextSearchField::OracleTextLower => "oracle",
+                // Never generated (the fuzz corpus carries one oracle string per card), but the
+                // match is exhaustive so a new field has to be given an answer here.
+                TextSearchField::FullOracleTextLower => "fulloracle",
                 TextSearchField::FlavorTextLower => "flavor",
                 TextSearchField::ArtistLower => "artist",
             };
@@ -11615,6 +11619,51 @@ fn a_type_value_matches_the_type_line_as_a_substring() {
     assert!(matches!(
         super::build_filter(&type_leaf("card_subtypes", "!=", "Goblin")).unwrap(),
         FilterExpr::CollectionCmp { field: CollField::Subtypes, .. }
+    ));
+}
+
+#[test]
+fn fo_searches_the_unstripped_text_and_o_does_not() {
+    // `fo:`/`fulloracle:` share `oracle_text`'s column and are told apart by the spelling the
+    // user typed. Measured on api.scryfall.com 2026-08-16: `fo:lifelink` 713 where `o:` answers
+    // the stripped text, `fo:draw e:khm` 57 against `o:draw e:khm` 39, and `fo:/\(this creature/`
+    // 1,098 where `o:/\(/` is 0 corpus-wide.
+    let leaf = |orig: &str, value: &str| {
+        serde_json::json!({
+            "node_type": "CardBinaryOperatorNode",
+            "kwargs": {
+                "op": ":",
+                "lhs": {"node_type": "CardAttributeNode", "kwargs": {"attribute_name": "oracle_text", "original_attribute": orig}},
+                "rhs": {"node_type": "StringValueNode", "kwargs": {"value": value}},
+            }
+        })
+    };
+    for orig in ["fo", "fulloracle"] {
+        assert!(
+            matches!(
+                super::build_filter(&leaf(orig, "lifelink")).unwrap(),
+                FilterExpr::TextContains { field: TextSearchField::FullOracleTextLower, .. }
+            ),
+            "{orig}: must read the unstripped column"
+        );
+    }
+    assert!(matches!(
+        super::build_filter(&leaf("o", "lifelink")).unwrap(),
+        FilterExpr::TextContains { field: TextSearchField::OracleTextLower, .. }
+    ));
+    // A regex takes the same routing — the one shape that CANNOT work against the stripped
+    // form, since no parenthesis survives there.
+    let regex_leaf_orig = serde_json::json!({
+        "node_type": "CardBinaryOperatorNode",
+        "kwargs": {
+            "op": ":",
+            "lhs": {"node_type": "CardAttributeNode", "kwargs": {"attribute_name": "oracle_text", "original_attribute": "fo"}},
+            "rhs": {"node_type": "RegexValueNode", "kwargs": {"value": "\\(this creature"}},
+        }
+    });
+    assert!(matches!(
+        super::build_filter(&regex_leaf_orig).unwrap(),
+        FilterExpr::TextRegex { field: TextField::FullOracleTextLower, .. }
     ));
 }
 
