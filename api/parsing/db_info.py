@@ -70,14 +70,22 @@ DB_COLUMNS = [
     FieldInfo(
         db_column_name="card_colors",
         field_type=FieldType.JSONB_OBJECT,
+        # `colour`/`colours` are Scryfall's British spellings and answer identically (`colour:wu e:khm`
+        # = `c:wu e:khm` = 6, measured 2026-08-16). `color_identity`/`coloridentity` below are the
+        # reverse case -- spellings THIS parser accepts and Scryfall does not -- and are left alone:
+        # answering where Scryfall warns costs a searcher nothing, while removing them would break
+        # queries that already work.
         search_aliases=["color", "colors", "colour", "colours", "c"],
         parser_class=ParserClass.COLOR,
     ),
     FieldInfo(
         db_column_name="card_color_identity",
         field_type=FieldType.JSONB_OBJECT,
-        # `commander:` is how players search a commander's colour identity -- a deck built
-        # around it must stay within it, so a commander query is a color-identity query.
+        # `commander` is how a player actually searches a commander's colours, and it is plain colour
+        # IDENTITY: `commander:wu e:khm` = `id:wu e:khm` = 117, and it takes the counts too
+        # (`commander:m e:khm` = `commander>=2 e:khm` = 74). Scryfall's identity vocabulary is a
+        # BOUNDARY -- `cid`, `commanderidentity`, `colouridentity` and `colour_identity` all come
+        # back "Unknown keyword" -- so nothing else joins it.
         search_aliases=["color_identity", "coloridentity", "id", "identity", "ci", "commander"],
         parser_class=ParserClass.COLOR,
     ),
