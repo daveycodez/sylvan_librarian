@@ -467,6 +467,21 @@ UNPARSEABLE = [
     "{Q}",
 ]
 
+# What Scryfall SAYS about an unreadable cost, not merely that it says something. Every pair is a
+# golden captured from api.scryfall.com on 2026-08-16, one request each, and together they pin the
+# rule the wording follows: the reported fragment is the input with everything Scryfall could read
+# struck out, adjacent bare characters merge into one run, and a braced token keeps its braces.
+UNPARSEABLE_MESSAGES = [
+    ("{QQQ}", "{QQQ}"),
+    ("{}", "{}"),
+    ("{", "{"),
+    ("!!!", "!!!"),
+    ("é", "É"),
+    # A triple hybrid is not a Magic symbol. This one is also the reason the rule above had to be
+    # worked out at all: the recognized halves come out and only the punctuation is reported.
+    ("{W/U/B}", "{//}"),
+]
+
 
 class TestParseManaGoldens:
     """Parity with Scryfall, case by case."""
@@ -481,6 +496,14 @@ class TestParseManaGoldens:
     def test_a_non_mana_fragment_is_rejected(self, written: str) -> None:
         with pytest.raises(ManaCostError):
             parse_mana_cost(written)
+
+    @pytest.mark.parametrize(("written", "fragment"), UNPARSEABLE_MESSAGES)
+    def test_the_rejection_names_the_fragment_scryfall_names(self, written: str, fragment: str) -> None:
+        """The `details` string is compared byte for byte by clients, so it is pinned that way."""
+        with pytest.raises(ManaCostError) as raised:
+            parse_mana_cost(written)
+        expected = f"The string fragment(s) “{fragment}” could not be understood as part of mana cost."
+        assert str(raised.value) == expected
 
 
 class TestParseManaProperties:
@@ -506,3 +529,22 @@ class TestParseManaProperties:
         """Unlike `cost`, which is reordered canonically, `colors` is not."""
         assert parse_mana_cost("RUW")["cost"] == "{U}{R}{W}"
         assert parse_mana_cost("RUW")["colors"] == ["W", "U", "R"]
+
+    def test_variable_pips_come_out_in_xyz_order_however_they_were_written(self) -> None:
+        """`?cost=xyzzy` answers `{X}{Y}{Y}{Z}{Z}` on api.scryfall.com, not writing order."""
+        assert parse_mana_cost("xyzzy")["cost"] == "{X}{Y}{Y}{Z}{Z}"
+        assert parse_mana_cost("zyx")["cost"] == "{X}{Y}{Z}"
+
+    def test_a_hybrid_has_exactly_two_halves(self) -> None:
+        """`{W/U/B}` is not printable, and pricing it answered a three-coloured cost for one."""
+        assert parse_mana_cost("{W/U}")["cost"] == "{W/U}"
+        assert parse_mana_cost("{2/W}")["cmc"] == 2.0
+        assert parse_mana_cost("{W/P}")["cmc"] == 1.0
+        with pytest.raises(ManaCostError):
+            parse_mana_cost("{W/U/B}")
+
+    def test_every_unreadable_fragment_is_named_at_once(self) -> None:
+        """The message says "fragment(s)" because it can name more than one, separated by a space."""
+        with pytest.raises(ManaCostError) as raised:
+            parse_mana_cost("{Q}W{T}")
+        assert "“{Q} {T}”" in str(raised.value)

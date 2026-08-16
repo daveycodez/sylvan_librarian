@@ -42,10 +42,19 @@ class ScryfallResponder:
         """
         if falcon_response is not None:
             falcon_response.content_type = JSON_CONTENT_TYPE
-            status = payload.get("status") if payload.get("object") == "error" else None
+            is_error = payload.get("object") == "error"
+            status = payload.get("status") if is_error else None
             if isinstance(status, int):
                 falcon_response.status = falcon.util.code_to_http_status(status)
-            if pretty:
+            # AN ERROR BODY IS ALWAYS INDENTED, whatever `pretty` says. Not a style choice: it is
+            # what api.scryfall.com does. Measured 2026-08-16 across the whole surface -- every
+            # `object: "error"` body comes back two-space-indented while every data body comes back
+            # compact, and it does not negotiate: `Accept: application/json`, `Accept: text/html`, a
+            # bare wildcard and an explicit `?pretty=false` all produce the same 130-byte indented
+            # not-found. Scryfall renders errors through a different serializer than answers, and
+            # this rendered both compact, so a client comparing bytes saw a different document for
+            # every 4xx it received.
+            if pretty or is_error:
                 falcon_response.text = orjson.dumps(payload, option=orjson.OPT_INDENT_2).decode()
                 return None
         return payload

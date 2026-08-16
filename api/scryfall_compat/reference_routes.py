@@ -25,7 +25,7 @@ from typing import Any
 import falcon  # noqa: TC002
 
 from api.scryfall_compat.mana import ManaCostError, parse_mana_cost
-from api.scryfall_compat.objects import bad_request_error, card_list, catalog_object, error_object, not_found_error
+from api.scryfall_compat.objects import card_list, catalog_object, error_object, not_found_error
 from api.scryfall_compat.responder import ScryfallResponder
 from api.utils.routing import route
 
@@ -49,6 +49,15 @@ _MIRRORED_CACHE_CONTROL = "public"
 # CachingMiddleware (only `no-store` does, which is why /cards/random uses that), so the in-process
 # cache still answers repeat parses.
 _PARSE_MANA_CACHE_CONTROL = "max-age=0, private, must-revalidate"
+
+# The tier on a MISS THAT IS ABOUT THE ROUTE rather than about Magic, measured 2026-08-16 -- and it
+# is a real split, not noise. `/sets/zzzz`, a well-formed set lookup that found nothing, is `public`:
+# the same tier the answer would have had, because "there is no such set" is a fact about Magic.
+# `/catalog/not-a-catalog`, `/catalog/Card-Types`, `/sets/khm/extra` and every parse-mana 422 are
+# `no-cache`, because those are facts about the URL. This surface sent `public` on all of them, so a
+# client that mistyped a catalog name got the mistake held at every edge for as long as the
+# heuristics liked.
+_ROUTE_MISS_CACHE_CONTROL = "no-cache"
 
 # The twenty catalogs Scryfall documents. Listed rather than discovered so that a request for a name
 # this instance has never imported 404s as an unknown catalog, instead of reporting an empty one and
@@ -87,6 +96,10 @@ CATALOG_NAMES = (
 #       "The requested object or REST method was not found."
 _SET_MISS_DETAILS = "No Magic set found for the given code or ID"
 _CATALOG_MISS_DETAILS = "The requested object or REST method was not found."
+# The wording for a path that addresses nothing. Today it is the same sentence the catalog miss uses
+# and it is spelled separately anyway: the two mean different things ("there is no such catalog"
+# against "there is no such route"), and one of them changing must not be blocked by the other.
+_ROUTE_MISS_DETAILS = "The requested object or REST method was not found."
 
 # The host a Catalog's own `uri` points at: Scryfall's, not this service's, which is the rule the
 # card objects already follow for `uri`, `rulings_uri` and `prints_search_uri`.
@@ -169,8 +182,14 @@ class ScryfallReferenceRoutes(ScryfallResponder):
                 return self._scryfall_respond(falcon_response, not_found_error(_SET_MISS_DETAILS), pretty=is_pretty)
             found = self._set_by_tcgplayer_id(second)
         elif second:
-            # /sets takes at most one identifying segment; anything longer addresses nothing.
-            found = None
+            # /sets takes at most one identifying segment; anything longer addresses nothing -- and
+            # that is a statement about the URL, not about Magic, so it answers with the ROUTE miss
+            # rather than the set one. `/sets/khm/extra` on api.scryfall.com is "The requested object
+            # or REST method was not found." at `no-cache`, not "No Magic set found ..." at `public`
+            # (measured 2026-08-16); this sent the latter, which told a client the set was missing
+            # when the set was fine and the path was not.
+            _set_reference_cache(falcon_response, _ROUTE_MISS_CACHE_CONTROL)
+            return self._scryfall_respond(falcon_response, not_found_error(_ROUTE_MISS_DETAILS), pretty=is_pretty)
         else:
             found = self._set_by_code_or_id(identifier)
 
@@ -255,8 +274,16 @@ class ScryfallReferenceRoutes(ScryfallResponder):
         _set_reference_cache(falcon_response)
         self._require_setup_complete()
 
-        wanted = name.strip().lower()
+        # VERBATIM, not lowercased and not stripped: catalog names are CASE-SENSITIVE on
+        # api.scryfall.com -- `/catalog/Card-Types` is a 404 there and was a 200 here (measured
+        # 2026-08-16). Folding the case made this route answer a URL Scryfall does not serve, which
+        # is the same class of mistake as failing to answer one it does.
+        wanted = name
         if wanted not in CATALOG_NAMES:
+            # `no-cache`, not the data tier: a 404 about the PATH is a statement about the URL, and
+            # Scryfall declines to cache those. Its `/sets/zzzz` -- a well-formed set lookup that
+            # found nothing -- keeps `public`, which is the other half of the same rule.
+            _set_reference_cache(falcon_response, _ROUTE_MISS_CACHE_CONTROL)
             return self._scryfall_respond(falcon_response, not_found_error(_CATALOG_MISS_DETAILS), pretty=is_pretty)
 
         rows = self._run_query(
@@ -334,16 +361,19 @@ class ScryfallReferenceRoutes(ScryfallResponder):
         is_pretty = _as_bool(pretty)
         _set_reference_cache(falcon_response, _PARSE_MANA_CACHE_CONTROL)
 
-        if cost is None:
-            return self._scryfall_respond(
-                falcon_response,
-                bad_request_error("You must provide a cost parameter to parse."),
-                pretty=is_pretty,
-            )
+        # A MISSING `cost` is the same request as an empty one, and both are answered: measured
+        # 2026-08-16, `/symbology/parse-mana` with no parameter and `?cost=` both return
+        # `200 {"object": "mana_cost", "cost": null, "colors": [], "cmc": 0.0, ...}`. This sent a 400
+        # saying "You must provide a cost parameter to parse." -- a sentence Scryfall does not own
+        # and a rejection it does not make. `parse_mana_cost("")` already produces exactly that body.
         try:
-            parsed = parse_mana_cost(cost)
+            parsed = parse_mana_cost(cost or "")
         except ManaCostError as bad_cost:
-            # 422 rather than 400, which is what Scryfall answers an unparseable fragment with.
+            # 422 rather than 400, which is what Scryfall answers an unparseable fragment with -- at
+            # `no-cache` rather than this route's own tier, because an unreadable cost is a fact
+            # about the REQUEST and Scryfall declines to cache those (measured on `{QQQ}`, `!!!`,
+            # `{}`, `é` and `{W/U/B}`).
+            _set_reference_cache(falcon_response, _ROUTE_MISS_CACHE_CONTROL)
             return self._scryfall_respond(
                 falcon_response,
                 error_object(code="validation_error", status=422, details=str(bad_cost)),

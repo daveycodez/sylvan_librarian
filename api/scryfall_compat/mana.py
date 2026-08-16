@@ -17,7 +17,7 @@ because nothing documents them:
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, NamedTuple
 
 # The colour wheel. Every canonical ordering is a walk around this cycle.
 _WUBRG = ("W", "U", "B", "R", "G")
@@ -34,9 +34,23 @@ _BRACED = re.compile(r"\{([^}]*)\}")
 # Half-mana symbols are written {HW}; the half applies to the symbol that follows the H.
 _HALF_MANA = 0.5
 
+# A hybrid symbol has exactly this many halves. `{W/U/B}` is not a Magic symbol, and
+# api.scryfall.com rejects it rather than pricing it (measured 2026-08-16).
+_HYBRID_HALVES = 2
+
 
 class ManaCostError(ValueError):
     """A fragment of the cost could not be understood as mana."""
+
+
+class _UnparseableSymbolError(Exception):
+    """One token is not mana. Internal; never raised out of this module.
+
+    The message Scryfall sends names **every** unparseable fragment of the cost at once ("The
+    string fragment(s) ..."), so the fragments have to be collected before any error can be worded.
+    Raising the finished ``ManaCostError`` from ``_symbol_value`` reported only the first, and
+    reported it re-braced: ``?cost=!!!`` came back as ``“{!}”`` where api.scryfall.com says ``“!!!”``.
+    """
 
 
 def _canonical_colors(colors: set[str]) -> list[str]:
@@ -86,13 +100,18 @@ def _symbol_value(symbol: str) -> float:
     if symbol.startswith("H") and len(symbol) > 1:
         return _HALF_MANA
     if "/" in symbol:
-        # A hybrid is worth its more expensive half: {2/W} is 2, {W/U} and {W/P} are 1.
+        # A hybrid has exactly TWO halves. `{W/U/B}` is not a Magic symbol and api.scryfall.com
+        # rejects it with a 422 (measured 2026-08-16); this summed it to 1 and answered a
+        # three-coloured ManaCost for a cost that cannot be printed. Each half must also be a
+        # colour, a generic amount, or Phyrexian `P` -- the three things the rule below can price.
         parts = symbol.split("/")
+        if len(parts) != _HYBRID_HALVES or not all(part.isdigit() or part in _COLOR_INDEX or part == "P" for part in parts):
+            raise _UnparseableSymbolError
+        # A hybrid is worth its more expensive half: {2/W} is 2, {W/U} and {W/P} are 1.
         return max(float(part) if part.isdigit() else 1.0 for part in parts)
     if symbol in _COLORLESS_PIPS or symbol in _COLOR_INDEX:
         return 1.0
-    msg = f"The string fragment(s) “{{{symbol}}}” could not be understood as part of mana cost."
-    raise ManaCostError(msg)
+    raise _UnparseableSymbolError
 
 
 def _symbol_colors(symbol: str) -> set[str]:
@@ -107,7 +126,18 @@ def _symbol_colors(symbol: str) -> set[str]:
     return {part for part in re.split(r"[/]", symbol.removeprefix("H")) if part in _COLOR_INDEX}
 
 
-def _tokenize(raw: str) -> list[str]:
+class _Token(NamedTuple):
+    """One symbol, plus how it was written -- which the error wording needs and the rules do not."""
+
+    symbol: str
+    """The symbol's inside, brace-stripped and uppercased. Every parsing rule reads this."""
+    spelling: str
+    """How it was WRITTEN, uppercased: a braced token keeps its braces, a bare character does not."""
+    braced: bool
+    """True for a braced token, which is what stops `!!` and `{!}{!}` merging into one fragment."""
+
+
+def _tokenize(raw: str) -> list[_Token]:
     """Split a written cost into braced-symbol contents.
 
     Unbraced runs are read a character at a time, except for digits, which group so `11R` is
@@ -117,27 +147,62 @@ def _tokenize(raw: str) -> list[str]:
         raw: The cost as written.
 
     Returns:
-        One entry per symbol, without braces, uppercased.
+        One entry per symbol.
     """
-    tokens: list[str] = []
+    tokens: list[_Token] = []
     position = 0
     upper = raw.upper()
     while position < len(upper):
         braced = _BRACED.match(upper, position)
         if braced:
-            tokens.append(braced.group(1).strip())
+            tokens.append(_Token(braced.group(1).strip(), braced.group(0), braced=True))
             position = braced.end()
             continue
         char = upper[position]
         if char.isdigit():
             digits = re.match(r"\d+", upper[position:]).group(0)
-            tokens.append(digits)
+            tokens.append(_Token(digits, digits, braced=False))
             position += len(digits)
             continue
         if not char.isspace():
-            tokens.append(char)
+            tokens.append(_Token(char, char, braced=False))
         position += 1
     return tokens
+
+
+def _reported_fragment(token: _Token) -> str:
+    """How Scryfall names a part of the cost it could not read.
+
+    Measured one request per row against api.scryfall.com on 2026-08-16::
+
+        ?cost=!!!       “!!!”     three bare characters, reported as ONE run
+        ?cost=é         “É”       uppercased, and reported as itself rather than re-braced
+        ?cost={QQQ}     “{QQQ}”   a braced token keeps its braces
+        ?cost={}        “{}”      including the empty one
+        ?cost={W/U/B}   “{//}”    the RECOGNIZED halves are struck out and the residue reported
+
+    The last row is the rule the others are a degenerate case of: what comes back is the fragment
+    with everything Scryfall could read removed. `{QQQ}` keeps all three Qs because none of them is
+    a symbol; `{W/U/B}` keeps only its punctuation.
+
+    Args:
+        token: The token that could not be parsed.
+
+    Returns:
+        The fragment as Scryfall would name it.
+    """
+    if not token.braced:
+        return token.spelling
+    residue = "".join(
+        char
+        for char in token.symbol
+        if char not in _COLOR_INDEX
+        and char not in _COLORLESS_PIPS
+        and char not in _VARIABLE_PIPS
+        and not char.isdigit()
+        and char not in {"P", "H"}
+    )
+    return f"{{{residue}}}"
 
 
 def parse_mana_cost(raw: str) -> dict[str, Any]:
@@ -161,17 +226,33 @@ def parse_mana_cost(raw: str) -> dict[str, Any]:
     color_set: set[str] = set()
     total = 0.0
 
-    for token in tokens:
-        total += _symbol_value(token)
-        color_set |= _symbol_colors(token)
-        if token.isdigit():
-            generic += int(token)
-        elif token in _VARIABLE_PIPS:
-            variables.append(token)
-        elif token in _COLORLESS_PIPS:
-            colorless.append(token)
+    # EVERY unparseable fragment is collected before any error is raised, because Scryfall's message
+    # names them all at once -- and adjacent BARE ones merge into a single run, which is what makes
+    # `?cost=!!!` one fragment (“!!!”) rather than three.
+    bad: list[str] = []
+    for at, token in enumerate(tokens):
+        try:
+            total += _symbol_value(token.symbol)
+        except _UnparseableSymbolError:
+            previous = tokens[at - 1] if at else None
+            if bad and not token.braced and previous is not None and not previous.braced:
+                bad[-1] += _reported_fragment(token)
+            else:
+                bad.append(_reported_fragment(token))
+            continue
+        color_set |= _symbol_colors(token.symbol)
+        if token.symbol.isdigit():
+            generic += int(token.symbol)
+        elif token.symbol in _VARIABLE_PIPS:
+            variables.append(token.symbol)
+        elif token.symbol in _COLORLESS_PIPS:
+            colorless.append(token.symbol)
         else:
-            colored.append(token)
+            colored.append(token.symbol)
+
+    if bad:
+        msg = f"The string fragment(s) “{' '.join(bad)}” could not be understood as part of mana cost."
+        raise ManaCostError(msg)
 
     colors = _canonical_colors(color_set)
     # An empty cost is null, but a cost that was written and happens to be free is `{0}`: Scryfall
@@ -217,7 +298,11 @@ def _render_cost(
         return (min((rank[color] for color in own), default=len(rank)), colored.index(symbol))
 
     ordered = sorted(colored, key=sort_key)
-    parts = [f"{{{symbol}}}" for symbol in variables]
+    # Variables come out in X, Y, Z order regardless of how they were written, and repeats group:
+    # `?cost=xyzzy` is `{X}{Y}{Y}{Z}{Z}` on api.scryfall.com (measured 2026-08-16) where writing
+    # order gives `{X}{Y}{Z}{Z}{Y}`. A plain sort does both at once -- the alphabet and the pip
+    # order coincide.
+    parts = [f"{{{symbol}}}" for symbol in sorted(variables)]
     if generic:
         parts.append(f"{{{generic}}}")
     parts.extend(f"{{{symbol}}}" for symbol in ordered)
