@@ -1021,12 +1021,13 @@ class ScryfallCardsRoutes:
             pretty=pretty,
         )
 
-    def _best_printing(self, where: str, params: dict[str, Any]) -> dict[str, Any] | None:
+    def _best_printing(self, where: str, params: dict[str, Any], rank_first: str = "") -> dict[str, Any] | None:
         """Return the id and name of the best-scoring printing matching a predicate.
 
         Args:
             where: SQL predicate over `magic.cards AS card`.
             params: Bound parameters.
+            rank_first: An ORDER BY fragment ranked ABOVE prefer_score, ending in ", ".
 
         Returns:
             A row with scryfall_id and card_name, or None.
@@ -1034,7 +1035,7 @@ class ScryfallCardsRoutes:
         rows = self._run_query(
             query=(
                 f"SELECT scryfall_id, card_name FROM magic.cards AS card WHERE {where} "
-                "ORDER BY prefer_score DESC NULLS LAST, released_at DESC LIMIT 1"
+                f"ORDER BY {rank_first}prefer_score DESC NULLS LAST, released_at DESC LIMIT 1"
             ),
             params=params,
             explain=False,
@@ -1047,7 +1048,14 @@ class ScryfallCardsRoutes:
         base_clauses: list[str],
         base_params: dict[str, Any],
     ) -> dict[str, Any] | None:
-        """Return the card whose folded name is exactly the folded query, if there is one.
+        """Return the card one of whose names IS the query, separators aside, if there is one.
+
+        Separators do not count here either (see `_fuzzy_containment_candidates`):
+        `fuzzy=lightningbolt` answers Lightning Bolt on api.scryfall.com (2026-08-16) rather than
+        reporting it ambiguous with "Emeritus of Conflict // Lightning Bolt", which contains the
+        same letters. And a PRINTED name that is the query resolves to its printing --
+        `fuzzy=blitzschlag` answers the German Lightning Bolt, `fuzzy=ego à deriva` the
+        Portuguese Unmoored Ego -- while `exact=` stays scoped to oracle names.
 
         Args:
             needle: The accent-folded, lowercased query.
@@ -1057,9 +1065,14 @@ class ScryfallCardsRoutes:
         Returns:
             The matching printing, or None.
         """
-        params = {**base_params, "needle": needle}
-        clauses = [*base_clauses, "lower(card_name_folded) = %(needle)s"]
-        return self._best_printing(" AND ".join(clauses), params)
+        params = {**base_params, "needle": _unseparated(needle)}
+        oracle = f"{_UNSEPARATED.format(column='card_name_folded')} = %(needle)s"
+        printed = f"{_UNSEPARATED.format(column='printed_name_folded')} = %(needle)s"
+        clauses = [*base_clauses, f"({oracle} OR {printed})"]
+        # An ORACLE name that is the query outranks a PRINTED one that is: `exact=` is scoped to
+        # oracle names (measured -- `exact=Ego à Deriva` is a 404 there while `fuzzy=` resolves
+        # it), so when both exist the English card is the one the query names.
+        return self._best_printing(" AND ".join(clauses), params, rank_first=f"({oracle}) DESC, ")
 
     def _fuzzy_containment_candidates(
         self,
