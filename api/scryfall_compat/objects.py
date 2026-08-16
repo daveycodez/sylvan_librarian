@@ -18,6 +18,7 @@ import closes.
 from __future__ import annotations
 
 import datetime
+import re
 import urllib.parse
 import uuid
 from typing import Any
@@ -46,6 +47,7 @@ MAX_AUTOCOMPLETE_VALUES = 20
 # lookup, so the engine emits exactly this and nothing is fetched that is never read.
 CARD_OBJECT_FIELDS = (
     "name", "scryfall_id", "oracle_id", "layout", "mana_cost", "cmc", "type_line", "oracle_text",
+    "printed_name", "printed_type_line", "printed_text",
     "power", "toughness", "loyalty", "colors", "color_identity", "card_keywords", "set_code", "set_name",
     "collector_number", "rarity", "flavor_text", "artist", "illustration_id", "released_at",
     "legalities", "edhrec_rank", "price_usd", "price_eur", "price_tix", "watermark",
@@ -143,27 +145,137 @@ def _image_uris(scryfall_id: str, updated_at: int | None, face: str = "front") -
     }
 
 
+# Characters Scryfall DELETES from a slug rather than hyphenating. Live-derived: "Erayo's
+# Essence" slugs to `erayos-essence` (not `erayo-s-essence`), "S.H.I.E.L.D." to `shield`,
+# `Henzie "Toolbox" Torre` to `henzie-toolbox-torre`, and the zhs printings of Kongming/Pang Tong
+# pin the curly quotes. U+201E („) is NOT deleted — `Henzie „Der Beschaffer" Torre` (de) keeps it.
+_SLUG_DELETED = frozenset("'\",./“”")
+
+# Slug bytes served literally; every other byte is UTF-8 percent-encoded, uppercase hex. The
+# literal set is exactly what appears un-encoded across the bulk corpus (`!&()+-:;=_`); `?` is the
+# one ASCII special observed encoded. Unobserved characters encode, which can never break a URL.
+# (A hand-rolled encoder rather than urllib.parse.quote: quote() can never encode `~`, and the
+# byte-identical Rust and TypeScript twins need one shared safe set.)
+_SLUG_LITERAL = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!&()+-:;=_")
+
+# The languages Scryfall writes into the scryfall_uri path — its ten print localizations, exactly.
+# The glyph and novelty languages (ph, qya, he, la, grc, ar, sa, dw) get NO path segment: a ph
+# Elesh Norn lives at `/card/one/414/elesh-norn-mother-of-machines`, English form.
+_SLUG_LANG_SEGMENTS = frozenset({"de", "es", "fr", "it", "ja", "ko", "pt", "ru", "zhs", "zht"})
+
+# Languages whose printed name never reaches the slug even when stored: the Phyrexian and Quenya
+# printings carry glyph-font printed_names ("|Ceghm.", U+E0xx runs) and production serves them the
+# plain English slug. Every other non-English language — including he/grc/ar/sa, which lack the
+# path segment — keeps the `printed-(english)` slug form.
+_SLUG_PRINTED_IGNORED = frozenset({"en", "ph", "qya"})
+
+
 def _slug(name: str) -> str:
-    """Scryfall's URL slug for a card name: lowercase, non-alphanumerics collapsed to hyphens."""
-    out = "".join(c if c.isalnum() else "-" for c in name.lower())
-    while "--" in out:
-        out = out.replace("--", "-")
-    return out.strip("-")
+    """Scryfall's URL slug for a card name.
+
+    NOT the folklore "non-alphanumerics collapse to hyphens" rule this module first shipped — that
+    rule hyphenates apostrophes (`erayo-s-essence`) and serves raw UTF-8 (`jötun-grunt`) where
+    production Scryfall deletes the apostrophe and percent-encodes the bytes. The real rule,
+    verified against the `scryfall_uri` of all 540,484 printings in the 2026-08-16 all_cards bulk
+    (zero mismatches): lowercase; DELETE `' " , . /` and the curly quotes U+201C/U+201D; each run
+    of ASCII spaces becomes one hyphen (literal hyphens pass through and may stack — the ru
+    printed name "Пламенник - военный разведчик" keeps `---` — and nothing is trimmed: "Humming-"
+    keeps its trailing hyphen); everything else survives verbatim and is then UTF-8
+    percent-encoded per _SLUG_LITERAL.
+
+    Args:
+        name: The card (or printed) name.
+
+    Returns:
+        The percent-encoded slug.
+    """
+    cleaned = "".join(c for c in name.lower() if c not in _SLUG_DELETED)
+    hyphenated = re.sub(" +", "-", cleaned)
+    return "".join(ch if ch in _SLUG_LITERAL else "".join(f"%{b:02X}" for b in ch.encode()) for ch in hyphenated)
 
 
-def _related_uris(name: str) -> dict[str, str]:
+def _printed_full_name(row: dict[str, Any], lang: str) -> str | None:
+    """The printing's printed full name, when the slug should use one.
+
+    The top-level `printed_name`, or on a multi-face card the faces' `printed_name`s joined
+    " // " — ONLY the faces that have one: the es printing of sos/113, whose second face has no
+    printed_name, slugs as `em%C3%A9rita-del-conflicto-(emeritus-of-conflict-lightning-bolt)`
+    (verified live).
+
+    Args:
+        row: The engine row.
+        lang: The printing's language.
+
+    Returns:
+        The printed full name, or None for English and for the Phyrexian/Quenya glyph printings,
+        whose stored printed_names production never slugs.
+    """
+    if lang in _SLUG_PRINTED_IGNORED:
+        return None
+    if row.get("printed_name"):
+        return str(row["printed_name"])
+    parts = [face["printed_name"] for face in row.get("card_faces") or [] if face.get("printed_name")]
+    return " // ".join(parts) if parts else None
+
+
+def _scryfall_uri(row: dict[str, Any], name: str, set_code: str, number: str, lang: str) -> str:
+    """Build `scryfall_uri`: `https://scryfall.com/card/{set}/{number}[/{lang}]/{slug}?utm_source=api`.
+
+    A foreign printing's slug is `slug(printed full name)-(slug(english full name))`, parentheses
+    literal (grn/212/pt: `ego-%C3%A0-deriva-(unmoored-ego)`, verified live). A foreign printing
+    with no printed name falls back to the plain English slug, keeping the language segment
+    (ody/243/zhs -> `/zhs/holistic-wisdom`, verified live); one whose printed name slugs to
+    nothing takes the same fallback (live-unpinned — no such printing exists in the corpus).
+
+    Args:
+        row: The engine row.
+        name: The English full name.
+        set_code: The set code.
+        number: The collector number.
+        lang: The printing's language.
+
+    Returns:
+        The absolute scryfall.com URL.
+    """
+    segment = f"{lang}/" if lang in _SLUG_LANG_SEGMENTS else ""
+    english = _slug(name)
+    printed_full = _printed_full_name(row, lang)
+    printed = _slug(printed_full) if printed_full else ""
+    path = f"{printed}-({english})" if printed else english
+    return f"https://scryfall.com/card/{set_code}/{number}/{segment}{path}?utm_source=api"
+
+
+def _related_uris(name: str, multiverse_ids: list[int], lang: str) -> dict[str, str]:
     """Scryfall's `related_uris`, pointing at the destinations directly.
 
     Scryfall wraps the TCGplayer entries in `partner.tcgplayer.com/...?u=<encoded real URL>` with
     its own affiliate code. The destination is the same page, and emitting the wrapper from this
     host would route another service's affiliate revenue to Scryfall.
+
+    `gatherer` LEADS the dict when the printing has multiverse ids, built from the FIRST id, with
+    `printed=true` for every non-English printing and `printed=false` for English — verified
+    against the bulk corpus at 540,430 of 540,484 printings. The 54 exceptions are foreign-only
+    promos (dd2-ja, snc launch, one-ph, ltc-qya) whose Gatherer entries carry no translation; that
+    fact lives on Scryfall's side of the wire and is not derivable from the row, so they stay a
+    known limit rather than a rule.
+
+    Args:
+        name: The English card name.
+        multiverse_ids: The printing's multiverse ids, possibly empty.
+        lang: The printing's language.
+
+    Returns:
+        The related_uris dict, gatherer first when present.
     """
+    out: dict[str, str] = {}
+    if multiverse_ids:
+        printed = "false" if lang == "en" else "true"
+        out["gatherer"] = f"https://gatherer.wizards.com/Pages/Card/Details.aspx?multiverseid={multiverse_ids[0]}&printed={printed}"
     quoted = urllib.parse.quote_plus(name)
-    return {
-        "tcgplayer_infinite_articles": f"https://www.tcgplayer.com/search/articles?productLineName=magic&q={quoted}",
-        "tcgplayer_infinite_decks": f"https://www.tcgplayer.com/search/decks?productLineName=magic&q={quoted}",
-        "edhrec": f"https://edhrec.com/route/?cc={quoted}",
-    }
+    out["tcgplayer_infinite_articles"] = f"https://www.tcgplayer.com/search/articles?productLineName=magic&q={quoted}"
+    out["tcgplayer_infinite_decks"] = f"https://www.tcgplayer.com/search/decks?productLineName=magic&q={quoted}"
+    out["edhrec"] = f"https://edhrec.com/route/?cc={quoted}"
+    return out
 
 
 def _purchase_uris(row: dict[str, Any]) -> dict[str, str]:
@@ -269,6 +381,7 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
     name = row.get("name") or ""
     set_code = row.get("set_code") or ""
     number = row.get("collector_number") or ""
+    lang = row.get("lang") or "en"
     faces = _faces(row)
 
     card: dict[str, Any] = {
@@ -277,15 +390,23 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
         "oracle_id": oracle_id,
         "multiverse_ids": row.get("multiverse_ids") or [],
         "name": name,
-        "lang": row.get("lang") or "en",
+        # Between `name` and `lang`, where api.scryfall.com puts it (verified on grn/212/pt and
+        # khm/1/ja) — and PRESENT only when the printing carries one, which is why these are
+        # conditional splats mid-literal rather than entries in the optional tail: the tail would
+        # put them after `legalities`, and key position is part of the parity contract here the
+        # same way security_stamp's position was.
+        **({"printed_name": row["printed_name"]} if row.get("printed_name") else {}),
+        "lang": lang,
         "released_at": row.get("released_at"),
         "uri": f"{base_url}/cards/{scryfall_id}",
-        "scryfall_uri": f"https://scryfall.com/card/{set_code}/{number}/{_slug(name)}?utm_source=api",
+        "scryfall_uri": _scryfall_uri(row, name, set_code, number, lang),
         "layout": row.get("card_layout") or row.get("layout"),
         "highres_image": bool(row.get("highres_image")),
         "image_status": row.get("image_status"),
         "cmc": _decimal(row.get("cmc")),
         "type_line": row.get("type_line"),
+        # Directly after the oracle `type_line` it translates, per the live objects.
+        **({"printed_type_line": row["printed_type_line"]} if row.get("printed_type_line") else {}),
         "colors": row.get("colors") or [],
         "color_identity": row.get("color_identity") or [],
         "keywords": row.get("card_keywords") or [],
@@ -317,7 +438,7 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
         "booster": bool(row.get("booster")),
         "story_spotlight": bool(row.get("story_spotlight")),
         "prices": _prices(row),
-        "related_uris": _related_uris(name),
+        "related_uris": _related_uris(name, row.get("multiverse_ids") or [], lang),
         "purchase_uris": _purchase_uris(row),
     }
 
@@ -329,6 +450,10 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
     else:
         card["mana_cost"] = row.get("mana_cost")
         card["oracle_text"] = row.get("oracle_text")
+        # Directly after the `oracle_text` it translates — single-face only, like the text it
+        # shadows; a multi-face printing's printed text rides its face objects.
+        if row.get("printed_text"):
+            card["printed_text"] = row["printed_text"]
         card["image_uris"] = _image_uris(scryfall_id, row.get("image_updated_at"))
 
     # Keys Scryfall sends only when the card has them. Emitting null instead would differ from
