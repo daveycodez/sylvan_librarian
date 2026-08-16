@@ -53,6 +53,7 @@ from api.scryfall_compat.objects import (
     sql_row_to_engine_row,
     to_scryfall_card,
 )
+from api.scryfall_compat.query_terms import scryfall_term_policy
 from api.settings import settings
 from api.utils.routing import route
 
@@ -143,11 +144,35 @@ def _echo_order(orderby: CardOrdering, raw_order: str) -> str:
 
 # Scryfall's own wording, down to the typographic apostrophe, so a client that string-matches on
 # `details` behaves the same.
+#
+# The URL is `/docs/reference`, not `/docs/syntax`. Scryfall moved it and this surface kept citing
+# the old page in every no-match body, so a client following the link landed somewhere else than
+# the one Scryfall sends it to. Re-measured 2026-08-16 on the no-match, the beyond-the-end and the
+# random-miss bodies; all three cite `reference`.
+_DOCS_REFERENCE = "https://scryfall.com/docs/reference"
 _NO_MATCH_DETAILS = (
     "Your query didn’t match any cards. Adjust your search terms or refer to the syntax guide "  # noqa: RUF001
-    "at https://scryfall.com/docs/syntax"
+    f"at {_DOCS_REFERENCE}"
 )
-_EMPTY_QUERY_DETAILS = "You didn't enter anything to search for."
+# Scryfall paginates past the end with a 422, not a 404 -- the query DID match, the page did not.
+# Measured 2026-08-16: `e:khm` is two pages, and `page=3`, `page=007`, `page=9999` and a twenty-digit
+# page all answer `422 validation_error` with this sentence, while a query that matched nothing
+# answers the 404 above at every page. The backtick around `page` is Scryfall's.
+_BEYOND_END_DETAILS = (
+    "You have paginated beyond the end of these results, reduce your `page` parameter or refer to "
+    f"the syntax guide at {_DOCS_REFERENCE}"
+)
+# The character after `didn` is U+2018, Scryfall's own and verified byte by byte -- it is not the
+# ASCII apostrophe it looks like.
+_EMPTY_QUERY_DETAILS = "You didn‘t enter anything to search for."  # noqa: RUF001
+# Every term in the query was one Scryfall (and now this surface) cannot honor. See query_terms.py.
+_ALL_IGNORED_DETAILS = "All of your terms were ignored."
+# Scryfall's sentence for a query whose parentheses do not balance, in either direction.
+_UNCLOSED_PARENS_DETAILS = "Your search contains unclosed parentheses."
+# `/cards/random`'s own miss sentence, which names what it could not do rather than the query.
+_RANDOM_NO_MATCH_DETAILS = "0 cards matched this search, a random card could not be returned."
+# Scryfall's wording for `/cards/named` with neither parameter -- backticks and no full stop.
+_NAMED_MISSING_PARAM_DETAILS = "You must provide a `fuzzy` or `exact` parameter"
 
 # CSV columns for `format=csv`. Fixed rather than derived from the page's cards so the header does
 # not change between pages of one result set. Nested objects are flattened with `_`, matching how
@@ -459,6 +484,60 @@ def _as_int(value: str | None) -> int | None:
         return int(value.strip())
     except (ValueError, AttributeError):
         return None
+
+
+def _scryfall_page(value: str) -> int:
+    """Parse Scryfall's `page`, which never rejects anything.
+
+    Measured one request per row (2026-08-16, `q=e:khm`, a two-page result)::
+
+        page=0  page=-3  page=-0  page=abc  page=  page=0x2  page=1e2   all serve PAGE 1
+        page=2.5  page=1.9  page=+2  page=" 2"  page=2abc                truncate at the first
+                                                                         non-digit
+        page=007                                                         is 7, not octal -- a THIRD
+                                                                         page here, so 422
+
+    That is Ruby's `String#to_i` (leading space, optional sign, digits, stop) followed by a clamp to
+    1 -- not integer validation. This surface answered `400 "The page parameter must be a positive
+    integer."` to the first row above, which is a sentence Scryfall does not own and a rejection it
+    does not make. The only 4xx `page` earns is the 422 for a page past the end, and that one needs
+    the result count, so it is decided where the count is (`_empty_page_error`).
+
+    Args:
+        value: The raw `page` parameter.
+
+    Returns:
+        The 1-based page number.
+    """
+    digits = re.match(r"\s*[-+]?\d*", value or "")
+    try:
+        page = int(digits.group(0)) if digits else 0
+    except ValueError:
+        page = 0
+    return max(page, 1)
+
+
+def _empty_page_error(total_cards: int, page_offset: int) -> dict[str, Any]:
+    """The error for a page that came back with no rows -- which is TWO different errors.
+
+    Scryfall separates "your query matched nothing" from "your query matched, but not this far in":
+    a query with no results is `404 not_found` at every page, and a page past the end of a result
+    that DOES have rows is `422 validation_error` (measured 2026-08-16: `e:khm` is two pages, and
+    `page=3` is a 422 while `e:notaset` is a 404 at `page=1` and at `page=3` alike). This surface
+    answered 404 to both, which told a paginating client its query had stopped matching.
+
+    Neither body carries `warnings`, even for a query whose terms were ignored -- also measured.
+
+    Args:
+        total_cards: How many cards the query matched in total.
+        page_offset: The 0-based offset of the page that came back empty.
+
+    Returns:
+        The Scryfall error object.
+    """
+    if total_cards > 0 and page_offset >= total_cards:
+        return error_object(code="validation_error", status=422, details=_BEYOND_END_DETAILS)
+    return not_found_error(_NO_MATCH_DETAILS)
 
 
 def _self_base_url(request: falcon.Request | None, request_host: str, path: str) -> str:
@@ -891,24 +970,38 @@ class ScryfallCardsRoutes:
         # what api.scryfall.com does (an empty-query 400 comes back with the route's own max-age).
         _set_cards_cache(falcon_response)
         if not q or not q.strip():
-            return self._scryfall_respond(falcon_response, bad_request_error(_EMPTY_QUERY_DETAILS), pretty=is_pretty)
-
-        # `or 1` would swallow page=0 into page=1; an unparseable page defaults, a non-positive
-        # one is rejected below.
-        parsed_page = _as_int(page)
-        page_number = 1 if parsed_page is None else parsed_page
-        if page_number < 1:
             return self._scryfall_respond(
                 falcon_response,
-                bad_request_error("The page parameter must be a positive integer."),
+                bad_request_error(_EMPTY_QUERY_DETAILS, warnings=None),
                 pretty=is_pretty,
             )
 
-        warnings: list[str] = []
-        unique_on = _UNIQUE_MAP.get(unique.lower())
-        if unique_on is None:
-            warnings.append(f"Unrecognized unique mode {unique!r}; rolled up by card instead.")
-            unique_on = UniqueOn.CARD
+        page_number = _scryfall_page(page)
+
+        # SCRYFALL'S IGNORE-AND-CONTINUE POLICY, applied to the raw query before anything reads it:
+        # the terms this API cannot honor leave the query carrying a warning, and only a query with
+        # NOTHING left is a bad request. See query_terms.py for the measurements behind every rule.
+        policy = scryfall_term_policy(q)
+        if policy.unclosed_parens:
+            return self._scryfall_respond(
+                falcon_response,
+                bad_request_error(_UNCLOSED_PARENS_DETAILS, warnings=None),
+                pretty=is_pretty,
+            )
+        if policy.all_ignored:
+            return self._scryfall_respond(
+                falcon_response,
+                bad_request_error(_ALL_IGNORED_DETAILS, warnings=policy.warnings),
+                pretty=is_pretty,
+            )
+        warnings: list[str] = list(policy.warnings)
+
+        # An unrecognized `unique` is Scryfall's default, SILENTLY: `unique=printing`,
+        # `unique=card`, `unique=printings`, `unique=artwork` and `unique=bogus` all come back as
+        # the plain unique-by-card answer with no `warnings` key at all (measured 2026-08-16). This
+        # surface warned on all five -- and four of them are its own vocabulary, which the in-query
+        # `unique:` directive accepts, so the warning announced an inconsistency, not a problem.
+        unique_on = _UNIQUE_MAP.get(unique.lower(), UniqueOn.CARD)
 
         orderby = _ORDER_MAP.get(order.lower())
         if orderby is None:
@@ -924,7 +1017,7 @@ class ScryfallCardsRoutes:
 
         try:
             result = self._search(
-                query=q,
+                query=policy.query,
                 orderby=orderby,
                 direction=direction,
                 fields=["scryfall_id"],
@@ -950,7 +1043,7 @@ class ScryfallCardsRoutes:
         if not cards:
             return self._scryfall_respond(
                 falcon_response,
-                error_object(code="not_found", status=404, details=_NO_MATCH_DETAILS, warnings=warnings),
+                _empty_page_error(total_cards, (page_number - 1) * PAGE_SIZE),
                 pretty=is_pretty,
             )
 
@@ -1022,7 +1115,7 @@ class ScryfallCardsRoutes:
         if not (exact or fuzzy):
             return self._scryfall_respond(
                 falcon_response,
-                bad_request_error("You must provide a fuzzy or exact name parameter."),
+                bad_request_error(_NAMED_MISSING_PARAM_DETAILS),
                 pretty=is_pretty,
             )
 
@@ -1124,7 +1217,7 @@ class ScryfallCardsRoutes:
         if not words:
             return self._scryfall_respond(
                 falcon_response,
-                bad_request_error("You must provide a fuzzy or exact name parameter."),
+                bad_request_error(_NAMED_MISSING_PARAM_DETAILS),
                 pretty=pretty,
             )
 
@@ -1490,8 +1583,26 @@ class ScryfallCardsRoutes:
         self._require_setup_complete()
         where, params = "TRUE", {}
         if q and q.strip():
+            # The same ignore-and-continue policy `/cards/search` runs, because Scryfall runs it
+            # here too: `/cards/random?q=subtype:elf` is a 400 "All of your terms were ignored." and
+            # not a random elf (measured 2026-08-16). A random card drawn from a query whose only
+            # term was silently dropped is a random card from the WHOLE corpus, which is the worst
+            # of the available answers.
+            policy = scryfall_term_policy(q)
+            if policy.unclosed_parens:
+                return self._scryfall_respond(
+                    falcon_response,
+                    bad_request_error(_UNCLOSED_PARENS_DETAILS, warnings=None),
+                    pretty=is_pretty,
+                )
+            if policy.all_ignored:
+                return self._scryfall_respond(
+                    falcon_response,
+                    bad_request_error(_ALL_IGNORED_DETAILS, warnings=policy.warnings),
+                    pretty=is_pretty,
+                )
             try:
-                where, params = generate_sql_query(parse_scryfall_query(q))
+                where, params = generate_sql_query(parse_scryfall_query(policy.query))
             except ValueError:
                 return self._scryfall_respond(
                     falcon_response,
@@ -1515,7 +1626,13 @@ class ScryfallCardsRoutes:
             explain=False,
         )["result"][0]["total"]
         if not matched:
-            return self._scryfall_respond(falcon_response, not_found_error(_NO_MATCH_DETAILS), pretty=is_pretty)
+            # Scryfall words the random miss differently from the search miss, and says the thing
+            # this route was unable to do (measured on `/cards/random?q=e:notaset`).
+            return self._scryfall_respond(
+                falcon_response,
+                not_found_error(_RANDOM_NO_MATCH_DETAILS),
+                pretty=is_pretty,
+            )
 
         rows = self._run_uncached(
             query=(
@@ -1525,7 +1642,11 @@ class ScryfallCardsRoutes:
             params={**params, "matched": matched},
         )
         if not rows:
-            return self._scryfall_respond(falcon_response, not_found_error(_NO_MATCH_DETAILS), pretty=is_pretty)
+            return self._scryfall_respond(
+                falcon_response,
+                not_found_error(_RANDOM_NO_MATCH_DETAILS),
+                pretty=is_pretty,
+            )
         return self._render_card(
             to_scryfall_card(sql_row_to_engine_row(rows[0])),
             falcon_response=falcon_response,
@@ -1803,16 +1924,8 @@ class ScryfallCardsRoutes:
         Returns:
             A List object of cards, or a Scryfall error object.
         """
-        # `or 1` would swallow page=0 into page=1; an unparseable page defaults, a non-positive
-        # one is rejected below.
-        parsed_page = _as_int(page)
-        page_number = 1 if parsed_page is None else parsed_page
-        if page_number < 1:
-            return self._scryfall_respond(
-                falcon_response,
-                bad_request_error("The page parameter must be a positive integer."),
-                pretty=pretty,
-            )
+        # The same never-rejecting `page` as /cards/search -- one rule, because it is one parameter.
+        page_number = _scryfall_page(page)
         total = self._run_query(query="SELECT count(1) AS total FROM magic.cards", explain=False)["result"][0]["total"]
         rows = self._run_query(
             query=(
@@ -1824,7 +1937,11 @@ class ScryfallCardsRoutes:
             explain=False,
         )["result"]
         if not rows:
-            return self._scryfall_respond(falcon_response, not_found_error(_NO_MATCH_DETAILS), pretty=pretty)
+            return self._scryfall_respond(
+                falcon_response,
+                _empty_page_error(total, (page_number - 1) * PAGE_SIZE),
+                pretty=pretty,
+            )
 
         cards = [to_scryfall_card(row) for row in rows]
         has_more = (page_number - 1) * PAGE_SIZE + len(cards) < total

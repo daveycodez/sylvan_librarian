@@ -638,15 +638,34 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
     return card
 
 
+class _Unset:
+    """Sentinel for `error_object(warnings=...)`: the key is omitted entirely.
+
+    Three states are needed, not two. api.scryfall.com writes `"warnings": null` on a
+    `bad_request` from `/cards/search` even when nothing was warned about, writes the array when
+    something was, and writes NO key at all on a `not_found`, a `validation_error` or
+    `/cards/named`'s missing-parameter 400 (all measured 2026-08-16). `None` therefore has to mean
+    "present and null", which leaves nothing for "absent" but a sentinel.
+    """
+
+
+_UNSET = _Unset()
+
+
 def error_object(
     *,
     code: str,
     status: int,
     details: str,
     error_type: str | None = None,
-    warnings: list[str] | None = None,
+    warnings: list[str] | _Unset | None = _UNSET,
 ) -> dict[str, Any]:
     """Build Scryfall's error object.
+
+    `warnings` sits BEFORE `details`, which is Scryfall's own key order -- measured on every error
+    body that carries one (`/cards/search?q=f:notaformat` and `/cards/search` with no `q` at all):
+    `{object, code, status, warnings, details}`. This used to append it last, so a client comparing
+    bodies byte for byte saw a different document for the same answer.
 
     Args:
         code: Scryfall's machine-readable error slug, e.g. "not_found".
@@ -655,18 +674,20 @@ def error_object(
         error_type: Scryfall's refinement of `code`, when it sends one -- `ambiguous` on a
             `/cards/named?fuzzy=` that resolved to more than one card. Emitted between `code` and
             `status`, which is where api.scryfall.com puts it.
-        warnings: Non-fatal notes about the request, when there are any.
+        warnings: Non-fatal notes about the request. Pass a list or None to WRITE the key (null
+            when there is nothing to say); omit the argument to leave the key out.
 
     Returns:
-        The error object, with `type` and `warnings` present only when supplied.
+        The error object, with `type` present only when supplied and `warnings` positioned before
+        `details`.
     """
     error: dict[str, Any] = {"object": "error", "code": code}
     if error_type is not None:
         error["type"] = error_type
     error["status"] = status
+    if not isinstance(warnings, _Unset):
+        error["warnings"] = warnings or None
     error["details"] = details
-    if warnings:
-        error["warnings"] = warnings
     return error
 
 

@@ -224,7 +224,13 @@ class TestSearch:
     def test_missing_query_is_a_scryfall_400(self, compat_corpus: APIResource):
         resp = dispatch(compat_corpus, "/cards/search")
         assert resp.status == falcon.HTTP_400
-        assert payload(resp)["details"] == "You didn't enter anything to search for."
+        body = payload(resp)
+        # The character after `didn` is U+2018, and a `warnings: null` sits beside it: Scryfall
+        # writes both, and this is the body a client sees most often after a typo. Key ORDER is
+        # Scryfall's too.
+        assert body["details"] == "You didn\u2018t enter anything to search for."
+        assert list(body) == ["object", "code", "status", "warnings", "details"]
+        assert body["warnings"] is None
 
     @pytest.mark.parametrize("order", ["penny", "review"])
     def test_the_two_unsupported_orders_warn_instead_of_failing(self, compat_corpus: APIResource, order):
@@ -273,9 +279,36 @@ class TestSearch:
         dispatch(compat_corpus, "/cards/search", "q=%21%22Compat+Bolt%22&order=usd&dir=asc")
         assert seen["direction"] == SortDirection.ASC
 
-    def test_page_beyond_the_results_is_a_404(self, compat_corpus: APIResource):
+    def test_page_beyond_the_results_is_a_422(self, compat_corpus: APIResource):
+        """Scryfall separates "matched nothing" from "matched, but not this far in".
+
+        A query with no results is `404 not_found` at every page; a page past the end of a result
+        that DID match is `422 validation_error` (measured 2026-08-16). Answering 404 to both told
+        a paginating client its query had stopped matching.
+        """
         resp = dispatch(compat_corpus, "/cards/search", "q=%21%22Compat+Bolt%22&page=2")
-        assert resp.status == falcon.HTTP_404
+        assert resp.status == falcon.HTTP_422
+        body = payload(resp)
+        assert body["code"] == "validation_error"
+        assert body["details"].startswith("You have paginated beyond the end of these results")
+        assert "warnings" not in body
+
+    def test_a_query_that_matched_nothing_keeps_the_404_at_every_page(self, compat_corpus: APIResource):
+        for page in ("1", "5"):
+            resp = dispatch(compat_corpus, "/cards/search", f"q=%21%22No+Such+Card+At+All%22&page={page}")
+            assert resp.status == falcon.HTTP_404
+            assert payload(resp)["code"] == "not_found"
+
+    @pytest.mark.parametrize("page", ["0", "-3", "abc", "", "0x2", "1e2", "-0"])
+    def test_page_is_scryfalls_to_i_and_clamp_never_a_rejection(self, compat_corpus: APIResource, page):
+        """Measured on api.scryfall.com 2026-08-16.
+
+        page=0, page=-3, page=abc and page= all serve page 1, and page=2.5 / page=+2 / page=2abc
+        truncate at the first non-digit. This surface answered `400 "The page parameter must be a
+        positive integer."` -- a sentence Scryfall does not own and a rejection it does not make.
+        """
+        resp = dispatch(compat_corpus, "/cards/search", f"q=%21%22Compat+Bolt%22&page={page}")
+        assert resp.status == falcon.HTTP_200
 
     def test_next_page_is_absent_when_the_page_is_the_last(self, compat_corpus: APIResource):
         assert "next_page" not in payload(dispatch(compat_corpus, "/cards/search", "q=%21%22Compat+Bolt%22"))
@@ -334,9 +367,51 @@ class TestSearch:
         assert BOLT_ID in row
 
     def test_unparseable_query_is_a_scryfall_400(self, compat_corpus: APIResource):
-        resp = dispatch(compat_corpus, "/cards/search", "q=cmc%3E")
+        resp = dispatch(compat_corpus, "/cards/search", "q=%28cmc%3E1")
         assert resp.status == falcon.HTTP_400
         assert payload(resp)["object"] == "error"
+
+    def test_unbalanced_parentheses_get_scryfalls_own_sentence(self, compat_corpus: APIResource):
+        resp = dispatch(compat_corpus, "/cards/search", "q=t%3Acreature+%28t%3Aland")
+        assert resp.status == falcon.HTTP_400
+        body = payload(resp)
+        assert body["details"] == "Your search contains unclosed parentheses."
+        assert body["warnings"] is None
+
+    def test_a_query_whose_every_term_was_ignored_is_a_400_carrying_the_warnings(self, compat_corpus: APIResource):
+        resp = dispatch(compat_corpus, "/cards/search", "q=subtype%3Aeldrazi")
+        assert resp.status == falcon.HTTP_400
+        body = payload(resp)
+        assert list(body) == ["object", "code", "status", "warnings", "details"]
+        assert body["details"] == "All of your terms were ignored."
+        assert body["warnings"] == [
+            "Invalid expression \u201csubtype:eldrazi\u201d was ignored. Unknown keyword \u201csubtype\u201d.",
+        ]
+
+    def test_a_surviving_term_makes_an_ignored_one_a_warning_on_a_200(self, compat_corpus: APIResource):
+        body = payload(dispatch(compat_corpus, "/cards/search", "q=f%3Anotaformat+%21%22Compat+Bolt%22"))
+        assert body["object"] == "list"
+        assert body["total_cards"] == 1
+        assert body["warnings"] == [
+            "Invalid expression \u201cf:notaformat\u201d was ignored. Unknown game format \u201cnotaformat\u201d",
+        ]
+
+    def test_typographic_quotes_reach_the_parser_as_the_quotes_they_stand_for(self, compat_corpus: APIResource):
+        """Users paste curly quotes constantly; this surface answered 400 to every one of them."""
+        curly = payload(dispatch(compat_corpus, "/cards/search", "q=%21%E2%80%9CCompat+Bolt%E2%80%9D"))
+        assert curly["total_cards"] == 1
+
+    def test_a_malformed_regex_is_a_400_carrying_scryfalls_reason(self, compat_corpus: APIResource):
+        resp = dispatch(compat_corpus, "/cards/search", "q=o%3A%2F%5Bunclosed%2F")
+        assert resp.status == falcon.HTTP_400
+        assert payload(resp)["warnings"] == [
+            "Invalid expression \u201co:/[unclosed/\u201d was ignored. Invalid regular expression: brackets [] not balanced.",
+        ]
+
+    @pytest.mark.parametrize("unique", ["card", "printing", "printings", "artwork", "bogus"])
+    def test_an_unrecognized_unique_mode_is_silent_as_scryfalls_is(self, compat_corpus: APIResource, unique):
+        body = payload(dispatch(compat_corpus, "/cards/search", f"q=%21%22Compat+Bolt%22&unique={unique}"))
+        assert "warnings" not in body
 
 
 class TestNamed:
@@ -681,13 +756,16 @@ class TestAllCards:
         assert body["total_cards"] >= 3
         assert len(body["data"]) <= PAGE_SIZE
 
-    def test_a_page_past_the_end_is_a_404(self, compat_corpus: APIResource):
-        assert dispatch(compat_corpus, "/cards", "page=100000").status == falcon.HTTP_404
+    def test_a_page_past_the_end_is_a_422(self, compat_corpus: APIResource):
+        resp = dispatch(compat_corpus, "/cards", "page=100000")
+        assert resp.status == falcon.HTTP_422
+        assert payload(resp)["code"] == "validation_error"
 
-    def test_a_non_positive_page_is_a_400(self, compat_corpus: APIResource):
+    def test_a_non_positive_page_serves_page_one(self, compat_corpus: APIResource):
+        """The same never-rejecting `page` as /cards/search -- one rule, because it is one parameter."""
         resp = dispatch(compat_corpus, "/cards", "page=0")
-        assert resp.status == falcon.HTTP_400
-        assert payload(resp)["code"] == "bad_request"
+        assert resp.status == falcon.HTTP_200
+        assert payload(resp)["object"] == "list"
 
     def test_next_page_addresses_this_host(self, compat_corpus: APIResource, monkeypatch):
         """The listing builds its own next_page, on a path the search route's tests never reach.
