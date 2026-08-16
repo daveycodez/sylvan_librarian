@@ -168,11 +168,12 @@ class TestToScryfallCard:
         assert card["oracle_text"] == "Lightning Bolt deals 3 damage to any target."
         assert card["image_uris"]
 
-    def test_a_multi_faced_card_moves_its_text_into_the_faces(self):
+    def test_a_two_image_card_moves_its_text_and_its_picture_into_the_faces(self):
         """Which keys sit at top level varies by LAYOUT, so this is a branch, not a fixed shape."""
         card = to_scryfall_card(
             row(
                 name="Delver of Secrets // Insectile Aberration",
+                card_layout="transform",
                 card_faces=[
                     {"name": "Delver of Secrets", "oracle_text": "Front.", "mana_cost": "{U}"},
                     {"name": "Insectile Aberration", "oracle_text": "Back.", "power": "3"},
@@ -181,11 +182,32 @@ class TestToScryfallCard:
         )
         assert "oracle_text" not in card
         assert "image_uris" not in card
+        assert "mana_cost" not in card
+        assert "card_back_id" not in card
         assert [f["name"] for f in card["card_faces"]] == ["Delver of Secrets", "Insectile Aberration"]
         assert all(f["object"] == "card_face" for f in card["card_faces"])
         # Each face gets its own side of the CDN path.
         assert "/front/" in card["card_faces"][0]["image_uris"]["large"]
         assert "/back/" in card["card_faces"][1]["image_uris"]["large"]
+
+    def test_a_one_image_card_keeps_its_picture_and_joins_its_faces_costs(self):
+        """A split card is one piece of cardboard: one picture, one cost, and text-only faces."""
+        card = to_scryfall_card(
+            row(
+                name="Fire // Ice",
+                card_layout="split",
+                card_faces=[
+                    {"name": "Fire", "oracle_text": "Two damage.", "mana_cost": "{1}{R}"},
+                    {"name": "Ice", "oracle_text": "Tap it.", "mana_cost": "{1}{U}"},
+                ],
+            )
+        )
+        assert card["mana_cost"] == "{1}{R} // {1}{U}"
+        assert "/front/" in card["image_uris"]["large"]
+        assert card["card_back_id"] == "0aeebaf5-8c7d-4636-9e82-8c27447861f7"
+        assert all("image_uris" not in face for face in card["card_faces"])
+        # ...and edhrec files a split under both halves, unlike every other multi-face layout.
+        assert card["related_uris"]["edhrec"] == "https://edhrec.com/route/?cc=Fire+%2F%2F+Ice"
 
     def test_related_cards_pass_through_when_present(self):
         parts = [{"object": "related_card", "id": "x", "component": "token", "name": "Goblin", "type_line": "Token"}]
