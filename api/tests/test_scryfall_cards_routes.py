@@ -814,6 +814,20 @@ class TestExtrasTriggers:
         for value in ("1993", "2015", "future"):
             assert routes_module._extras_triggers(parse_scryfall_query(f"frame:{value}")).forced is False, value
 
+    def test_banned_triggers_wholesale_and_f_only_at_premodern(self):
+        """Every legality alias binds to `card_legalities`, so the alias separates them.
+
+        `banned:` fires at every value probed while `restricted:` does not, and of the 21 format
+        values `premodern` is the only one that fires -- `legal:premodern` fires too, so it is the
+        value rather than the alias. Measured 2026-08-16.
+        """
+        for value in ("legacy", "vintage", "modern", "pauper"):
+            assert routes_module._extras_triggers(parse_scryfall_query(f"banned:{value}")).forced is True, value
+        for query in ("f:premodern", "format:premodern", "legal:premodern", "-f:premodern t:land"):
+            assert routes_module._extras_triggers(parse_scryfall_query(query)).forced is True, query
+        for query in ("restricted:vintage", "f:pauper", "f:legacy", "f:vintage", "legal:standard", "f:oldschool"):
+            assert routes_module._extras_triggers(parse_scryfall_query(query)).forced is False, query
+
 
 class TestNamed:
     """GET /cards/named."""

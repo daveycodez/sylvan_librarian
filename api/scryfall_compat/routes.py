@@ -332,9 +332,27 @@ def _extras_triggers_of_term(node: BinaryOperatorNode) -> _ExtrasTriggers:
     # the flag this fires on all three.
     if value in _VALUE_EXTRAS_TRIGGERS.get(attribute, frozenset()) and not node.rhs.regex_derived:
         return _ExtrasTriggers(forced=True, sets=())
+    if attribute == "card_legalities" and _legality_term_triggers(node, value):
+        return _ExtrasTriggers(forced=True, sets=())
     if attribute == _SET_CODE_ATTRIBUTE:
         return _ExtrasTriggers(forced=False, sets=(value,))
     return _NO_EXTRAS_TRIGGERS
+
+
+def _legality_term_triggers(node: BinaryOperatorNode, value: str) -> bool:
+    """`banned:` at any value, and `f:`/`format:`/`legal:` at exactly `premodern`.
+
+    Every legality alias binds to `card_legalities`, so the ALIAS is what separates them.
+    Measured on api.scryfall.com 2026-08-16: `banned:legacy`, `banned:vintage`, `banned:modern` and
+    `banned:pauper` all echo `include_extras=true` while `restricted:vintage` echoes false; and of
+    the 21 format values probed one at a time, `premodern` is the ONLY one that fires (9,187 rows
+    echoing true, against false for standard/modern/legacy/pauper/vintage/commander/oldschool/predh
+    and the rest). `legal:premodern` fires too and `-f:premodern t:land` fires, so it is the value
+    rather than the alias, and negation does not cancel it.
+    """
+    lhs = node.lhs
+    original = getattr(lhs, "original_attribute", None) if isinstance(lhs, AttributeNode) else None
+    return original == "banned" or value == "premodern"
 
 
 def _mentions_is_tag(node: object, tag: str) -> bool:
