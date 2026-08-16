@@ -220,8 +220,11 @@ _VALUE_EXTRAS_TRIGGERS = {
 #  - NOT "the population contains extras". `is:mdfc` fires with 327 printings and ZERO of them
 #    `is:extra`; `is:glossy` fires with 7 and zero. `is:stamped` does NOT fire with 696 extras out
 #    of 3,195 -- the largest extras share in the table.
-#  - NOT the layout family. `is:mdfc` fires, `is:transform` and `is:meld` do not, and `is:dfc` --
-#    which is exactly their union -- fires.
+#  - NOT the layout family. `is:mdfc` fires while `is:transform` and `is:meld` do not, and
+#    `is:dfc` -- which overlaps both -- fires. (`is:dfc` is NOT the union of the three,
+#    measured separately: it excludes meld outright and reaches art_series,
+#    double_faced_token and reversible_card. See `_DERIVED_EXPANSIONS`. The refutation stands
+#    either way; the union was the wrong name for it.)
 #
 # So it is Scryfall's own per-value table, and the honest way to mirror it is to copy it down.
 # Re-derive it by re-running the probe, not by reasoning about the values.
