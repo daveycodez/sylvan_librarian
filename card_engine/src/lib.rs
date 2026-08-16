@@ -5797,18 +5797,38 @@ fn narrow_rec(
 
     match filter {
         FilterExpr::ExactName(needle) => {
-            // The ascending name permutation is keyed on name_rank — i.e. on
-            // card_name_lower byte order — so equal-name blocks are contiguous
-            // and equality is a binary-searched range: an exact, tight card
-            // set. A miss proves the empty set (names are never null).
-            let perm = &indexes.sort_perms.name[0];
-            if perm.len() != n_cards || cards.len() != n_cards || n_cards == 0 {
-                return None; // store without name permutations
+            // `!"…"` names a card by its whole name OR by either side of the `" // "` join
+            // (filter::exact_name_matches, with the live measurements). The ascending name
+            // permutation answers only the first of those: it is keyed on name_rank — i.e. on
+            // card_name_lower byte order — so an equal-name block is a contiguous binary-searched
+            // range, but a card whose *back* face carries the needle sorts under its front face's
+            // name and is nowhere near it. Narrowing on the range alone would drop it before the
+            // verify ever ran, which is exactly how `!"Lightning Bolt"` came back without
+            // `Emeritus of Conflict // Lightning Bolt`.
+            //
+            // The folded-name trigram index does answer it: a face-name match means the needle is a
+            // CONTIGUOUS substring of the stored name, so the card carries every trigram of it. The
+            // index is built over card_name_folded while the comparison is on card_name_lower, and
+            // that is sound in one direction only — folding leaves ASCII alone and only ever ADDS
+            // ASCII (é→e, æ→ae), so an ASCII needle inside the lower name is still inside the folded
+            // one. A non-ASCII needle has no such guarantee ("éowyn" has no window in common with
+            // the folded "eowyn"), and a needle under 3 bytes has no window at all: both decline to
+            // narrow rather than narrow unsoundly, and the scan verifies every card instead.
+            //
+            // Candidates are verified here with the same predicate the walk uses, so the result is
+            // exact — `tight_narrow_space` still reports ExactName as tight card space, and the Not
+            // arm's complement stays sound.
+            if cards.len() != n_cards || n_cards == 0 {
+                return None;
             }
-            let name_of = |cid: &Archived<u32>| cards[u32::from(*cid) as usize].card_name_lower.as_str();
-            let lo = perm.partition_point(|cid| name_of(cid) < needle.as_str());
-            let width = perm[lo..].partition_point(|cid| name_of(cid) == needle.as_str());
-            let ids: Vec<u32> = perm[lo..lo + width].iter().map(|x| u32::from(*x)).collect();
+            let idx = &indexes.name_trigram;
+            if !needle.is_ascii() || u32::from(idx.domain) as usize != n_cards {
+                return None;
+            }
+            let mut ids = trigram_candidates(idx, needle)?;
+            ids.retain(|&cid| {
+                crate::filter::exact_name_matches(cards[cid as usize].card_name_lower.as_str(), needle)
+            });
             Narrowed::tight(Candidates::Cards(ids))
         }
 

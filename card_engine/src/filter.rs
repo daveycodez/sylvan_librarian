@@ -1416,7 +1416,7 @@ impl FilterExpr {
                 Tri::PrintingDep => Tri::PrintingDep,
             },
 
-            FilterExpr::ExactName(lower) => tri_bool(card.card_name_lower.as_str() == lower.as_str()),
+            FilterExpr::ExactName(lower) => tri_bool(exact_name_matches(card.card_name_lower.as_str(), lower)),
 
             FilterExpr::NumericCmp { lhs, op, rhs } => {
                 numeric_cmp_tri(lhs, *op, rhs, &|f| field_num(card, printing, f))
@@ -1952,6 +1952,25 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
     }
 
     build_text_filter(attr, op, rhs)
+}
+
+/// Does `!"needle"` name this card? `stored` is `card_name_lower`, `needle` the query's own
+/// lowercased spelling.
+///
+/// The whole name, or **either side of the `" // "` join** — a multi-face card answers to each of
+/// its face names on its own. Measured against api.scryfall.com on 2026-08-16:
+/// `!"Lightning Bolt"` returns two cards, `Lightning Bolt` and `Emeritus of Conflict // Lightning
+/// Bolt` (sos/113), whose *second* face carries the name; `!"Fire"` returns `Fire // Ice`,
+/// `!"Stomp"` returns `Bonecrusher Giant // Stomp`, `!"Insectile Aberration"` returns
+/// `Delver of Secrets // Insectile Aberration`. Comparing only the joined name found the first of
+/// those and missed all the rest.
+///
+/// This is the `!` SEARCH operator and nothing else. `/cards/named?exact=` deliberately answers on
+/// ORACLE names alone (see `core_api::folded_name_matches` and the route's own note) — the two
+/// surfaces share a rule shape, not a scope, and conflating them would widen a route Scryfall keeps
+/// narrow.
+pub(crate) fn exact_name_matches(stored: &str, needle: &str) -> bool {
+    stored == needle || stored.split(" // ").any(|face| face == needle)
 }
 
 fn rhs_value_str(rhs: &Value) -> &str {

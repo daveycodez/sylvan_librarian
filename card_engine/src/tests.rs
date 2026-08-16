@@ -10099,6 +10099,9 @@ fn named_store() -> CardData {
     assign_name_ranks(&mut cards);
     let mut data = store_of(cards, &[1; 6], vocab);
     data.indexes.sort_perms = build_sort_permutations(&data.cards);
+    // ExactName narrows through this index, not the permutation — a face name is not addressable
+    // by a range over the joined name (see narrow_rec's ExactName arm).
+    data.indexes.name_trigram = build_trigram_index(&data.cards, |c| c.card_name_folded.as_str());
     data
 }
 
@@ -10111,9 +10114,9 @@ fn name_ranks_dense_and_shared_across_duplicates() {
     assert_eq!(ranks, vec![3, 4, 0, 4, 1, 2]);
 }
 
-// ExactName narrows to the exact, tight card set through the ascending name
-// permutation: hit (single), hit (duplicate pair), boundary names, and a miss
-// proving the empty set.
+// ExactName narrows to the exact, tight card set: hit (single), hit (duplicate pair), boundary
+// names, and a miss proving the empty set. The candidates come from the folded-name trigram index
+// and are verified in the narrow, so the set is exactly what the walk would have kept.
 #[test]
 fn exact_name_narrows_tight() {
     let data = named_store();
@@ -10136,7 +10139,7 @@ fn exact_name_narrows_tight() {
         ("sol rin", vec![]),        // prefix of a real name is still a miss
     ] {
         let n = narrow(name);
-        assert!(n.tight, "{name}: equality through the sorted permutation is exact");
+        assert!(n.tight, "{name}: candidates are verified in the narrow, so the set is exact");
         let mut got = n.set.into_cards(&archived.offsets, &archived.indexes.printing_to_card);
         got.sort_unstable();
         want.sort_unstable();
@@ -11389,6 +11392,92 @@ fn arith_tuple_key_budget_catches_a_blown_domain() {
 /// Above `ARITH_TUPLE_GUARD_MIN_CARDS`, and large enough that an all-distinct key space
 /// clears `10*sqrt(n)+32` by a wide margin.
 const ARITH_TUPLE_BLOWUP_CARDS: usize = 6_000;
+
+#[test]
+fn exact_name_matches_either_face() {
+    // `!"Lightning Bolt"` returns TWO cards on api.scryfall.com (2026-08-16): `Lightning Bolt` and
+    // `Emeritus of Conflict // Lightning Bolt` (sos/113), whose SECOND face carries the name. The
+    // same rule answers `!"Fire"` with `Fire // Ice`, `!"Stomp"` with `Bonecrusher Giant // Stomp`
+    // and `!"Insectile Aberration"` with `Delver of Secrets // Insectile Aberration`.
+    use super::filter::exact_name_matches;
+    let joined = "emeritus of conflict // lightning bolt";
+    assert!(exact_name_matches(joined, joined));
+    assert!(exact_name_matches(joined, "lightning bolt"), "the back face names the card");
+    assert!(exact_name_matches(joined, "emeritus of conflict"), "so does the front face");
+    assert!(exact_name_matches("lightning bolt", "lightning bolt"));
+    // Still EXACT, per face: a prefix, a suffix or a substring of a face name is not a match.
+    assert!(!exact_name_matches(joined, "lightning"));
+    assert!(!exact_name_matches(joined, "bolt"));
+    assert!(!exact_name_matches(joined, "conflict // lightning bolt"));
+    assert!(!exact_name_matches("lightning bolt", "lightning bol"));
+    // A one-sided separator is not the join, so nothing splits on it.
+    assert!(!exact_name_matches("who//what//when", "what"));
+}
+
+#[test]
+fn exact_name_narrow_finds_a_back_face_and_declines_where_it_cannot() {
+    // The narrowing half of the same bug: the ascending name permutation only addresses whole-name
+    // equality, so a card named by its BACK face was dropped before the walk could verify it. The
+    // folded-name trigram index reaches it; a needle that index cannot speak for (under three
+    // bytes, or non-ASCII against a folded index) declines to narrow instead of narrowing wrongly.
+    let mut vocab = VocabInterner::new();
+    let names = ["lightning bolt", "emeritus of conflict // lightning bolt", "fog", "ow"];
+    let mut cards: Vec<OracleCard> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let mut c = stub_card((i + 1) as u128, TYPE_CREATURE, &[], &mut vocab);
+            c.card_name_lower = InlineStr::from_str(name);
+            c.card_name_folded = InlineStr::from_str(name);
+            c
+        })
+        .collect();
+    assign_name_ranks(&mut cards);
+    let mut data = store_of(cards, &[1; 4], vocab);
+    data.indexes.sort_perms = build_sort_permutations(&data.cards);
+    data.indexes.name_trigram = build_trigram_index(&data.cards, |c| c.card_name_folded.as_str());
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+
+    let narrow = |name: &str| {
+        super::narrow_rec(
+            &FilterExpr::ExactName(name.to_string()),
+            &archived.indexes,
+            &archived.offsets,
+            &archived.cards,
+            false,
+        )
+    };
+    let cards_of = |n: super::Narrowed| {
+        let mut got = n.set.into_cards(&archived.offsets, &archived.indexes.printing_to_card);
+        got.sort_unstable();
+        got
+    };
+
+    let n = narrow("lightning bolt").expect("must narrow");
+    assert!(n.tight);
+    assert_eq!(cards_of(n), vec![0, 1], "both the card and the card whose back face is named");
+    let n = narrow("emeritus of conflict").expect("must narrow");
+    assert_eq!(cards_of(n), vec![1]);
+    let n = narrow("fog").expect("must narrow");
+    assert_eq!(cards_of(n), vec![2]);
+    let n = narrow("no such card").expect("must narrow");
+    assert_eq!(cards_of(n), Vec::<u32>::new());
+
+    // Under three bytes there is no trigram window, so there is nothing to narrow through and the
+    // walk scans — declining is the only sound answer, and it still finds the card.
+    assert!(narrow("ow").is_none());
+    // Likewise a non-ASCII needle: folding only guarantees an ASCII substring survives.
+    assert!(narrow("éowyn").is_none());
+
+    // Whatever the narrow does, run_query agrees with a full scan.
+    for name in ["lightning bolt", "emeritus of conflict", "ow", "no such card"] {
+        let mut f = FilterExpr::ExactName(name.to_string());
+        let brute = archived.cards.iter().filter(|c| f.eval_card(c, &archived.strings) == Tri::True).count();
+        let (total, _) = run_query(&QueryCtx::from(archived), &mut f, None, "card", "default", "edhrec", "asc", 100, 0);
+        assert_eq!(total, brute, "totals parity for {name:?}");
+    }
+}
 
 // ─── Face storage ─────────────────────────────────────────────────────────────
 
