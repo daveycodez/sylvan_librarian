@@ -138,6 +138,7 @@ class TestCardProcessing:
         # A funny set _FUNNY_EXTRA_SETS has never heard of is SERVED, not hidden — the stale-list
         # failure mode that direction was chosen for.
         assert "extra" not in tags(set_type="funny", set_code="un99"), "an unlisted funny set defaults to served"
+        assert "extra" not in tags(set_type="funny", set_code="sunf", type_line="Stickers"), "sunf's sheets are served"
         # ...and the playtest promo inside a served un-set: `und`/`unh`'s "Look at Me, I'm R&D" is a
         # real Un-card that merely depicts a playtest card, and `is:extra e:und` answers 0.
         assert "extra" not in tags(
@@ -160,6 +161,9 @@ class TestCardProcessing:
         # A funny ODDITY set: `is:extra e:ulst` is 62 of 62, and its rows are field-for-field
         # indistinguishable from the ust twins above — the set code is the whole signal.
         assert "extra" in tags(set_type="funny", set_code="ulst", border_color="silver"), "is:extra e:ulst is 62"
+        # ...and a TOKEN in an unlisted funny set is still one: the funny rule adds and never
+        # subtracts, so a stale list cannot make a future un-set's tokens vanish from search.
+        assert "extra" in tags(set_type="funny", set_code="un99", layout="token"), "tokens survive a stale list"
         # A digital printing legal in NO format: `is:extra e:hbg` is 122, 104 of them this class.
         assert "extra" in tags(digital=True, set_type="alchemy", legalities={"alchemy": "not_legal", "historic": "not_legal"}), (
             "hbg's Arena-only duplicates"

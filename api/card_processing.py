@@ -356,14 +356,24 @@ def _is_extra(card: dict[str, Any]) -> bool:
         True when the printing should carry `is:extra`.
     """
     never_legal = not set(card["legalities"].values()) & {"legal", "restricted"}
-    # A FUNNY SET DECIDES FOR ALL OF ITS PRINTINGS, in both directions — see `_FUNNY_EXTRA_SETS`
-    # for the measurement and for why no printing field can stand in for the list. This returns
-    # rather than falling through so the answer is total: `und`/`unh` carry a `playtest` promo each
-    # ("Look at Me, I'm R&D", a real Un-card that merely DEPICTS a playtest card) that the clause
-    # at the bottom used to call an extra, and `sunf`'s 48 sticker sheets would trip the `Stickers`
-    # clause below. Both sets answer `is:extra` 0 on api.scryfall.com.
-    if card.get("set_type") == "funny":
-        return card.get("set") in _FUNNY_EXTRA_SETS
+    # A FUNNY SET DECIDES FOR ITS PRINTINGS — see `_FUNNY_EXTRA_SETS` for the measurement and for
+    # why no printing field can stand in for the list.
+    #
+    # A funny set the list names is extra outright. A funny set it does NOT name still falls
+    # through to the layout, memorabilia, content-warning and "Card"/"Token" clauses below, and
+    # skips only the two that measurably misfire inside the un-sets: `und`/`unh` carry a `playtest`
+    # promo each ("Look at Me, I'm R&D", a real Un-card that merely DEPICTS a playtest card) and
+    # `sunf` ships 48 sticker sheets, and all three sets answer `is:extra` 0 on api.scryfall.com.
+    #
+    # FALLING THROUGH RATHER THAN RETURNING FALSE IS THE POINT. An early False would let a future
+    # funny set's tokens, planes or vanguards vanish from search the moment the list went stale --
+    # the silent-vanishing failure this list's polarity was chosen to avoid, reintroduced one level
+    # down. It costs nothing today: of the 57 funny printings another clause would call extra
+    # (punk 52 planar, cmb1/cmb2 1 vanguard each, hho/h17 1 token each) every one is already in a
+    # listed set, so the two rules agree wherever they overlap.
+    funny = card.get("set_type") == "funny"
+    if funny and card.get("set") in _FUNNY_EXTRA_SETS:
+        return True
     # A DIGITAL PRINTING NO FORMAT ALLOWS. Arena's Alchemy duplicates and the Astral cards from the
     # 1997 MicroProse game are legal nowhere and served nowhere: 117 printings across hbg (104),
     # past (12) and prm (1), every one of them inside Scryfall's `is:extra` and not one outside it,
@@ -393,17 +403,17 @@ def _is_extra(card: dict[str, Any]) -> bool:
     # A "Card"/"Token"/"Stickers" TYPE LINE, for the printings whose layout does not already say
     # so: the checklist and substitute-card family ships as layout `normal` in some sets, and the
     # Secret Lair sticker sheets (sld/335-339) ship as an ordinary `normal` box-set printing whose
-    # only tell is the type. `Stickers` is safe here only because the funny short-circuit above
-    # already answered for `sunf`, whose 48 sticker sheets Scryfall serves.
+    # only tell is the type. `Stickers` is guarded on `funny` because `sunf` ships 48 sticker
+    # sheets that Scryfall serves; `Card`/`Token` need no guard, and deliberately do not have one.
     type_line = card.get("type_line")
     if type_line:
         card_types, _ = parse_type_line(type_line)
-        if any(t in {"Card", "Token", "Stickers"} for t in card_types):
+        if any(t == "Card" or t == "Token" or (t == "Stickers" and not funny) for t in card_types):  # noqa: PLR1714
             return True
     # A playtest promo, EXCEPT where the printing is otherwise playable: sld/SCTLR Counterspell
     # carries `playtest`, is legal in modern, and is returned by a bare
     # `!"Counterspell"&unique=prints` — so the flag alone hides nothing.
-    return "playtest" in card.get("promo_types", []) and never_legal
+    return "playtest" in card.get("promo_types", []) and never_legal and not funny
 
 
 def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0915,C901,PLR0912
