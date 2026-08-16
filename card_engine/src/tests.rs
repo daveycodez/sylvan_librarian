@@ -199,6 +199,7 @@ fn stub_card(oracle_id: u128, card_types: u16, subtypes: &[&str], vocab: &mut Vo
         card_colors: 0,
         card_color_identity: 0,
         produced_mana: 0,
+        color_indicator: 0,
         card_types,
         legality_divergent: false,
         oracle_id,
@@ -217,6 +218,7 @@ fn stub_card(oracle_id: u128, card_types: u16, subtypes: &[&str], vocab: &mut Vo
         name_rank: 0,
         card_subtypes: subtypes.iter().map(|s| vocab.intern(s.to_string()).unwrap()).collect(),
         card_keywords: Vec::new(),
+        card_keywords_printed: Vec::new(),
         card_oracle_tags: Vec::new(),
         card_legalities: 0,
         mana_cost: ManaCost { core: 0, hybrids: Vec::new(), devotion: 0, cmc: 0.0 },
@@ -224,7 +226,6 @@ fn stub_card(oracle_id: u128, card_types: u16, subtypes: &[&str], vocab: &mut Vo
         creature_toughness_text_id: NONE_STR,
         planeswalker_loyalty_text_id: NONE_STR,
         faces: Vec::new(),
-        all_parts: Vec::new(),
     }
 }
 
@@ -263,6 +264,7 @@ fn stub_printing(scryfall_id: u128, illustration_id: u128, prefer_score: Option<
         printed_text_id: NONE_STR,
         printed_name_folded_id: NONE_STR,
         printed_faces: Vec::new(),
+        all_parts: Vec::new(),
         compat: CompatFields::default(),
     }
 }
@@ -11698,15 +11700,14 @@ fn related_cards_stand_alone_without_the_referenced_card() {
     // The reason all_parts carries its own name and type line: a `token` component references a
     // card the import FILTERS OUT (preprocess_card drops Token type lines), so an index into our
     // cards would resolve to nothing. The reference has to be self-contained.
-    let mut vocab = VocabInterner::new();
-    let mut card = stub_card(1, 0, &[], &mut vocab);
-    card.all_parts = vec![
+    let mut printing = stub_printing(1, 1, None);
+    printing.all_parts = vec![
         RelatedCard { id: 0xAAAA, name_id: 10, type_line_id: 11, component_id: 1 },
         RelatedCard { id: 0xBBBB, name_id: 20, type_line_id: 21, component_id: 2 },
     ];
 
-    let bytes = rkyv::to_bytes::<Error>(&card).expect("serialize");
-    let a = rkyv::access::<Archived<OracleCard>, Error>(&bytes).expect("access");
+    let bytes = rkyv::to_bytes::<Error>(&printing).expect("serialize");
+    let a = rkyv::access::<Archived<Printing>, Error>(&bytes).expect("access");
 
     assert_eq!(a.all_parts.len(), 2);
     // Order is meaningful for melds: the two parts, then the result.
@@ -11718,12 +11719,11 @@ fn related_cards_stand_alone_without_the_referenced_card() {
 }
 
 #[test]
-fn cards_without_relations_carry_none() {
-    let mut vocab = VocabInterner::new();
-    let card = stub_card(1, 0, &[], &mut vocab);
-    let bytes = rkyv::to_bytes::<Error>(&card).expect("serialize");
-    let a = rkyv::access::<Archived<OracleCard>, Error>(&bytes).expect("access");
-    assert!(a.all_parts.is_empty(), "~59% of cards have no relations");
+fn printings_without_relations_carry_none() {
+    let printing = stub_printing(1, 1, None);
+    let bytes = rkyv::to_bytes::<Error>(&printing).expect("serialize");
+    let a = rkyv::access::<Archived<Printing>, Error>(&bytes).expect("access");
+    assert!(a.all_parts.is_empty(), "~95% of printings have no relations");
 }
 
 // ─── Fuzzy name matching ──────────────────────────────────────────────────────
