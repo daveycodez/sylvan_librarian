@@ -235,10 +235,11 @@ fn stub_card(oracle_id: u128, card_types: u16, subtypes: &[&str], vocab: &mut Vo
 fn stub_printing(scryfall_id: u128, illustration_id: u128, prefer_score: Option<f32>) -> Printing {
     Printing {
         scryfall_id,
+        flavor_name_id: NONE_STR,
+        flavor_name_folded_id: NONE_STR,
         illustration_id,
         flavor_text_id: NONE_STR,
         flavor_text_lower_id: NONE_STR,
-        flavor_name_id: NONE_STR,
         card_artist_vid: ARTIST_NONE,
         card_set_code: InlineStr::from_str(""),
         set_rank: 0,
@@ -13263,7 +13264,12 @@ fn compat_fields_survive_the_archive_round_trip() {
 #[test]
 fn the_overflow_id_is_free_in_the_row() {
     assert_eq!(std::mem::size_of::<Archived<OracleCard>>(), 256);
-    assert_eq!(std::mem::size_of::<Archived<Printing>>(), 256);
+    // `Printing` is 272 since #927's flavor-name pair (`flavor_name_id` + `flavor_name_folded_id`,
+    // carried here for `prefer:borderless`): eight bytes of ids under the 16-byte alignment
+    // `scryfall_id` gives the row, which the trailing round-up could not absorb — a single u32 did
+    // fit, the pair moved the row a step, ~1.5 MB over ~98k canonical printings. Pinned for the
+    // same reason as the card row: the next field gets measured, not assumed free.
+    assert_eq!(std::mem::size_of::<Archived<Printing>>(), 272);
     // The inline width is unchanged by this field: 61 bytes plus the length byte, and the u32 that
     // follows starts at 64 either way. Narrowing it would only push more names onto the spill path.
     assert_eq!(std::mem::size_of::<InlineStr<NAME_INLINE>>(), 62);

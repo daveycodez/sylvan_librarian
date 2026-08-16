@@ -120,6 +120,10 @@ _FACE_TEXT_SEPARATOR = "\n//\n"
 # face's position, so neither is stored; both are re-emitted on read.
 _FACE_OBJECT_FIELDS = (
     "name",
+    # Scryfall's face key order is name -> flavor_name -> mana_cost, verified live on vow/338
+    # (transform) and sld/1079 (reversible_card) 2026-08-16. A printing carries the flavor name at
+    # the CARD level or on its faces, never both.
+    "flavor_name",
     "mana_cost",
     "type_line",
     "oracle_text",
@@ -150,6 +154,21 @@ def _face_records(card_faces: list[dict[str, Any]]) -> list[dict[str, Any]]:
         agree key-for-key.
     """
     return [{field: face[field] for field in _FACE_OBJECT_FIELDS if field in face} for face in card_faces]
+
+
+def _fold_name(value: str | None) -> str | None:
+    """Lowercase and accent-fold a name for the engine's name indexes, or None.
+
+    The same fold `card_name_folded` and `printed_name_folded` use, factored out because
+    `flavor_name_folded` is a third caller and the three must agree exactly.
+
+    Args:
+        value: The name as Scryfall sent it, or None when the key was absent.
+
+    Returns:
+        The folded name, or None when there was none to fold.
+    """
+    return fold_accents(value.lower()) if value else None
 
 
 # Keys that do NOT go in card_compat_blob, because a column already holds them or they are a pure
@@ -325,6 +344,8 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
         # is a fallback, so anything only the blob carries is unanswerable on the engine path.
         merged_row["card_faces"] = _face_records(card_faces)
         merged_row["card_compat_blob"] = _compat_blob(card)
+        merged_row["flavor_name"] = card.get("flavor_name")
+        merged_row["flavor_name_folded"] = _fold_name(merged_row["flavor_name"])
         return [merged_row]
 
     # Single face case - set defaults
@@ -410,6 +431,13 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
     # Accent-folded lowercase name, precomputed once at import so fuzzy name: search can
     # match "eowyn" against "Éowyn" without folding diacritics on every query (#649).
     card["card_name_folded"] = fold_accents(card["card_name"].lower())
+    # Scryfall's `flavor_name`: the alternate name a printing is SOLD under (the Godzilla series,
+    # Stranger Things, the Secret Lair crossovers). PRINTING-level and quite separate from the
+    # printed triple — a printing may carry both — and `_folded` is the name-lookup key that makes
+    # `/cards/named?exact=Godzilla, Primeval Champion` resolve prm/80925, which it does on
+    # api.scryfall.com and did not here. The FACE-level variant rides card_faces.
+    card["flavor_name"] = card.get("flavor_name")
+    card["flavor_name_folded"] = _fold_name(card["flavor_name"])
     card["mana_cost_text"] = card.get("mana_cost")
     card["planeswalker_loyalty_text"] = card.get("loyalty")
     card["card_artist"] = card.get("artist")

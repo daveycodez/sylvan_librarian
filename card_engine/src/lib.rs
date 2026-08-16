@@ -531,12 +531,6 @@ struct Printing {
 
     flavor_text_id: u32,
     flavor_text_lower_id: u32,
-    // Scryfall's top-level `flavor_name`: the alternate name a printing is SOLD under (Godzilla,
-    // Tidus, Spider-Gwen) with this card's rules text underneath. Interned, NONE_STR = absent;
-    // read from the row's `flavor_name` key when the loader carries one -- `ENGINE_COLUMNS` does
-    // not select it yet, so until it does every printing stores NONE_STR and the field costs
-    // four bytes. `prefer:borderless` never answers a printing carrying one.
-    flavor_name_id: u32,
     // Interned id into CardData.artist_vocab (~2.2k distinct lowercase artist
     // names); ARTIST_NONE = absent. Artist predicates resolve their match set
     // against the vocab once per query (FilterExpr::ArtistMatch), so no artist
@@ -588,6 +582,18 @@ struct Printing {
     // single-faced cards, and empty when a multi-face card's printing carries no per-face art.
     faces: Vec<PrintingFace>,
 
+    // Scryfall's top-level `flavor_name`: the alternate name a printing is SOLD under (the
+    // Godzilla series, Stranger Things, the Secret Lair crossovers). Printing-level and quite
+    // separate from the printed triple above — a printing may carry both, and 669 of the
+    // 540,484 all_cards rows carry this one, 609 of them English. `_folded_id` is the search
+    // key, indexed by `CardIndexes.flavor_names`; `_id` is what the card object emits.
+    //
+    // The FACE-level variant (28 face occurrences on 15 printings, `transform` and
+    // `reversible_card` only, and never on a printing that also has the top-level key) rides
+    // `PrintingFace` instead, because that is where Scryfall puts it.
+    flavor_name_id: u32,
+    flavor_name_folded_id: u32,
+
     // The card_compat_blob residue, packed. Printing-level: every field here varies by printing
     // (ids, prices, finishes) or is set-level and therefore constant across a set's printings.
     compat: CompatFields,
@@ -620,7 +626,6 @@ struct CardRow {
     oracle_text_lower_id: u32,
     flavor_text_id: u32,
     flavor_text_lower_id: u32,
-    flavor_name_id: u32,
     card_artist_vid: u16,
     card_set_code: InlineStr<8>,
     card_layout_id: u32,
@@ -659,6 +664,8 @@ struct CardRow {
     creature_toughness_text_id: u32,
     planeswalker_loyalty_text_id: u32,
 
+    flavor_name_id: u32,
+    flavor_name_folded_id: u32,
     // Both halves of each face, together, until the commit pass splits them the same way it splits
     // the row itself: text to the OracleCard, art to the Printing.
     card_faces: Vec<FaceRow>,
@@ -1291,7 +1298,6 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
         oracle_text_id: it.intern(oracle_text),
         flavor_text_lower_id,
         flavor_text_id: it.intern(flavor_text),
-        flavor_name_id: it.intern_opt(opt_str(d, "flavor_name")),
         card_artist_vid,
         card_set_code: InlineStr::<8>::from_str(&opt_str(d, "card_set_code").unwrap_or_default()),
         card_layout_id: it.intern(opt_str(d, "card_layout").unwrap_or_default()),
@@ -1335,6 +1341,9 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
         creature_toughness_text_id: it.intern_opt(opt_str(d, "creature_toughness_text")),
         planeswalker_loyalty_text_id: it.intern_opt(opt_str(d, "planeswalker_loyalty_text")),
 
+        flavor_name_id: it.intern_opt(opt_str(d, "flavor_name")),
+        // Already lowercased + accent-folded by the importer, like the two above.
+        flavor_name_folded_id: it.intern_opt(opt_str(d, "flavor_name_folded")),
         card_faces: faces_from_pydict(d, it, artists)?,
         all_parts: all_parts_from_pydict(d, it, vocab)?,
         compat: compat_from_pydict(d, vocab)?,
@@ -15614,7 +15623,6 @@ impl QueryEngine {
                 illustration_id: row.illustration_id,
                 flavor_text_id: row.flavor_text_id,
                 flavor_text_lower_id: row.flavor_text_lower_id,
-                flavor_name_id: row.flavor_name_id,
                 card_artist_vid: row.card_artist_vid,
                 card_set_code: row.card_set_code,
                 // Both assigned once the whole printing list exists, by assign_set_ranks /
@@ -15649,6 +15657,8 @@ impl QueryEngine {
                         flavor_name_id: f.flavor_name_id,
                     })
                     .collect(),
+            flavor_name_id: row.flavor_name_id,
+            flavor_name_folded_id: row.flavor_name_folded_id,
             
                 compat: row.compat,
             });
