@@ -6,6 +6,8 @@ post-parse seam. Mappings are validated against Scryfall's live API in
 docs/issues/00713-is-tag-recovery.md.
 """
 
+import re
+
 import pytest
 
 from api.parsing import generate_sql_query, parse_scryfall_query
@@ -267,6 +269,82 @@ _PLAIN_LITERAL_CASES = {
 def test_regex_plain_literal(expected: str | None, pattern: str) -> None:
     """`_regex_plain_literal` extracts the literal for metachar-free patterns, else None."""
     assert _regex_plain_literal(pattern) == expected
+
+
+_EQUIVALENCE_CORPUS = [
+    "(this creature can't be blocked)",
+    "this creature can't be blocked",
+    "{T}: Add {G}.",
+    "T: Add G.",
+    "deal 2 damage. draw a card.",
+    "+1/+1 counter",
+    "11 counter",
+    "a-b",
+    "ab",
+    "[brackets]",
+    "brackets",
+    "back\\slash",
+]
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    [
+        r"\(this creature",
+        r"\{t\}",
+        r"target\.",
+        r"\+1/\+1",
+        r"a\-b",
+        r"\[brackets\]",
+        r"back\\slash",
+    ],
+)
+def test_lowering_preserves_what_the_pattern_matches(pattern: str) -> None:
+    r"""The PROPERTY the rewrite has to have, not a table of what it currently answers.
+
+    `o:/\(this creature/` reaching the engine as the substring `(this creature` reads like a
+    mangled pattern and is not one: a backslash before a NON-word character IS that character, so
+    the lowered literal matches exactly the strings the regex did. Stating that as an equivalence
+    against `re` is what the table above cannot do -- it would pass just the same if `\(` were
+    being DROPPED rather than resolved, which is how this looked to a reader who found the
+    unescaped value in a wire tree and reported it as a bug.
+
+    `re.IGNORECASE` is the flag the engine prepends to every query pattern, and the substring path
+    compares case-folded text, so case-insensitivity is what both sides mean.
+    """
+    literal = _regex_plain_literal(pattern)
+    assert literal is not None
+    compiled = re.compile(pattern, re.IGNORECASE)
+    for text in _EQUIVALENCE_CORPUS:
+        assert (literal.casefold() in text.casefold()) == bool(compiled.search(text)), text
+
+
+@pytest.mark.parametrize(
+    ("operator", "pattern"),
+    [
+        ("o", r"\(a.b"),
+        ("name", r"^\(x"),
+        ("ft", r"\d\d\d"),
+        ("a", r"\bguay\b"),
+        ("t", r"\(a|b"),
+        ("fo", r"[\]]"),
+        ("e", r"kh\w"),
+        ("cn", r"\d+a"),
+        ("watermark", r"izz\S+"),
+        ("layout", r"norm\w+"),
+        ("border", r"bl\w+"),
+    ],
+)
+def test_a_surviving_regex_keeps_its_backslashes(parse_query, operator: str, pattern: str) -> None:
+    """The other half: a pattern that keeps its regex leaf is handed on byte for byte.
+
+    That string goes straight to a regex compiler, so a backslash lost anywhere between the
+    tokenizer and here changes what the query means.
+    """
+    rhs = parse_query(f"{operator}:/{pattern}/").root.rhs
+
+    assert isinstance(rhs, RegexValueNode)
+    assert rhs.value == pattern
 
 
 # ─── The `is:` vocabulary, and what happens outside it ────────────────────────
