@@ -107,6 +107,16 @@ fn write_str_or_null(out: &mut Vec<u8>, first: &mut bool, key: &str, value: Opti
     }
 }
 
+/// A key written only when the row carries a value — the omit-when-absent twin of
+/// `write_str_or_null`, for the keys Scryfall drops entirely rather than nulling (the printed
+/// triple mid-object; the optional tail spells the same rule out inline).
+fn write_opt_str(out: &mut Vec<u8>, first: &mut bool, key: &str, value: Option<&str>) {
+    if let Some(s) = value {
+        write_key(out, first, key);
+        write_json_str(out, s);
+    }
+}
+
 fn write_bool(out: &mut Vec<u8>, first: &mut bool, key: &str, value: bool) {
     write_key(out, first, key);
     out.extend_from_slice(if value { b"true" } else { b"false" });
@@ -123,27 +133,100 @@ fn write_list(out: &mut Vec<u8>, first: &mut bool, key: &str, value: Option<&Vec
 
 // ─── derived values ──────────────────────────────────────────────────────────
 
-/// Scryfall's URL slug: lowercase, every non-alphanumeric collapsed to one hyphen, trimmed.
+/// Scryfall's URL slug for a card name.
 ///
-/// Alphanumeric in the UNICODE sense, matching Python's `str.isalnum()` and the port's
-/// `\p{L}\p{N}` — "Æther" and "Jötun" must slug the same way in all three.
+/// NOT the folklore "non-alphanumerics collapse to hyphens" rule this file first shipped — that
+/// rule hyphenates apostrophes (`erayo-s-essence`) and serves raw UTF-8 (`jötun-grunt`) where
+/// production Scryfall deletes the apostrophe and percent-encodes the bytes. The real rule,
+/// verified against the `scryfall_uri` of all 540,484 printings in the 2026-08-16 all_cards bulk
+/// (zero mismatches):
+///
+///   1. lowercase;
+///   2. DELETE `' " , . /` and the curly quotes U+201C/U+201D ("S.H.I.E.L.D." -> `shield`,
+///      `Henzie "Toolbox" Torre` -> `henzie-toolbox-torre`; U+201E is NOT deleted — the de
+///      printing `Henzie „Der Beschaffer" Torre` keeps it);
+///   3. each run of ASCII spaces becomes one hyphen — literal hyphens pass through and may stack
+///      (ru "Пламенник - военный разведчик" keeps `---`), and nothing is trimmed ("Humming-" and
+///      "With Great Power . . ." both keep their trailing hyphen);
+///   4. everything else survives verbatim (`:`, `!`, `&`, `、`, `・`, fullwidth punctuation,
+///      U+00A0) and is then UTF-8 percent-encoded, uppercase hex, sparing exactly the bytes the
+///      corpus serves literally: alphanumerics and `!&()+-:;=_`.
 fn slug(name: &str) -> String {
-    let mut out = String::with_capacity(name.len());
-    let mut pending_hyphen = false;
-    for ch in name.chars() {
-        if ch.is_alphanumeric() {
-            if pending_hyphen && !out.is_empty() {
-                out.push('-');
+    let mut hyphenated = String::with_capacity(name.len());
+    let mut prev_space = false;
+    for ch in name.chars().flat_map(char::to_lowercase) {
+        if matches!(ch, '\'' | '"' | ',' | '.' | '/' | '\u{201C}' | '\u{201D}') {
+            continue;
+        }
+        if ch == ' ' {
+            if !prev_space {
+                hyphenated.push('-');
             }
-            pending_hyphen = false;
-            out.extend(ch.to_lowercase());
+            prev_space = true;
         } else {
-            // Collapsed rather than emitted: a run of non-alphanumerics is ONE hyphen, and a run
-            // at either end is none at all.
-            pending_hyphen = true;
+            prev_space = false;
+            hyphenated.push(ch);
+        }
+    }
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(hyphenated.len());
+    for byte in hyphenated.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'!' | b'&' | b'(' | b')' | b'+' | b'-'
+            | b':' | b';' | b'=' | b'_' => out.push(*byte as char),
+            _ => {
+                out.push('%');
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0xf) as usize] as char);
+            }
         }
     }
     out
+}
+
+/// The languages Scryfall writes into the scryfall_uri path — its ten print localizations,
+/// exactly. The glyph and novelty languages (ph, qya, he, la, grc, ar, sa, dw) get NO path
+/// segment: a ph Elesh Norn lives at `/card/one/414/elesh-norn-mother-of-machines`, English form.
+const SLUG_LANG_SEGMENTS: [&str; 10] = ["de", "es", "fr", "it", "ja", "ko", "pt", "ru", "zhs", "zht"];
+
+/// The printing's printed full name, when the slug should use one.
+///
+/// The top-level `printed_name`, or on a multi-face card the faces' `printed_name`s joined
+/// " // " — ONLY the faces that have one: the es printing of sos/113, whose second face has no
+/// printed_name, slugs as `em%C3%A9rita-del-conflicto-(emeritus-of-conflict-lightning-bolt)`
+/// (verified live). None for en, and for the Phyrexian/Quenya glyph printings, whose stored
+/// `printed_name`s ("|Ceghm.", U+E0xx runs) production never slugs.
+fn printed_full_name(row: &Map<String, Value>, lang: &str) -> Option<String> {
+    if matches!(lang, "en" | "ph" | "qya") {
+        return None;
+    }
+    if let Some(s) = str_of(row, "printed_name") {
+        return Some(s.to_owned());
+    }
+    let faces = list_of(row, "card_faces")?;
+    let parts: Vec<&str> = faces
+        .iter()
+        .filter_map(|face| match face {
+            Value::Object(map) => str_of(map, "printed_name"),
+            _ => None,
+        })
+        .collect();
+    if parts.is_empty() { None } else { Some(parts.join(" // ")) }
+}
+
+/// `scryfall_uri`: `https://scryfall.com/card/{set}/{number}[/{lang}]/{slug}?utm_source=api`.
+///
+/// A foreign printing's slug is `slug(printed full name)-(slug(english full name))`, parentheses
+/// literal (grn/212/pt: `ego-%C3%A0-deriva-(unmoored-ego)`, verified live). A foreign printing
+/// with no printed name falls back to the plain English slug, keeping the language segment
+/// (ody/243/zhs -> `/zhs/holistic-wisdom`, verified live); one whose printed name slugs to
+/// nothing takes the same fallback (live-unpinned — no such printing exists in the corpus).
+fn scryfall_uri(row: &Map<String, Value>, name: &str, set_code: &str, number: &str, lang: &str) -> String {
+    let segment = if SLUG_LANG_SEGMENTS.contains(&lang) { format!("{lang}/") } else { String::new() };
+    let english = slug(name);
+    let printed = printed_full_name(row, lang).map(|full| slug(&full)).unwrap_or_default();
+    let path = if printed.is_empty() { english } else { format!("{printed}-({english})") };
+    format!("https://scryfall.com/card/{set_code}/{number}/{segment}{path}?utm_source=api")
 }
 
 /// Python's `urllib.parse.quote_plus`: space to `+`, everything outside the unreserved set
@@ -214,10 +297,25 @@ fn write_prices(out: &mut Vec<u8>, row: &Map<String, Value>) {
 
 /// `related_uris`, pointing at the destinations directly rather than through Scryfall's affiliate
 /// wrapper — emitting the wrapper from this host would route another service's revenue to them.
-fn write_related_uris(out: &mut Vec<u8>, name: &str) {
+///
+/// `gatherer` LEADS the object when the printing has multiverse ids, built from the FIRST id,
+/// with `printed=true` for every non-English printing and `printed=false` for English — verified
+/// against the bulk corpus at 540,430 of 540,484 printings. The 54 exceptions are foreign-only
+/// promos (dd2-ja, snc launch, one-ph, ltc-qya) whose Gatherer entries carry no translation; that
+/// fact lives on Scryfall's side of the wire and is not derivable from the row, so they stay a
+/// known limit rather than a rule.
+fn write_related_uris(out: &mut Vec<u8>, name: &str, multiverse_first: Option<u64>, lang: &str) {
     let quoted = quote_plus(name);
     out.push(b'{');
     let mut first = true;
+    if let Some(id) = multiverse_first {
+        let printed = if lang == "en" { "false" } else { "true" };
+        write_key(out, &mut first, "gatherer");
+        write_json_str(
+            out,
+            &format!("https://gatherer.wizards.com/Pages/Card/Details.aspx?multiverseid={id}&printed={printed}"),
+        );
+    }
     for (key, url) in [
         (
             "tcgplayer_infinite_articles",
@@ -303,6 +401,7 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     let set_code = str_of(row, "set_code").unwrap_or("");
     let number = str_of(row, "collector_number").unwrap_or("");
     let set_id = str_of(row, "set_id");
+    let lang = str_of(row, "lang").unwrap_or("en");
     let image_updated_at = u64_of(row, "image_updated_at");
     let faces = list_of(row, "card_faces").filter(|f| !f.is_empty());
 
@@ -318,16 +417,19 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     write_list(out, &mut first, "multiverse_ids", list_of(row, "multiverse_ids"));
     write_key(out, &mut first, "name");
     write_json_str(out, name);
+    // Between `name` and `lang`, where api.scryfall.com puts it (verified on grn/212/pt and
+    // khm/1/ja) — and PRESENT only when the printing carries one, which is why this is
+    // `write_opt_str` mid-object rather than an entry in the optional tail: the tail would put it
+    // after `legalities`, and key position is part of the parity contract here the same way
+    // security_stamp's position was (see the note at the tail).
+    write_opt_str(out, &mut first, "printed_name", str_of(row, "printed_name"));
     write_key(out, &mut first, "lang");
-    write_json_str(out, str_of(row, "lang").unwrap_or("en"));
+    write_json_str(out, lang);
     write_str_or_null(out, &mut first, "released_at", str_of(row, "released_at"));
     write_key(out, &mut first, "uri");
     write_json_str(out, &format!("{base_url}/cards/{scryfall_id}"));
     write_key(out, &mut first, "scryfall_uri");
-    write_json_str(
-        out,
-        &format!("https://scryfall.com/card/{set_code}/{number}/{}?utm_source=api", slug(name)),
-    );
+    write_json_str(out, &scryfall_uri(row, name, set_code, number, lang));
     write_str_or_null(out, &mut first, "layout", str_of(row, "layout"));
     write_bool(out, &mut first, "highres_image", bool_of(row, "highres_image"));
     write_str_or_null(out, &mut first, "image_status", str_of(row, "image_status"));
@@ -343,6 +445,8 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
         None => out.extend_from_slice(b"null"),
     }
     write_str_or_null(out, &mut first, "type_line", str_of(row, "type_line"));
+    // Directly after the oracle `type_line` it translates, per the live objects.
+    write_opt_str(out, &mut first, "printed_type_line", str_of(row, "printed_type_line"));
     write_list(out, &mut first, "colors", list_of(row, "colors"));
     write_list(out, &mut first, "color_identity", list_of(row, "color_identity"));
     write_list(out, &mut first, "keywords", list_of(row, "card_keywords"));
@@ -394,7 +498,8 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     write_key(out, &mut first, "prices");
     write_prices(out, row);
     write_key(out, &mut first, "related_uris");
-    write_related_uris(out, name);
+    let multiverse_first = list_of(row, "multiverse_ids").and_then(|ids| ids.first()).and_then(Value::as_u64);
+    write_related_uris(out, name, multiverse_first, lang);
     write_key(out, &mut first, "purchase_uris");
     write_purchase_uris(out, row);
 
@@ -407,6 +512,9 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     } else {
         write_str_or_null(out, &mut first, "mana_cost", str_of(row, "mana_cost"));
         write_str_or_null(out, &mut first, "oracle_text", str_of(row, "oracle_text"));
+        // Directly after the `oracle_text` it translates — single-face only, like the text it
+        // shadows; a multi-face printing's printed text rides its face objects.
+        write_opt_str(out, &mut first, "printed_text", str_of(row, "printed_text"));
         write_key(out, &mut first, "image_uris");
         write_image_uris(out, scryfall_id, image_updated_at, "front");
     }
@@ -571,14 +679,30 @@ mod tests {
         assert_eq!(card["prices"]["usd_foil"], serde_json::Value::Null);
     }
 
-    /// The slug and quote_plus paths, which are where a reimplementation drifts.
+    /// The slug and quote_plus paths, which are where a reimplementation drifts. Every slug
+    /// expectation here is a live production byte string (see the rule note on `slug`).
     #[test]
-    fn slug_and_quote_plus_match_their_python_originals() {
+    fn slug_and_quote_plus_match_their_live_originals() {
         assert_eq!(slug("Lightning Bolt"), "lightning-bolt");
-        assert_eq!(slug("  Fire  //  Ice  "), "fire-ice");
-        assert_eq!(slug("!!! ??? ---"), "");
-        assert_eq!(slug("Æther Vial"), "æther-vial", "isalnum() is Unicode-aware");
-        assert_eq!(slug("Jötun Grunt"), "jötun-grunt");
+        assert_eq!(slug("Fire // Ice"), "fire-ice", "slashes are deleted, the space run is one hyphen");
+        // Apostrophes are DELETED, not hyphenated: sok/35 serves
+        // `erayo-soratami-ascendant-erayos-essence`.
+        assert_eq!(
+            slug("Erayo, Soratami Ascendant // Erayo's Essence"),
+            "erayo-soratami-ascendant-erayos-essence"
+        );
+        // Non-ASCII output is UTF-8 percent-encoded: cmd/16 serves `j%C3%B6tun-grunt`.
+        assert_eq!(slug("Jötun Grunt"), "j%C3%B6tun-grunt");
+        assert_eq!(slug("Æther Vial"), "%C3%A6ther-vial");
+        // Deleted set beyond the apostrophe: periods and straight/curly double quotes.
+        assert_eq!(slug("S.H.I.E.L.D. Flying Car"), "shield-flying-car");
+        assert_eq!(slug("Henzie \"Toolbox\" Torre"), "henzie-toolbox-torre");
+        // Kept set: colon and bang survive (msc's Summon cards, acorn names), and literal hyphens
+        // stack with space-hyphens rather than collapsing (dis/61's ru printed name keeps `---`).
+        assert_eq!(slug("Summon: Choco/Mog"), "summon:-chocomog");
+        assert_eq!(slug("Пламенник - военный разведчик"), "%D0%BF%D0%BB%D0%B0%D0%BC%D0%B5%D0%BD%D0%BD%D0%B8%D0%BA---%D0%B2%D0%BE%D0%B5%D0%BD%D0%BD%D1%8B%D0%B9-%D1%80%D0%B0%D0%B7%D0%B2%D0%B5%D0%B4%D1%87%D0%B8%D0%BA");
+        // Nothing is trimmed: unfinity's "Humming-" ends in its hyphen on production.
+        assert_eq!(slug("Humming-"), "humming-");
 
         assert_eq!(quote_plus("Lightning Bolt"), "Lightning+Bolt");
         assert_eq!(quote_plus("Æther Vial"), "%C3%86ther+Vial");
@@ -586,6 +710,54 @@ mod tests {
         // The safe set is the thing that has to match: `~` is left alone, `!*'()` are not.
         assert_eq!(quote_plus("a~b"), "a~b");
         assert_eq!(quote_plus("Yawgmoth's (Alt!)*"), "Yawgmoth%27s+%28Alt%21%29%2A");
+    }
+
+    /// The foreign scryfall_uri form and the printed triple's positions, pinned to the live pt
+    /// object (grn/212/pt, cached 2026-08-16).
+    #[test]
+    fn a_foreign_printing_gets_the_printed_slug_form_and_the_printed_triple() {
+        let serde_json::Value::Object(map) = json!({
+            "name": "Unmoored Ego", "scryfall_id": "87130bc6-3a34-4855-9dd6-10607983bb29",
+            "set_code": "grn", "collector_number": "212", "lang": "pt",
+            "printed_name": "Ego à Deriva", "type_line": "Sorcery",
+            "printed_type_line": "Feitiço", "oracle_text": "Choose a card name.",
+            "printed_text": "Escolha um nome de card.", "multiverse_ids": [454775],
+        }) else {
+            panic!()
+        };
+        let mut out = Vec::new();
+        write_scryfall_card(&mut out, &map, "https://api.example/v1");
+        let text = String::from_utf8(out).expect("utf-8");
+
+        assert!(text.contains(
+            r#""scryfall_uri":"https://scryfall.com/card/grn/212/pt/ego-%C3%A0-deriva-(unmoored-ego)?utm_source=api""#
+        ));
+        assert!(text.contains(
+            r#""gatherer":"https://gatherer.wizards.com/Pages/Card/Details.aspx?multiverseid=454775&printed=true""#
+        ));
+        // The positions: printed_name between name and lang, printed_type_line after type_line,
+        // printed_text after oracle_text.
+        let at = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("{needle} missing"));
+        assert!(at(r#""name":"#) < at(r#""printed_name":"#));
+        assert!(at(r#""printed_name":"#) < at(r#""lang":"#));
+        assert!(at(r#""type_line":"#) < at(r#""printed_type_line":"#));
+        assert!(at(r#""oracle_text":"#) < at(r#""printed_text":"#));
+        assert!(at(r#""printed_text":"#) < at(r#""image_uris":"#));
+    }
+
+    /// gatherer leads related_uris for an English printing too, with printed=false — and is
+    /// absent without multiverse ids (both verified live, cmd/16 and sos/113).
+    #[test]
+    fn gatherer_rides_the_first_multiverse_id() {
+        let with_ids = build(json!({"name": "Jötun Grunt", "scryfall_id": "ab000000-0000-0000-0000-000000000007",
+            "multiverse_ids": [247182, 999999]}));
+        assert_eq!(
+            with_ids["related_uris"]["gatherer"],
+            "https://gatherer.wizards.com/Pages/Card/Details.aspx?multiverseid=247182&printed=false"
+        );
+
+        let without = build(json!({"name": "x", "scryfall_id": "ab000000-0000-0000-0000-000000000007"}));
+        assert!(without["related_uris"].get("gatherer").is_none());
     }
 
     /// `purchase_uris` carries only the marketplaces the card is actually on, and a zero id is not
