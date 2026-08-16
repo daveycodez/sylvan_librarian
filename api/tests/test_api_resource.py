@@ -1,5 +1,6 @@
 """Comprehensive tests for APIResource class functionality."""
 
+import json
 import multiprocessing
 import os
 import pathlib
@@ -250,17 +251,29 @@ class TestRequestDispatch(TestBaseAPIResourceTest):
         assert resp.status == falcon.HTTP_200
         assert resp.content_type == "text/html"
 
-    def test_unmatched_route_with_extra_segments_raises_not_found(self) -> None:
-        with pytest.raises(falcon.HTTPNotFound):
-            self._dispatch("/nonexistent/thing/other")
+    def _assert_scryfall_not_found(self, resp: falcon.Response) -> None:
+        """An unresolved path answers Scryfall's error object rather than the route listing."""
+        assert resp.status == falcon.HTTP_404
+        assert resp.content_type == "application/json; charset=utf-8"
+        assert resp.headers["cache-control"] == "no-cache"
+        assert json.loads(resp.text) == {
+            "object": "error",
+            "code": "not_found",
+            "status": 404,
+            "details": "The requested object or REST method was not found.",
+        }
+
+    def test_unmatched_route_with_extra_segments_is_a_scryfall_not_found(self) -> None:
+        # No longer an HTTPNotFound carrying the route listing: a client parses `code` and
+        # `details`, and `{"title": ..., "description": {"routes": ...}}` gives it neither.
+        self._assert_scryfall_not_found(self._dispatch("/nonexistent/thing/other"))
 
     def test_known_zero_arg_route_with_extra_segment_raises_not_found(self) -> None:
         # Regression: a matched action_word that can't absorb a trailing segment (get_pid takes
         # no positional args) used to reach the handler anyway, raising a TypeError that _handle
         # converted to 400 — the extra segment means the path doesn't identify anything, so this
         # should 404 like any other unmatched path.
-        with pytest.raises(falcon.HTTPNotFound):
-            self._dispatch("/get_pid/extra")
+        self._assert_scryfall_not_found(self._dispatch("/get_pid/extra"))
 
     def test_positional_route_with_too_many_segments_raises_not_found(self) -> None:
         # card() accepts exactly 2 positional args (set_code, collector_number); a 3rd segment
@@ -437,17 +450,13 @@ class TestAPIResourceRequestHandling(unittest.TestCase):
             # Should call get_pid method and set response media
             assert mock_resp.media is not None
 
-    def test_handle_raises_not_found_for_invalid_paths(self) -> None:
-        """Test _handle raises HTTPNotFound for invalid paths."""
-        mock_req = MagicMock()
-        mock_req.method = "GET"
-        mock_req.uri = mock_req.path = mock_req.relative_uri = "/nonexistent"
-        mock_req.params = {}
-        mock_resp = MagicMock()
-        mock_resp.complete = False
-
-        with pytest.raises(falcon.HTTPNotFound):
-            self.api_resource._handle(mock_req, mock_resp)
+    def test_handle_answers_a_scryfall_not_found_for_invalid_paths(self) -> None:
+        """_handle writes the error itself now rather than raising for falcon to serialize."""
+        req = falcon.Request(falcon.testing.create_environ(path="/nonexistent"))
+        resp = falcon.Response()
+        self.api_resource._handle(req, resp)
+        assert resp.status == falcon.HTTP_404
+        assert json.loads(resp.text)["code"] == "not_found"
 
     def test_disallowed_query_params_do_not_cause_type_error(self) -> None:
         """Query params named after internal kwargs must be stripped before dispatch."""

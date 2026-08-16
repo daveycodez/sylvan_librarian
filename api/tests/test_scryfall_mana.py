@@ -480,6 +480,27 @@ UNPARSEABLE_MESSAGES = [
     # A triple hybrid is not a Magic symbol. This one is also the reason the rule above had to be
     # worked out at all: the recognized halves come out and only the punctuation is reported.
     ("{W/U/B}", "{//}"),
+    # SEVERAL fragments, which is what the "(s)" in the message is about. They concatenate in written
+    # order with NO separator, and the readable symbols between them leave no trace. An earlier pass
+    # here asserted a space, which nothing measured supported and `{Q}W{T}` disproves.
+    ("{Q}W{T}", "{Q}{T}"),
+    ("{Q}{T}", "{Q}{T}"),
+    ("!W!", "!!"),
+    ("{Q}WW{T}", "{Q}{T}"),
+    ("!{Q}!", "!{Q}!"),
+    ("{Q} {T}", "{Q}{T}"),
+    # `b` is BLACK MANA and reads fine, so only `a` and `{Q}` are reported.
+    ("a{Q}b", "A{Q}"),
+    # The 51-CHARACTER cap, measured across nine lengths. It is characters and not bytes (51 `é` come
+    # back whole at 102 bytes), it applies to the whole joined list rather than per fragment, and
+    # there is no ellipsis -- the string simply stops.
+    ("a" * 51, "A" * 51),
+    ("a" * 52, "A" * 51),
+    ("a" * 200, "A" * 51),
+    ("é" * 51, "É" * 51),
+    ("é" * 60, "É" * 51),
+    ("{" + "a" * 50 + "}", ("{" + "A" * 50 + "}")[:51]),
+    ("{QQQQQQQQ}" * 10, ("{QQQQQQQQ}" * 10)[:51]),
 ]
 
 
@@ -544,7 +565,10 @@ class TestParseManaProperties:
             parse_mana_cost("{W/U/B}")
 
     def test_every_unreadable_fragment_is_named_at_once(self) -> None:
-        """The message says "fragment(s)" because it can name more than one, separated by a space."""
+        """The message says "fragment(s)" because it can name more than one -- concatenated, not spaced.
+
+        The exact strings live in UNPARSEABLE_MESSAGES; this states the property they encode.
+        """
         with pytest.raises(ManaCostError) as raised:
             parse_mana_cost("{Q}W{T}")
-        assert "“{Q} {T}”" in str(raised.value)
+        assert "“{Q}{T}”" in str(raised.value)

@@ -30,6 +30,7 @@ from typing import cast as typecast
 
 import cachebox
 import falcon
+import falcon.util
 import minify_html
 import orjson
 import psycopg
@@ -238,6 +239,38 @@ def _hostname_to_site_name(hostname: str) -> str:
 
 
 # Query parameters that must not be forwarded to action handlers.
+# The route keys that make up the SCRYFALL-COMPATIBLE surface.
+#
+# It decides one thing: which shape a DISPATCH-level error takes on that path -- Scryfall's
+# `{object, code, status, details}` or falcon's `{title, description}`. Everything a handler answers
+# for itself already knows which surface it is on.
+#
+# The split is by ROUTE KEY rather than by path prefix because the two surfaces interleave under one
+# namespace: `catalog` is Scryfall's `/catalog/:name` and `get_catalog` is this service's own, and
+# only the table can tell them apart. Keys for routes a given branch has not merged yet are harmless
+# -- an unregistered key is never resolved, so it is never consulted.
+#
+# What is deliberately NOT here: `_root`, `card`, `index`, `search` and `random_search` -- this
+# service's own surface, whose error bodies its web interface renders by reading `title` and
+# `description` -- plus `get_catalog`, `get_pid` and the admin handlers.
+SCRYFALL_SURFACE_ROUTES = frozenset(
+    {
+        "cards",
+        "cards/search",
+        "cards/named",
+        "cards/autocomplete",
+        "cards/random",
+        "cards/collection",
+        "catalog",
+        "sets",
+        "symbology",
+        "symbology/parse-mana",
+    },
+)
+
+# Scryfall's sentence for a path that addresses nothing, measured 2026-08-16.
+_SCRYFALL_NOT_FOUND_DETAILS = "The requested object or REST method was not found."
+
 DISALLOWED_QUERY_ARGS: frozenset[str] = frozenset(["falcon_response", "request", "request_host"])
 
 # Body for an unhandled exception. Fixed and content-free on purpose: the frames live at throw sites
@@ -780,12 +813,26 @@ class APIResource(ScryfallCardsRoutes, ScryfallReferenceRoutes):
 
         entry, action_args = self._resolve_action(path)
         action = self._raise_not_found
-        if entry is not None:
-            # A route answers only the methods it declares. Checked after the path resolves, so a
-            # path that identifies nothing stays a 404 rather than reporting what it would accept.
-            if req.method not in entry.spec.methods:
-                raise falcon.HTTPMethodNotAllowed(allowed_methods=sorted(entry.spec.methods))
-            action = entry.action
+        if entry is None:
+            # AN UNKNOWN PATH ANSWERS IN SCRYFALL'S SHAPE, not with the route listing.
+            #
+            # The listing is a convenience for a human poking at the origin. A client is not a human:
+            # it parses `code` and `details`, and `{"title": ..., "description": {"routes": ...}}`
+            # gives it neither -- so a client pointed at this service instead of api.scryfall.com has
+            # to special-case this origin, which is exactly what it cannot do and still be pointable
+            # back at Scryfall. Status, wording and tier are measured (404, "The requested object or
+            # REST method was not found.", `no-cache`).
+            #
+            # A human still has the listing: every route is documented, and the route table is the
+            # source both this and `_build_routes_listing` read.
+            self._respond_scryfall_error(resp, code="not_found", status=404, details=_SCRYFALL_NOT_FOUND_DETAILS)
+            return
+        # A route answers only the methods it declares. Checked after the path resolves, so a
+        # path that identifies nothing stays a 404 rather than reporting what it would accept.
+        if req.method not in entry.spec.methods:
+            self._reject_method(resp, path=path, allowed=sorted(entry.spec.methods))
+            return
+        action = entry.action
 
         res = None
         before = time.monotonic()
@@ -842,13 +889,71 @@ class APIResource(ScryfallCardsRoutes, ScryfallReferenceRoutes):
                     record_span(req, span_name, span_data.get("_meta", {}).get("duration_ms", 0))
 
     def _raise_not_found(self, *_args: object, **_: object) -> None:
-        """Raise a Falcon HTTPNotFound error with available routes."""
+        """Raise a Falcon HTTPNotFound error with available routes.
+
+        Reached only by a handler that delegates to it deliberately; `_handle` answers an unresolved
+        path itself now, in Scryfall's shape.
+        """
         raise falcon.HTTPNotFound(
             title="Not Found",
             description={
                 "routes": self._not_found_routes,
             },
         )
+
+    def _reject_method(self, resp: falcon.Response, *, path: str, allowed: list[str]) -> None:
+        """Answer a method this route does not accept.
+
+        405 and the `Allow` header are KEPT where api.scryfall.com answers 404: 405 is the correct
+        HTTP answer, it is strictly more informative, and a client that would have seen Scryfall's
+        404 here is already using a method Scryfall does not serve. Only the BODY follows the surface.
+
+        `method_not_allowed` is the one error `code` on the Scryfall surface with NO measurement
+        behind it, because api.scryfall.com never emits a 405 to measure. It is named for the status
+        rather than invented from nothing, and flagged here so a later reader does not mistake it for
+        a captured string.
+
+        Args:
+            resp: The response to write to.
+            path: The resolved route key, which selects the error shape.
+            allowed: The methods this route does accept, sorted.
+
+        Raises:
+            falcon.HTTPMethodNotAllowed: On this service's own surface, whose shape is unchanged.
+        """
+        if path not in SCRYFALL_SURFACE_ROUTES:
+            raise falcon.HTTPMethodNotAllowed(allowed_methods=allowed)
+        resp.set_header("Allow", ", ".join(allowed))
+        self._respond_scryfall_error(
+            resp,
+            code="method_not_allowed",
+            status=405,
+            details=f"Allowed methods: {', '.join(allowed)}",
+        )
+
+    @staticmethod
+    def _respond_scryfall_error(resp: falcon.Response, *, code: str, status: int, details: str) -> None:
+        """Write a dispatch-level error in Scryfall's shape.
+
+        Written directly rather than raised: falcon's error serializer produces `{title,
+        description}` from an `HTTPError`, which is the shape this is replacing. Indented, like every
+        `object: "error"` body api.scryfall.com sends, and `no-cache`, which is the tier it sends on
+        a 404 about a PATH (a 404 about DATA, such as `/sets/zzzz`, keeps the data tier and is
+        answered by its own route rather than here).
+
+        Args:
+            resp: The response to write to.
+            code: Scryfall's error code.
+            status: The HTTP status, which the body repeats.
+            details: The human-readable sentence.
+        """
+        resp.status = falcon.util.code_to_http_status(status)
+        resp.content_type = "application/json; charset=utf-8"
+        resp.set_header("Cache-Control", "no-cache")
+        resp.text = orjson.dumps(
+            {"object": "error", "code": code, "status": status, "details": details},
+            option=orjson.OPT_INDENT_2,
+        ).decode()
 
     def _run_query(
         self,

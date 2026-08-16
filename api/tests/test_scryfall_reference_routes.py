@@ -231,6 +231,23 @@ class TestCatalog:
         assert dispatch(reference_corpus, "/catalog/not-a-catalog").headers["cache-control"] == "no-cache"
         assert dispatch(reference_corpus, "/sets/zzzz").headers["cache-control"] == "public"
 
+    def test_a_wrong_method_on_the_scryfall_surface_is_a_scryfall_error_object(self, reference_corpus: APIResource) -> None:
+        """405 is KEPT where api.scryfall.com answers 404; only the body follows the surface.
+
+        405 is the correct HTTP answer and strictly more informative, and a client that would have
+        seen Scryfall's 404 here is already using a method Scryfall does not serve. `method_not_allowed`
+        is the one error code with no measurement behind it -- api.scryfall.com never emits a 405.
+        """
+        resp = dispatch(reference_corpus, "/sets", method="DELETE")
+        assert resp.status == falcon.HTTP_405
+        assert resp.headers["allow"] == "GET, HEAD"
+        assert payload(resp) == {
+            "object": "error",
+            "code": "method_not_allowed",
+            "status": 405,
+            "details": "Allowed methods: GET, HEAD",
+        }
+
     def test_an_over_long_path_is_a_route_miss_not_a_set_miss(self, reference_corpus: APIResource) -> None:
         """`/sets/khm/extra` said "No Magic set found ..." -- about a set that was fine."""
         resp = dispatch(reference_corpus, "/sets/zzt/extra")

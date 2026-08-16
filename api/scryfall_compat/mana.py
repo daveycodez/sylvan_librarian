@@ -38,6 +38,16 @@ _HALF_MANA = 0.5
 # api.scryfall.com rejects it rather than pricing it (measured 2026-08-16).
 _HYBRID_HALVES = 2
 
+# How many CHARACTERS of the joined fragment list the error names before Scryfall cuts it.
+#
+# 51, and it is characters rather than bytes -- measured across nine lengths on 2026-08-16: 51 `a`s
+# come back whole and 52 come back as 51, while 51 `é`s (102 bytes) also come back whole and 60 come
+# back as 51 characters / 102 bytes. The cut applies to the WHOLE joined list rather than per
+# fragment: ten separate `{QQQQQQQQ}` tokens come back as 51 characters of the concatenation. There
+# is no ellipsis, unlike `/cards/collection`'s 30-character echo -- the string simply stops. 51 is an
+# odd bound and nothing here explains it, which is why the measurement travels with the constant.
+_FRAGMENT_ECHO_LIMIT = 51
+
 
 class ManaCostError(ValueError):
     """A fragment of the cost could not be understood as mana."""
@@ -227,18 +237,23 @@ def parse_mana_cost(raw: str) -> dict[str, Any]:
     total = 0.0
 
     # EVERY unparseable fragment is collected before any error is raised, because Scryfall's message
-    # names them all at once -- and adjacent BARE ones merge into a single run, which is what makes
-    # `?cost=!!!` one fragment (“!!!”) rather than three.
-    bad: list[str] = []
-    for at, token in enumerate(tokens):
+    # names them all at once -- CONCATENATED IN ORDER WITH NO SEPARATOR, and the readable symbols
+    # between them do not separate them either. Measured 2026-08-16, one request per row::
+    #
+    #     ?cost={Q}W{T}   “{Q}{T}”   the readable {W} between them leaves no trace
+    #     ?cost=!W!       “!!”       same, for bare characters
+    #     ?cost=!{Q}!     “!{Q}!”    braced and bare interleave in written order
+    #     ?cost=a{Q}b     “A{Q}”     `b` is BLACK MANA and readable, so only two fragments
+    #
+    # An earlier pass joined the fragments with a space, which no measurement supported and which
+    # `{Q}W{T}` disproves. One accumulated string is now the whole mechanism -- with an empty
+    # separator there is nothing left for a per-fragment merge rule to do.
+    bad = ""
+    for token in tokens:
         try:
             total += _symbol_value(token.symbol)
         except _UnparseableSymbolError:
-            previous = tokens[at - 1] if at else None
-            if bad and not token.braced and previous is not None and not previous.braced:
-                bad[-1] += _reported_fragment(token)
-            else:
-                bad.append(_reported_fragment(token))
+            bad += _reported_fragment(token)
             continue
         color_set |= _symbol_colors(token.symbol)
         if token.symbol.isdigit():
@@ -251,7 +266,7 @@ def parse_mana_cost(raw: str) -> dict[str, Any]:
             colored.append(token.symbol)
 
     if bad:
-        msg = f"The string fragment(s) “{' '.join(bad)}” could not be understood as part of mana cost."
+        msg = f"The string fragment(s) “{bad[:_FRAGMENT_ECHO_LIMIT]}” could not be understood as part of mana cost."
         raise ManaCostError(msg)
 
     colors = _canonical_colors(color_set)
