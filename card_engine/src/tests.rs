@@ -11747,21 +11747,32 @@ fn trigram_similarity_matches_pg_trgm() {
     assert_eq!(trigram_similarity("lightning", "lightnin"), trigram_similarity("lightnin", "lightning"));
 }
 
-#[test]
-fn a_typo_resolves_to_the_intended_card() {
+/// A CardData whose cards carry the given names, one printing each — the fuzzy scan's minimal
+/// fixture. The printed-name index stays empty, which is every pre-multilingual store.
+fn named_cards_store(names: &[&str]) -> CardData {
     let mut vocab = VocabInterner::new();
     let mut cards = Vec::new();
-    for (i, name) in ["lightning bolt", "shock", "counterspell"].iter().enumerate() {
+    for (i, name) in names.iter().enumerate() {
         let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
         c.card_name_folded = InlineStr::from_str(name);
         c.card_name_lower = InlineStr::from_str(name);
         cards.push(c);
     }
-    let bytes = rkyv::to_bytes::<Error>(&cards).expect("serialize");
-    let a = rkyv::access::<Archived<Vec<OracleCard>>, Error>(&bytes).expect("access");
+    let counts = vec![1usize; names.len()];
+    store_of(cards, &counts, vocab)
+}
+
+#[test]
+fn a_typo_resolves_to_the_intended_card() {
+    let data = named_cards_store(&["lightning bolt", "shock", "counterspell"]);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
     match fuzzy_name_match(a, "lightnig bolt", 0.4, 0.05) {
-        FuzzyOutcome::Hit(cid) => assert_eq!(cid, 0, "a one-letter typo still finds Lightning Bolt"),
+        FuzzyOutcome::Hit { cid, vpid } => {
+            assert_eq!(cid, 0, "a one-letter typo still finds Lightning Bolt");
+            assert_eq!(vpid, 0, "an English hit carries the card's preferred printing");
+        }
         _ => panic!("expected a hit"),
     }
     // Nothing close enough clears the floor.
@@ -11772,15 +11783,9 @@ fn a_typo_resolves_to_the_intended_card() {
 fn two_close_names_are_ambiguous_not_a_guess() {
     // Scryfall reports `ambiguous` rather than picking, and collapsing that to "not found" would
     // tell the client the card does not exist.
-    let mut vocab = VocabInterner::new();
-    let mut cards = Vec::new();
-    for (i, name) in ["fire dragon", "fire dragoon"].iter().enumerate() {
-        let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
-        c.card_name_folded = InlineStr::from_str(name);
-        cards.push(c);
-    }
-    let bytes = rkyv::to_bytes::<Error>(&cards).expect("serialize");
-    let a = rkyv::access::<Archived<Vec<OracleCard>>, Error>(&bytes).expect("access");
+    let data = named_cards_store(&["fire dragon", "fire dragoon"]);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
     assert!(matches!(fuzzy_name_match(a, "fire dragen", 0.4, 0.05), FuzzyOutcome::Ambiguous));
 }
 
@@ -11788,16 +11793,10 @@ fn two_close_names_are_ambiguous_not_a_guess() {
 fn printings_of_one_card_do_not_look_ambiguous() {
     // Several cards sharing a NAME are one answer, not competing ones. Without the distinct-name
     // rule they would tie with themselves and every fuzzy lookup would report ambiguous.
-    let mut vocab = VocabInterner::new();
-    let mut cards = Vec::new();
-    for i in 0..3u128 {
-        let mut c = stub_card(i + 1, 0, &[], &mut vocab);
-        c.card_name_folded = InlineStr::from_str("lightning bolt");
-        cards.push(c);
-    }
-    let bytes = rkyv::to_bytes::<Error>(&cards).expect("serialize");
-    let a = rkyv::access::<Archived<Vec<OracleCard>>, Error>(&bytes).expect("access");
-    assert!(matches!(fuzzy_name_match(a, "lightning bolt", 0.4, 0.05), FuzzyOutcome::Hit(_)));
+    let data = named_cards_store(&["lightning bolt", "lightning bolt", "lightning bolt"]);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    assert!(matches!(fuzzy_name_match(a, "lightning bolt", 0.4, 0.05), FuzzyOutcome::Hit { .. }));
 }
 
 #[test]

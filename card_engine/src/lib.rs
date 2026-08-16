@@ -3169,20 +3169,143 @@ pub(crate) fn trigram_similarity(a: &str, b: &str) -> f32 {
 
 /// What a `?fuzzy=` lookup resolved to.
 pub(crate) enum FuzzyOutcome {
-    /// The card index that won outright.
-    Hit(u32),
-    /// Two distinct names scored too close to choose between; Scryfall answers `ambiguous`.
+    /// The card that won outright, and the printing that carries the matched name: the card's
+    /// preferred printing for an English-name hit, the best printing of the matched printed
+    /// name for a foreign hit — which is how "ego à deriva" materializes the Portuguese
+    /// printing object rather than the English card.
+    Hit { cid: u32, vpid: u32 },
+    /// Two distinct names on two distinct CARDS scored too close to choose between; Scryfall
+    /// answers `ambiguous`. A card's own English and foreign names never read ambiguous, and
+    /// neither do two cards sharing one name (they are one answer, the pre-multilingual rule).
     Ambiguous,
     /// Nothing cleared the floor.
     Miss,
 }
 
-/// The typo-tolerant name match, with #912's thresholds.
+/// The running best and runner-up of the fuzzy scan, under the competition rule above: a
+/// candidate threatens the leader only when BOTH its name and its oracle card differ.
+struct FuzzyRace<'a> {
+    best: Option<(f32, u32, u32, &'a str)>, // (score, cid, vpid, name)
+    runner_up: Option<f32>,
+}
+
+impl<'a> FuzzyRace<'a> {
+    fn offer(&mut self, score: f32, cid: u32, vpid: u32, name: &'a str) {
+        match self.best {
+            Some((best_score, best_cid, _, best_name)) if score <= best_score => {
+                if name != best_name && cid != best_cid && self.runner_up.is_none_or(|r| score > r) {
+                    self.runner_up = Some(score);
+                }
+            }
+            _ => {
+                if let Some((prev_score, prev_cid, _, prev_name)) = self.best
+                    && prev_name != name && prev_cid != cid && self.runner_up.is_none_or(|r| prev_score > r) {
+                        self.runner_up = Some(prev_score);
+                    }
+                self.best = Some((score, cid, vpid, name));
+            }
+        }
+    }
+
+    fn outcome(self, lead: f32) -> FuzzyOutcome {
+        match (self.best, self.runner_up) {
+            (None, _) => FuzzyOutcome::Miss,
+            (Some((score, _, _, _)), Some(second)) if score - second < lead => FuzzyOutcome::Ambiguous,
+            (Some((_, cid, vpid, _)), _) => FuzzyOutcome::Hit { cid, vpid },
+        }
+    }
+}
+
+/// The owning card of a virtual printing id, via the direct arrays of whichever space it is in.
+pub(crate) fn card_of_vpid(data: &Archived<CardData>, vpid: u32) -> u32 {
+    let n = data.printings.len() as u32;
+    if vpid < n {
+        u32::from(data.indexes.printing_to_card[vpid as usize])
+    } else {
+        u32::from(data.indexes.foreign_to_card[(vpid - n) as usize])
+    }
+}
+
+/// pg_trgm's Jaccard over two sorted, deduped trigram runs, or None when it cannot clear
+/// `floor`. The size-ratio ceiling (`shared <= min(|a|,|b|)`, `union >= max`) makes the skip
+/// exact rather than approximate — no candidate that could clear the floor is dropped.
+fn jaccard_cleared(name_tg: &[[u8; 3]], needle_tg: &[[u8; 3]], floor: f32) -> Option<f32> {
+    let (la, lb) = (name_tg.len(), needle_tg.len());
+    if la == 0 || (la.min(lb) as f32) < floor * la.max(lb) as f32 {
+        return None;
+    }
+    // Two sorted runs merged: no set, no allocation, no hashing.
+    let (mut i, mut j, mut shared) = (0usize, 0usize, 0usize);
+    while i < la && j < lb {
+        match name_tg[i].cmp(&needle_tg[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                shared += 1;
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    let union = la + lb - shared;
+    let score = if union == 0 { 0.0 } else { shared as f32 / union as f32 };
+    (score >= floor).then_some(score)
+}
+
+/// Printed-name records worth scoring against `needle`: the union of the trigram index's
+/// postings over the needle's raw 3-byte windows — any record sharing NO window with the
+/// needle is skipped without being resolved or scored, which is what keeps the foreign pass
+/// at candidate scale (~a few posting lists) instead of ~247k Jaccard evaluations.
 ///
-/// A candidate must clear `floor`, and the best must lead the next DISTINCT name by `lead`. The
-/// distinctness matters: several printings of one card would otherwise look like a tie with
-/// themselves and report ambiguous.
-pub(crate) fn fuzzy_name_match(cards: &Archived<Vec<OracleCard>>, needle: &str, floor: f32, lead: f32) -> FuzzyOutcome {
+/// Union, not intersection: fuzzy tolerates typos, so requiring EVERY window (the containment
+/// rule `trigram_candidates` enforces) would drop real matches. A needle under 3 bytes has no
+/// windows and falls back to every record, like the English scan's own short-needle behavior.
+/// KNOWN EDGE: a record whose folded name is under 3 bytes contributes no windows at build and
+/// is unreachable here — printed names that short do not occur in the real corpus, and the
+/// English pass (which scans) is unaffected.
+fn printed_record_candidates(pn: &Archived<PrintedNameIndex>, needle: &str) -> Vec<u32> {
+    let n_records = pn.name_ids.len();
+    // Applicability check, same shape as name_scan_candidates: an index built for a different
+    // record count (a hand-built fixture) must widen to a scan, never silently drop candidates.
+    if u32::from(pn.trigrams.domain) as usize != n_records || needle.len() < 3 {
+        return (0..n_records as u32).collect();
+    }
+    let mut bits = vec![0u64; n_records.div_ceil(64)];
+    let mut seen: Vec<[u8; 3]> = needle.as_bytes().windows(3).map(|w| [w[0], w[1], w[2]]).collect();
+    seen.sort_unstable();
+    seen.dedup();
+    for tri in seen {
+        match lookup_trigram(&pn.trigrams, tri) {
+            Some(TriOperand::Posting(ids)) => {
+                for id in ids {
+                    bits[(id >> 6) as usize] |= 1u64 << (id & 63);
+                }
+            }
+            Some(TriOperand::Plane(words)) => or_bits_into(&mut bits, &words),
+            None => {}
+        }
+    }
+    let mut out = Vec::new();
+    for (wi, word) in bits.iter().enumerate() {
+        let mut w = *word;
+        while w != 0 {
+            out.push((wi as u32) << 6 | w.trailing_zeros());
+            w &= w - 1;
+        }
+    }
+    out
+}
+
+/// The typo-tolerant name match, with Scryfall's thresholds, over BOTH name spaces: every
+/// card's folded English name (a scan, as ever) plus every distinct (folded printed name, lang)
+/// record, trigram-narrowed to the records sharing a window with the needle.
+///
+/// A candidate must clear `floor`, and the best must lead the runner-up by `lead`. The
+/// runner-up rule is FuzzyRace's: only a different name on a different CARD competes — several
+/// printings of one card are the same answer, a card's own foreign and English names are too,
+/// and two cards sharing a name stay one answer.
+pub(crate) fn fuzzy_name_match(data: &Archived<CardData>, needle: &str, floor: f32, lead: f32) -> FuzzyOutcome {
+    let needle = needle.to_lowercase();
     let needle = needle.to_lowercase();
     // The needle's trigrams are LOOP-INVARIANT, and a sorted Vec is the shape this scan wants
     // rather than the BTreeSet `trigram_similarity` returns. Calling that helper per card rebuilt
@@ -3191,73 +3314,38 @@ pub(crate) fn fuzzy_name_match(cards: &Archived<Vec<OracleCard>>, needle: &str, 
     // Measured on the real corpus: 25,350 us for one `?fuzzy=` lookup before this.
     //
     // `trigram_similarity` itself is deliberately untouched: it is pinned to pg_trgm's definition
-    // by `trigram_similarity_matches_pg_trgm`, and this computes the identical Jaccard ratio by a
-    // different route (two sorted runs merged, instead of two sets intersected).
+    // by `trigram_similarity_matches_pg_trgm`, and jaccard_cleared computes the identical ratio
+    // by a different route (two sorted runs merged, instead of two sets intersected).
     let mut needle_tg: Vec<[u8; 3]> = trigrams(&needle).into_iter().collect();
     needle_tg.sort_unstable();
     needle_tg.dedup();
     if needle_tg.is_empty() {
         return FuzzyOutcome::Miss;
     }
-    // Reused across every card, so the scan allocates once rather than per name. Card names are
-    // InlineStr<61>, so a name yields at most ~64 trigrams and this never grows after the first.
+    // Reused across every candidate, so the scan allocates once rather than per name.
     let mut name_tg: Vec<[u8; 3]> = Vec::with_capacity(64);
-    let mut best: Option<(f32, u32, &str)> = None;
-    let mut runner_up: Option<f32> = None;
-    for (cid, card) in cards.iter().enumerate() {
+    let mut race = FuzzyRace { best: None, runner_up: None };
+    for (cid, card) in data.cards.iter().enumerate() {
         let name = card.card_name_folded.as_str();
         trigrams_into(name, &mut name_tg);
-        if name_tg.is_empty() {
-            continue;
-        }
-        // Jaccard is bounded by the size ratio: `shared <= min(|a|,|b|)` and
-        // `union >= max(|a|,|b|)`, so `score <= min/max`. When that ceiling is already under the
-        // floor the merge below cannot change the outcome, and skipping it is exact rather than
-        // approximate — no candidate that could clear `floor` is dropped.
-        let (la, lb) = (name_tg.len(), needle_tg.len());
-        if (la.min(lb) as f32) < floor * la.max(lb) as f32 {
-            continue;
-        }
-        // Two sorted runs merged: no set, no allocation, no hashing.
-        let (mut i, mut j, mut shared) = (0usize, 0usize, 0usize);
-        while i < la && j < lb {
-            match name_tg[i].cmp(&needle_tg[j]) {
-                std::cmp::Ordering::Less => i += 1,
-                std::cmp::Ordering::Greater => j += 1,
-                std::cmp::Ordering::Equal => {
-                    shared += 1;
-                    i += 1;
-                    j += 1;
-                }
-            }
-        }
-        let union = la + lb - shared;
-        let score = if union == 0 { 0.0 } else { shared as f32 / union as f32 };
-        if score < floor {
-            continue;
-        }
-        match best {
-            Some((best_score, _, best_name)) if score <= best_score => {
-                // Only a DIFFERENT name can be the runner-up; other printings of the same card are
-                // the same answer, not a competing one.
-                if name != best_name && runner_up.is_none_or(|r| score > r) {
-                    runner_up = Some(score);
-                }
-            }
-            _ => {
-                if let Some((prev_score, _, prev_name)) = best
-                    && prev_name != name && runner_up.is_none_or(|r| prev_score > r) {
-                        runner_up = Some(prev_score);
-                    }
-                best = Some((score, cid as u32, name));
-            }
+        if let Some(score) = jaccard_cleared(&name_tg, &needle_tg, floor) {
+            // An English-name hit materializes what it always has: the card's preferred printing.
+            race.offer(score, cid as u32, u32::from(data.offsets[cid]), name);
         }
     }
-    match (best, runner_up) {
-        (None, _) => FuzzyOutcome::Miss,
-        (Some((score, _, _)), Some(second)) if score - second < lead => FuzzyOutcome::Ambiguous,
-        (Some((_, cid, _)), _) => FuzzyOutcome::Hit(cid),
+    let pn = &data.indexes.printed_names;
+    for rec in printed_record_candidates(pn, &needle) {
+        let rec = rec as usize;
+        let Some(name) = str_at(&data.strings, u32::from(pn.name_ids[rec])) else { continue };
+        trigrams_into(name, &mut name_tg);
+        if let Some(score) = jaccard_cleared(&name_tg, &needle_tg, floor) {
+            // The record's first vpid is its best-prefer printing — the object a foreign hit
+            // materializes.
+            let vpid = u32::from(pn.vpids[u32::from(pn.offsets[rec]) as usize]);
+            race.offer(score, card_of_vpid(data, vpid), vpid, name);
+        }
     }
+    race.outcome(lead)
 }
 
 /// Card names MATCHING `needle`, case-insensitively, in the SQL route's own order, up to `limit`.
@@ -14253,17 +14341,16 @@ impl QueryEngine {
         let mmap = self.get_mmap()?;
         // Safety: see the access_unchecked justification in query().
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
-        match fuzzy_name_match(&data.cards, name, floor, lead) {
+        match fuzzy_name_match(data, name, floor, lead) {
             FuzzyOutcome::Miss => Ok(("miss".to_string(), None)),
             FuzzyOutcome::Ambiguous => Ok(("ambiguous".to_string(), None)),
-            FuzzyOutcome::Hit(cid) => {
-                let cid = cid as usize;
-                // The card's default-preferred printing, the same one every other by-name path shows.
-                let preferred = u32::from(data.offsets[cid]) as usize;
+            FuzzyOutcome::Hit { cid, vpid } => {
+                // The card's preferred printing for an English hit; the matched printed name's
+                // best printing for a foreign one — the vpid encodes which.
                 let dict = card_to_pydict(
                     py,
-                    &data.cards[cid],
-                    &data.printings[preferred],
+                    &data.cards[cid as usize],
+                    printing_at(data, vpid),
                     &data.strings,
                     &data.coll_vocab,
                     &resolved_fields,
