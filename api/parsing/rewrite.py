@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from api.parsing.card_query_nodes import CardAttributeNode
-from api.parsing.db_info import BOOLEAN_IS_TAGS
+from api.parsing.db_info import ARRAY_IS_TAGS, BOOLEAN_IS_TAGS
 from api.parsing.hand_parser import parse_query as _parse_query
 from api.parsing.nodes import (
     AndNode,
@@ -70,8 +70,22 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     # reversible_card / double_faced_token (~2394 art & token entries) that aren't gameplay cards
     # and aren't in our corpus, so the layout union is the correct set for our data.
     ("is", "dfc"): "layout:transform or layout:modal_dfc or layout:meld",
+    # `tdfc` is `transform` under another name: `is:tdfc -is:transform` and its converse are
+    # both empty on api.scryfall.com.
+    ("is", "tdfc"): "layout:transform",
+    # Layouts this import does not carry. Spelled out anyway: a predicate that is UNDERSTOOD and
+    # matches nothing is a different answer from one that is not understood, and only the first
+    # is what a corpus-policy exclusion actually means.
+    ("is", "artseries"): "layout:art_series",
+    ("is", "augmentation"): "layout:augment",
+    ("is", "host"): "layout:host",
+    ("is", "planar"): "layout:planar",
+    ("is", "reversible"): "layout:reversible_card",
+    ("is", "token"): "layout:token",
     # Frame-effect (stored in card_frame_data). is:colorshifted == frame:colorshifted exactly (45).
     ("is", "colorshifted"): "frame:colorshifted",
+    ("is", "extendedart"): "frame:extendedart",  # 3,629 = 3,629
+    ("is", "showcase"): "frame:showcase",  # 2,213 = 2,213
     # ── Land cycles: one alphabetized segment (per review) ──────────────
     # creatureland/manland keep the oracle-text heuristic: 48/49 vs Scryfall,
     # 0 false positives (the one miss is Alchemy-only and absent here).
@@ -86,12 +100,15 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     # enters-tapped-gain-life cycles Scryfall's list lacks -- with counts
     # last validated against api.scryfall.com on 2026-08-07.
     ("is", "battleland"): "otag:cycle-tangoland",  # 10
+    # The Amonkhet/Hour cycling duals. Scryfall spells them three ways; all three are 10.
+    ("is", "bicycleland"): "otag:cycle-dual-cycling-land",  # 10, exact
     ("is", "bikeland"): "otag:cycle-dual-cycling-land",  # 10, exact
     ("is", "bondland"): "otag:cycle-bondland",  # 10
     ("is", "bounceland"): "otag:bounceland",  # 17, exact
     ("is", "canland"): "otag:cycle-horizon-land",  # 6; Scryfall's other spelling of canopyland
     ("is", "canopyland"): "otag:cycle-horizon-land",  # 6, exact
     ("is", "checkland"): "otag:cycle-checkland",  # 10, exact
+    ("is", "cycleland"): "otag:cycle-bicycle-land",  # 10; third spelling of bikeland
     ("is", "creatureland"): "t:land o:become o:creature o:/still a.* land/",
     ("is", "dual"): "otag:cycle-abu-dual-land",  # 10, the ABUR duals, exact
     ("is", "fastland"): "otag:cycle-fastland",  # 10, exact
@@ -100,6 +117,10 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     ("is", "gainland"): "otag:gainland",  # 42, self-updating superset of Scryfall's 15
     ("is", "karoo"): "otag:bounceland",  # 17; Scryfall's other spelling of bounceland
     ("is", "manland"): "t:land o:become o:creature o:/still a.* land/",
+    # Land, and the name says so -- there is no cycle tag for these, and upstream's own
+    # CUSTOM_IS_TAGS note describes them the same way ("land and name contains pathway").
+    # 10 = 10 against api.scryfall.com.
+    ("is", "pathway"): "t:land name:pathway",
     ("is", "painland"): "otag:cycle-painland",  # 10, exact
     ("is", "pathway"): "otag:cycle-pathway",  # 10, exact
     ("is", "scryland"): "otag:cycle-block-ths-scry-land",  # 10, exact
@@ -112,6 +133,10 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     ("is", "shockland"): "otag:shockland",  # 11, includes Multiversal Passage
     ("is", "slowland"): "otag:cycle-slowland",  # 10, exact
     ("is", "snarl"): "t:land o:/reveal an? (Plains|Island|Swamp|Mountain|Forest)/",  # same family; Scryfall accepts both
+    # The MKM cycle, and Scryfall's list is still exactly those 10 -- `cycle-dual-surveil-land`
+    # holds the same set today, and the SOS cycle sits under its own slug that Scryfall has not
+    # adopted, so the MKM slug is the one that tracks their answer rather than drifting past it.
+    ("is", "surveilland"): "otag:cycle-mkm-surveil-land",  # 10, exact
     (
         "is",
         "storageland",
@@ -123,6 +148,9 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     ("is", "tricycleland"): "otag:tricycle-land",  # 10, exact
     ("is", "triland"): "otag:cycle-ala-shardland or otag:cycle-ktk-wedgeland",  # 10, name-verified
     ("is", "triome"): "otag:cycle-iko-triome or otag:cycle-snc-triland",  # 10, name-verified
+    # Scryfall's `is:tricycleland` is the triomes, name for name (the five IKO plus the five
+    # SNC) -- not a third cycling-land cycle, despite the spelling.
+    ("is", "tricycleland"): "otag:cycle-iko-triome or otag:cycle-snc-triland",  # 10, name-verified
     # ── Non-land derivables ──────────────────────────────────────────────
     # Commander eligibility, refined per review: legendary permanents with a
     # printed toughness (creatures, Vehicles, Spacecraft -- toughness>=0, the
@@ -173,6 +201,10 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     # falls out of the complement without a rule of its own. Scryfall accepts both spellings.
     ("is", "firstprinting"): "-is:reprint",
     ("is", "firstprint"): "-is:reprint",
+    # Spelling aliases of tags the importer stores (db_info.BOOLEAN_IS_TAGS / ARRAY_IS_TAGS).
+    # Aliased rather than stored twice: a second copy of a 3,228-card tag is bytes for nothing.
+    ("is", "full"): "is:fullart",
+    ("is", "promostamped"): "is:stamped",
 }
 
 # Every `is:` value this parser can answer at all: the derivable expansions above plus the booleans
@@ -180,8 +212,10 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
 # back as zero results with nothing to say why -- see `unsupported_is_warnings`. Reading
 # BOOLEAN_IS_TAGS rather than restating it is what keeps a tag added to the importer from being
 # reported unsupported by the parser.
-SUPPORTED_IS_VALUES: frozenset[str] = frozenset(BOOLEAN_IS_TAGS) | frozenset(
-    value for alias, value in _DERIVED_EXPANSIONS if alias == "is"
+SUPPORTED_IS_VALUES: frozenset[str] = (
+    frozenset(BOOLEAN_IS_TAGS)
+    | frozenset(ARRAY_IS_TAGS)
+    | frozenset(value for alias, value in _DERIVED_EXPANSIONS if alias == "is")
 )
 
 

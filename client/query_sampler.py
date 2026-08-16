@@ -167,14 +167,17 @@ STATIC_VALUES: dict[str, list[str]] = {
     # Anything outside this set parses but falls through to a `card_is_tags` lookup, and that column
     # carries only the booleans the import syncs from the bulk blob (db_info.BOOLEAN_IS_TAGS) —
     # `is:reserved` and `is:reprint` are the ones to reach for. Values with no key there match zero
-    # cards AND now raise a warning, as `is:token` does. All 49 are kept rather
+    # cards AND now raise a warning, as `is:token` does. All 66 are kept rather
     # than a token few: the family's share of traffic is set by its weight, not by how many values
     # it holds, and each expands to a genuinely different shape — layout lookups, type unions, an
     # oracle-text heuristic, a numeric conjunction.
     "tag": [
         "is:adventure",
+        "is:artseries",
+        "is:augmentation",
         "is:battleland",
         "is:bear",
+        "is:bicycleland",
         "is:bikeland",
         "is:bondland",
         "is:bounceland",
@@ -186,8 +189,10 @@ STATIC_VALUES: dict[str, list[str]] = {
         "is:commander",
         "is:companion",
         "is:creatureland",
+        "is:cycleland",
         "is:dfc",
         "is:dual",
+        "is:extendedart",
         "is:fastland",
         "is:fetchland",
         "is:filterland",
@@ -195,8 +200,10 @@ STATIC_VALUES: dict[str, list[str]] = {
         "is:firstprinting",
         "is:flip",
         "is:frenchvanilla",
+        "is:full",
         "is:gainland",
         "is:historic",
+        "is:host",
         "is:karoo",
         "is:leveler",
         "is:manland",
@@ -206,13 +213,17 @@ STATIC_VALUES: dict[str, list[str]] = {
         "is:new",
         "is:old",
         "is:outlaw",
-        "is:party",
         "is:painland",
+        "is:party",
         "is:pathway",
         "is:permanent",
+        "is:planar",
+        "is:promostamped",
+        "is:reversible",
         "is:scryland",
         "is:shadowland",
         "is:shockland",
+        "is:showcase",
         "is:slowland",
         "is:snarl",
         "is:spell",
@@ -220,6 +231,8 @@ STATIC_VALUES: dict[str, list[str]] = {
         "is:storageland",
         "is:surveilland",
         "is:tangoland",
+        "is:tdfc",
+        "is:token",
         "is:transform",
         "is:tricycleland",
         "is:triland",

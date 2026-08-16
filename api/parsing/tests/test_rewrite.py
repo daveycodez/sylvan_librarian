@@ -9,7 +9,7 @@ docs/issues/00713-is-tag-recovery.md.
 import pytest
 
 from api.parsing import generate_sql_query, parse_scryfall_query
-from api.parsing.db_info import BOOLEAN_IS_TAGS
+from api.parsing.db_info import ARRAY_IS_TAGS, BOOLEAN_IS_TAGS
 from api.parsing.nodes import RegexValueNode
 from api.parsing.rewrite import SUPPORTED_IS_VALUES, _regex_plain_literal
 
@@ -81,9 +81,24 @@ EQUIVALENCES = [
     # Scryfall, ties included (2026-08-16). Both spellings are accepted there.
     ("is:firstprinting", "-is:reprint"),
     ("is:firstprint", "-is:reprint"),
-    # Scryfall's second names for two land cycles we already carry.
+    # Scryfall's second names for land cycles we already carry, and the ones we did not.
     ("is:karoo", "otag:bounceland"),
     ("is:canland", "otag:cycle-horizon-land"),
+    ("is:bikeland", "otag:cycle-bicycle-land"),
+    ("is:cycleland", "otag:cycle-bicycle-land"),
+    ("is:bicycleland", "otag:cycle-bicycle-land"),
+    ("is:surveilland", "otag:cycle-mkm-surveil-land"),
+    ("is:tricycleland", "otag:cycle-iko-triome or otag:cycle-snc-triland"),
+    ("is:pathway", "t:land name:pathway"),
+    # Frame effects and layouts that were already expressible and simply had no entry.
+    ("is:showcase", "frame:showcase"),
+    ("is:extendedart", "frame:extendedart"),
+    ("is:tdfc", "layout:transform"),
+    ("is:planar", "layout:planar"),
+    ("is:reversible", "layout:reversible_card"),
+    # Spelling aliases of stored tags: the expansion is the OTHER is: value, which stays a leaf.
+    ("is:full", "is:fullart"),
+    ("is:promostamped", "is:stamped"),
     # composes under negation and inside compounds
     ("-frame:old", "-(frame:1993 or frame:1997)"),
     ("t:goblin frame:modern", "t:goblin frame:2003"),
@@ -240,6 +255,20 @@ def test_regex_plain_literal(expected: str | None, pattern: str) -> None:
 # ─── The `is:` vocabulary, and what happens outside it ────────────────────────
 
 
+def test_array_is_tags_name_a_real_blob_array() -> None:
+    """Every ARRAY_IS_TAGS entry points at a bulk array key, not a boolean or a scalar.
+
+    The mappings were read off Scryfall's own card objects rather than guessed, and the two keys
+    that appear (`promo_types`, `finishes`) are the only arrays this table has any business
+    naming. A third would mean somebody wrote a scalar field here, where the containment test
+    silently answers false for every card — the silent-zero shape this whole table exists to end.
+    """
+    assert {key for key, _ in ARRAY_IS_TAGS.values()} == {"promo_types", "finishes"}
+    # ...and no tag is claimed by both tables, which would make the two halves of the sync
+    # statement fight over one key.
+    assert not (frozenset(ARRAY_IS_TAGS) & frozenset(BOOLEAN_IS_TAGS))
+
+
 def test_every_stored_is_tag_is_a_supported_value() -> None:
     """A tag the importer writes must be one the parser reports as supported.
 
@@ -248,11 +277,29 @@ def test_every_stored_is_tag_is_a_supported_value() -> None:
     grew its own copy again.
     """
     assert frozenset(BOOLEAN_IS_TAGS) <= SUPPORTED_IS_VALUES
+    assert frozenset(ARRAY_IS_TAGS) <= SUPPORTED_IS_VALUES
 
 
 @pytest.mark.parametrize(
     argnames="query",
-    argvalues=["is:reprint", "is:promo", "is:foil", "is:reserved", "is:spell", "is:firstprinting", "is:fetchland"],
+    argvalues=[
+        "is:reprint",
+        "is:promo",
+        "is:foil",
+        "is:reserved",
+        "is:spell",
+        "is:firstprinting",
+        "is:fetchland",
+        "is:nonfoil",
+        "is:booster",
+        "is:hires",
+        "is:prerelease",
+        "is:universesbeyond",
+        "is:judge",
+        "is:etched",
+        "is:showcase",
+        "is:tdfc",
+    ],
 )
 def test_supported_is_values_do_not_warn(query: str) -> None:
     """Everything the vocabulary covers — stored or derived — passes without a warning."""
