@@ -68,22 +68,41 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     ("is", "mdfc"): "layout:modal_dfc",
     ("is", "meld"): "layout:meld",
     ("is", "leveler"): "layout:leveler",
-    # is:dfc = gameplay double-faced cards. Scryfall's is:dfc additionally counts art_series /
-    # reversible_card / double_faced_token (~2394 art & token entries) that aren't gameplay cards
-    # and aren't in our corpus, so the layout union is the correct set for our data.
-    ("is", "dfc"): "layout:transform or layout:modal_dfc or layout:meld",
+    # `is:dfc` is NOT "the gameplay double-faced cards", and the old union was wrong in BOTH
+    # directions. Measured on api.scryfall.com 2026-08-16 on two independent axes -- `unique=prints`
+    # with `include_extras`+`include_variations`, and the plain default `unique=cards` -- both set
+    # differences against the five layouts below are ZERO on both. It EXCLUDES meld, which the old
+    # union included: `is:meld is:dfc` is 0 while `is:meld -is:dfc` is every meld printing (72
+    # prints / 21 cards). And it INCLUDES the three layouts the old comment set aside as "not
+    # gameplay cards and not in our corpus" -- art_series 2,650, double_faced_token 120,
+    # reversible_card 81 -- two of which the import demonstrably carries: counting `layout` over the
+    # 2026-08-16 all_cards bulk gives art_series 2,650 and double_faced_token 120, agreeing with
+    # Scryfall exactly.
+    ("is", "dfc"): (
+        "layout:transform or layout:modal_dfc or layout:art_series or layout:double_faced_token or "
+        "layout:reversible_card"
+    ),
     # `tdfc` is `transform` under another name: `is:tdfc -is:transform` and its converse are
     # both empty on api.scryfall.com.
     ("is", "tdfc"): "layout:transform",
-    # Layouts this import does not carry. Spelled out anyway: a predicate that is UNDERSTOOD and
-    # matches nothing is a different answer from one that is not understood, and only the first
-    # is what a corpus-policy exclusion actually means.
+    # The rest of the layout family, each pinned in both directions the same way.
+    #
+    # `is:host` and `is:augmentation` are the SAME predicate -- Unstable's two halves together, not
+    # one each. All four differences are empty: `is:host -is:augmentation`, its converse, and each
+    # against `layout:host or layout:augment` (46 = 29 + 17). Written out per value rather than
+    # aliased, because their equality is a measurement about Scryfall and not a spelling of ours.
+    #
+    # `is:token` reaches past `layout:token` to the double-faced tokens and to six Wilds of Eldraine
+    # Role tokens that ship as `layout:flip` (twoe/15-17, twoc/1-2, plst/TWOE-17). The `t:token`
+    # clause is what catches those six, and it cannot over-catch: `t:token -is:token` is empty on
+    # Scryfall, so the union is exactly `is:token` and stays so as further odd-layout tokens are
+    # printed. `is:token layout:emblem` is 0 -- an emblem is not a token.
     ("is", "artseries"): "layout:art_series",
-    ("is", "augmentation"): "layout:augment",
-    ("is", "host"): "layout:host",
+    ("is", "augmentation"): "layout:host or layout:augment",
+    ("is", "host"): "layout:host or layout:augment",
     ("is", "planar"): "layout:planar",
     ("is", "reversible"): "layout:reversible_card",
-    ("is", "token"): "layout:token",
+    ("is", "token"): "layout:token or layout:double_faced_token or t:token",
     # Frame-effect (stored in card_frame_data). is:colorshifted == frame:colorshifted exactly (45).
     ("is", "colorshifted"): "frame:colorshifted",
     ("is", "extendedart"): "frame:extendedart",  # 3,629 = 3,629

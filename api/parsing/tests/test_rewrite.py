@@ -36,7 +36,16 @@ EQUIVALENCES = [
     ("is:mdfc", "layout:modal_dfc"),
     ("is:meld", "layout:meld"),
     ("is:leveler", "layout:leveler"),
-    ("is:dfc", "layout:transform or layout:modal_dfc or layout:meld"),
+    (
+        "is:dfc",
+        "layout:transform or layout:modal_dfc or layout:art_series or layout:double_faced_token or "
+        "layout:reversible_card",
+    ),
+    # The same predicate under two names, and neither of them is one layout: `is:host
+    # -is:augmentation` and its converse are both empty on api.scryfall.com.
+    ("is:host", "layout:host or layout:augment"),
+    ("is:augmentation", "layout:host or layout:augment"),
+    ("is:token", "layout:token or layout:double_faced_token or t:token"),
     ("is:colorshifted", "frame:colorshifted"),
     ("is:manland", "t:land o:become o:creature o:/still a.* land/"),
     ("is:creatureland", "t:land o:become o:creature o:/still a.* land/"),
