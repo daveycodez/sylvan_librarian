@@ -303,11 +303,51 @@ def _merge_processed_faces(faces: list[dict[str, Any]]) -> dict[str, Any]:
 # 2026-08-16; 46 printings across ust/und/ulst stop carrying `is:extra`.
 _EXTRA_LAYOUTS = frozenset({"token", "double_faced_token", "emblem", "planar", "scheme", "vanguard", "art_series", "front_card"})
 
+# The `funny` sets Scryfall hides behind `include_extras`. Every OTHER funny set is served
+# ordinarily, and both halves are total: measured on api.scryfall.com 2026-08-16, all 22 funny sets
+# in the corpus answer `is:extra e:<code>` with either their whole card count or zero — never
+# anything in between.
+#
+#   whole set extra   cmb1 121  cmb2 121  h17 4  hho 21  ph17 3  ph18 4  ph19 7  ph20 3  ph21 4
+#                     ph22 5  ph23 2  phtr 3  punk 52  ulst 62  unk 512
+#   whole set served  ptg 0  sunf 0  ugl 0  und 0  unf 0  unh 0  ust 0
+#
+# NOTHING ON THE PRINTING PREDICTS THE SPLIT, and that is a measurement rather than a shrug. The
+# ulst rows (The List's Unstable reprints) were diffed field by field against their own ust twins
+# over the whole 2026-08-16 bulk: of the 40-odd keys, the only values ulst holds that no
+# ust/und/unh/unf/ugl row holds are `highres_image: false` and `image_status: "lowres"` — scan
+# quality, and not even uniform across ulst. `set_type`, `border_color` (silver both), `layout`,
+# `security_stamp`, `promo_types`, `frame_effects`, `games`, `finishes`, `booster`, `reprint`,
+# `content_warning`, `legalities` (never legal both) all overlap. Widening the comparison to the
+# two GROUPS — 927 printings across the 15 extra sets against 1,310 across the 7 served ones —
+# found no field whose value set separates them either.
+#
+# The SET objects do not predict it: `foil_only` is true for both h17 (extra) and ptg (served),
+# `parent_set_code` is set on both punk (extra) and sunf (served), `tcgplayer_id` is set on both
+# unk (extra) and ptg (served), and `card_count`/`printed_size`/`digital`/`block` split neither
+# way. So it is editorial data in Scryfall's own database, and a list is the only faithful port.
+#
+# SPELLED AS THE EXTRA SIDE ON PURPOSE. A funny set this list has never heard of is served
+# ORDINARILY, so the failure mode of a stale list is a handful of employee-award or convention
+# cards leaking into search — not a 639-card retail Un-set vanishing from it, which is what
+# defaulting the other way would risk the first time Wizards prints another one.
+_FUNNY_EXTRA_SETS = frozenset(
+    {"cmb1", "cmb2", "h17", "hho", "ph17", "ph18", "ph19", "ph20", "ph21", "ph22", "ph23", "phtr", "punk", "ulst", "unk"}
+)
+
 
 def _is_extra(card: dict[str, Any]) -> bool:
     """Whether Scryfall hides this printing from a default `/cards/search` — the `is:extra` class.
 
     See `preprocess_card` for the per-class probe that decided each half of this.
+
+    MEASURED COVERAGE (2026-08-16, the 114,068 English printings of the all_cards bulk against
+    api.scryfall.com's own `is:extra`, 10,818 printings): this class reaches 10,732 — 45 short and
+    none over. The 45 are Arena-only duplicate printings with no signal on them at all (hbg 18,
+    j21 16, ydmu 9, ybro 1) plus one Secret Lair poster; the same field-by-field diff that cleared
+    `_FUNNY_EXTRA_SETS` finds nothing separating them from their own set-mates either, so they are
+    left rather than enumerated one id at a time. Before the funny/digital/silver-promo/Stickers
+    clauses it reached 10,482 with 308 misses and 2 false positives.
 
     Args:
         card: The bulk card object.
@@ -315,6 +355,29 @@ def _is_extra(card: dict[str, Any]) -> bool:
     Returns:
         True when the printing should carry `is:extra`.
     """
+    never_legal = not set(card["legalities"].values()) & {"legal", "restricted"}
+    # A FUNNY SET DECIDES FOR ALL OF ITS PRINTINGS, in both directions — see `_FUNNY_EXTRA_SETS`
+    # for the measurement and for why no printing field can stand in for the list. This returns
+    # rather than falling through so the answer is total: `und`/`unh` carry a `playtest` promo each
+    # ("Look at Me, I'm R&D", a real Un-card that merely DEPICTS a playtest card) that the clause
+    # at the bottom used to call an extra, and `sunf`'s 48 sticker sheets would trip the `Stickers`
+    # clause below. Both sets answer `is:extra` 0 on api.scryfall.com.
+    if card.get("set_type") == "funny":
+        return card.get("set") in _FUNNY_EXTRA_SETS
+    # A DIGITAL PRINTING NO FORMAT ALLOWS. Arena's Alchemy duplicates and the Astral cards from the
+    # 1997 MicroProse game are legal nowhere and served nowhere: 117 printings across hbg (104),
+    # past (12) and prm (1), every one of them inside Scryfall's `is:extra` and not one outside it,
+    # over the whole English corpus. Digital and never-legal are each ordinary on their own —
+    # Alchemy's playable cards are legal in alchemy/historic, and paper's never-legal conspiracies
+    # are ordinary results — so it is the conjunction that carries the class.
+    if card.get("digital") is True and never_legal:
+        return True
+    # A SILVER-BORDERED PROMO: an Un-card handed out outside its own set (Arena League, judge
+    # gifts, prerelease stamps). 10 printings across pal04/j17/p30m/punh/pust, all extras, no false
+    # positive — silver alone is not the class (567 silver printings are ordinary), and neither is
+    # `promo`.
+    if card.get("border_color") == "silver" and card.get("set_type") == "promo":
+        return True
     if card.get("layout") in _EXTRA_LAYOUTS:
         return True
     if card.get("set_type") == "memorabilia":
@@ -327,17 +390,19 @@ def _is_extra(card: dict[str, Any]) -> bool:
     # are the same story. Measured 2026-08-16: `is:extra e:lea` answers 1.
     if card.get("content_warning") is True:
         return True
-    # A "Card"/"Token" TYPE LINE, for the printings whose layout does not already say so: the
-    # checklist and substitute-card family ships as layout `normal` in some sets.
+    # A "Card"/"Token"/"Stickers" TYPE LINE, for the printings whose layout does not already say
+    # so: the checklist and substitute-card family ships as layout `normal` in some sets, and the
+    # Secret Lair sticker sheets (sld/335-339) ship as an ordinary `normal` box-set printing whose
+    # only tell is the type. `Stickers` is safe here only because the funny short-circuit above
+    # already answered for `sunf`, whose 48 sticker sheets Scryfall serves.
     type_line = card.get("type_line")
     if type_line:
         card_types, _ = parse_type_line(type_line)
-        if any(t in {"Card", "Token"} for t in card_types):
+        if any(t in {"Card", "Token", "Stickers"} for t in card_types):
             return True
     # A playtest promo, EXCEPT where the printing is otherwise playable: sld/SCTLR Counterspell
     # carries `playtest`, is legal in modern, and is returned by a bare
     # `!"Counterspell"&unique=prints` — so the flag alone hides nothing.
-    never_legal = not set(card["legalities"].values()) & {"legal", "restricted"}
     return "playtest" in card.get("promo_types", []) and never_legal
 
 

@@ -128,13 +128,24 @@ class TestCardProcessing:
 
         # ORDINARY — served by a bare `/cards/search`.
         assert "extra" not in tags(legalities={"vintage": "not_legal"}), "cn2/6 is 200 bare"
-        assert "extra" not in tags(set_type="funny"), "e:ust answers 249 with and without the flag"
+        assert "extra" not in tags(set_type="funny", set_code="ust"), "e:ust answers 249 either way"
         assert "extra" not in tags(layout="reversible_card", name="Echo // Echo"), "tdm/380 is 200 bare"
         assert "extra" not in tags(promo_types=["sldbonus", "playtest"]), "sld/SCTLR is legal and served"
         # Unstable's Hosts and Augments: `is:extra e:ust` answers 0, and both layouts were in
         # _EXTRA_LAYOUTS until 2026-08-16. Asserted as a pair so re-adding either fails here.
-        assert "extra" not in tags(layout="host", set_type="funny"), "is:extra e:ust is 0"
-        assert "extra" not in tags(layout="augment", set_type="funny"), "is:extra e:ust is 0"
+        assert "extra" not in tags(layout="host", set_type="funny", set_code="ust"), "is:extra e:ust is 0"
+        assert "extra" not in tags(layout="augment", set_type="funny", set_code="ust"), "is:extra e:ust is 0"
+        # A funny set _FUNNY_EXTRA_SETS has never heard of is SERVED, not hidden — the stale-list
+        # failure mode that direction was chosen for.
+        assert "extra" not in tags(set_type="funny", set_code="un99"), "an unlisted funny set defaults to served"
+        # ...and the playtest promo inside a served un-set: `und`/`unh`'s "Look at Me, I'm R&D" is a
+        # real Un-card that merely depicts a playtest card, and `is:extra e:und` answers 0.
+        assert "extra" not in tags(
+            set_type="funny", set_code="und", promo_types=["playtest"], legalities={"vintage": "not_legal"}
+        ), "is:extra e:und is 0"
+        # Digital and never-legal are each ordinary alone; only the conjunction is the class.
+        assert "extra" not in tags(digital=True, set_type="alchemy"), "a playable Alchemy card is served"
+        assert "extra" not in tags(border_color="silver", set_type="expansion"), "567 silver printings are served"
 
         # EXTRA — 404 bare, 200 with include_extras=true.
         assert "extra" in tags(set_type="memorabilia"), "ced/78 appears only with extras"
@@ -146,6 +157,17 @@ class TestCardProcessing:
         # `content_warning`, the flag with no other signal behind it: layout `normal`, an ordinary
         # type line, legal somewhere. `is:extra e:lea` answers 1 and that one card is Crusade.
         assert "extra" in tags(content_warning=True), "lea/61 Crusade"
+        # A funny ODDITY set: `is:extra e:ulst` is 62 of 62, and its rows are field-for-field
+        # indistinguishable from the ust twins above — the set code is the whole signal.
+        assert "extra" in tags(set_type="funny", set_code="ulst", border_color="silver"), "is:extra e:ulst is 62"
+        # A digital printing legal in NO format: `is:extra e:hbg` is 122, 104 of them this class.
+        assert "extra" in tags(digital=True, set_type="alchemy", legalities={"alchemy": "not_legal", "historic": "not_legal"}), (
+            "hbg's Arena-only duplicates"
+        )
+        # A silver-bordered promo: pal04's Arena League un-cards, j17's Rules Lawyer, pust/punh.
+        assert "extra" in tags(border_color="silver", set_type="promo"), "pal04/10 Mise"
+        # A Secret Lair sticker sheet (sld/335-339), whose only tell is the type line.
+        assert "extra" in tags(type_line="Stickers", set_type="box"), "sld/336"
 
     def test_preprocess_card_keeps_non_paper_cards(self) -> None:
         """A digital-only printing is IMPORTED: Scryfall serves it with default parameters.
