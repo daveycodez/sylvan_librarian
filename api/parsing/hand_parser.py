@@ -288,8 +288,8 @@ class ParseError(ValueError):
     """Raised when the parser encounters unexpected token structure."""
 
 
-def _name_node(value: str) -> CardBinaryOperatorNode:
-    return CardBinaryOperatorNode(CardAttributeNode("name", ParserClass.TEXT), ":", StringValueNode(value))
+def _name_node(value: str, literal: bool = False) -> CardBinaryOperatorNode:
+    return CardBinaryOperatorNode(CardAttributeNode("name", ParserClass.TEXT), ":", StringValueNode(value, literal=literal))
 
 
 class Parser:
@@ -397,7 +397,10 @@ class Parser:
             return self.parse_exact_name()
         if tok.type == TT.QUOTED:
             self.consume()
-            return _name_node(str(tok.value))
+            # A bare QUOTED term is `name:"..."`, and quoting still means "match this literally":
+            # measured on api.scryfall.com 2026-08-16, `q="ft"` answers 362 exactly as
+            # `q=name:"ft"` does, against the bare word `q=ft`'s 1,628.
+            return _name_node(str(tok.value), literal=True)
         if tok.type == TT.WORD:
             self.consume()
             return self.parse_word_primary(str(tok.value))
@@ -618,7 +621,8 @@ class Parser:
         tok = self.peek()
         if tok.type == TT.QUOTED:
             self.consume()
-            return StringValueNode(str(tok.value))
+            # QUOTED, and `name:` reads that as "match this literally" -- see StringValueNode.
+            return StringValueNode(str(tok.value), literal=True)
         if tok.type == TT.REGEX:
             self.consume()
             return RegexValueNode(str(tok.value))
