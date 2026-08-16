@@ -1098,33 +1098,35 @@ impl FilterExpr {
                 // The literal scans the index's lowercased copies with a SIMD `memmem`; a user's
                 // own `t:/…/` runs against the original line, where its pattern's own case
                 // expectations still mean what they say.
-                enum Needle<'a> {
-                    Literal(memmem::Finder<'a>),
-                    Pattern(&'a CompiledRegex),
+                fn scan(idx: &rkyv::Archived<TypeLineIndex>, hit: impl Fn(usize, u32) -> bool) -> (Vec<u32>, Vec<u32>) {
+                    let mut gids: Vec<u32> = Vec::new();
+                    let mut line_ids: Vec<u32> = Vec::new();
+                    for (d, gid) in idx.gids.iter().enumerate() {
+                        let gid = u32::from(*gid);
+                        if hit(d, gid) {
+                            gids.push(gid);
+                            line_ids.push(d as u32);
+                        }
+                    }
+                    // `line_ids` comes out ascending (dense order); `gids` follows first-seen order
+                    // and has to be sorted for the binary search in tri(). Distinct dense ids intern
+                    // to distinct strings, so there are no duplicates to dedup.
+                    gids.sort_unstable();
+                    (gids, line_ids)
                 }
-                let needle = match self {
-                    FilterExpr::TypeLineContains { needle } => Needle::Literal(memmem::Finder::new(needle.as_bytes())),
-                    FilterExpr::TextRegex { regex, .. } => Needle::Pattern(regex),
+                // The literal scans the index's lowercased copies with a SIMD `memmem`; a user's
+                // own `t:/…/` runs against the original line, where its pattern's own case
+                // expectations still mean what they say.
+                let (gids, line_ids) = match self {
+                    FilterExpr::TypeLineContains { needle } => {
+                        let finder = memmem::Finder::new(needle.as_bytes());
+                        scan(idx, |d, _| idx.lower.get(d).is_some_and(|l| finder.find(l.as_bytes()).is_some()))
+                    }
+                    FilterExpr::TextRegex { regex, .. } => {
+                        scan(idx, |_, gid| str_at(strings, gid).is_some_and(|s| regex.is_match(s)))
+                    }
                     _ => unreachable!("guarded by the match arm above"),
                 };
-                let mut gids: Vec<u32> = Vec::new();
-                let mut line_ids: Vec<u32> = Vec::new();
-                for (d, gid) in idx.gids.iter().enumerate() {
-                    let gid = u32::from(*gid);
-                    let hit = match &needle {
-                        Needle::Literal(finder) => idx.lower.get(d).is_some_and(|l| finder.find(l.as_bytes()).is_some()),
-                        Needle::Pattern(re) => str_at(strings, gid).is_some_and(|s| re.is_match(s)),
-                    };
-                    if hit {
-                        gids.push(gid);
-                        line_ids.push(d as u32);
-                    }
-                }
-                // `line_ids` comes out ascending (dense order); `gids` follows
-                // first-seen order and has to be sorted for the binary search in
-                // tri(). Distinct dense ids intern to distinct strings, so there
-                // are no duplicates to dedup.
-                gids.sort_unstable();
                 *self = FilterExpr::TypeLineMatch { gids, line_ids };
             }
             _ => {}
