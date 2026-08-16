@@ -11502,6 +11502,43 @@ fn printings_are_findable_by_scryfall_id() {
     assert_eq!(find_printing_by_scryfall_id(aperm, aprint, 0), None, "null id");
 }
 
+/// `oracleid:<uuid>` — the query every Scryfall-compat card object puts in its
+/// `prints_search_uri` — selects exactly one card's printings, through the sorted oracle-id
+/// permutation rather than a scan, and answers an id this store does not hold with the empty set.
+#[test]
+fn an_oracle_id_filter_selects_one_cards_printings() {
+    let mut vocab = VocabInterner::new();
+    let (id_a, id_b) = (0x43fb_feec_u128, 0x21f4_5043_u128);
+    let cards = vec![stub_card(id_a, 0, &[], &mut vocab), stub_card(id_b, 0, &[], &mut vocab)];
+    let mut data = store_of(cards, &[2, 1], vocab);
+    // The permutation the narrowing binary-searches; store_of leaves the index defaulted.
+    data.indexes.oracle_by_oracle_id = build_oracle_by_oracle_id(&data.cards);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+
+    let run = |f: &mut FilterExpr, unique: &str| {
+        run_query(&QueryCtx::from(a), f, None, unique, "default", "edhrec", "asc", 100, 0).0
+    };
+
+    // Card A owns printings 1 and 2; card B owns printing 3. Neither of B's rows may appear.
+    let mut filter = FilterExpr::OracleIdMatch { id: id_a };
+    assert_eq!(run(&mut filter, "printing"), 2, "both of A's printings");
+    let mut filter = FilterExpr::OracleIdMatch { id: id_a };
+    assert_eq!(run(&mut filter, "card"), 1, "unique=cards rolls the same match up to one row");
+
+    // An id this store does not hold, and parse_uuid_or_hash's 0 for an unparseable value: both
+    // are the empty set, never an error — the parser deliberately does not validate the uuid.
+    for miss in [0xdead_beef_u128, 0] {
+        let mut filter = FilterExpr::OracleIdMatch { id: miss };
+        assert_eq!(run(&mut filter, "printing"), 0, "id {miss:#x} names no card");
+    }
+
+    // Negation complements the same exact set, which is only sound because the narrowing is
+    // tight (tight_narrow_space) — B's single row and nothing else.
+    let mut filter = FilterExpr::Not(Box::new(FilterExpr::OracleIdMatch { id: id_a }));
+    assert_eq!(run(&mut filter, "printing"), 1, "everything that is not card A");
+}
+
 #[test]
 fn cards_are_findable_by_oracle_id() {
     let mut vocab = VocabInterner::new();

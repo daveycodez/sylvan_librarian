@@ -517,6 +517,15 @@ pub(crate) enum FilterExpr {
         any: bool,
     },
 
+    /// `oracleid:<uuid>` — the oracle card whose `oracle_id` equals `id` (`parse_uuid_or_hash`'s
+    /// u128, 0 for an unparseable value, which no stored id ever equals). Card-level and total,
+    /// with nothing for `bind()` to resolve — bind() sees the vocab tables, not `CardIndexes` —
+    /// so `tri()` compares the raw u128 and `narrow_rec` seeds the same id through
+    /// `oracle_by_oracle_id` for the O(log n) answer.
+    OracleIdMatch {
+        id: u128,
+    },
+
     Legality {
         shift: Option<u8>, // None: format absent from all loaded data — matches nothing
         expected: u64,
@@ -647,6 +656,8 @@ pub(crate) fn verify_cost_tier(f: &FilterExpr) -> u32 {
         | FilterExpr::Legality { .. }
         // A LangMatch is one integer equality against a resolved vocab id.
         | FilterExpr::LangMatch { .. }
+        // An OracleIdMatch is one 128-bit integer equality against a field already in the card.
+        | FilterExpr::OracleIdMatch { .. }
         | FilterExpr::DateCmp { .. }
         | FilterExpr::YearCmp { .. } => MASK_COMPARE_NS100,
     }
@@ -790,6 +801,8 @@ fn leaf_compares_printing_field(f: &FilterExpr) -> bool {
         | FilterExpr::ExactName(_)
         | FilterExpr::NameMatch { .. }
         | FilterExpr::OracleMatch { .. }
+        // The oracle id is the card's own identity — every printing of it shares one.
+        | FilterExpr::OracleIdMatch { .. }
         | FilterExpr::ColorCmp { .. }
         | FilterExpr::TypeCmp { .. }
         | FilterExpr::ManaCostCmp { .. }
@@ -1442,6 +1455,11 @@ impl FilterExpr {
                 }
             }
 
+            // Two-valued, never Null: a stored oracle_id is never 0 (build enforces it), and
+            // parse_uuid_or_hash's 0 for an unparseable value therefore rejects every card —
+            // the same answer the oracle_by_oracle_id path gives, which refuses id 0 outright.
+            FilterExpr::OracleIdMatch { id } => tri_bool(u128::from(card.oracle_id) == *id),
+
             FilterExpr::FlavorMatch { gids, .. } => {
                 let Some(p) = printing else { return Tri::PrintingDep };
                 let gid = u32::from(p.flavor_text_lower_id);
@@ -1897,6 +1915,17 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
         let value = rhs_value_str(rhs).to_lowercase();
         let any = value == "any";
         return Ok(FilterExpr::LangMatch { value, vid: None, any });
+    }
+
+    if attr == "oracle_id" {
+        // Equality only, the surface upstream's parser grants `oracleid:` (string-order
+        // comparisons parse there like on the other string columns, so a non-equality op reaching
+        // here is defense in depth, not a reachable path). parse_uuid_or_hash folds hex case, so
+        // an uppercase uuid — the parser hands the value on unchanged — resolves the same id.
+        if !matches!(op, ":" | "=") {
+            return Err(format!("operator {op:?} is not supported on oracle_id"));
+        }
+        return Ok(FilterExpr::OracleIdMatch { id: super::parse_uuid_or_hash(rhs_value_str(rhs)) });
     }
 
     if attr == "card_subtypes" {

@@ -115,6 +115,8 @@ pub(crate) fn has_printing_varying_leaf(f: &FilterExpr) -> bool {
         | FilterExpr::ExactName(_)
         | FilterExpr::NameMatch { .. }
         | FilterExpr::OracleMatch { .. }
+        // The oracle id is the card's own identity — every printing of it shares one.
+        | FilterExpr::OracleIdMatch { .. }
         | FilterExpr::ColorCmp { .. }
         | FilterExpr::TypeCmp { .. }
         | FilterExpr::ManaCostCmp { .. }
@@ -489,6 +491,12 @@ fn estimate_leaf(f: &FilterExpr, indexes: &Archived<CardIndexes>, n_cards: u32, 
         // gids.len() an undercount; not exercised here).
         FilterExpr::NameMatch { ids } => exact(ids.len() as u32),
         FilterExpr::OracleMatch { gids } => exact(gids.len() as u32),
+
+        // An oracle id is unique per OracleCard (the build groups printings by it), so at most one
+        // card matches — and zero when the id names nothing this store holds. Not `exact(1)`: that
+        // would assert a floor of 1. The exact answer needs the permutation's sort keys, which live
+        // on the `cards` slice this entry point does not take (the ExactName caveat above).
+        FilterExpr::OracleIdMatch { .. } => Cardinality { lo: 0, est: 1, hi: 1 },
 
         FilterExpr::DateCmp { op, value } => match date_range_bounds(*op, *value) {
             None => unknown(n),

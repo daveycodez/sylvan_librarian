@@ -3513,7 +3513,7 @@ pub(crate) fn find_printing_by_scryfall_id(
 /// The oracle card with this oracle id, or None. Backs `oracleid:` and prints-of-this-card.
 pub(crate) fn find_oracle_by_oracle_id(
     perm: &Archived<Vec<u32>>,
-    cards: &Archived<Vec<OracleCard>>,
+    cards: &[AOracleCard],
     id: u128,
 ) -> Option<u32> {
     find_by_sorted_id(perm, id, |i| u128::from(cards[i as usize].oracle_id))
@@ -5259,6 +5259,8 @@ fn tight_narrow_space(f: &FilterExpr) -> Option<bool> {
         FilterExpr::ColorCmp { .. } | FilterExpr::TypeCmp { .. } => Some(false),
         // Exact names resolve exactly through the sorted name permutation.
         FilterExpr::ExactName(_) => Some(false),
+        // An oracle id resolves exactly through the sorted oracle_id permutation, to 0 or 1 card.
+        FilterExpr::OracleIdMatch { .. } => Some(false),
         // 1- and 2-byte name needles resolve exactly through the unigram / bigram indexes.
         FilterExpr::TextContains { field: TextSearchField::NameLower, word } if word.len() <= 2 => Some(false),
         // Ge-only guard is deliberate (#700): narrow_rec's CollectionCmp arm
@@ -5772,6 +5774,17 @@ fn narrow_rec(
             let width = perm[lo..].partition_point(|cid| name_of(cid) == needle.as_str());
             let ids: Vec<u32> = perm[lo..lo + width].iter().map(|x| u32::from(*x)).collect();
             Narrowed::tight(Candidates::Cards(ids))
+        }
+
+        FilterExpr::OracleIdMatch { id } => {
+            // oracle_by_oracle_id is the card-space permutation ordered by oracle_id, and the id is
+            // unique per card, so the binary search answers with the whole matching set: 0 or 1
+            // card, exact either way (a stored oracle_id is never null, and a miss proves empty).
+            let perm = &indexes.oracle_by_oracle_id;
+            if perm.len() != n_cards || cards.len() != n_cards || n_cards == 0 {
+                return None; // store without the oracle-id permutation
+            }
+            Narrowed::tight(Candidates::Cards(find_oracle_by_oracle_id(perm, cards, *id).into_iter().collect()))
         }
 
         FilterExpr::TextContains { field: TextSearchField::NameLower, word } if word.len() == 1 => {
