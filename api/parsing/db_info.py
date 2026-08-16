@@ -192,7 +192,14 @@ DB_COLUMNS = [
     FieldInfo(
         db_column_name="oracle_text",
         field_type=FieldType.TEXT,
-        search_aliases=["oracle", "o"],
+        # `fo:`/`fulloracle:` are Scryfall's FULL-oracle spellings and share this column: the
+        # stored `oracle_text` IS the full text, reminder text included, so the SQL path answers
+        # both from it and needs no second column. They are told apart downstream by
+        # `original_attribute` -- which matters only to the card engine, whose searchable oracle
+        # column has reminder text stripped out of it the way Scryfall's `o:` does.
+        # Measured on api.scryfall.com 2026-08-16: `fo:lifelink` 713 / `o:lifelink` stripped,
+        # `fo:draw e:khm` 57 / `o:draw e:khm` 39, `fo:/\(this creature/` 1,098 / `o:/\(/` 0.
+        search_aliases=["oracle", "o", "fo", "fulloracle"],
         parser_class=ParserClass.TEXT,
     ),
     FieldInfo(
