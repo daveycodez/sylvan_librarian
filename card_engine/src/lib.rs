@@ -284,6 +284,16 @@ struct PrintingFace {
     illustration_id: u128,
     card_artist_vid: u16,
     flavor_text_id: u32,
+    // Scryfall's FACE-level `flavor_name`, interned (NONE_STR = absent). The card-level twin is
+    // `Printing.flavor_name_id`, and a printing carries one or the other, never both: 28 face
+    // occurrences on 15 printings in the 2026-08-16 all_cards bulk, all `transform` or
+    // `reversible_card` (vow/338 "Dracula, Lord of Blood" // "Dracula, Lord of Bats").
+    //
+    // NOT INDEXED, and that is Scryfall's own split rather than a shortcut:
+    // `exact=Dracula, Lord of Blood` answers 404 there while `exact=Godzilla, Primeval Champion`
+    // (a card-level flavor name) answers prm/80925. Only the card-level one reaches the name
+    // routes; this one is emission-only, like `flavor_text` beside it.
+    flavor_name_id: u32,
     // The face's artist AS SCRYFALL PRINTS IT (interned; NONE_STR = absent) — the string a card
     // object emits. `card_artist_vid` above cannot stand in for it twice over: it indexes the
     // ARTIST vocab, not the collection vocab a coll_str lookup reads, and that vocab holds only
@@ -757,6 +767,7 @@ struct FaceRow {
     // The face's original-case artist string (see PrintingFace.card_artist_name_id).
     card_artist_name_id: u32,
     flavor_text_id: u32,
+    flavor_name_id: u32,
     // The per-face printed-language triple (PrintedFaceText before the commit pass splits it).
     printed_name_id: u32,
     printed_type_line_id: u32,
@@ -1268,6 +1279,7 @@ fn faces_from_pydict(d: &Bound<PyDict>, it: &mut Interner, artists: &mut VocabIn
             illustration_id: opt_str(face, "illustration_id").map_or(0, |s| parse_uuid_or_hash(&s)),
             card_artist_vid,
             flavor_text_id: it.intern_opt(opt_str(face, "flavor_text")),
+            flavor_name_id: it.intern_opt(opt_str(face, "flavor_name")),
             printed_name_id: it.intern_opt(opt_str(face, "printed_name")),
             printed_type_line_id: it.intern_opt(opt_str(face, "printed_type_line")),
             printed_text_id: it.intern_opt(opt_str(face, "printed_text")),
@@ -3378,8 +3390,17 @@ fn build_printed_name_index(
 /// The score at or above which a candidate is eligible at all, and the margin the winner must
 /// hold over the best DIFFERENT answer. Fitted, not chosen: 0.625 sits in the middle of the
 /// 0.60–0.65 plateau over which the 86-needle set scores identically.
+///
+/// THE LEAD WAS REFITTED WHEN THE CORPUS GREW. It was 0.01 while the extras classes were refused
+/// at import; importing them put `Lightning Bolt // Lightning Bolt` (astx/76, an art-series
+/// printing Scryfall also has) into the name space at 0.6731 against Blightning's 0.6763 for
+/// `fuzzy=bolt lightning` — a 0.0032 gap, so a 0.01 lead called the headline needle ambiguous.
+/// Scryfall answers Blightning with that card in its own corpus, so the metric's separation is
+/// real and the threshold was simply too coarse for it. 0.002 sits inside the 0.0005–0.003
+/// plateau the refit found, and still leaves an EXACT tie (difference 0) ambiguous, which is the
+/// only thing the lead has to catch.
 pub(crate) const FUZZY_SCORE_FLOOR: f32 = 0.625;
-pub(crate) const FUZZY_SCORE_LEAD: f32 = 0.01;
+pub(crate) const FUZZY_SCORE_LEAD: f32 = 0.002;
 
 /// `s` with every non-alphanumeric ASCII byte removed, written into a caller-owned buffer.
 ///
@@ -3571,6 +3592,25 @@ fn fuzzy_score_cleared(
     (score >= floor).then_some(score)
 }
 
+/// The card's PREFERRED canonical printing as a virtual printing id, or None when its canonical
+/// range is empty.
+///
+/// An `Option` rather than a bare index, and the reason is that the failure is SILENT otherwise.
+/// Printings are stored prefer-desc, so `offsets[cid]` is the answer whenever the range is
+/// non-empty — but on an empty one it equals `offsets[cid + 1]`, and `printing_at`'s vpid
+/// convention then reinterprets that number: `vpid == printings.len()` falls into the annex
+/// branch and returns `foreign[0]`, an unrelated card's row, with no panic and no marker. Every
+/// caller that used to write `u32::from(data.offsets[cid])` inline could produce that, so the
+/// index is only handed out behind a check.
+///
+/// `drop_group_if_annex_only` is what keeps empty ranges out of a built store in the first place;
+/// this is the belt to its braces, and the two are cheap enough to keep even once the corpus
+/// stops producing the state (see that function's comment).
+pub(crate) fn preferred_vpid(data: &Archived<CardData>, cid: usize) -> Option<u32> {
+    let start = u32::from(data.offsets[cid]);
+    (start < u32::from(data.offsets[cid + 1])).then_some(start)
+}
+
 /// The needle, in the form both scans below compare against: lowercased, separator-folded bytes
 /// plus their sorted trigram run. Empty when nothing alphanumeric survives.
 fn fuzzy_needle(needle: &str) -> Option<(Vec<u8>, Vec<[u8; 3]>)> {
@@ -3613,7 +3653,9 @@ pub(crate) fn fuzzy_name_match(
             fuzzy_score_cleared(&name_tg, &needle_tg, &name_bytes, &needle_bytes, floor, &mut dp)
         {
             // An English-name hit materializes what it always has: the card's preferred printing.
-            race.offer(score, cid as u32, u32::from(data.offsets[cid]), name);
+            if let Some(vpid) = preferred_vpid(data, cid) {
+                race.offer(score, cid as u32, vpid, name);
+            }
         }
     }
     race.outcome(lead)
@@ -13637,6 +13679,9 @@ fn faces_to_pylist<'py>(
             d.set_item("artist", str_at(strings, u32::from(art.card_artist_name_id)))?;
             d.set_item("illustration_id", uuid_from_u128(u128::from(art.illustration_id)))?;
             d.set_item("flavor_text", str_at(strings, u32::from(art.flavor_text_id)))?;
+            if let Some(v) = str_at(strings, u32::from(art.flavor_name_id)) {
+                d.set_item("flavor_name", v)?;
+            }
         }
         // The printed-language triple, inserted only when this printing's face carries the key:
         // absence is exact per face (a prepare-layout Spanish printing localizes the front
@@ -14296,10 +14341,41 @@ impl QueryEngine {
         // each side's relative order). See CardData.foreign.
         let mut foreign: Vec<Printing> = Vec::new();
         let mut foreign_offsets: Vec<u32> = Vec::new();
-        // A group that closes with ZERO canonical rows is dropped whole, annex rows included —
-        // see drop_group_if_annex_only for the mechanism and the real-corpus trigger (the ja 4ED
-        // ante cards, whose every canonical printing the never-legal filter removes).
-        let mut annex_only_oracles_dropped = 0usize;
+        // A group that closes with ZERO canonical rows is dropped whole, annex rows included: this is
+    // what enforces the every-card-has-a-canonical-representative invariant the entire canonical
+    // space is built on.
+    //
+    // WHAT IT PREVENTS, audited site by site rather than asserted — an empty canonical range is
+    // three panics and five silent wrongnesses, and the silent half is why the guard is worth its
+    // lines even when nothing produces the state:
+    //
+    //   PANIC     `divergent_formats_of` (planes.rs) reads `printings[start]` on the zero-width
+    //             window. Now guarded there too, so this one is loud-then-skipped rather than a
+    //             crash, but the guard here is what makes it unreachable.
+    //   SILENT    every "the card's preferred printing is `offsets[cid]`" read. `printing_at`'s
+    //             vpid convention reinterprets `vpid == printings.len()` as ANNEX row 0 — an
+    //             unrelated card's printing — so the read succeeds and answers the wrong card.
+    //             `preferred_vpid` now hands that index out behind an Option so it cannot be
+    //             written by accident.
+    //   SILENT    `run_query_streamed_popcount`: a card-space plan's match set never consults
+    //             printings, so an empty-ranged card inflates `total` and shortens every page
+    //             behind it — a wrong count with no error anywhere.
+    //   DESIGN    `PlanePopcountOrder` would need a build-time mask to exclude such cards from
+    //             its planes. That is the ONE site that would need real work if this invariant
+    //             were ever deliberately relaxed; nothing else on the list would.
+    //
+    // HISTORICALLY reachable through a real Scryfall data quirk: the ja 4th Edition printings of
+    // the three ante cards (Bronze Tablet, Rebirth, Tempest Efreet) carry
+    // `legalities.oldschool = "legal"` while every OTHER printing is never-legal, so the
+    // never-legal import filter kept only rows outside default_cards and the oracle arrived here
+    // annex-only.
+    //
+    // THOSE THREE ARE GONE now that the never-legal filter is relaxed (see transform.rs): the
+    // cards import as ordinary cards with canonical rows, and a build reports 0 drops. The guard
+    // stays anyway — it costs one comparison per group, it is the only thing standing between a
+    // reintroduced filter and five failures that do not announce themselves, and the counter
+    // below turns "it happened" into a number a build prints rather than a silence.
+    let mut annex_only_oracles_dropped = 0usize;
         // The ROW count those drops removed, so the completeness assert below can account for
         // every staged row exactly (canonical + annex + dropped == staged).
         let mut annex_only_rows_dropped = 0usize;
@@ -14444,6 +14520,7 @@ impl QueryEngine {
                         card_artist_vid: f.card_artist_vid,
                         card_artist_name_id: f.card_artist_name_id,
                         flavor_text_id: f.flavor_text_id,
+                        flavor_name_id: f.flavor_name_id,
                     })
                     .collect(),
                 printed_name_id: row.printed_name_id,
@@ -14963,7 +15040,9 @@ impl QueryEngine {
         let dicts: Vec<Bound<PyDict>> = chosen.iter()
             .map(|&cid| {
                 let card = &data.cards[cid];
-                let preferred = u32::from(data.offsets[cid]) as usize;
+                // The random pool is built from cards, so a card with no canonical printing would
+                // read an unrelated row rather than fail; see preferred_vpid.
+                let preferred = preferred_vpid(data, cid).unwrap_or_default() as usize;
                 card_to_pydict(py, card, &data.printings[preferred], &data.strings, &data.coll_vocab, &resolved_fields)
             })
             .collect::<PyResult<_>>()?;

@@ -300,6 +300,15 @@ pub(crate) fn divergent_formats_of(printings: &[Printing], offsets: &[u32]) -> u
     let mut mask = 0u64;
     for w in offsets.windows(2) {
         let (start, end) = (w[0] as usize, w[1] as usize);
+        // A ZERO-WIDTH window has no first printing to XOR against, and reading one anyway is the
+        // only true structural panic in the empty-canonical-range family: `printings[start]`
+        // silently reads the NEXT card's first printing when the empty group is interior, and
+        // panics outright when it is last. `drop_group_if_annex_only` is what stops such a group
+        // reaching here, and this is the belt to its braces — an XOR over no pairs contributes
+        // nothing to the mask, so skipping is also the arithmetically correct answer.
+        if start >= end {
+            continue;
+        }
         // XOR every printing against the group's first: a field that ever differs shows up in some XOR,
         // and a field that never does contributes nothing from any pair.
         let first = printings[start].card_legalities;

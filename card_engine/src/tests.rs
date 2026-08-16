@@ -11542,8 +11542,8 @@ fn two_faces() -> (Vec<OracleFace>, Vec<PrintingFace>) {
         },
     ];
     let printing = vec![
-        PrintingFace { illustration_id: 0xAAAA, card_artist_vid: 1, card_artist_name_id: NONE_STR, flavor_text_id: 7 },
-        PrintingFace { illustration_id: 0xBBBB, card_artist_vid: 2, card_artist_name_id: NONE_STR, flavor_text_id: NONE_STR },
+        PrintingFace { illustration_id: 0xAAAA, card_artist_vid: 1, card_artist_name_id: NONE_STR, flavor_text_id: 7, flavor_name_id: NONE_STR },
+        PrintingFace { illustration_id: 0xBBBB, card_artist_vid: 2, card_artist_name_id: NONE_STR, flavor_text_id: NONE_STR, flavor_name_id: NONE_STR },
     ];
     (oracle, printing)
 }
