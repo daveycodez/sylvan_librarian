@@ -213,9 +213,14 @@ def _compare_ints(lhs: int, operator: str, rhs: int) -> bool:
     raise ValueError(msg)
 
 
-def _color_count_masks(operator: str, count: int) -> list[int]:
-    """Bitmask values (5 colors => 2^5) whose popcount satisfies `popcount <op> count`."""
-    return [v for v in range(32) if _compare_ints(v.bit_count(), operator, count)]
+def _color_count_masks(operator: str, count: int, bits: int = 5) -> list[int]:
+    """Bitmask values whose popcount satisfies `popcount <op> count`.
+
+    `bits` is 5 for the colour columns and SIX for produced_mana, whose array can literally hold
+    "C" (Sol Ring produces ["C"] while its colors and color_identity are both []). See the
+    2026-08-16-03 migration for the measurements that pin the difference.
+    """
+    return [v for v in range(1 << bits) if _compare_ints(v.bit_count(), operator, count)]
 
 
 def _subset_masks(query_mask: int) -> list[int]:
@@ -532,7 +537,7 @@ class ExactNameNode(QueryNode):
 
 # What a colour-COUNT name (`c:m`, `id:gold`) means, per operator, as the (operator, count) pair
 # the numeric colour-count comparison is built from. Measured; the evidence and the two surprises
-# in it are written out at db_info.COLOR_COUNT_NAMES.
+# in it are written out at colors.COLOR_COUNT_NAMES.
 _COLOR_COUNT_BY_OPERATOR: typing.Final = {
     ":": (">=", 2),
     "=": (">=", 2),
@@ -549,7 +554,24 @@ _COLOR_COUNT_BY_OPERATOR: typing.Final = {
 # `magic.color_identity_mask` and the engine's popcount both read the five WUBRG keys and would
 # call it zero. `produces:m` is therefore a count this column cannot answer yet, and it stays the
 # error it already was rather than becoming a silently different one.
-_COLOR_COUNT_ATTRIBUTES: typing.Final = ("card_colors", "card_color_identity")
+# The same table for produced_mana, intersected with "produces at least one value". A card that
+# makes no mana at all is not a producer of anything, and Scryfall keeps it out of every one of
+# these: `produces<m` = `produces!=m` = 1,143 = `produces=1`, NOT `produces<2` (32,139) or
+# `produces!=2` (33,095), both of which sweep in the 30,996 cards that produce nothing; and
+# `produces<=m` = 2,603 = `produces>=1` rather than every card. The extra conjunct collapses into
+# the count itself (`<2` and `>=1` is `=1`; `>=0` and `>=1` is `>=1`), so this stays one
+# (operator -> operator, count) table and no AND node is needed.
+_PRODUCED_COUNT_BY_OPERATOR: typing.Final = {
+    ":": (">=", 2),
+    "=": (">=", 2),
+    ">": (">=", 2),
+    ">=": (">=", 2),
+    "<": ("=", 1),
+    "!=": ("=", 1),
+    "<=": (">=", 1),
+}
+
+_COLOR_COUNT_ATTRIBUTES: typing.Final = ("card_colors", "card_color_identity", "produced_mana")
 
 
 class CardBinaryOperatorNode(BinaryOperatorNode):
@@ -576,7 +598,8 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
             and lhs.attribute_name in _COLOR_COUNT_ATTRIBUTES
             and rhs.value.strip().lower() in COLOR_COUNT_NAMES
         ):
-            lowered = _COLOR_COUNT_BY_OPERATOR.get(operator)
+            table = _PRODUCED_COUNT_BY_OPERATOR if lhs.attribute_name == "produced_mana" else _COLOR_COUNT_BY_OPERATOR
+            lowered = table.get(operator)
             if lowered is not None:
                 operator, count = lowered
                 rhs = NumericValueNode(count)
@@ -635,7 +658,7 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
             # Numeric color syntax (id>=3 / c=2): pass the raw NumericValueNode so the
             # Rust engine builds a color-count comparison instead of a mask compare.
             if isinstance(self.rhs, NumericValueNode):
-                return self._numeric_color_rhs_to_json(attr)
+                return _node_to_json(self.rhs)
             val = self.rhs.value.strip()
             if attr in ("card_colors", "card_color_identity", "produced_mana"):
                 return list(get_colors_comparison_object(val.lower(), attr).keys())
@@ -657,17 +680,6 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
             return {"node_type": "StringValueNode", "kwargs": {"value": value}}
 
         return _node_to_json(self.rhs)
-
-    def _numeric_color_rhs_to_json(self, attr: str) -> object:
-        """Serialize a numeric color-count rhs (id>=3 / c=2) for the Rust engine.
-
-        Only the two real color fields support counting; produced_mana's C key is a
-        genuine producible value, not a color, so a count over it would be ambiguous.
-        """
-        if attr in ("card_colors", "card_color_identity"):
-            return _node_to_json(self.rhs)
-        msg = f"Numeric comparison is not supported for {attr}"
-        raise ValueError(msg)
 
     def to_sql(self, context: QueryContext) -> str:
         """Generate SQL for card-specific binary operations.
@@ -730,7 +742,10 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
 
         # Numeric color syntax compares the count of colors, not the colors themselves
         if db_column_name in ("card_colors", "card_color_identity") and isinstance(self.rhs, NumericValueNode):
-            noun = "colors in the color identity" if db_column_name == "card_color_identity" else "colors"
+            noun = {
+                "card_color_identity": "colors in the color identity",
+                "produced_mana": "kinds of mana produced",  # SIX kinds: colorless is one of them
+            }.get(db_column_name, "colors")
             count_op = "is" if self.operator == ":" else operator_str  # : compares counts as equality
             return f"the number of {noun} {count_op} {rhs_str}"
         # `=` against an empty value reaches here (see to_human_explanation) as a real
@@ -1111,16 +1126,18 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         mask set restricted to values whose popcount satisfies the comparison.
         ":" with a number behaves like "=" (verified against the live Scryfall API).
 
-        produced_mana is refused: its C key is a genuine producible value, not a
-        color, so a count over it would be ambiguous.
+        produced_mana counts SIX values, colorless among them, and so uses its
+        own six-bit mask function: `produces=1 produces:c` = 481 (the cards that
+        produce colorless and nothing else) and `produces=6` = 106, neither of
+        which a five-key count can express. The colour columns keep counting
+        five -- `c=5` = `c:all` = 60 and `c=6` is not a valid query at all.
         """
-        if attr == "produced_mana":
-            msg = f"Numeric comparison is not supported for {attr}"
-            raise ValueError(msg)
+        produced = attr == "produced_mana"
         operator = "=" if self.operator == ":" else self.operator
-        masks = IntArray(_color_count_masks(operator, int(self.rhs.value)))
+        masks = IntArray(_color_count_masks(operator, int(self.rhs.value), bits=6 if produced else 5))
         pmask = context.add(masks)
-        return f"(magic.color_identity_mask({lhs_sql}) = ANY({pmask}::smallint[]))"
+        mask_fn = "magic.produced_mana_mask" if produced else "magic.color_identity_mask"
+        return f"({mask_fn}({lhs_sql}) = ANY({pmask}::smallint[]))"
 
     def _handle_jsonb_object(self, context: QueryContext) -> str:  # noqa: PLR0912, C901
         # Produce the query as a jsonb object

@@ -114,16 +114,20 @@ COLOR_ALIAS_TO_CODES = {
 # `id>=m` = 5,831 = `id>=2`, `id<m` = `id!=m` = 27,768 = `id<2` (`id!=2` is 28,824), and
 # `id<=m` = 33,599 = every card (`id<=2` is 32,543).
 #
-# `produces:` is DELIBERATELY NOT lowered, and the reason is a measurement rather than caution.
-# `produces:m` really is a count on Scryfall -- 1,460, which is `produces>=2` -- but it is a count
-# over SIX values, colorless among them: `produces=1 produces:c` = 481, exactly the cards that
-# produce colorless and nothing else, so a C-only producer counts ONE there. Both of this project's
-# count implementations read the five WUBRG keys and would call that card zero
-# (`magic.color_identity_mask` on the SQL side, the popcount in card_engine's ColorCountCmp on the
-# other), and the five-colour union agrees on both sides at 2,121 while Scryfall's `produces>=1` is
-# 2,603 -- the 482-card difference IS the colorless producers. So `produces:m` stays the error it
-# already was rather than a count that is quietly short by 481 cards; making it work is a
-# six-value count, which is its own change on both halves.
+# `produces:` takes the same table, but over SIX values rather than five, and that asymmetry is
+# measured rather than tidy: produced_mana is the one colour-ish column whose array can literally
+# contain "C" (Sol Ring produces ["C"] while its colors and color_identity are both []). So
+# `produces=6` = 106 = `produces:all` -- a count no five-key popcount can even reach -- the 481
+# cards that produce colorless and nothing else answer `produces=1` rather than `produces=0`, the
+# three producing exactly {C,W} land in `produces=2` and not `produces=1`, and counts 0..6 partition
+# the corpus exactly (30,996 + 1,143 + 504 + 147 + 10 + 693 + 106 = 33,599). The colour columns must
+# keep counting five: `c:all` = `c:wubrg` = `c=5` = 60, and `c=6` is not a valid query there at all
+# ("Unknown color 6"). Both halves are pinned by tests so the asymmetry is not "fixed" later.
+#
+# `produces:m` = `produces=m` = `produces>m` = `produces>=m` = 1,460 = `produces>=2`
+# (`produces=2` is 504), while `produces<m` = `produces!=m` = 1,143 = `produces=1` -- NOT
+# `produces<2` (32,139), which sweeps in the cards that produce nothing -- and `produces<=m` =
+# 2,603 = `produces>=1` rather than every card.
 COLOR_COUNT_NAMES = frozenset(
     {
         "m",

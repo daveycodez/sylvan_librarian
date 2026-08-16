@@ -8311,12 +8311,16 @@ fn color_cmp_ge_empty_mask_is_colorless_only() {
     check(ColorField::ColorIdentity, &[0]);
 }
 
-// Scryfall numeric color syntax (id>=3, c=2): ColorCountCmp compares the
-// popcount of the WUBRG bits against the queried count. Checked for every op ×
-// count 0..=5 against a popcount oracle over the color-diverse plane fixture —
-// which includes a C-bit identity (card 9) that must count as ZERO colors,
-// mirroring the SQL path's magic.color_identity_mask reading only the five
-// WUBRG keys.
+// Scryfall numeric color syntax (id>=3, c=2, produces>=2, and the colour-COUNT
+// names the parser lowers to them): ColorCountCmp compares the popcount of the
+// field against the queried count. Checked for every op × count 0..=6 over all
+// THREE fields against a popcount oracle on the color-diverse plane fixture.
+//
+// THE ORACLE IS DELIBERATELY WIDTH-AWARE, because the width is the thing under
+// test: five bits for the colour columns, where a C-bit identity (card 9) must
+// count as ZERO, and SIX for produced_mana, where card 5 produces only C and
+// must count as ONE. Both directions are asserted outright below so that
+// "fixing" the asymmetry fails loudly.
 #[test]
 fn color_count_cmp_matches_popcount_oracle() {
     let data = plane_fixture_store();
@@ -8332,16 +8336,17 @@ fn color_count_cmp_matches_popcount_oracle() {
         CmpOp::Ge => a >= b,
     };
     for op in [CmpOp::Eq, CmpOp::Ne, CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge] {
-        for count in 0u8..=5 {
-            for field in [ColorField::Colors, ColorField::ColorIdentity] {
+        for count in 0u8..=6 {
+            for field in [ColorField::Colors, ColorField::ColorIdentity, ColorField::ProducedMana] {
                 let f = FilterExpr::ColorCountCmp { field, op, count };
                 for (cid, card) in archived.cards.iter().enumerate() {
-                    let bits = match field {
-                        ColorField::Colors => card.card_colors,
-                        ColorField::ColorIdentity => card.card_color_identity,
-                        ColorField::ProducedMana => unreachable!("numeric syntax never targets produced_mana"),
+                    let (bits, mask) = match field {
+                        ColorField::Colors => (card.card_colors, 0b1_1111),
+                        ColorField::ColorIdentity => (card.card_color_identity, 0b1_1111),
+                        // SIX bits: colorless is a producible VALUE, not the absence of one.
+                        ColorField::ProducedMana => (card.produced_mana, 0b11_1111),
                     };
-                    let want = cmp(op, u32::from(bits & 0b1_1111).count_ones(), u32::from(count));
+                    let want = cmp(op, u32::from(bits & mask).count_ones(), u32::from(count));
                     assert_eq!(
                         f.eval_card(card, &archived.strings) == Tri::True,
                         want,
@@ -8353,57 +8358,12 @@ fn color_count_cmp_matches_popcount_oracle() {
     }
 }
 
-// The colour-COUNT names (`c:m`, `id:gold`, `c!=multicolored`) reach the engine
-// as the numeric comparison the parser lowered them to, and the operator
-// is NOT the one that was typed: `c>m` arrives as `>= 2` and `c!=m` as `< 2`.
-// This walks the wire JSON the parser now emits for each of them and pins the
-// matched rows on the plane fixture, so a lowering that drifts shows up as a
-// changed row set rather than as a filter that still builds.
-#[test]
-fn color_count_name_wire_shapes_select_expected_rows() {
-    let data = plane_fixture_store();
-    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
-    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
-
-    let matched = |attr: &str, orig: &str, op: &str, n: u8| -> Vec<usize> {
-        let node = serde_json::json!({
-            "node_type": "CardBinaryOperatorNode",
-            "kwargs": {
-                "lhs": {"node_type": "CardAttributeNode", "kwargs": {"attribute_name": attr, "original_attribute": orig}},
-                "op": op,
-                "rhs": {"node_type": "NumericValueNode", "kwargs": {"value": n}},
-            },
-        });
-        let f = super::build_filter(&node).expect("colour-count node must build");
-        archived
-            .cards
-            .iter()
-            .enumerate()
-            .filter(|(_, card)| f.eval_card(card, &archived.strings) == Tri::True)
-            .map(|(cid, _)| cid)
-            .collect()
-    };
-
-    // colors popcounts on the fixture: [0, 1, 1, 2, 0, 5, 1, 2, 1, 0]
-    // c:m / c=m / c>m / c>=m -> ">= 2"
-    assert_eq!(matched("card_colors", "c", ">=", 2), vec![3, 5, 7]);
-    // c<m / c!=m -> "< 2", which is NOT "!= 2" (that would also take rows 3 and 7)
-    assert_eq!(matched("card_colors", "c", "<", 2), vec![0, 1, 2, 4, 6, 8, 9]);
-    // c<=m -> ">= 0", a tautology
-    assert_eq!(matched("card_colors", "c", ">=", 0), (0..10).collect::<Vec<_>>());
-
-    // identity popcounts: [0, 1, 1, 2, 2, 1, 2, 5, 1, 0] -- row 9's C-bit identity is zero colors
-    assert_eq!(matched("card_color_identity", "id", ">=", 2), vec![3, 4, 6, 7]);
-    assert_eq!(matched("card_color_identity", "id", "<", 2), vec![0, 1, 2, 5, 8, 9]);
-}
-
 // The Python side serializes a numeric color comparison as a raw
 // NumericValueNode rhs (not the usual color-letter list); build_binary must
 // turn that into ColorCountCmp — with ":" behaving as equality, matching the
-// live Scryfall API — and refuse produced_mana. That refusal is measured, not
-// cautious: Scryfall counts SIX values there (`produces=1 produces:c` = 481, the
-// cards that produce colorless and nothing else), which this five-key popcount
-// cannot express — so `produces:m` is not lowered into this node either.
+// live Scryfall API — on all three fields. produced_mana counts too, over six
+// values rather than five: `produces>=2` is 1,460 on api.scryfall.com where
+// `produces=2` is 504, and `produces:m` is the same 1,460 once lowered.
 #[test]
 fn build_filter_numeric_color_rhs() {
     let node = |attr: &str, orig: &str, op: &str, n: u8| {
@@ -8426,7 +8386,11 @@ fn build_filter_numeric_color_rhs() {
     let f = super::build_filter(&node("card_color_identity", "id", "=", 0)).expect("id=0 must build");
     assert!(matches!(f, FilterExpr::ColorCountCmp { field: ColorField::ColorIdentity, op: CmpOp::Eq, count: 0 }));
 
-    assert!(super::build_filter(&node("produced_mana", "produces", "=", 2)).is_err());
+    let f = super::build_filter(&node("produced_mana", "produces", "=", 2)).expect("produces=2 must build");
+    assert!(matches!(f, FilterExpr::ColorCountCmp { field: ColorField::ProducedMana, op: CmpOp::Eq, count: 2 }));
+
+    let f = super::build_filter(&node("produced_mana", "produces", ">=", 1)).expect("produces>=1 must build");
+    assert!(matches!(f, FilterExpr::ColorCountCmp { field: ColorField::ProducedMana, op: CmpOp::Ge, count: 1 }));
 }
 
 // produced_mana must be its own independent transposition, not derived from

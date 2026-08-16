@@ -487,11 +487,10 @@ pub(crate) enum FilterExpr {
         mask: u8,
     },
 
-    /// Scryfall numeric color syntax (`id>=3`, `c=2`): compares the NUMBER of
-    /// colors in the field (popcount over the WUBRG bits) against `count`.
-    /// Only Colors/ColorIdentity reach here — the Python side rejects numeric
-    /// comparisons on produced_mana, which Scryfall counts over SIX values
-    /// (colorless included) rather than the five this popcount reads.
+    /// Scryfall numeric color syntax (`id>=3`, `c=2`, `produces>=2`): compares
+    /// the NUMBER of values in the field against `count`. Five bits for the two
+    /// colour columns, SIX for produced_mana — whose array can hold "C" — see
+    /// the eval arm for the measurements behind that split.
     ColorCountCmp {
         field: ColorField,
         op: CmpOp,
@@ -1432,10 +1431,18 @@ impl FilterExpr {
 
             FilterExpr::ColorCountCmp { field, op, count } => {
                 // Colors are always present (colorless = 0 bits, not Null), so this is
-                // total and two-valued. The C bit (32) is masked off before counting:
-                // colorless is ZERO colors on Scryfall, and the SQL path's
-                // magic.color_identity_mask likewise reads only the WUBRG keys.
-                let n = (card_colors(card, *field) & 0b1_1111).count_ones() as u8;
+                // total and two-valued.
+                //
+                // WIDTH DEPENDS ON THE COLUMN, and the asymmetry is measured. For the two colour
+                // columns the C bit (32) is masked OFF before counting: colorless is ZERO colors
+                // on Scryfall (`c:all` = `c:wubrg` = `c=5` = 60, and `c=6` is not even a valid
+                // query there), matching the SQL path's magic.color_identity_mask. produced_mana
+                // keeps it: that array can literally contain "C" — Sol Ring produces ["C"] while
+                // its colors and color_identity are both [] — so `produces=6` = 106 = `produces:all`
+                // and the 481 cards producing colorless and nothing else answer `produces=1`.
+                // magic.produced_mana_mask is the six-bit twin of this line.
+                let mask = if matches!(field, ColorField::ProducedMana) { 0b11_1111 } else { 0b1_1111 };
+                let n = (card_colors(card, *field) & mask).count_ones() as u8;
                 tri_bool(num_cmp(*op, f64::from(n), f64::from(*count)))
             }
 
@@ -1791,10 +1798,9 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
         // nothing else -- where the popcount below masks C off and would call
         // those zero. That is also why `produces:m`, which IS a count on
         // Scryfall, is not lowered into this node by the parser.
+        // produced_mana counts here too, over SIX values rather than five — see
+        // the ColorCountCmp eval arm.
         if rhs["node_type"].as_str() == Some("NumericValueNode") {
-            if matches!(color_field, ColorField::ProducedMana) {
-                return Err("numeric comparison is not supported for produced_mana".to_string());
-            }
             let count = rhs["kwargs"]["value"].as_f64().ok_or("NumericValueNode missing value")? as u8;
             return Ok(FilterExpr::ColorCountCmp { field: color_field, op: str_op_to_cmp(op)?, count });
         }
