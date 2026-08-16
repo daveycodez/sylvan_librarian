@@ -1,6 +1,6 @@
 use memchr::memmem;
 use serde_json::Value;
-use super::regex_compat::CompiledRegex;
+use super::regex_compat::{CompiledRegex, QUERY_REGEX_FLAGS};
 use super::{AOracleCard, APrinting, AStrings, str_at, mana_lane, lane_add, lanes_ge, LANES6_HI, LANES8_HI, mana_pip_counts, mana_cmc, color_list_to_mask, card_type_str_to_bit, trigram_candidates, trigram_min_posting, ARTIST_NONE, NONE_STR, FlavorIndex, NameBigramIndex, OracleTextIndex, SortedTrigramIndex, flavor_fingerprint, flavor_match_sets};
 use super::legality::{LEGALITY_LEGAL, LEGALITY_BANNED, LEGALITY_RESTRICTED, format_shift};
 
@@ -663,7 +663,7 @@ pub(crate) fn verify_cost_tier(f: &FilterExpr) -> u32 {
 
 /// Classify a regex pattern's per-candidate cost by shape. The regex crate
 /// compiles literal-only patterns to memcmp-style matchers (with case
-/// folding for the (?i) every query regex carries), and anchors bound the
+/// folding for the QUERY_REGEX_FLAGS every query regex carries), and anchors bound the
 /// scan to one position — measured on the real corpus, `^flying$` costs
 /// ~half a substring scan while an unanchored literal costs about the same
 /// as one. Ranking them as general regexes inverted real costs and made
@@ -675,7 +675,7 @@ pub(crate) fn verify_cost_tier(f: &FilterExpr) -> u32 {
 ///                         same cost as live metacharacters, not the same as
 ///                         TextContains — see REGEX_MACHINERY_NS100's doc)
 pub(crate) fn regex_tier(pattern: &str) -> u32 {
-    let mut p = pattern.strip_prefix("(?i)").unwrap_or(pattern);
+    let mut p = pattern.strip_prefix(QUERY_REGEX_FLAGS).unwrap_or(pattern);
     let anchored_start = p.starts_with('^');
     if anchored_start {
         p = &p[1..];

@@ -4464,7 +4464,7 @@ fn fuse_and_range_children<'f, 'i>(
 /// Guaranteed literal factors of a regex pattern — substrings present in **every** match, each ≥3
 /// bytes (so each has at least one trigram). Used to trigram-narrow a `TextRegex` to a loose candidate
 /// set that the walk then re-verifies with the real regex (#734 step 3). Extracted from the RAW pattern
-/// (strip the `(?i)` we add; a case-folded HIR would be classes, not literals) and lowercased to match
+/// (strip the `QUERY_REGEX_FLAGS` we add; a case-folded HIR would be classes, not literals) and lowercased to match
 /// the `*_lower` trigram index.
 ///
 /// Pass one — concatenations of literals only. Anything a match can *skip over* ends the current run:
@@ -4496,7 +4496,7 @@ fn regex_required_factors(pattern: &str) -> Vec<String> {
             _ => flush(run, out), // Empty | Class | Look | Alternation | Repetition{min:0}
         }
     }
-    let raw = pattern.strip_prefix("(?i)").unwrap_or(pattern);
+    let raw = pattern.strip_prefix(crate::regex_compat::QUERY_REGEX_FLAGS).unwrap_or(pattern);
     let Ok(hir) = regex_syntax::parse(raw) else { return Vec::new() };
     let (mut run, mut out) = (Vec::new(), Vec::new());
     walk(&hir, &mut run, &mut out);

@@ -10226,14 +10226,14 @@ fn machinery_regex() -> FilterExpr {
 #[test]
 fn regex_tier_classifies_pattern_shapes() {
     use super::{regex_tier, REGEX_MACHINERY_NS100, SET_LOOKUP_NS100};
-    assert_eq!(regex_tier("(?i)^flying$"), SET_LOOKUP_NS100);
+    assert_eq!(regex_tier("(?im)^flying$"), SET_LOOKUP_NS100);
     assert_eq!(regex_tier("dragon$"), SET_LOOKUP_NS100);
-    assert_eq!(regex_tier("(?i)^\\{t\\}: add"), SET_LOOKUP_NS100, "escaped punctuation is literal");
+    assert_eq!(regex_tier("(?im)^\\{t\\}: add"), SET_LOOKUP_NS100, "escaped punctuation is literal");
     assert_eq!(regex_tier("^gob"), SET_LOOKUP_NS100);
-    assert_eq!(regex_tier("(?i)flying"), REGEX_MACHINERY_NS100, "unanchored literal measures the same as machinery");
+    assert_eq!(regex_tier("(?im)flying"), REGEX_MACHINERY_NS100, "unanchored literal measures the same as machinery");
     assert_eq!(regex_tier("draw .* cards?"), REGEX_MACHINERY_NS100);
     assert_eq!(regex_tier("^[aeiou]"), REGEX_MACHINERY_NS100);
-    assert_eq!(regex_tier("(?i)^\\d+$"), REGEX_MACHINERY_NS100, "class escapes are machinery");
+    assert_eq!(regex_tier("(?im)^\\d+$"), REGEX_MACHINERY_NS100, "class escapes are machinery");
     assert_eq!(regex_tier("a|b"), REGEX_MACHINERY_NS100);
     assert_eq!(regex_tier("ends with backslash\\"), REGEX_MACHINERY_NS100, "dangling escape: not literal");
 }
@@ -11296,8 +11296,8 @@ fn regex_required_factors_extracts_only_guaranteed() {
     assert_eq!(f("^flying$"), vec!["flying".to_string()]);
     assert_eq!(f("dragon$"), vec!["dragon".to_string()]);
     assert_eq!(f("^gob"), vec!["gob".to_string()]);
-    // the `(?i)` we prepend is stripped; factors come back lowercased
-    assert_eq!(f("(?i)Dragon"), vec!["dragon".to_string()]);
+    // the `QUERY_REGEX_FLAGS` we prepend are stripped; factors come back lowercased
+    assert_eq!(f("(?im)Dragon"), vec!["dragon".to_string()]);
     // optional tail char drops below the ≥3 threshold on its own but keeps the mandatory stem
     assert_eq!(f("colou?r"), vec!["colo".to_string()]); // "r" alone is <3 → dropped
     // escaped punctuation is a literal
@@ -11308,7 +11308,7 @@ fn regex_required_factors_extracts_only_guaranteed() {
     assert!(f(r"\d+").is_empty());
     assert!(f("a.b").is_empty(), "no run reaches 3 literal bytes");
     // a min≥1 repetition of a literal is still guaranteed
-    assert_eq!(f("(?i)aaa+"), vec!["aaa".to_string()]);
+    assert_eq!(f("(?im)aaa+"), vec!["aaa".to_string()]);
 }
 
 /// The arith-tuple key budget is a tripwire for adding a high-cardinality field to
@@ -11403,6 +11403,48 @@ fn lookaround_matches_what_it_should() {
     assert!(!re.is_match("draw two cards"));
     // (?i) is applied to every query regex, the same as the SQL path's ~*.
     assert!(re.is_match("DRAW A CARD"));
+}
+
+#[test]
+fn anchors_are_line_anchors_and_dot_is_not() {
+    use super::regex_compat::CompiledRegex;
+    // Firja, Judge of Valor (khm/209), verbatim: the case that made this a bug rather than a
+    // preference. `^Whenever you cast` and `lifelink$` both hit it on api.scryfall.com and both
+    // missed here, because `^`/`$` anchored to the whole string instead of to a line.
+    let firja = "Flying, lifelink\nWhenever you cast your second spell each turn, create a 1/1 white Human creature token.";
+    assert!(CompiledRegex::new("^Whenever you cast").unwrap().is_match(firja));
+    assert!(CompiledRegex::new("lifelink$").unwrap().is_match(firja));
+    // A whole line, exactly — `o:/^Flying$/` is a real query, and it must not need the card's
+    // oracle text to be nothing but "Flying".
+    assert!(CompiledRegex::new("^Flying$").unwrap().is_match("Flying\nVigilance"));
+    // ...and `$` still matches at the end of the string, with no trailing newline in sight, so
+    // the single-line columns (name, type line, artist) are untouched.
+    assert!(CompiledRegex::new("lifelink$").unwrap().is_match("First strike, lifelink"));
+    assert!(CompiledRegex::new("^Firja").unwrap().is_match("Firja, Judge of Valor"));
+
+    // `s` is deliberately NOT on: `.` stops at a newline. Measured on api.scryfall.com
+    // (2026-08-16), `o:/Flying.Whenever/ e:khm` is empty while `o:/Flying\nWhenever/ e:khm` is
+    // not — the same pair PostgreSQL ARE's `(?n)` gives, which is the dialect this mirrors.
+    assert!(!CompiledRegex::new("Flying.Whenever").unwrap().is_match("Flying\nWhenever you cast"));
+    assert!(CompiledRegex::new(r"Flying\nWhenever").unwrap().is_match("Flying\nWhenever you cast"));
+
+    // A negated anchor still means "no line starts with this", not "the string does not start
+    // with this" — the shape a `-o:/^…/` query leans on.
+    assert!(!CompiledRegex::new("^Vigilance").unwrap().is_match("Flying\nWhenever"));
+}
+
+#[test]
+fn query_regex_flags_stay_strippable() {
+    // regex_tier and regex_required_factors both recover the raw pattern by removing this exact
+    // prefix; a flag added without updating them costs the trigram narrow silently (the HIR of a
+    // case-folded pattern is classes, not literals, so no factor comes back and the query scans).
+    use super::regex_compat::{CompiledRegex, QUERY_REGEX_FLAGS};
+    let re = CompiledRegex::new("dragon").unwrap();
+    assert_eq!(re.as_str().strip_prefix(QUERY_REGEX_FLAGS), Some("dragon"));
+    assert_eq!(super::regex_required_factors(re.as_str()), vec!["dragon".to_string()]);
+    // An anchored literal must still price as a set lookup with the new flags in front of it.
+    let anchored = CompiledRegex::new("^flying$").unwrap();
+    assert_eq!(super::regex_tier(anchored.as_str()), super::SET_LOOKUP_NS100);
 }
 
 #[test]
