@@ -2,7 +2,7 @@ use super::{
     and_child_rank, assign_name_ranks,
     build_numeric_index, build_oracle_text_index, build_tag_index, build_trigram_index,
     build_rarity_index, build_flavor_index, build_hybrid_tag_index, bitmap_beats_postings, HybridTagIndex, build_sort_permutations,
-    assign_artwork_groups, assign_collector_ranks, assign_set_ranks, assign_foreign_artwork_groups, build_artwork_base_from, build_lang_index, build_printed_name_index, drop_group_if_annex_only, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
+    assign_artist_ranks, assign_artwork_groups, assign_collector_ranks, assign_set_ranks, order_annex_by_language, assign_foreign_artwork_groups, build_artwork_base_from, build_lang_index, build_printed_name_index, drop_group_if_annex_only, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
     cards_of_printings, count_common_keywords, count_common_types,
     build_artist_index, build_printing_value_index, build_arith_tuple_index, is_arith_tuple_route, range_candidates, narrow_candidates, narrow_candidates_exact, rarity_candidates,
     range_too_broad_to_narrow, run_query, run_query_routed, run_query_widened, run_query_with_plan, explain, explain_analyze, AcquireFacts, PlanEstimate, PlanTrial,
@@ -12115,6 +12115,64 @@ fn include_multilingual_rolls_up_to_the_canonical_row() {
 /// than past every number, and `e:unk` answers `CAa, CAb, UB, CA01, ...`, so a digit-free number
 /// leads. Three shapes, one rule: integer first (9 before 10 — not a string sort), raw string
 /// breaking equal integers ("40" before "A-40" — not an integer sort), absent integer first.
+/// `order=artist` collates like `order=name` — the space is not a character.
+///
+/// Measured 2026-08-16 over 348 adjacent pairs from `e:khm` and `e:ltr` ordered by artist:
+/// stripping non-alphanumerics has 0 violations, raw byte order has 4. Each of those four is a
+/// pair where a space decides — `Alexander Mokhov` before `Alex Konstad`, `Steven Belledin`
+/// before `Steve Prescott`, `Daniel Zrom` before `Dan Murayama Scott` — and byte order gets every
+/// one of them backwards, because a space sorts below every letter.
+#[test]
+fn assign_artist_ranks_collates_like_a_name() {
+    let vocab_names = ["alex konstad", "alexander mokhov", "steve prescott", "steven belledin"];
+    let artist_vocab: Vec<String> = vocab_names.iter().map(|s| (*s).to_string()).collect();
+    let mut vocab = VocabInterner::new();
+    let mut printings: Vec<Printing> = (0..4)
+        .map(|i| {
+            let mut p = stub_printing(i as u128, i as u128, None);
+            p.card_artist_vid = i as u16;
+            p
+        })
+        .collect();
+    let _ = &mut vocab;
+    let mut none: Vec<Printing> = Vec::new();
+    assign_artist_ranks(&mut printings, &mut none, &artist_vocab);
+
+    let mut order: Vec<(u32, &str)> = printings.iter().zip(vocab_names).map(|(p, n)| (p.artist_rank, n)).collect();
+    order.sort_by_key(|&(r, _)| r);
+    assert_eq!(
+        order.iter().map(|&(_, n)| n).collect::<Vec<_>>(),
+        ["alexander mokhov", "alex konstad", "steven belledin", "steve prescott"],
+        "the space is dropped, so `alexander` beats `alexk` and `stevenb` beats `stevep`"
+    );
+}
+
+/// A card's annex rows are STORED in language order, which is the order Scryfall serves them in.
+///
+/// Measured 2026-08-16: `e:khm cn:1 include_multilingual=true` answers en, de, es, fr, it, ja, ko,
+/// pt, ru, zhs, zht. English is canonical and lives in the other space, so what has to be arranged
+/// here is the alphabetical tail — and it must beat prefer order, which is what it replaces: the
+/// fixture gives the LAST language alphabetically the best prefer score, so a prefer-desc store
+/// would put it first.
+#[test]
+fn the_annex_is_stored_in_language_order() {
+    let mut vocab = VocabInterner::new();
+    let ja = vocab.intern("ja".to_string()).expect("ja");
+    let de = vocab.intern("de".to_string()).expect("de");
+    let pt = vocab.intern("pt".to_string()).expect("pt");
+    let coll_vocab = vocab.strings.clone();
+    let row = |scry: u128, lang: u16, prefer: f32| {
+        let mut p = stub_printing(scry, scry, Some(prefer));
+        p.compat.lang_id = lang;
+        p
+    };
+    // Arrival order is prefer-desc, and it disagrees with language order on every pair.
+    let mut foreign = vec![row(1, pt, 90.0), row(2, ja, 80.0), row(3, de, 70.0)];
+    order_annex_by_language(&mut foreign, &[0, 3], &coll_vocab);
+    let langs: Vec<&str> = foreign.iter().map(|p| coll_vocab[p.compat.lang_id as usize].as_str()).collect();
+    assert_eq!(langs, ["de", "ja", "pt"], "alphabetical by code, not by prefer score");
+}
+
 #[test]
 fn assign_collector_ranks_follows_scryfalls_number_then_string() {
     let numbers = ["41", "A-40", "40", "10", "9", "UB"];

@@ -2810,6 +2810,39 @@ fn assign_set_ranks(printings: &mut [Printing], foreign: &mut [Printing]) {
     assign_printing_ranks(printings, foreign, |p| p.card_set_code.as_str().to_owned(), |p, r| p.set_rank = r);
 }
 
+/// Order each card's ANNEX rows by language, which is the order Scryfall serves them in.
+///
+/// Measured 2026-08-16: `e:khm cn:1 include_multilingual=true` answers en, de, es, fr, it, ja, ko,
+/// pt, ru, zhs, zht — English first, then alphabetical by code. English rows are canonical and so
+/// live in the other space entirely, and `select_page`'s vpid tiebreak already puts a card's
+/// canonical rows ahead of its annex rows; so "English first" falls out of the split and only the
+/// alphabetical tail has to be arranged here. The `!= "en"` term is belt and braces for a store
+/// where an English printing is ever non-canonical.
+///
+/// Done as STORE ORDER rather than as a fifth sort-key lane, and the choice is evidence-led: the
+/// four 32-bit lanes are full, `page_cmp` compares the top three and then falls to (cid, vpid), so
+/// within one (set, collector number) slot of one card the vpid order IS the tiebreak — arranging
+/// the rows is enough, and widening `Match` to u192 would have cost every match in every query.
+/// The "prefer-desc store order is load-bearing" note on `widened_rows` was read rather than
+/// assumed: what depends on it is (a) ties in the widened driver's best-row selection, which
+/// `annex_representative` now decides by slot before store order is consulted, and (b)
+/// `unique=prints` row order within a card, which is exactly what this is fixing. The canonical
+/// space — every "printings are stored prefer-desc, so the first match wins" fast path in the
+/// routed driver — is untouched, because none of it reads the annex.
+///
+/// A STABLE sort, so rows of one language keep the prefer-desc order they arrived in.
+fn order_annex_by_language(foreign: &mut [Printing], foreign_offsets: &[u32], coll_vocab: &[String]) {
+    let lang_of = |p: &Printing| -> (bool, &str) {
+        let vid = p.compat.lang_id;
+        let code = if vid == VOCAB_NONE { "" } else { coll_vocab.get(vid as usize).map_or("", String::as_str) };
+        (code != "en", code)
+    };
+    for w in foreign_offsets.windows(2) {
+        let (start, end) = (w[0] as usize, w[1] as usize);
+        foreign[start..end].sort_by(|a, b| lang_of(a).cmp(&lang_of(b)));
+    }
+}
+
 /// Rank printings by collector number, `order=set`'s second key.
 ///
 /// The key is `(collector_number_int, collector_number)` — the extracted integer first, the raw
@@ -2839,10 +2872,24 @@ fn assign_collector_ranks(printings: &mut [Printing], foreign: &mut [Printing], 
 ///
 /// Resolved through the vocab rather than sorting on `card_artist_vid`, which is intern order.
 /// A printing with no artist ranks last, matching how the absent side of every other order sorts.
+///
+/// Collated like a card name, because Scryfall collates it the same way: measured 2026-08-16 over
+/// 348 adjacent pairs from `e:khm` and `e:ltr` ordered by artist, stripping non-alphanumerics has
+/// 0 violations against 4 for raw bytes — `Alexander Mokhov` before `Alex Konstad`, `Steven
+/// Belledin` before `Steve Prescott`, `Daniel Zrom` before `Dan Murayama Scott`, each the reverse
+/// of what the space-bearing byte order gives. Those four pairs were the last `ordering-primary`
+/// findings left in the sweep.
+///
+/// RESIDUAL, recorded rather than approximated: the vocab holds the artist lowercased but NOT
+/// accent-folded, and this engine has no NFKD (the builder owns that, which is why `card_name_folded`
+/// arrives pre-folded). So an accented artist still sorts on its raw letter — 116 of the corpus's
+/// 2,540 artists carry one (`Volkan Baǵa`, `Tomáš Honz`, `Loïc Canavaggia`). Closing it means the
+/// builder supplying a folded artist alongside the vocab; the sample above cannot see it, because
+/// no adjacent pair in it is decided by an accent.
 fn assign_artist_ranks(printings: &mut [Printing], foreign: &mut [Printing], artist_vocab: &[String]) {
     let name_of = |p: &Printing| match p.card_artist_vid {
         ARTIST_NONE => None,
-        vid => artist_vocab.get(vid as usize).cloned(),
+        vid => artist_vocab.get(vid as usize).map(|n| collate_name(n)),
     };
     assign_printing_ranks(printings, foreign, |p| (name_of(p).is_none(), name_of(p)), |p, r| p.artist_rank = r);
 }
@@ -13592,7 +13639,13 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 //                `rarity_text_to_int` puts `special`=3 below `mythic`=4, Scryfall's ladder rather
 //                than the transposed one, which moves both `order=rarity` and `r>=mythic`; the
 //                rarity plane prefix grew to five so `mythic` keeps its plane.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026081603;
+//   2026081604 — two more orderings, same sweep. (1) `order=artist` collates like `order=name`
+//                now (0 violations of the strip rule over 348 adjacent pairs against 4 for raw
+//                bytes), so `artist_rank`'s VALUES move. (2) the annex is stored in language order
+//                rather than prefer-desc, because that is the order Scryfall serves a slot's
+//                languages in and `page_cmp` reaches it as the (cid, vpid) tiebreak — a stored
+//                ORDER, so nothing about the layout moves and only this constant can catch it.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026081604;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -14266,6 +14319,7 @@ impl QueryEngine {
         assign_set_ranks(&mut printings, &mut foreign);
         assign_artist_ranks(&mut printings, &mut foreign, &artist_vocab);
         assign_collector_ranks(&mut printings, &mut foreign, &strings);
+        order_annex_by_language(&mut foreign, &foreign_offsets, &coll_vocab);
         let mana_vocab = mana.strings;
         drop(mana.map);
         // String-sorted permutation of the vocab ids; VocabInterner caps the
