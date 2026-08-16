@@ -1305,19 +1305,25 @@ class TestFieldSelection:
         assert card["layout"] == "normal"
         assert card["cmc"] == 1
         assert card["rarity"] == "common"
-        # WUBRG-ordered letter list, not the raw JSONB object.
+        # A letter list, not the raw JSONB object.
         assert card["color_identity"] == ["R"]
         legalities = card["legalities"]
         assert legalities["modern"] == "legal"
         assert set(legalities.values()) <= {"legal", "not_legal", "restricted", "banned"}
 
-    def test_color_identity_is_wubrg_ordered(self, engine: QueryEngine) -> None:
-        # Any multicolor card: letters come back in WUBRG order regardless of storage order.
+    def test_color_identity_is_alphabetically_ordered(self, engine: QueryEngine) -> None:
+        # Any multicolor card: letters come back ALPHABETICALLY, regardless of storage order.
+        #
+        # This read WUBRG until it was checked against the data. Of the 540,484 printings in the
+        # 2026-08-16 all_cards bulk, every one of the 54,463 multi-colour `colors` arrays, all
+        # 96,030 multi-colour `color_identity` arrays and all 37,956 multi-symbol `produced_mana`
+        # arrays is in ascending letter order — and only 10,663 of the `colors` arrays are ALSO
+        # WUBRG-ordered. Scryfall serves ["R","U"] for Fire // Ice and ["B","G","R","U","W"] for
+        # Invasion of Alara; WUBRG was the coincidence and the alphabet is the rule.
         _, cards = _run(engine, "id>=rg", unique="card", limit=5, fields=["name", "color_identity"])
-        order = {letter: i for i, letter in enumerate("WUBRGC")}
         for card in cards:
             letters = card["color_identity"]
-            assert letters == sorted(letters, key=order.__getitem__)
+            assert letters == sorted(letters)
             assert {"R", "G"} <= set(letters)
 
 
