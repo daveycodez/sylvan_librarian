@@ -39,12 +39,12 @@ from cachebox import LRUCache, TTLCache
 from cachebox import cached as cachebox_cached
 from psycopg import Connection, Cursor
 
-from api.card_processing import preprocess_card
+from api.card_processing import EXTRA_IS_TAG, preprocess_card
 from api.db.bulk_upsert import bulk_upsert as _bulk_upsert
 from api.enums import CardOrdering, PreferOrder, ResponseShape, SortDirection, UniqueOn, resolve_direction
 from api.middlewares.timing import record_span
 from api.noscript_helpers import generate_results_count_html, generate_results_html
-from api.parsing import generate_sql_query, parse_scryfall_query
+from api.parsing import AndNode, NotNode, Query, QueryNode, TrueNode, generate_sql_query, parse_scryfall_query
 from api.rulings_import import import_rulings as _import_rulings
 from api.scryfall_bulk_data_fetcher import BulkDataKey, ScryfallBulkDataFetcher
 from api.scryfall_compat import ScryfallCardsRoutes
@@ -465,6 +465,42 @@ def _fold_directives(
         effective[target] = table[value]
         written[target] = (name, value)
     return effective["unique"], effective["orderby"], effective["direction"], effective["prefer"], warnings
+
+
+# Parsed once rather than constructed by hand: the `is:` rewrite expands a tag term into the shape
+# the engine and the SQL generator both expect, and building that node literally here would be a
+# fourth place for it to drift. Cached because the node is immutable in use -- the splice below
+# wraps it, never mutates it.
+@lru_cache(maxsize=1)
+def _extras_predicate() -> QueryNode:
+    """The `is:extra` filter node, parsed once and shared."""
+    return parse_scryfall_query(f"is:{EXTRA_IS_TAG}").root
+
+
+def _apply_extras_default(parsed_query: Query, *, include_extras: bool) -> None:
+    """Conjoin `-is:extra` onto a parsed query in place unless the caller asked for extras.
+
+    The extras class -- tokens and emblems, the art-series and "Card" type-line families,
+    memorabilia, the playtest promos, and the handful of content-warning cards -- is IMPORTED
+    (#927 stopped dropping it) and hidden at QUERY time instead, because hiding it by absence
+    cannot reproduce the flag: there would be nothing left for `include_extras=true` to include.
+
+    Conjoined onto the TREE rather than appended to the query string, and that is why this is a
+    node splice rather than an `f"({query}) -is:extra"`. Wrapping the caller's query in
+    parentheses would make every directive inside it read as nested, which `_fold_directives`
+    warns about; appending without parentheses binds to the last `or` branch instead of to the
+    whole query. Splicing has neither problem.
+
+    An empty query (TrueNode) is left ALONE: it is what the by-name and random lanes search with,
+    and they do their own scoping.
+
+    Args:
+        parsed_query: The parsed query, whose root is replaced unless it is a TrueNode.
+        include_extras: True leaves the query exactly as written.
+    """
+    if include_extras or isinstance(parsed_query.root, TrueNode):
+        return
+    parsed_query.root = AndNode([parsed_query.root, NotNode(_extras_predicate())])
 
 
 def _with_warnings(result: dict[str, Any], warnings: list[str]) -> dict[str, Any]:
@@ -1469,6 +1505,7 @@ class APIResource(ScryfallCardsRoutes):
         *,
         direction: SortDirection = SortDirection.ASC,
         fields: Sequence[str] | None = None,
+        include_extras: bool = True,
         include_multilingual: bool = False,
         limit: int = 100,
         offset: int = DEFAULT_OFFSET,
@@ -1489,7 +1526,21 @@ class APIResource(ScryfallCardsRoutes):
             # `include_multilingual` is part of the key: the same query widened to the foreign
             # annex is a different result set, and serving one for the other from cache would be
             # exactly the kind of wrong answer the flag exists to prevent.
-            cache_key = (direction, include_multilingual, limit, offset, orderby, prefer, query, unique, tuple(resolved_fields))
+            # `include_extras` joins it for the same reason: excluding the extras class is a
+            # different result set, and it is the DEFAULT on /cards/search, so a cache that
+            # confused the two would serve tokens and art series into an ordinary page.
+            cache_key = (
+                direction,
+                include_extras,
+                include_multilingual,
+                limit,
+                offset,
+                orderby,
+                prefer,
+                query,
+                unique,
+                tuple(resolved_fields),
+            )
             gen = self._cache_generation.value
             try:
                 search_cache = self._search_gen_cache[gen]
@@ -1524,6 +1575,10 @@ class APIResource(ScryfallCardsRoutes):
             direction=direction,
             prefer=prefer,
         )
+
+        # Scryfall's `include_extras=false` default, spliced onto the tree UPSTREAM of the
+        # engine/SQL dispatch so both paths honor it by construction -- see the helper.
+        _apply_extras_default(parsed_query, include_extras=include_extras)
 
         if not settings.enable_engine:
             pass  # feature-gated off: SQL serves everything, the store never loads

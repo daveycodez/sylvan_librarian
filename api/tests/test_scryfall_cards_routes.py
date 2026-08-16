@@ -12,6 +12,7 @@ import copy
 import json
 import uuid
 from typing import TYPE_CHECKING
+from urllib.parse import urlencode
 
 import falcon
 import falcon.testing
@@ -20,6 +21,8 @@ import pytest
 from cachebox import LRUCache
 
 from api.enums import SortDirection, resolve_direction
+from api.parsing import parse_scryfall_query
+from api.scryfall_compat import routes as routes_module
 from api.scryfall_compat.objects import PAGE_SIZE
 from api.tests.helpers import make_raw_card
 from api.utils.generation_cache import GenerationCache
@@ -34,6 +37,11 @@ BOLT_ID = "11111111-1111-4111-8111-111111111111"
 BEAR_ID = "22222222-2222-4222-8222-222222222222"
 DELVER_ID = "33333333-3333-4333-8333-333333333333"
 BOLT_ORACLE_ID = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+EXTRA_ID = "55555555-5555-4555-8555-555555555555"
+# A SET OF ITS OWN, on purpose. `e:`/`s:` is the CONDITIONAL `include_extras` trigger -- a set term
+# turns extras on iff that set holds one -- so putting the extra in SET_CODE would auto-enable
+# every `s:sfc` query in this module and quietly change what the paging tests page over.
+EXTRAS_SET_CODE = "sfe"
 
 
 def _bolt() -> dict:
@@ -122,10 +130,29 @@ def _delver() -> dict:
     return card
 
 
+def _extra() -> dict:
+    """A printing of the `is:extra` class, hidden by default and brought back by a trigger.
+
+    A "Card" type line, which is how Scryfall ships the checklist and substitute-card family --
+    `!"The Monarch"` (tmkc/31) is 404 bare and 200 with `include_extras=true`.
+    """
+    card = make_raw_card(card_id=EXTRA_ID, name="Compat Substitute")
+    card |= {
+        "object": "card",
+        "set": EXTRAS_SET_CODE,
+        "set_name": "Scryfall Compat Extras",
+        "collector_number": "1",
+        "type_line": "Card",
+        "oracle_text": "",
+        "lang": "en",
+    }
+    return card
+
+
 @pytest.fixture(name="compat_corpus", scope="module")
 def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
     """Load this module's cards and their rulings once, then hand back the resource."""
-    api_resource._upsert_cards([copy.deepcopy(card) for card in (_bolt(), _bear(), _delver())])
+    api_resource._upsert_cards([copy.deepcopy(card) for card in (_bolt(), _bear(), _delver(), _extra())])
     with api_resource._conn_pool.connection() as conn, conn.cursor() as cursor:
         cursor.execute("DELETE FROM magic.rulings WHERE oracle_id = %(oracle_id)s", {"oracle_id": BOLT_ORACLE_ID})
         # Three rulings across two dates, two of them same-day: a single ruling cannot tell one
@@ -352,6 +379,123 @@ class TestSearch:
         assert "order=name" in body["next_page"]
         assert "unique=cards" in body["next_page"]
 
+    # ── include_extras ───────────────────────────────────────────────────────
+
+    def test_the_extras_class_is_hidden_by_default(self, compat_corpus: APIResource):
+        """Scryfall's default, which is a QUERY-TIME gate and not an import one.
+
+        The printing is stored (#927 stopped dropping the class) and excluded here, which is the
+        only arrangement where `include_extras=true` has anything to include.
+        """
+        resp = dispatch(compat_corpus, "/cards/search", "q=%21%22Compat+Substitute%22")
+        assert resp.status == falcon.HTTP_404
+
+    def test_include_extras_true_returns_them(self, compat_corpus: APIResource):
+        body = payload(dispatch(compat_corpus, "/cards/search", "q=%21%22Compat+Substitute%22&include_extras=true"))
+        assert [card["id"] for card in body["data"]] == [EXTRA_ID]
+
+    def test_a_trigger_term_overrides_an_explicit_false(self, compat_corpus: APIResource):
+        """`is:extra` is one of the unconditional triggers, so it can never answer nothing.
+
+        Scryfall FORCES the flag rather than defaulting it -- an explicit `include_extras=false`
+        alongside a trigger term is overridden, in the rows and in the echo alike.
+        """
+        body = payload(
+            dispatch(compat_corpus, "/cards/search", "q=is%3Aextra&include_extras=false"),
+        )
+        assert [card["id"] for card in body["data"]] == [EXTRA_ID]
+
+    @pytest.mark.parametrize(
+        "query",
+        ['a:"Test Artist"', "wm:setsymbol", "layout:normal", "name:/^comp/", "t:token", "is:extra"],
+        ids=["artist", "watermark", "layout", "name-regex", "type-token", "is-extra"],
+    )
+    def test_every_unconditional_trigger_forces_the_flag(self, compat_corpus: APIResource, monkeypatch, query):
+        """Each fires on the TERM, whatever it matches -- see `_extras_triggers` for the probes.
+
+        Asserted on what reaches `_search` rather than on the page, because these terms select
+        different cards and only the flag is under test.
+        """
+        seen = {}
+        original = compat_corpus._search
+        monkeypatch.setattr(compat_corpus, "_search", lambda **kw: (seen.update(kw), original(**kw))[1])
+        dispatch(compat_corpus, "/cards/search", urlencode({"q": query, "include_extras": "false"}))
+        assert seen["include_extras"] is True
+
+    @pytest.mark.parametrize(
+        "query",
+        ["t:creature", "o:damage", 'name:"compat"', "cn:1", "border:black", "is:funny", '!"Compat Bolt"'],
+        ids=["type", "oracle", "name-literal", "collector-number", "border", "is-other", "exact-name"],
+    )
+    def test_a_non_trigger_term_leaves_the_flag_alone(self, compat_corpus: APIResource, monkeypatch, query):
+        """A non-trigger term leaves the flag exactly as the caller sent it.
+
+        The rule is SYNTACTIC and narrow: `t:creature` matches 1,742 extras on Scryfall and still
+        echoes `include_extras=false`. A rule read off the RESULT SET would fire on every one of
+        these.
+        """
+        seen = {}
+        original = compat_corpus._search
+        monkeypatch.setattr(compat_corpus, "_search", lambda **kw: (seen.update(kw), original(**kw))[1])
+        dispatch(compat_corpus, "/cards/search", urlencode({"q": query, "include_extras": "false"}))
+        assert seen["include_extras"] is False
+
+    def test_a_set_term_triggers_only_for_a_set_that_holds_an_extra(self, compat_corpus: APIResource, monkeypatch):
+        """The one CONDITIONAL trigger, and the reason the engine folds `sets_with_extras`.
+
+        Measured over 18 sets on 2026-08-16 and the split is perfect: lea/leb/2ed/3ed/sum hold 1,
+        4ed/5ed/6ed 2, leg 4, j21 16, hbg 122, unk 506 and every one enables; ust, ice, war, unf,
+        por and 7ed hold none and none of them does.
+        """
+        seen = {}
+        original = compat_corpus._search
+        monkeypatch.setattr(compat_corpus, "_search", lambda **kw: (seen.update(kw), original(**kw))[1])
+        monkeypatch.setattr(compat_corpus, "_sets_with_extras", lambda: frozenset({EXTRAS_SET_CODE}))
+
+        dispatch(compat_corpus, "/cards/search", urlencode({"q": f"e:{EXTRAS_SET_CODE}", "include_extras": "false"}))
+        assert seen["include_extras"] is True
+        dispatch(compat_corpus, "/cards/search", urlencode({"q": f"e:{SET_CODE}", "include_extras": "false"}))
+        assert seen["include_extras"] is False
+
+    def test_the_set_table_is_only_consulted_when_the_query_names_a_set(self, compat_corpus: APIResource, monkeypatch):
+        """An ordinary page must not pay for the table -- the guard is the trigger walk, not a cache."""
+        calls = []
+        monkeypatch.setattr(compat_corpus, "_sets_with_extras", lambda: (calls.append(1), frozenset())[1])
+        dispatch(compat_corpus, "/cards/search", "q=t%3Acreature")
+        assert calls == []
+        dispatch(compat_corpus, "/cards/search", urlencode({"q": f"e:{SET_CODE}"}))
+        assert calls == [1]
+
+    def test_an_engine_that_cannot_answer_leaves_the_auto_enable_off(self, compat_corpus: APIResource, monkeypatch):
+        """A missing or wrong-build store is an empty table, never a 500 on the search."""
+
+        class _Broken:
+            def sets_with_extras(self) -> frozenset[str]:
+                msg = "no store"
+                raise RuntimeError(msg)
+
+        broken = _Broken()
+        monkeypatch.setattr(compat_corpus, "_engine_for_lookup", lambda: broken)
+        assert compat_corpus._sets_with_extras() == frozenset()
+
+    def test_next_page_echoes_the_resolved_include_extras(self, compat_corpus: APIResource, monkeypatch):
+        """The echo is the value that was SERVED, not the parameter as sent.
+
+        `q=e:lea&include_extras=false` echoes `include_extras=true` on api.scryfall.com AND
+        returns the extras; echoing `false` while serving with them on gives a client a link that
+        contradicts the page it came from. Measured 2026-08-16 over 57 set probes plus the
+        unconditional families -- the echo agreed with what was served in every one.
+        """
+        monkeypatch.setattr("api.scryfall_compat.routes.PAGE_SIZE", 1)
+        body = payload(dispatch(compat_corpus, "/cards/search", urlencode({"q": "name:/^compat/", "include_extras": "false"})))
+        assert body["has_more"] is True
+        assert "include_extras=true" in body["next_page"]
+
+    def test_next_page_echoes_a_false_it_actually_served(self, compat_corpus: APIResource, monkeypatch):
+        monkeypatch.setattr("api.scryfall_compat.routes.PAGE_SIZE", 1)
+        body = payload(dispatch(compat_corpus, "/cards/search", "q=t%3Acreature&include_extras=false"))
+        assert "include_extras=false" in body["next_page"]
+
     def test_page_size_matches_scryfall(self):
         assert PAGE_SIZE == 175
 
@@ -412,6 +556,101 @@ class TestSearch:
     def test_an_unrecognized_unique_mode_is_silent_as_scryfalls_is(self, compat_corpus: APIResource, unique):
         body = payload(dispatch(compat_corpus, "/cards/search", f"q=%21%22Compat+Bolt%22&unique={unique}"))
         assert "warnings" not in body
+
+
+class TestExtrasTriggers:
+    """`_extras_triggers`, the syntactic rule behind `include_extras`'s auto-enable.
+
+    Pure parse-tree tests: no corpus, because the whole point of the measurement is that the rule
+    does NOT depend on what the query matches.
+    """
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            'a:"Wesley Burt"',
+            "wm:llorwyn",
+            "layout:normal",
+            "layout:art_series",
+            "name:/^z/",
+            "t:token",
+            "is:extra",
+        ],
+    )
+    def test_unconditional_triggers(self, query):
+        """Each fires on the TERM, not on what it selects.
+
+        `a:"Wesley Burt"` triggers although `a:"Wesley Burt" is:extra` is 0, `name:/zzzqq/` matches
+        nothing and still triggers, and `layout:normal` -- the most ordinary value there is --
+        triggers. Measured on api.scryfall.com 2026-08-16.
+        """
+        assert routes_module._extras_triggers(parse_scryfall_query(query)).forced is True
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "t:creature",
+            "o:draw",
+            "o:/^whenever/",
+            "ft:death",
+            "cn:100",
+            "year:1993",
+            "border:black",
+            "frame:2003",
+            "is:funny",
+            'name:"lightning"',
+            "name:lightning",
+            '!"Lightning Bolt"',
+            "",
+        ],
+    )
+    def test_probed_non_triggers(self, query):
+        """Every one of these was probed and does NOT auto-enable.
+
+        `t:creature`, `o:draw` and `ft:death` match 1,742 / 358 / 26 extras respectively, so a rule
+        read off the RESULT SET would fire on all three. This one does not, which is the whole
+        finding.
+        """
+        assert routes_module._extras_triggers(parse_scryfall_query(query)).forced is False
+
+    @pytest.mark.parametrize(
+        ("query", "expected"),
+        [
+            ("e:lea", ("lea",)),
+            ("s:khm", ("khm",)),
+            ("set:WAR", ("war",)),
+            ("e:war or e:lea", ("war", "lea")),
+            ("-e:lea t:land", ("lea",)),
+        ],
+    )
+    def test_set_terms_are_collected_lowercased(self, query, expected):
+        triggers = routes_module._extras_triggers(parse_scryfall_query(query))
+        assert triggers.forced is False
+        assert triggers.sets == expected
+
+    def test_a_trigger_propagates_out_of_an_or_and_a_negation(self):
+        """Both kinds of trigger propagate through `or` and through negation.
+
+        `(e:lea t:creature) or t:land` enables on api.scryfall.com even though LEA's only extra is
+        an enchantment that cannot be in that result set, and `-e:lea t:land` enables while
+        `-e:war t:land` does not. Negation does not cancel a trigger, which is what makes the rule
+        syntactic rather than semantic.
+        """
+        assert routes_module._extras_triggers(parse_scryfall_query("t:land or wm:x")).forced is True
+        assert routes_module._extras_triggers(parse_scryfall_query("-wm:x t:land")).forced is True
+        assert routes_module._extras_triggers(parse_scryfall_query("(e:lea t:creature) or t:land")).sets == ("lea",)
+
+    def test_a_literal_regex_is_the_known_residual(self):
+        """The rewrite lowers a metacharacter-free regex to a literal before this walk sees it.
+
+        So `name:/zzzqq/` reads as `name:"zzzqq"` and misses a trigger Scryfall fires, and
+        `t:/token/` reads as `t:token` and fires one Scryfall does not. One cause, two directions;
+        every pattern with a metacharacter keeps its RegexValueNode and behaves.
+        """
+        assert routes_module._extras_triggers(parse_scryfall_query("name:/zzzqq/")).forced is False
+        assert routes_module._extras_triggers(parse_scryfall_query("name:/^z/")).forced is True
+        assert routes_module._extras_triggers(parse_scryfall_query("t:/token/")).forced is True
+        assert routes_module._extras_triggers(parse_scryfall_query("t:/^token$/")).forced is False
 
 
 class TestNamed:

@@ -15651,6 +15651,23 @@ impl QueryEngine {
         Ok(autocomplete_names(data, prefix, limit).into_iter().map(str::to_string).collect())
     }
 
+    /// The set codes this store holds an `is:extra` printing for, sorted — Scryfall's
+    /// `include_extras` AUTO-ENABLE table.
+    ///
+    /// Folded at build (see `CardIndexes::sets_with_extras`) rather than answered per request,
+    /// because the question a set-scoped query asks is "does THIS set contain an extra" and there
+    /// is no index that answers it without intersecting two posting lists. ~1 KB for the whole
+    /// corpus, and the compat route only asks when the query actually named a set.
+    ///
+    /// An empty list is the honest answer for a missing or foreign-build archive: the auto-enable
+    /// then simply does not fire, which is the same thing `include_extras=false` already means.
+    fn sets_with_extras(&self) -> PyResult<Vec<String>> {
+        let Ok(mmap) = self.get_mmap() else { return Ok(Vec::new()) };
+        // Safety: see the access_unchecked justification in query().
+        let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
+        Ok(data.indexes.sets_with_extras.iter().map(|s| s.as_str().to_owned()).collect())
+    }
+
     /// The printing carrying this external id, or None.
     ///
     /// `namespace` is Scryfall's own path segment. mtgo also matches mtgo_foil_id and tcgplayer

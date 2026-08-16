@@ -24,8 +24,10 @@ from api.api_resource import (
     _split_words,
     hostname_to_site_name,
 )
+from api.card_processing import EXTRA_IS_TAG
 from api.enums import ResponseShape, UniqueOn
 from api.middlewares.caching_middleware import CachingMiddleware
+from api.parsing import AndNode, NotNode, OrNode, TrueNode, parse_scryfall_query
 from api.settings import settings
 from api.utils.routing import BoundRoute, RouteSpec, route
 
@@ -651,6 +653,49 @@ class TestIdentityLetters(unittest.TestCase):
         """A colorless identity is an empty list, matching Scryfall's JSON."""
         assert api_resource_module._identity_letters({}) == []
         assert api_resource_module._identity_letters(None) == []
+
+
+class TestExtrasDefault:
+    """`_apply_extras_default`, the tree splice behind `include_extras=false`."""
+
+    def test_the_conjunct_is_spliced_onto_the_tree(self) -> None:
+        """`-is:extra` is ANDed on, so both search paths get it from one place.
+
+        Spliced rather than appended to the query string: `f"({query}) -is:extra"` would make
+        every directive inside the query read as nested (a warning `_fold_directives` emits), and
+        appending without the parentheses would bind to the last `or` branch instead of the whole
+        query.
+        """
+        parsed = parse_scryfall_query("t:creature or t:land")
+        api_resource_module._apply_extras_default(parsed, include_extras=False)
+        assert isinstance(parsed.root, AndNode)
+        original, excluded = parsed.root.operands
+        assert isinstance(original, OrNode)
+        assert excluded == NotNode(parse_scryfall_query("is:extra").root)
+
+    def test_include_extras_leaves_the_query_exactly_as_written(self) -> None:
+        parsed = parse_scryfall_query("t:creature")
+        before = repr(parsed.root)
+        api_resource_module._apply_extras_default(parsed, include_extras=True)
+        assert repr(parsed.root) == before
+
+    def test_an_empty_query_is_left_alone(self) -> None:
+        """A TrueNode is what the by-name and random lanes search with, and they scope themselves.
+
+        Wrapping it would change what `/cards/random` and the collection lookups answer, which is
+        a different surface from the one the flag belongs to.
+        """
+        parsed = parse_scryfall_query("")
+        api_resource_module._apply_extras_default(parsed, include_extras=False)
+        assert isinstance(parsed.root, TrueNode)
+
+    def test_the_predicate_is_the_parsers_own_is_extra_node(self) -> None:
+        """The predicate is parsed, never hand-built.
+
+        The `is:` rewrite decides the node shape the engine and the SQL generator both read, and a
+        literal here would be a fourth place for it to drift.
+        """
+        assert api_resource_module._extras_predicate() == parse_scryfall_query(f"is:{EXTRA_IS_TAG}").root
 
 
 class TestSearchQueryDirectives(TestBaseAPIResourceTest):

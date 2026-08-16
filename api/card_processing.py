@@ -304,6 +304,13 @@ def _merge_processed_faces(faces: list[dict[str, Any]]) -> dict[str, Any]:
 _EXTRA_LAYOUTS = frozenset({"token", "double_faced_token", "emblem", "planar", "scheme", "vanguard", "art_series", "front_card"})
 
 
+# The `is:` value the extras class is stored under. Read by `api_resource`'s default
+# `include_extras=false` conjunct and by the compat route's auto-enable walk; spelled once more in
+# card_engine's `EXTRA_IS_TAG`, which folds `sets_with_extras` from it. Those two must agree or the
+# fold silently comes back empty.
+EXTRA_IS_TAG = "extra"
+
+
 def _is_extra(card: dict[str, Any]) -> bool:
     """Whether Scryfall hides this printing from a default `/cards/search` — the `is:extra` class.
 
@@ -384,7 +391,7 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
     # `reserved` and `gamechanger` do. It is set here, on the row, and the merge below preserves
     # it through the NOT NULL default.
     if _is_extra(card):
-        card["card_is_tags"] = {**card.get("card_is_tags", {}), "extra": True}
+        card["card_is_tags"] = {**card.get("card_is_tags", {}), EXTRA_IS_TAG: True}
 
     if "raw_card_blob" in card:
         # Already processed, don't need to re-process

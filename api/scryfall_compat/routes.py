@@ -25,15 +25,28 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import operator
 import re
-from typing import TYPE_CHECKING, Any
+from functools import reduce
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import falcon
 import orjson
 
+from api.card_processing import EXTRA_IS_TAG
 from api.enums import CardOrdering, PreferOrder, SortDirection, UniqueOn
-from api.parsing import generate_sql_query, parse_scryfall_query
+from api.parsing import (
+    AttributeNode,
+    BinaryOperatorNode,
+    NotNode,
+    Query,
+    RegexValueNode,
+    StringValueNode,
+    generate_sql_query,
+    parse_scryfall_query,
+)
 from api.parsing.card_query_nodes import fold_accents
+from api.parsing.nodes import NaryOperatorNode
 from api.scryfall_compat import objects
 from api.scryfall_compat.objects import (
     CARD_OBJECT_FIELDS,
@@ -140,6 +153,115 @@ def _echo_order(orderby: CardOrdering, raw_order: str) -> str:
     if lowered in _SCRYFALL_ONLY_ORDERS and lowered not in _ORDER_MAP:
         return lowered
     return str(orderby)
+
+
+class _ExtrasTriggers(NamedTuple):
+    """What a query's parse tree says about Scryfall's `include_extras` auto-enable."""
+
+    forced: bool
+    """An UNCONDITIONAL trigger term is present: extras are on whatever the caller asked for."""
+
+    sets: tuple[str, ...]
+    """The set codes named by `e:`/`s:`/`set:`, lowercased -- the CONDITIONAL trigger."""
+
+    def __or__(self, other: _ExtrasTriggers) -> _ExtrasTriggers:
+        """Merge two subtrees. Both kinds of trigger propagate upward, so this is a union."""
+        return _ExtrasTriggers(self.forced or other.forced, self.sets + other.sets)
+
+
+_NO_EXTRAS_TRIGGERS = _ExtrasTriggers(forced=False, sets=())
+
+# Attributes whose mere PRESENCE forces `include_extras=true`, whatever their value:
+# `a:`, `wm:` and `layout:`.
+_UNCONDITIONAL_EXTRAS_ATTRIBUTES = frozenset({"card_artist", "card_watermark", "card_layout"})
+
+# The two VALUE-specific triggers -- `t:token` and `is:extra` -- as {attribute: triggering value}.
+# `t:` binds to `card_types` or `card_subtypes` depending on which vocabulary the value is in, and
+# "Token" is in both, so both spellings are listed.
+_VALUE_EXTRAS_TRIGGERS = {"card_types": "token", "card_subtypes": "token", "card_is_tags": EXTRA_IS_TAG}
+
+# The set-code attribute every spelling of the set operator (`e:`, `s:`, `set:`) rewrites to.
+_SET_CODE_ATTRIBUTE = "card_set_code"
+
+
+def _extras_triggers(node: object) -> _ExtrasTriggers:
+    """Read Scryfall's `include_extras` auto-enable off a parsed query.
+
+    MEASURED, not inferred -- ~119 serial probes against api.scryfall.com on 2026-08-16, and the
+    result contradicts the obvious hypothesis. It is NOT a property of the RESULT SET: `t:creature`,
+    `o:draw` and `ft:death` match 1,742 / 358 / 26 extras respectively and every one of them echoes
+    `include_extras=false`. It is a SYNTACTIC property of the terms, propagated through `or`, `and`
+    and negation alike -- `e:war or e:lea` is true, `(e:lea t:creature) or t:land` is true even
+    though LEA's only extra is an enchantment that cannot be in that result set, `-e:lea t:land` is
+    true and `-e:war t:land` is false. And it is a FORCE, not a default: an explicit
+    `include_extras=false` is overridden, in the echo and in the rows.
+
+    Unconditional triggers: `a:`, `wm:`, `layout:`, `name:/regex/`, `t:token` and `is:extra`
+    (`b:` belongs here too -- this parser has no block operator, so the term cannot reach us).
+    Each fires on the TERM and not on what it matches: `a:"Wesley Burt"` triggers although
+    `a:"Wesley Burt" is:extra` is 0, `name:/zzzqq/` matches nothing and still triggers,
+    `layout:normal` triggers. Deliberately NOT triggers, each probed: `t:` at any other value,
+    `o:`, `o:/…/`, `t:/…/`, `cn:`, `st:`, `year:`/`date:`, `border:`, `frame:`, `is:` at any other
+    value, `name:"literal"`, a bare `name:` word, and `!"Exact"`.
+
+    Conditional trigger: a set term, IFF that set holds at least one `is:extra` printing --
+    `QueryEngine.sets_with_extras` is that table. Over 18 measured sets the split is perfect
+    (lea/leb/2ed/3ed/sum 1, 4ed/5ed/6ed 2, leg 4, j21 16, hbg 122, unk 506 enable; ust, ice, war,
+    unf, por and 7ed hold 0 and none of them does), and six more predicted from the local bulk
+    before being measured were all correct. LEA is the instructive one: its single extra is
+    Crusade, which carries `content_warning`.
+
+    RANKED on the 57 set probes: this rule 57/57, against 20/57 for a "does the query mention a
+    set" rule -- which is wrong on every ordinary modern set. Across the non-set probes that rule
+    also missed `name:/…/`, `layout:`, `t:token` and `is:extra`.
+
+    KNOWN RESIDUAL, in both directions and from one cause: the rewrite lowers a regex with no
+    metacharacters to a literal before this walk sees it. So `name:/zzzqq/` reads here as
+    `name:"zzzqq"` and does NOT trigger where Scryfall does, and `t:/token/` reads as `t:token`
+    and DOES where Scryfall does not. `name:/^z/`, `t:/^token$/` and every other real pattern keep
+    their `RegexValueNode` and behave.
+
+    Args:
+        node: A parsed query, or any node inside one.
+
+    Returns:
+        The unconditional verdict, and the set codes to look up in the engine's table.
+    """
+    if isinstance(node, Query):
+        return _extras_triggers(node.root)
+    if isinstance(node, NaryOperatorNode):
+        # `and` and `or` alike: a trigger anywhere under either one triggers the whole query.
+        return reduce(operator.or_, (_extras_triggers(child) for child in node.operands), _NO_EXTRAS_TRIGGERS)
+    if isinstance(node, NotNode):
+        # NEGATION DOES NOT CANCEL A TRIGGER, which is the measurement that makes this syntactic
+        # rather than semantic: `-e:lea t:land` enables extras and `-e:war t:land` does not, even
+        # though neither result set can contain an LEA card.
+        return _extras_triggers(node.operand)
+    if isinstance(node, BinaryOperatorNode):
+        return _extras_triggers_of_term(node)
+    return _NO_EXTRAS_TRIGGERS
+
+
+def _extras_triggers_of_term(node: BinaryOperatorNode) -> _ExtrasTriggers:
+    """The trigger verdict for a single comparison term. See `_extras_triggers`."""
+    lhs = node.lhs
+    if not isinstance(lhs, AttributeNode):
+        return _NO_EXTRAS_TRIGGERS
+    attribute = lhs.attribute_name
+    if attribute in _UNCONDITIONAL_EXTRAS_ATTRIBUTES:
+        return _ExtrasTriggers(forced=True, sets=())
+    # `name:/…/` triggers and `name:"…"` does not, so the VALUE NODE is what decides -- the
+    # attribute is the same either way.
+    if attribute == "card_name" and isinstance(node.rhs, RegexValueNode):
+        return _ExtrasTriggers(forced=True, sets=())
+    if not isinstance(node.rhs, StringValueNode):
+        return _NO_EXTRAS_TRIGGERS
+    value = str(node.rhs.value).lower()
+    if _VALUE_EXTRAS_TRIGGERS.get(attribute) == value:
+        return _ExtrasTriggers(forced=True, sets=())
+    if attribute == _SET_CODE_ATTRIBUTE:
+        return _ExtrasTriggers(forced=False, sets=(value,))
+    return _NO_EXTRAS_TRIGGERS
 
 
 # Scryfall's own wording, down to the typographic apostrophe, so a client that string-matches on
@@ -756,6 +878,26 @@ class ScryfallCardsRoutes:
             return None
         return self._engine
 
+    def _sets_with_extras(self) -> frozenset[str]:
+        """The set codes holding at least one `is:extra` printing, lowercased.
+
+        Scryfall's `include_extras` auto-enable table -- see `_extras_triggers` for what asks it.
+        Folded into the archive at build, so this is a read rather than a query; an engine that
+        cannot answer gives an empty table, which simply leaves the auto-enable off.
+
+        Returns:
+            The set codes, or an empty set when the engine cannot answer.
+        """
+        engine = self._engine_for_lookup()
+        if engine is None:
+            return frozenset()
+        try:
+            return frozenset(code.lower() for code in engine.sets_with_extras())
+        # An engine that cannot answer leaves the auto-enable off; it never 500s the search.
+        except Exception:
+            logger.exception("Engine sets_with_extras failed, leaving include_extras as asked")
+            return frozenset()
+
     def _engine_card(self, fetch: Callable[[Any], dict[str, Any] | None]) -> dict[str, Any] | _EngineMiss | None:
         """Run one engine lookup, or report that the engine could not serve it.
 
@@ -951,9 +1093,15 @@ class ScryfallCardsRoutes:
 
         `include_multilingual` is honored: the default is Scryfall's -- English (canonical)
         printings only -- and `include_multilingual=true` widens the search to foreign printings,
-        as does a `lang:` term in the query itself. `include_extras` and `include_variations` are
-        accepted and have no effect: the corpus holds no tokens, emblems or funny-set cards for
-        `include_extras` to add, and it holds every variation it has imported unconditionally.
+        as does a `lang:` term in the query itself.
+
+        `include_extras` is honored too, and it is the one parameter this route can OVERRULE. The
+        default hides the extras class (`-is:extra`, applied to the tree in `_search`); a query
+        whose parse tree syntactically carries a trigger term turns it on regardless of what the
+        caller sent, in the results and in the `next_page` echo alike. See `_extras_triggers`.
+
+        `include_variations` is accepted and has no effect: the corpus holds every variation it
+        has imported, unconditionally.
 
         Args:
             falcon_response: The Falcon response to write to.
@@ -966,7 +1114,7 @@ class ScryfallCardsRoutes:
             page: 1-based page number.
             format: Response format -- json or csv.
             pretty: Whether to indent JSON output.
-            include_extras: Accepted, ignored.
+            include_extras: Whether to include the extras class; a trigger term in `q` forces it.
             include_multilingual: Whether to widen the search to foreign printings.
             include_variations: Accepted, ignored.
 
@@ -1023,6 +1171,31 @@ class ScryfallCardsRoutes:
         # Scryfall ignores one it does not know rather than erroring.
         direction = _DIRECTION_MAP.get(dir.lower(), SortDirection.AUTO)
 
+        # THE PARSE THIS ROUTE OWNS, and the only one it needs: `include_extras`'s auto-enable and
+        # the `next_page` echo are both properties of the parse TREE, and `_search` takes a string.
+        # A parse failure here is the same 400 `_search` would have raised, spelled as a Scryfall
+        # error object rather than a Falcon one.
+        try:
+            parsed = parse_scryfall_query(policy.query)
+        except ValueError:
+            return self._scryfall_respond(
+                falcon_response,
+                bad_request_error(f'Failed to parse query: "{q}"', warnings=warnings),
+                pretty=is_pretty,
+            )
+
+        # SCRYFALL FORCES `include_extras`, it does not merely default it: a parse tree carrying a
+        # trigger term overrides an explicit `include_extras=false`, in the rows AND in the echo.
+        # See `_extras_triggers` for the rule and the measurements behind it.
+        triggers = _extras_triggers(parsed)
+        forced = triggers.forced
+        if not forced and triggers.sets:
+            # The one CONDITIONAL trigger, and the only reason this route asks the engine anything
+            # before searching: a set term enables extras iff that set holds one. Asked only when
+            # the query actually named a set, so an ordinary page never pays for the table.
+            forced = not self._sets_with_extras().isdisjoint(triggers.sets)
+        effective_extras = forced or _as_bool(include_extras)
+
         try:
             result = self._search(
                 query=policy.query,
@@ -1033,9 +1206,10 @@ class ScryfallCardsRoutes:
                 offset=(page_number - 1) * PAGE_SIZE,
                 unique=unique_on,
                 prefer=PreferOrder.DEFAULT,
-                # Always resolved, never left to a default downstream: false IS Scryfall's default
-                # (English/canonical printings only), and fixing it here keeps "absent" from
-                # meaning anything.
+                # RESOLVED, never left to a default downstream: false IS Scryfall's default and the
+                # auto-enable above is what can override it. Fixing both on the way in keeps
+                # "absent" from meaning anything.
+                include_extras=effective_extras,
                 include_multilingual=_as_bool(include_multilingual),
             )
         except falcon.HTTPBadRequest as err:
@@ -1063,7 +1237,13 @@ class ScryfallCardsRoutes:
                 {
                     "dir": dir,
                     "format": format,
-                    "include_extras": str(_as_bool(include_extras)).lower(),
+                    # THE RESOLVED VALUE, not the parameter as sent -- the same rule `order` and
+                    # `unique` follow below. `q=e:lea&include_extras=false` echoes
+                    # `include_extras=true` on api.scryfall.com AND returns the extras; echoing
+                    # `false` while serving with them on gives a client a link that contradicts
+                    # the page it came from. Measured 2026-08-16 over 57 set probes plus the
+                    # unconditional families: the echo agreed with what was served in every one.
+                    "include_extras": str(effective_extras).lower(),
                     "include_multilingual": str(_as_bool(include_multilingual)).lower(),
                     "include_variations": str(_as_bool(include_variations)).lower(),
                     # RESOLVED, not raw -- see _UNIQUE_ECHO. This is also what makes the link
@@ -1531,7 +1711,8 @@ class ScryfallCardsRoutes:
             falcon_response: The Falcon response to write to.
             q: The partial name.
             pretty: Whether to indent JSON output.
-            include_extras: Accepted, ignored -- the corpus holds no extras to include.
+            include_extras: Accepted, ignored -- the autocomplete catalog is names, and this
+                surface has never scoped it by the extras class.
 
         Returns:
             A Catalog object of card names.
