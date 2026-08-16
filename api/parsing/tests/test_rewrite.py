@@ -9,8 +9,9 @@ docs/issues/00713-is-tag-recovery.md.
 import pytest
 
 from api.parsing import generate_sql_query, parse_scryfall_query
+from api.parsing.db_info import BOOLEAN_IS_TAGS
 from api.parsing.nodes import RegexValueNode
-from api.parsing.rewrite import _regex_plain_literal
+from api.parsing.rewrite import SUPPORTED_IS_VALUES, _regex_plain_literal
 
 # (synonym query, canonical expansion) — the two must produce identical ASTs.
 EQUIVALENCES = [
@@ -70,6 +71,19 @@ EQUIVALENCES = [
     ("is:surveilland", "otag:cycle-dual-surveil-land"),
     ("is:tricycleland", "otag:tricycle-land"),
     ("is:pathway", "otag:cycle-pathway"),
+    # Everything castable. A strict superset of Scryfall's face-level is:spell: +48 / 31,760 on the
+    # imported corpus, 0 misses (2026-08-16).
+    (
+        "is:spell",
+        "t:artifact or t:battle or t:creature or t:enchantment or t:instant or t:kindred or t:planeswalker or t:sorcery",
+    ),
+    # "first printing" is exactly "not a reprint" — the two partition the printing space on
+    # Scryfall, ties included (2026-08-16). Both spellings are accepted there.
+    ("is:firstprinting", "-is:reprint"),
+    ("is:firstprint", "-is:reprint"),
+    # Scryfall's second names for two land cycles we already carry.
+    ("is:karoo", "otag:bounceland"),
+    ("is:canland", "otag:cycle-horizon-land"),
     # composes under negation and inside compounds
     ("-frame:old", "-(frame:1993 or frame:1997)"),
     ("t:goblin frame:modern", "t:goblin frame:2003"),
@@ -221,3 +235,48 @@ _PLAIN_LITERAL_CASES = {
 def test_regex_plain_literal(expected: str | None, pattern: str) -> None:
     """`_regex_plain_literal` extracts the literal for metachar-free patterns, else None."""
     assert _regex_plain_literal(pattern) == expected
+
+
+# ─── The `is:` vocabulary, and what happens outside it ────────────────────────
+
+
+def test_every_stored_is_tag_is_a_supported_value() -> None:
+    """A tag the importer writes must be one the parser reports as supported.
+
+    The two read one dict (db_info.BOOLEAN_IS_TAGS), so this is a structural check rather than a
+    duplicate-keeping-honest one — but it is the assertion that would fail if either side ever
+    grew its own copy again.
+    """
+    assert frozenset(BOOLEAN_IS_TAGS) <= SUPPORTED_IS_VALUES
+
+
+@pytest.mark.parametrize(
+    argnames="query",
+    argvalues=["is:reprint", "is:promo", "is:foil", "is:reserved", "is:spell", "is:firstprinting", "is:fetchland"],
+)
+def test_supported_is_values_do_not_warn(query: str) -> None:
+    """Everything the vocabulary covers — stored or derived — passes without a warning."""
+    assert parse_scryfall_query(query).warnings == ()
+
+
+def test_unsupported_is_value_warns_once_per_leaf() -> None:
+    """An `is:` value with no data behind it says so instead of returning a silent zero.
+
+    Scryfall IGNORES an unknown `is:` value and warns (measured 2026-08-16: `is:notarealtag e:khm`
+    returns the whole set). This parser keeps the term, so the answer is a no-match — the warning is
+    what tells the caller which of the two happened.
+    """
+    (warning,) = parse_scryfall_query("is:notarealtag t:creature").warnings
+    assert "is:notarealtag" in warning
+
+    # Under a negation and inside an or-group, both of which the walk descends into.
+    assert len(parse_scryfall_query("-is:notarealtag").warnings) == 1
+    assert len(parse_scryfall_query("is:nope or is:alsonope").warnings) == 2
+
+    # A supported value in the same query does not add one.
+    assert len(parse_scryfall_query("is:nope is:reprint").warnings) == 1
+
+
+def test_type_operator_is_not_an_is_value() -> None:
+    """Only `is:` is checked — a subtype nobody has is a legitimate empty result, not a warning."""
+    assert parse_scryfall_query("t:notarealtype").warnings == ()

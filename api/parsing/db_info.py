@@ -352,3 +352,62 @@ FORMAT_CODE_TO_NAME = {
     "v": "vintage",
     "h": "historic",
 }
+
+# The `is:` values derivable from a single boolean SQL expression against a card's own row,
+# synced in one set-based statement after each import (see _sync_boolean_is_tags) -- no
+# per-tag API sweep, unlike CUSTOM_IS_TAGS below, and no accumulation in the import loop.
+# Each expression must reference the row alias `cards` (it runs inside a correlated
+# subquery, not a plain WHERE) -- adding a tag here is the whole change. Most read
+# `cards.raw_card_blob`; hybrid/phyrexian read `cards.mana_cost_text` instead, per
+# docs/issues/done/00713-is-tag-recovery.md's own reasoning for putting them here rather
+# than in the query-rewrite table: the DSL only does exact-symbol containment, so a
+# rewrite would be a brittle ~15-term OR over an open, growing symbol set. Density-gated
+# at ~2% of the corpus (see docs/issues/00985): reserved (1.1%) and gamechanger (0.4%)
+# were the original two; the rest were added after a corpus-wide survey of every is: tag
+# on Scryfall's syntax page found these sitting at or under masterpiece's 1.8%.
+# foil/nonfoil/reprint/booster/hires (50-97%) are deliberately NOT here -- "higher
+# cardinality, memory check first" -- and stay a candidate for a separate, more careful
+# pass -- except for the three below, whose memory question is now ANSWERED rather than
+# assumed: the Cloudflare port's builder ran twice over the same corpus (2026-08-16 all_cards,
+# 31,724 cards / 517,746 rows) and the archives total 363.02 MiB without foil/promo/reprint and
+# 364.17 MiB with them, +1.16 MiB / +0.32%, because a value carried by that share of the corpus
+# stores as a bitmap plane rather than a posting list.
+#
+# It lives HERE rather than in admin_resource because the parser reads it too: the keys are half of
+# `rewrite.SUPPORTED_IS_VALUES`, the complete list of `is:` values this parser can answer, and
+# api/parsing cannot import api/admin_resource.
+BOOLEAN_IS_TAGS: dict[str, str] = {
+    # Alphabetized by key. Expressions read either a plain top-level boolean (reserved,
+    # gamechanger, spotlight), promo_types/keywords/finishes array membership, or a
+    # single-field lookup (set_type, preview.source).
+    "arena_league": "cards.raw_card_blob->'promo_types' @> '\"arenaleague\"'",
+    "buyabox": "cards.raw_card_blob->'promo_types' @> '\"buyabox\"'",
+    "convention": "cards.raw_card_blob->'promo_types' @> '\"convention\"'",
+    "etched": "cards.raw_card_blob->'finishes' @> '\"etched\"'",
+    "fnm": "cards.raw_card_blob->'promo_types' @> '\"fnm\"'",
+    "foil": "cards.raw_card_blob->'foil' = 'true'::jsonb",
+    "gamechanger": "cards.raw_card_blob->'game_changer' = 'true'::jsonb",
+    "gameday": "cards.raw_card_blob->'promo_types' @> '\"gameday\"'",
+    "giftbox": "cards.raw_card_blob->'promo_types' @> '\"giftbox\"'",
+    "glossy": "cards.raw_card_blob->'promo_types' @> '\"glossy\"'",
+    "hybrid": r"cards.mana_cost_text ~ '\{[WUBRG]/[WUBRG]\}'",
+    "instore": "cards.raw_card_blob->'promo_types' @> '\"instore\"'",
+    "intro_pack": "cards.raw_card_blob->'promo_types' @> '\"intropack\"'",
+    "judge_gift": "cards.raw_card_blob->'promo_types' @> '\"judgegift\"'",
+    "league": "cards.raw_card_blob->'promo_types' @> '\"league\"'",
+    "masterpiece": "cards.raw_card_blob->>'set_type' = 'masterpiece'",
+    "media_insert": "cards.raw_card_blob->'promo_types' @> '\"mediainsert\"'",
+    # "Partner with <name>" cards carry a plain "Partner" keyword alongside it (verified
+    # against the corpus), so checking for "Partner" alone already covers both.
+    "partner": "cards.raw_card_blob->'keywords' @> '\"Partner\"'",
+    "phyrexian": r"cards.mana_cost_text ~ '\{[WUBRG]/P\}'",
+    "planeswalker_deck": "cards.raw_card_blob->'promo_types' @> '\"planeswalkerdeck\"'",
+    "player_rewards": "cards.raw_card_blob->'promo_types' @> '\"playerrewards\"'",
+    "promo": "cards.raw_card_blob->'promo' = 'true'::jsonb",
+    "release": "cards.raw_card_blob->'promo_types' @> '\"release\"'",
+    "reprint": "cards.raw_card_blob->'reprint' = 'true'::jsonb",
+    "reserved": "cards.raw_card_blob->'reserved' = 'true'::jsonb",
+    "scryfallpreview": "cards.raw_card_blob->'preview'->>'source' = 'Scryfall'",
+    "set_promo": "cards.raw_card_blob->'promo_types' @> '\"setpromo\"'",
+    "spotlight": "cards.raw_card_blob->'story_spotlight' = 'true'::jsonb",
+}

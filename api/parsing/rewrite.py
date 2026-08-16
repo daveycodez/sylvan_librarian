@@ -17,6 +17,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from api.parsing.card_query_nodes import CardAttributeNode
+from api.parsing.db_info import BOOLEAN_IS_TAGS
 from api.parsing.hand_parser import parse_query as _parse_query
 from api.parsing.nodes import (
     AndNode,
@@ -88,6 +89,7 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     ("is", "bikeland"): "otag:cycle-dual-cycling-land",  # 10, exact
     ("is", "bondland"): "otag:cycle-bondland",  # 10
     ("is", "bounceland"): "otag:bounceland",  # 17, exact
+    ("is", "canland"): "otag:cycle-horizon-land",  # 6; Scryfall's other spelling of canopyland
     ("is", "canopyland"): "otag:cycle-horizon-land",  # 6, exact
     ("is", "checkland"): "otag:cycle-checkland",  # 10, exact
     ("is", "creatureland"): "t:land o:become o:creature o:/still a.* land/",
@@ -96,6 +98,7 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     ("is", "fetchland"): "otag:cycle-fetchland",  # 10, exact
     ("is", "filterland"): "otag:cycle-hybrid-filterland or otag:cycle-ody-filterland",  # 20 vs 22
     ("is", "gainland"): "otag:gainland",  # 42, self-updating superset of Scryfall's 15
+    ("is", "karoo"): "otag:bounceland",  # 17; Scryfall's other spelling of bounceland
     ("is", "manland"): "t:land o:become o:creature o:/still a.* land/",
     ("is", "painland"): "otag:cycle-painland",  # 10, exact
     ("is", "pathway"): "otag:cycle-pathway",  # 10, exact
@@ -152,7 +155,34 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     # from it") while missing modal cards worded otherwise (Sieges, Confluences).
     # Not an exact mirror of theirs, just a much closer one.
     ("is", "modal"): "otag:modal",
+    # Everything with a castable primary type on some face. Scryfall's own is:spell is FACE-level
+    # and this type union is not, so the two differ on the merged type lines: +48 / 31,760 measured
+    # against api.scryfall.com on 2026-08-16 (excluding funny sets, which are not imported), with
+    # ZERO misses -- a strict superset, and the over-catch is the single-faced Artifact Lands plus
+    # Unfinity's Attractions. `-t:land` was the other candidate and is worse in both directions:
+    # 173 over, 87 under, because it drops the modal DFCs whose front face is a spell.
+    (
+        "is",
+        "spell",
+    ): "t:artifact or t:battle or t:creature or t:enchantment or t:instant or t:kindred or t:planeswalker or t:sorcery",
+    # A printing that is not a reprint IS the first printing, exactly -- not approximately. Measured
+    # on api.scryfall.com 2026-08-16: `is:firstprinting is:reprint` and `-is:firstprinting
+    # -is:reprint` are both empty, so the two partition the printing space; `e:khm` is 425 prints,
+    # 26 of them reprints and 399 first printings; `!"Lightning Bolt"` is 64 prints, 61 reprints and
+    # 3 first printings. Ties all count -- `!"Forest"` answers with BOTH lea/294 and lea/295 -- which
+    # falls out of the complement without a rule of its own. Scryfall accepts both spellings.
+    ("is", "firstprinting"): "-is:reprint",
+    ("is", "firstprint"): "-is:reprint",
 }
+
+# Every `is:` value this parser can answer at all: the derivable expansions above plus the booleans
+# the importer stores on the row. Anything else reaches the engine as a tag no row carries and comes
+# back as zero results with nothing to say why -- see `unsupported_is_warnings`. Reading
+# BOOLEAN_IS_TAGS rather than restating it is what keeps a tag added to the importer from being
+# reported unsupported by the parser.
+SUPPORTED_IS_VALUES: frozenset[str] = frozenset(BOOLEAN_IS_TAGS) | frozenset(
+    value for alias, value in _DERIVED_EXPANSIONS if alias == "is"
+)
 
 
 def _leaf_key(node: QueryNode) -> tuple[str, str] | None:
@@ -316,6 +346,41 @@ def expand_derived_predicates(query: Query) -> Query:
     return flatten_nested_operations(Query(root))
 
 
+def _collect_unsupported_is(node: QueryNode, found: list[str]) -> None:
+    """Append a warning for every `is:` leaf naming a value this server cannot answer."""
+    cls = node.__class__
+    if cls is AndNode or cls is OrNode:
+        for op in node.operands:
+            _collect_unsupported_is(op, found)
+        return
+    if cls is NotNode:
+        _collect_unsupported_is(node.operand, found)
+        return
+    key = _leaf_key(node)
+    if key is not None and key[0] == "is" and key[1] not in SUPPORTED_IS_VALUES:
+        found.append(
+            f"Unsupported term \u201cis:{key[1]}\u201d: this server has no data for that predicate, so it matched no cards.",
+        )
+
+
+def unsupported_is_warnings(query: Query) -> tuple[str, ...]:
+    """Warnings for the `is:` values in `query` that this server cannot answer, in source order.
+
+    A tag no row carries is indistinguishable from a tag every row happens to miss: both come back
+    as zero results, and the caller cannot tell an empty answer from an unimplemented predicate.
+    Scryfall answers an unknown `is:` value by IGNORING the term and warning (measured 2026-08-16:
+    `is:notarealtag e:khm` returns the whole set with "Invalid expression ... was ignored"). This
+    server keeps the term -- so the result is a no-match, not a widened one -- and says so, which is
+    the honest version of the same courtesy. Whether to adopt the ignore-and-continue policy wholesale
+    is a separate decision that touches every operator, not just this one.
+
+    Runs BEFORE `expand_derived_predicates`, which replaces exactly the leaves this reads.
+    """
+    found: list[str] = []
+    _collect_unsupported_is(query.root, found)
+    return tuple(found)
+
+
 # The post-parse rewrite pipeline, applied in order at the shared parse seam. Add future AST
 # rewrites to this tuple — both parsers call `rewrite_query`, so a new pass lands in exactly one
 # place and is guaranteed identical treatment across parsers (enforced by test_parser_parity).
@@ -325,12 +390,16 @@ _REWRITE_PASSES = (negate_not_prefix, expand_derived_predicates, lower_literal_r
 def rewrite_query(query: Query) -> Query:
     """Apply every post-parse AST rewrite, in order. The single seam both parsers call.
 
-    Order is significant: `negate_not_prefix` runs first (a `not:`-spelled leaf becomes
+    Order is significant: `unsupported_is_warnings` runs first because it reads the very leaves
+    `expand_derived_predicates` replaces; then `negate_not_prefix` (a `not:`-spelled leaf becomes
     `NotNode(is:...)`, so it reads as a plain `is:` leaf to everything after it), then
     `expand_derived_predicates` (a synonym may expand into a subtree that itself contains a
     regex or other rewritable leaf), then `lower_literal_regexes`, then any future pass
-    appended to `_REWRITE_PASSES`.
+    appended to `_REWRITE_PASSES`. The warnings are re-attached afterwards because each pass
+    returns a fresh Query.
     """
+    warnings = unsupported_is_warnings(query)
     for rewrite_pass in _REWRITE_PASSES:
         query = rewrite_pass(query)
+    query.warnings = warnings
     return query

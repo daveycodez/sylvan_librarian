@@ -46,6 +46,10 @@ from cachebox import TTLCache
 
 from api.card_processing import preprocess_card
 from api.db.bulk_upsert import bulk_upsert as _bulk_upsert
+
+# BOOLEAN_IS_TAGS lives in db_info because the parser reads it too (rewrite.SUPPORTED_IS_VALUES)
+# and cannot import this module.
+from api.parsing.db_info import BOOLEAN_IS_TAGS
 from api.scryfall_bulk_data_fetcher import BulkDataKey, ScryfallBulkDataFetcher
 from api.settings import settings
 from api.tag_import import import_art_tags as _import_art_tags
@@ -90,53 +94,6 @@ IMPORT_LOCK_TIMEOUT = 2
 # total, and it halves the logged parameter too (see log_parameter_max_length in the pg config).
 _UPSERT_PAGE_SIZE = 3_000
 
-# is: values derivable from a single boolean SQL expression against a card's own row,
-# synced in one set-based statement after each import (see _sync_boolean_is_tags) -- no
-# per-tag API sweep, unlike CUSTOM_IS_TAGS below, and no accumulation in the import loop.
-# Each expression must reference the row alias `cards` (it runs inside a correlated
-# subquery, not a plain WHERE) -- adding a tag here is the whole change. Most read
-# `cards.raw_card_blob`; hybrid/phyrexian read `cards.mana_cost_text` instead, per
-# docs/issues/done/00713-is-tag-recovery.md's own reasoning for putting them here rather
-# than in the query-rewrite table: the DSL only does exact-symbol containment, so a
-# rewrite would be a brittle ~15-term OR over an open, growing symbol set. Density-gated
-# at ~2% of the corpus (see docs/issues/00985): reserved (1.1%) and gamechanger (0.4%)
-# were the original two; the rest were added after a corpus-wide survey of every is: tag
-# on Scryfall's syntax page found these sitting at or under masterpiece's 1.8%.
-# foil/nonfoil/reprint/booster/hires (50-97%) are deliberately NOT here -- "higher
-# cardinality, memory check first" -- and stay a candidate for a separate, more careful
-# pass.
-BOOLEAN_IS_TAGS: dict[str, str] = {
-    # Alphabetized by key. Expressions read either a plain top-level boolean (reserved,
-    # gamechanger, spotlight), promo_types/keywords/finishes array membership, or a
-    # single-field lookup (set_type, preview.source).
-    "arena_league": "cards.raw_card_blob->'promo_types' @> '\"arenaleague\"'",
-    "buyabox": "cards.raw_card_blob->'promo_types' @> '\"buyabox\"'",
-    "convention": "cards.raw_card_blob->'promo_types' @> '\"convention\"'",
-    "etched": "cards.raw_card_blob->'finishes' @> '\"etched\"'",
-    "fnm": "cards.raw_card_blob->'promo_types' @> '\"fnm\"'",
-    "gamechanger": "cards.raw_card_blob->'game_changer' = 'true'::jsonb",
-    "gameday": "cards.raw_card_blob->'promo_types' @> '\"gameday\"'",
-    "giftbox": "cards.raw_card_blob->'promo_types' @> '\"giftbox\"'",
-    "glossy": "cards.raw_card_blob->'promo_types' @> '\"glossy\"'",
-    "hybrid": r"cards.mana_cost_text ~ '\{[WUBRG]/[WUBRG]\}'",
-    "instore": "cards.raw_card_blob->'promo_types' @> '\"instore\"'",
-    "intro_pack": "cards.raw_card_blob->'promo_types' @> '\"intropack\"'",
-    "judge_gift": "cards.raw_card_blob->'promo_types' @> '\"judgegift\"'",
-    "league": "cards.raw_card_blob->'promo_types' @> '\"league\"'",
-    "masterpiece": "cards.raw_card_blob->>'set_type' = 'masterpiece'",
-    "media_insert": "cards.raw_card_blob->'promo_types' @> '\"mediainsert\"'",
-    # "Partner with <name>" cards carry a plain "Partner" keyword alongside it (verified
-    # against the corpus), so checking for "Partner" alone already covers both.
-    "partner": "cards.raw_card_blob->'keywords' @> '\"Partner\"'",
-    "phyrexian": r"cards.mana_cost_text ~ '\{[WUBRG]/P\}'",
-    "planeswalker_deck": "cards.raw_card_blob->'promo_types' @> '\"planeswalkerdeck\"'",
-    "player_rewards": "cards.raw_card_blob->'promo_types' @> '\"playerrewards\"'",
-    "release": "cards.raw_card_blob->'promo_types' @> '\"release\"'",
-    "reserved": "cards.raw_card_blob->'reserved' = 'true'::jsonb",
-    "scryfallpreview": "cards.raw_card_blob->'preview'->>'source' = 'Scryfall'",
-    "set_promo": "cards.raw_card_blob->'promo_types' @> '\"setpromo\"'",
-    "spotlight": "cards.raw_card_blob->'story_spotlight' = 'true'::jsonb",
-}
 
 
 def _build_boolean_is_tags_sql(tags: dict[str, str]) -> str:

@@ -1105,6 +1105,14 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         raise ValueError(msg)
 
     def _handle_jsonb_array(self, context: QueryContext) -> str:
+        # A quoted multi-word type is a substring of the printed type line, not a member of either
+        # array — see _multi_word_type_line_needle. `type_line` is the column those arrays are
+        # derived from, and `~*` over the escaped literal is the same predicate the engine compiles
+        # (card_engine/src/filter.rs). Containment operators only: `=`/`<`/`>` compare SETS, and a
+        # substring is not one, so those keep the membership path and its (empty) answer.
+        needle = _multi_word_type_line_needle(self.lhs.attribute_name, self.rhs.value)
+        if needle is not None and self.operator in (">=", ":"):
+            return f"(card.type_line ~* {context.add(re.escape(needle))})"
         # TODO: this should produce the query as an array, not jsonb
         rhs_val = self.rhs.value.strip().title()
         if self.lhs.attribute_name.lower() in ("card_types", "card_subtypes", "type"):
@@ -1132,6 +1140,30 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
             return f"NOT(({col} <@ {query}) AND ({query} <@ {col}))"
         msg = f"Unknown operator: {self.operator}"
         raise ValueError(msg)
+
+
+# The type/subtype aliases, and the whitespace-collapsing rule a quoted multi-word value takes.
+_TYPE_ATTRS = ("card_types", "card_subtypes", "type")
+
+
+def _multi_word_type_line_needle(attribute_name: str, value: str) -> str | None:
+    """The type-line substring `t:"…"` means, or None when the value is a single type word.
+
+    A quoted multi-word type is NOT a member of the type/subtype vocabulary — `t:"artifact
+    creature"` arrives as the one token "Artifact Creature", which is neither a type nor a subtype,
+    so the containment tests below answer false for every card. Scryfall matches the quoted string
+    against the whole type line as a case-insensitive substring instead: measured on
+    api.scryfall.com 2026-08-16, `t:"artifact creature" cmc<=2` is 360 rows here and 0 before this,
+    and the rule is a plain substring rather than an and-over-words — order matters
+    (`t:"creature artifact"` is empty), neither side is word-anchored (`t:"tifact creat"` and
+    `t:"ifact creature"` both return the same 360), whitespace runs collapse (a doubled space is the
+    same query), and the em dash is ordinary text (`t:"creature — human"` matches; the hyphen
+    spelling does not). Subtype pairs behave identically: `t:"human wizard"` 6, reversed 0.
+    """
+    if attribute_name.lower() not in _TYPE_ATTRS:
+        return None
+    words = value.split()
+    return " ".join(words) if len(words) > 1 else None
 
 
 def to_card_query_ast(node: QueryNode) -> QueryNode:
