@@ -655,6 +655,9 @@ struct CardRow {
     card_artist_vid: u16,
     // The original-case artist string (see Printing.card_artist_name_id).
     card_artist_name_id: u32,
+    // The accent-folded lowercase artist, interned. Transient (CardRow is never archived): the
+    // commit pass reads it once to fill `CardData.artist_vocab_folded` at this row's vid.
+    card_artist_folded_id: u32,
     card_set_code: InlineStr<8>,
     card_layout_id: u32,
     card_border_id: u32,
@@ -1267,6 +1270,7 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
     // card object — see Printing.card_artist_name_id.
     let card_artist = opt_str(d, "card_artist");
     let card_artist_name_id = it.intern_opt(card_artist.clone());
+    let card_artist_folded_id = it.intern_opt(opt_str(d, "card_artist_folded"));
     let card_artist_vid = match card_artist {
         Some(a) => artists.intern(a.to_lowercase())?,
         None => ARTIST_NONE,
@@ -1275,6 +1279,7 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
 
     Ok(CardRow {
         card_artist_name_id,
+        card_artist_folded_id,
         scryfall_id: opt_uuid(d, "scryfall_id"),
         oracle_id: opt_uuid(d, "oracle_id"),
         illustration_id: opt_uuid(d, "illustration_id"),
@@ -2886,10 +2891,10 @@ fn assign_collector_ranks(printings: &mut [Printing], foreign: &mut [Printing], 
 /// 2,540 artists carry one (`Volkan Baǵa`, `Tomáš Honz`, `Loïc Canavaggia`). Closing it means the
 /// builder supplying a folded artist alongside the vocab; the sample above cannot see it, because
 /// no adjacent pair in it is decided by an accent.
-fn assign_artist_ranks(printings: &mut [Printing], foreign: &mut [Printing], artist_vocab: &[String]) {
+fn assign_artist_ranks(printings: &mut [Printing], foreign: &mut [Printing], artist_vocab_folded: &[String]) {
     let name_of = |p: &Printing| match p.card_artist_vid {
         ARTIST_NONE => None,
-        vid => artist_vocab.get(vid as usize).map(|n| collate_name(n)),
+        vid => artist_vocab_folded.get(vid as usize).map(|n| collate_name(n)),
     };
     assign_printing_ranks(printings, foreign, |p| (name_of(p).is_none(), name_of(p)), |p, r| p.artist_rank = r);
 }
@@ -4988,6 +4993,10 @@ struct CardData {
     // Artist predicates (contains/exact/regex) evaluate against these ~2.2k
     // strings once per query instead of per printing.
     artist_vocab: Vec<String>,
+    // Parallel to `artist_vocab` BY VID: the same artist, accent-folded, as the builder folded it.
+    // `order=artist` collates on this (see assign_artist_ranks); `a:` predicates keep binding
+    // against `artist_vocab`, so search semantics are untouched. ~2.5k strings, ~40KB.
+    artist_vocab_folded: Vec<String>,
     // Distinct hybrid mana symbols, indexed by ManaCost.hybrids ids (~29
     // entries). ManaCostCmp binds query symbols against these (see
     // MANA_SYM_UNKNOWN for symbols no card carries).
@@ -13645,7 +13654,19 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 //                rather than prefer-desc, because that is the order Scryfall serves a slot's
 //                languages in and `page_cmp` reaches it as the (cid, vpid) tiebreak — a stored
 //                ORDER, so nothing about the layout moves and only this constant can catch it.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026081604;
+//   2026081605 — `CardData` gains `artist_vocab_folded`, the artist vocab accent-folded and
+//                parallel BY VID, so `order=artist` can collate the way `order=name` does. The
+//                engine has no NFKD -- the builder owns folding, which is why `card_name_folded`
+//                arrives pre-folded -- so the fold now arrives with the row (`card_artist_folded`)
+//                and the commit pass fills the vocab from it. `a:` predicates keep binding against
+//                the UNFOLDED `artist_vocab`, so search semantics are untouched; only the sort
+//                moves. ~2.5k strings, ~40KB. No struct size changes, so only this constant can
+//                catch a stale archive -- one whose `artist_vocab_folded` is empty would rank
+//                every artist as the empty string and answer one arbitrary order for `order=artist`.
+//
+//                The deployment's vendored copy carries this as 2026081607; the two trees'
+//                in-flight stacks differ, so the numbers are no longer in step.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026081605;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -14123,6 +14144,8 @@ impl QueryEngine {
         // printing's value). Legality is the exception: a group whose rows
         // disagree gets legality_divergent set, deferring legality filters to
         // each printing's own word.
+        // Parallel to `artist_vocab` BY VID, filled from each row's fold as the commit loop walks them.
+        let mut artist_vocab_folded: Vec<String> = Vec::new();
         let mut cards: Vec<OracleCard> = Vec::new();
         let mut printings: Vec<Printing> = Vec::with_capacity(rows.len());
         let mut offsets: Vec<u32> = Vec::new();
@@ -14226,6 +14249,18 @@ impl QueryEngine {
             } else {
                 Vec::new()
             };
+            // `artist_vocab_folded[vid]`, filled the first time a row names that vid. Grown here
+            // rather than pre-sized because the artist vocab is not final until the loop ends; it
+            // is squared up to the vocab's length right after.
+            if row.card_artist_vid != ARTIST_NONE && row.card_artist_folded_id != NONE_STR {
+                let vid = row.card_artist_vid as usize;
+                if artist_vocab_folded.len() <= vid {
+                    artist_vocab_folded.resize(vid + 1, String::new());
+                }
+                if artist_vocab_folded[vid].is_empty() {
+                    artist_vocab_folded[vid].clone_from(&interner.strings[row.card_artist_folded_id as usize]);
+                }
+            }
             let is_canonical = row.is_canonical;
             let printing = Printing {
                 scryfall_id: row.scryfall_id,
@@ -14311,13 +14346,21 @@ impl QueryEngine {
         let coll_vocab = vocab.strings;
         drop(vocab.map);
         let artist_vocab = artists.strings;
+        // Square up to the vocab: a vid whose rows all lacked a fold keeps the unfolded string,
+        // which is the pre-fold behaviour rather than an empty sort key.
+        artist_vocab_folded.resize(artist_vocab.len(), String::new());
+        for (vid, folded) in artist_vocab_folded.iter_mut().enumerate() {
+            if folded.is_empty() {
+                folded.clone_from(&artist_vocab[vid]);
+            }
+        }
         drop(artists.map);
         // After the vocab is final, before the printings are archived: both ranks are stored on the
         // printing and must be in place when it is written out. Both rank over the canonical+annex
         // union — see assign_printing_ranks for why that is safe for the canonical sort order and
         // necessary for the widened one.
         assign_set_ranks(&mut printings, &mut foreign);
-        assign_artist_ranks(&mut printings, &mut foreign, &artist_vocab);
+        assign_artist_ranks(&mut printings, &mut foreign, &artist_vocab_folded);
         assign_collector_ranks(&mut printings, &mut foreign, &strings);
         order_annex_by_language(&mut foreign, &foreign_offsets, &coll_vocab);
         let mana_vocab = mana.strings;
@@ -14469,6 +14512,7 @@ impl QueryEngine {
             coll_vocab,
             coll_vocab_sorted,
             artist_vocab,
+            artist_vocab_folded,
             mana_vocab,
             indexes,
             format_shifts: format_shifts_snapshot,
