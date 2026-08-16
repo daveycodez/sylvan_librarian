@@ -1200,6 +1200,77 @@ fn expand_text_ids(idx: &Archived<OracleTextIndex>, text_ids: &[u32], n_cards: u
     expand_csr(&idx.offsets, &idx.card_indices, text_ids.iter().map(|&t| t as usize), n_cards)
 }
 
+// ─── Type-line index (#___ `t:` is a substring of the type line) ─────────────
+//
+// THE TYPE LINE IS A TINY VOCABULARY AND THAT IS THE WHOLE DESIGN. Measured on
+// the 2026-08-16 corpus: 526,865 rows carry **3,965 distinct type lines**,
+// 127 KB of text in total. Every `t:` question — the literal `t:creature`, the
+// quoted `t:"artifact creature"`, the regex `t:/^drag/` — is therefore
+// answerable by evaluating the predicate ONCE PER DISTINCT LINE at filter-bind
+// time (~4k short strings, and fewer than that in any one partition) and expanding the winners to
+// cards through a CSR. The result is not a prefilter that still has to be
+// verified: it is the exact card set, so the candidate arrives `tight` and the
+// per-card pass never re-runs the predicate.
+//
+// This is the same shape `OracleTextIndex` uses for oracle text and
+// `FlavorIndex` for flavor text (bind-time evaluation over the distinct values,
+// ids afterwards) — the difference is only that the type-line vocabulary is
+// three orders of magnitude smaller, which is why no trigram tier is needed to
+// make the scan affordable.
+//
+// WHY THIS EXISTS AT ALL: `t:` used to compile to the 14-bit type mask or to
+// subtype-vocabulary membership, and a single token that is not a whole type or
+// subtype matched nothing — `t:creat cmc<=2 e:khm` answered 0 where Scryfall
+// answers 39. The quoted multi-word case had already been rerouted to a regex
+// over `TextField::TypeLine`, which was CORRECT but had no narrowing arm at all
+// (there is no trigram index over type lines and the #734 literal-factor arm is
+// guarded to name/oracle), so it scanned the corpus. Both are now the same
+// path, and that path narrows exactly.
+#[derive(Archive, Serialize, Deserialize, Default)]
+struct TypeLineIndex {
+    /// Dense type-line id → global string id (CardData.strings) of the distinct
+    /// type line, in first-seen card order. Length n_lines.
+    gids: Vec<u32>,
+    /// The same lines, lowercased, so a literal `t:` needle is a `memmem` scan
+    /// rather than a case-insensitive regex. THAT IS THE WHOLE COST OF THE
+    /// FEATURE, and it was measured before it was paid: matching `(?i)creature`
+    /// against ~3k mixed-case lines costs ~160 us per query, because the regex
+    /// crate's prefilter fires on every case variant of the first byte and then
+    /// runs the automaton; the same scan over pre-lowercased bytes is ~5 us.
+    /// A user's own `t:/…/` still runs against the ORIGINAL line (`gids`) — its
+    /// pattern may say things about case that folding the haystack would
+    /// change.
+    lower: Vec<String>,
+    /// Row boundaries: cards of line id `t` live at
+    /// `card_indices[offsets[t] .. offsets[t + 1]]`. Length n_lines + 1.
+    offsets: Vec<u32>,
+    /// All card indices grouped by line id; every card carries exactly one
+    /// interned type line, so expansion can never duplicate.
+    card_indices: Vec<u32>,
+}
+
+fn build_type_line_index(cards: &[OracleCard], strings: &[String]) -> TypeLineIndex {
+    let mut dense: HashMap<u32, u32> = HashMap::new();
+    let mut line_id_of_card: Vec<u32> = Vec::with_capacity(cards.len());
+    for c in cards {
+        let next = dense.len() as u32;
+        line_id_of_card.push(*dense.entry(c.type_line_id).or_insert(next));
+    }
+    let mut gids: Vec<u32> = vec![0; dense.len()];
+    for (&global, &d) in &dense {
+        gids[d as usize] = global;
+    }
+    let lower: Vec<String> =
+        gids.iter().map(|&g| strings.get(g as usize).map(|s| s.to_lowercase()).unwrap_or_default()).collect();
+    let (offsets, card_indices) = build_csr(dense.len(), line_id_of_card.len(), |i| Some(line_id_of_card[i] as usize));
+    TypeLineIndex { gids, lower, offsets, card_indices }
+}
+
+/// Expand surviving dense type-line ids to card indices via the CSR table.
+fn expand_type_line_ids(idx: &Archived<TypeLineIndex>, line_ids: &[u32], n_cards: usize) -> Vec<u32> {
+    expand_csr(&idx.offsets, &idx.card_indices, line_ids.iter().map(|&t| t as usize), n_cards)
+}
+
 // ─── Name bigram index (#639 short-name narrowing) ──────────────────────────
 // Trigram narrowing needs a 3-byte needle, so 2-character name searches (the
 // typeahead shape: name:fi, name:dr) full-scanned with per-card substring
@@ -3151,6 +3222,11 @@ fn guard_env<T: std::str::FromStr>(name: &str, default: T) -> T {
 // still wins ~1.06-1.15× there).
 static MAX_NARROW_FRACTION: LazyLock<f64> = LazyLock::new(|| guard_env("CARD_ENGINE_MAX_NARROW_FRACTION", 0.25));
 
+/// Benchmark-only: skip the type-line index and let every `t:` predicate run as a per-card regex.
+/// See `FilterExpr::bind_type_lines`.
+pub(crate) static NO_TYPE_LINE_INDEX: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("CARD_ENGINE_NO_TYPE_LINE_INDEX").is_ok_and(|v| v == "1"));
+
 /// A different crossover from `MAX_NARROW_FRACTION` above, for a different decision: whether
 /// `printing_compose_fastpath`'s permutation-free `gather_composed_page` fallback is worth its
 /// build cost (see that function's doc). `MAX_NARROW_FRACTION` answers "does narrowing shrink the
@@ -3575,6 +3651,7 @@ fn narrow_rarity(indexes: &Archived<CardIndexes>, n_cards: usize, op: CmpOp, val
 struct CardIndexes {
     name_trigram:   SortedTrigramIndex, // card space
     oracle_trigram: OracleTextIndex, // card space (via dense text ids)
+    type_lines:     TypeLineIndex,   // card space (via dense type-line ids)
     cmc:            NumericIndex,    // card space
     power:          NumericIndex,    // card space
     toughness:      NumericIndex,    // card space
@@ -4666,6 +4743,39 @@ fn narrow_rec(
                     }
                     Narrowed::tight(Candidates::CardBits(acc))
                 }
+            }
+        }
+
+        // Every `t:` predicate, resolved by `bind_type_lines` to the dense ids of
+        // the type lines that satisfy it. The CSR row of a line id is exactly
+        // the cards carrying that line, so the union is the exact match set:
+        // TIGHT, with no verification pass. This is the arm that did not exist
+        // when the quoted `t:"artifact creature"` case was first rerouted to a
+        // TypeLine regex — there is no trigram index over type lines and the
+        // #734 factor arm below is guarded to name/oracle, so that leaf fell all
+        // the way through to the catch-all and scanned the corpus.
+        FilterExpr::TypeLineMatch { line_ids, .. } => {
+            // A BITMAP FOR A BROAD TYPE, a posting list for a narrow one — the same 1/32 density
+            // rule `HybridTagIndex` stores by, applied to the candidate REPRESENTATION. The CSR
+            // row lengths give the exact card count before anything is materialized, so the
+            // choice costs one pass over `offsets`.
+            //
+            // It matters because `t:creature` is 1,875 of a partition's 3,281 cards. As a sorted
+            // `Vec<u32>` that set is 7.5 KB the query then gathers by random access; as a bitmap
+            // it is 410 bytes the downstream algebra ANDs a word at a time — which is exactly the
+            // shape `TypeCmp` used to hand it from the type bit planes, and why replacing the
+            // mask with an index does not have to cost anything. Measured on p0 of the 2026-08-16
+            // store (3,281 cards): `t:creature` 288 us as a vector against a 88 us paging floor,
+            // 95 us as a bitmap; `t:elf` (65 cards) keeps its posting list at 65 us.
+            let k: usize = line_ids
+                .iter()
+                .map(|&t| (u32::from(indexes.type_lines.offsets[t as usize + 1]) - u32::from(indexes.type_lines.offsets[t as usize])) as usize)
+                .sum();
+            let ids = expand_type_line_ids(&indexes.type_lines, line_ids, n_cards);
+            if bitmap_beats_postings(k, n_cards) {
+                Narrowed::tight(Candidates::CardBits(scatter_bits(ids, n_cards)))
+            } else {
+                Narrowed::tight(Candidates::Cards(ids))
             }
         }
 
@@ -11744,7 +11854,13 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 // are `AOracleCard` and `APrinting`, and neither moves, because the change is entirely inside
 // `CardIndexes`. So this constant is the only thing stopping a reader from accessing an older
 // store's `HashMap<String, Vec<u32>>` as a `HybridTagIndex` through `access_unchecked`.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026081301;
+//
+// 2026082301 — `t:` IS A SUBSTRING OF THE TYPE LINE. `CardIndexes` gains `type_lines`, a
+// `TypeLineIndex` over the corpus's distinct type lines, so every `t:` predicate is resolved once
+// per distinct line at bind time and expands to an exact card set. No struct size moves, so the
+// header cannot catch this on its own: a store without the index would answer every `t:` query
+// with zero rows.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026082301;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -11882,6 +11998,10 @@ fn bind_and_split_filter(
     let mut filter_expr = build_filter(&json_val)
         .map_err(|e| QueryError::new_err(format!("build_filter: {e}")))?;
     filter_expr.bind(&data.coll_vocab, &data.coll_vocab_sorted, &data.artist_vocab, &data.mana_vocab, &data.indexes.flavor, &data.strings);
+    // The second half of binding, split out because `bind` predates the type-line index and is
+    // called from a dozen benches and tests that never build one. THE TWO BELONG TOGETHER: every
+    // production filter reaches the engine through here.
+    filter_expr.bind_type_lines(&data.indexes.type_lines, &data.strings);
 
     // Read before the split consumes the tree.
     let sort_bound = sort_col_bound(&filter_expr, sort_col);
@@ -12300,6 +12420,7 @@ impl QueryEngine {
         let indexes = CardIndexes {
             name_trigram:   build_trigram_index(&cards, |c| c.card_name_folded.as_str()),
             oracle_trigram: build_oracle_text_index(&cards, &strings),
+            type_lines:     build_type_line_index(&cards, &strings),
             cmc:            build_numeric_index(&cards, |c| c.cmc.map(|v| v as i16)),
             power:          build_numeric_index(&cards, |c| c.creature_power.map(|v| v as i16)),
             toughness:      build_numeric_index(&cards, |c| c.creature_toughness.map(|v| v as i16)),

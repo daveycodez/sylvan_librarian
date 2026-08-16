@@ -1,7 +1,7 @@
 use memchr::memmem;
 use serde_json::Value;
 use super::regex_compat::{CompiledRegex, QUERY_REGEX_FLAGS};
-use super::{AOracleCard, APrinting, AStrings, str_at, mana_lane, lane_add, lanes_ge, LANES6_HI, LANES8_HI, mana_pip_counts, mana_cmc, color_list_to_mask, card_type_str_to_bit, trigram_candidates, trigram_min_posting, ARTIST_NONE, NONE_STR, FlavorIndex, NameBigramIndex, OracleTextIndex, SortedTrigramIndex, flavor_fingerprint, flavor_match_sets};
+use super::{AOracleCard, APrinting, AStrings, str_at, mana_lane, lane_add, lanes_ge, LANES6_HI, LANES8_HI, mana_pip_counts, mana_cmc, color_list_to_mask, card_type_str_to_bit, trigram_candidates, trigram_min_posting, ARTIST_NONE, NONE_STR, FlavorIndex, NameBigramIndex, NO_TYPE_LINE_INDEX, OracleTextIndex, SortedTrigramIndex, TypeLineIndex, flavor_fingerprint, flavor_match_sets};
 use super::legality::{LEGALITY_LEGAL, LEGALITY_BANNED, LEGALITY_RESTRICTED, format_shift};
 
 // ─── Comparison / arithmetic operators ───────────────────────────────────────
@@ -477,6 +477,20 @@ pub(crate) enum FilterExpr {
     OracleMatch {
         gids: Vec<u32>,
     },
+    /// A literal `t:` needle, already lowercased and whitespace-collapsed, before
+    /// `bind_type_lines` resolves it. Separate from `TextRegex { TypeLine }` for
+    /// speed alone — the semantics are identical (`regex::escape` of this needle
+    /// under `(?i)` matches the same lines) — but a case-insensitive regex over
+    /// ~3k mixed-case type lines costs ~160 us per query where `memmem` over the
+    /// index's pre-lowercased copies costs ~5 us, and `t:` is the most common
+    /// filter there is.
+    TypeLineContains {
+        needle: String,
+    },
+    TypeLineMatch {
+        gids: Vec<u32>,
+        line_ids: Vec<u32>,
+    },
     TextExact {
         field: TextField,
         op: CmpOp,
@@ -636,12 +650,18 @@ pub(crate) fn verify_cost_tier(f: &FilterExpr) -> u32 {
     match f {
         FilterExpr::TextRegex { regex, .. } if regex.is_backtracking() => REGEX_BACKTRACK_NS100,
         FilterExpr::TextRegex { regex, .. } => regex_tier(regex.as_str()),
-        FilterExpr::TextContains { .. } => TEXT_SCAN_NS100,
+        // Unbound only (see tri()): a lowercasing scan of the type line, the same tier as any
+        // other per-card text scan.
+        FilterExpr::TypeLineContains { .. } | FilterExpr::TextContains { .. } => TEXT_SCAN_NS100,
         FilterExpr::Devotion { .. } | FilterExpr::ManaCostCmp { .. } => SET_LOOKUP_NS100,
         FilterExpr::ArtistMatch { .. }
         | FilterExpr::FlavorMatch { .. }
         | FilterExpr::NameMatch { .. }
         | FilterExpr::OracleMatch { .. }
+        // A binary search over the distinct type-line ids, the same shape as
+        // OracleMatch's — and the whole point of the rewrite is that this
+        // replaces regex_tier's REGEX_MACHINERY_NS100 for every `t:` predicate.
+        | FilterExpr::TypeLineMatch { .. }
         | FilterExpr::CollectionCmp { .. } => SET_LOOKUP_NS100,
         FilterExpr::And(children) | FilterExpr::Or(children) => {
             children.iter().map(verify_cost_tier).max().unwrap_or(0)
@@ -797,6 +817,11 @@ fn leaf_compares_printing_field(f: &FilterExpr) -> bool {
         | FilterExpr::ExactName(_)
         | FilterExpr::NameMatch { .. }
         | FilterExpr::OracleMatch { .. }
+        // The type line is oracle data (TextField::TypeLine reads the card, not
+        // the printing), so both the needle and the resolved id set are
+        // card-invariant.
+        | FilterExpr::TypeLineContains { .. }
+        | FilterExpr::TypeLineMatch { .. }
         | FilterExpr::ColorCmp { .. }
         | FilterExpr::TypeCmp { .. }
         | FilterExpr::ManaCostCmp { .. }
@@ -844,6 +869,12 @@ fn and_child_set_len(f: &FilterExpr) -> usize {
         FilterExpr::ArtistMatch { ids } => ids.len(),
         FilterExpr::NameMatch { ids } => ids.len(),
         FilterExpr::FlavorMatch { gids, .. } | FilterExpr::OracleMatch { gids } => gids.len(),
+        // Distinct type lines, not cards — a strictly smaller number than the
+        // card set it expands to, so a `t:` leaf sorts ahead of set-sized
+        // siblings it is in fact broader than. That is the same approximation
+        // the four above make (ids are values, not rows) and it only orders
+        // verification, never correctness.
+        FilterExpr::TypeLineMatch { gids, .. } => gids.len(),
         _ => usize::MAX,
     }
 }
@@ -1028,6 +1059,76 @@ impl FilterExpr {
         const MEMO_DOMAIN_FACTOR: usize = 2;
         const MEMO_DOMAIN_FLOOR: usize = 2_048;
         eval_domain >= (bind_bound * MEMO_DOMAIN_FACTOR).max(MEMO_DOMAIN_FLOOR.min(n_rows / 4))
+    }
+
+    /// Resolve every type-line predicate against the distinct type lines, the
+    /// second half of `bind()` — split out only because `bind()` predates the
+    /// index and is called from a dozen benches and tests that have no use for
+    /// it. `bind_and_split_filter` calls the two together and nothing else
+    /// should call one without the other.
+    ///
+    /// UNCONDITIONAL, unlike `memoize_text_predicates`. That rewrite is gated on
+    /// a cost model because it scans ~30k distinct oracle texts; this one walks
+    /// **3,965** distinct type lines totalling 127 KB (measured on the 2026-08-16
+    /// corpus, 526,865 rows) — fewer in any one partition — so there is no query
+    /// for which paying it is worse
+    /// than the per-card regex it replaces — and it is what turns a type
+    /// predicate from "no narrowing arm exists" into an exact card set.
+    ///
+    /// The answer is EXACT, not a prefilter: a card's whole type-line identity
+    /// is its interned id, so "the predicate held for these lines" is precisely
+    /// "these cards match". `narrow_rec` returns it `tight` for that reason.
+    pub(crate) fn bind_type_lines(&mut self, idx: &rkyv::Archived<TypeLineIndex>, strings: &AStrings) {
+        // MEASUREMENT ESCAPE HATCH, the same shape as CARD_ENGINE_MAX_NARROW_FRACTION and there
+        // for the same reason: the gate's ratios only mean something if the unnarrowed state can
+        // be measured too. With this set, `t:` keeps its (correct) substring semantics and falls
+        // back to running the regex against every card's type line — the naive shape this index
+        // exists to avoid. Never set in production; `guard_env` defaults it off.
+        if *NO_TYPE_LINE_INDEX {
+            return;
+        }
+        match self {
+            FilterExpr::And(children) | FilterExpr::Or(children) => {
+                for c in children.iter_mut() {
+                    c.bind_type_lines(idx, strings);
+                }
+            }
+            FilterExpr::Not(inner) => inner.bind_type_lines(idx, strings),
+            FilterExpr::TypeLineContains { .. } | FilterExpr::TextRegex { field: TextField::TypeLine, .. } => {
+                // The literal scans the index's lowercased copies with a SIMD `memmem`; a user's
+                // own `t:/…/` runs against the original line, where its pattern's own case
+                // expectations still mean what they say.
+                enum Needle<'a> {
+                    Literal(memmem::Finder<'a>),
+                    Pattern(&'a CompiledRegex),
+                }
+                let needle = match self {
+                    FilterExpr::TypeLineContains { needle } => Needle::Literal(memmem::Finder::new(needle.as_bytes())),
+                    FilterExpr::TextRegex { regex, .. } => Needle::Pattern(regex),
+                    _ => unreachable!("guarded by the match arm above"),
+                };
+                let mut gids: Vec<u32> = Vec::new();
+                let mut line_ids: Vec<u32> = Vec::new();
+                for (d, gid) in idx.gids.iter().enumerate() {
+                    let gid = u32::from(*gid);
+                    let hit = match &needle {
+                        Needle::Literal(finder) => idx.lower.get(d).is_some_and(|l| finder.find(l.as_bytes()).is_some()),
+                        Needle::Pattern(re) => str_at(strings, gid).is_some_and(|s| re.is_match(s)),
+                    };
+                    if hit {
+                        gids.push(gid);
+                        line_ids.push(d as u32);
+                    }
+                }
+                // `line_ids` comes out ascending (dense order); `gids` follows
+                // first-seen order and has to be sorted for the binary search in
+                // tri(). Distinct dense ids intern to distinct strings, so there
+                // are no duplicates to dedup.
+                gids.sort_unstable();
+                *self = FilterExpr::TypeLineMatch { gids, line_ids };
+            }
+            _ => {}
+        }
     }
 
     pub(crate) fn memoize_text_predicates(
@@ -1399,6 +1500,29 @@ impl FilterExpr {
                     Tri::Null
                 } else {
                     tri_bool(gids.binary_search(&gid).is_ok())
+                }
+            }
+
+            // The type line is interned per distinct string, so a card's line id
+            // IS its type-line identity: `bind_type_lines` already decided which
+            // ids satisfy the predicate, and there is nothing left to re-derive
+            // here. Missing type lines intern "" (never NONE_STR — see
+            // `type_line_id`'s `unwrap_or_default` at load), so this is
+            // two-valued like NameMatch rather than three-valued like
+            // OracleMatch.
+            FilterExpr::TypeLineMatch { gids, .. } => {
+                tri_bool(gids.binary_search(&u32::from(card.type_line_id)).is_ok())
+            }
+
+            // Only reachable when `bind_type_lines` did not run — a bench or a test that calls
+            // `bind` alone, or the CARD_ENGINE_NO_TYPE_LINE_INDEX measurement mode. Correct, and
+            // deliberately the slow way round: one allocation per card is what the index exists to
+            // remove, so a path that starts paying it is easy to spot in a profile.
+            FilterExpr::TypeLineContains { needle } => {
+                match text_field_value(card, printing, strings, TextField::TypeLine) {
+                    StrVal::Known(s) => tri_bool(s.to_lowercase().contains(needle.as_str())),
+                    StrVal::Null => Tri::Null,
+                    StrVal::PDep => Tri::PrintingDep,
                 }
             }
 
@@ -1822,31 +1946,44 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
         return Ok(FilterExpr::Legality { shift: format_shift(format), expected });
     }
 
-    // A MULTI-WORD type value is a substring of the printed type line, not a member of the
-    // type/subtype vocabulary. `t:"artifact creature"` reaches here as the single title-cased token
-    // "Artifact Creature", which is not a type and not a subtype, so both branches below resolve it
-    // to a membership test nothing satisfies -- 404 where Scryfall answers 360 (`cmc<=2`, 2026-08-16).
+    // A `t:` VALUE IS A SUBSTRING OF THE PRINTED TYPE LINE, not a member of the type/subtype
+    // vocabulary — for a single word exactly as much as for a quoted phrase.
     //
-    // Scryfall's rule, measured that day and not guessed: the quoted string is matched against the
-    // whole type line as a case-insensitive substring, with runs of whitespace collapsed. Order
-    // matters (`t:"creature artifact"` is empty), it is not word-anchored on either side
-    // (`t:"tifact creat"` and `t:"ifact creature"` both return the same 360), a doubled space is the
-    // same query, and the em dash is ordinary text (`t:"creature — human"` matches, `t:"creature -
-    // human"` does not). Subtype pairs behave identically -- `t:"human wizard"` 6, reversed 0.
+    // Scryfall's rule, MEASURED against api.scryfall.com on 2026-08-16 over `e:khm` (323 prints)
+    // and not guessed:
     //
-    // Compiled as a regex over the escaped literal so the existing TypeLine path carries it: that
-    // gives the case folding for free (`CompiledRegex::new` prepends the query flags) and keeps the
-    // #734 literal-factor trigram narrowing, which a bare substring comparison here would not have.
-    // Containment operators only: `=`/`<`/`>` are set comparisons on the type arrays, and a
-    // substring is not a set.
-    if matches!(attr, "card_types" | "card_subtypes") && matches!(op, ":" | ">=") {
+    //   t:creature 151   t:creat 151   t:reature 151   t:eatur 151   -> unanchored on both sides
+    //   t:snow 47        t:no 47                                     -> "no" inside "Snow"
+    //   t:elf 22         t:lf 25                                     -> "lf" also inside "Wolf"
+    //   t:CREAT 39 = t:Creat 39 = t:creat 39 (with cmc<=2)           -> case-insensitive
+    //   t:legend 42 = t:legendary 42                                 -> supertypes are in the line
+    //   t:— 227 = t:"—" 227                                          -> the em dash is ordinary text
+    //   t:"// creature" 182, t:"creature //" 0                       -> the " // " face join is too
+    //   -t:creat 172, and 151 + 172 = 323                            -> negation is a plain complement
+    //   t=creature 151 = t:creature, t="legendary creature" 32       -> `=` is the same substring
+    //   t:artifactcreature 0, t:"artifact creature" 360              -> not a token-set test
+    //
+    // and for a phrase, whitespace runs collapse (`t:"artifact  creature"` is the same query),
+    // order matters (`t:"creature artifact"` is empty) and it is not word-anchored either
+    // (`t:"tifact creat"` returns the same 360).
+    //
+    // Everything above is one rule — case-insensitive substring of the whole type line — so this
+    // compiles single tokens and phrases identically, as a regex over the escaped literal. The
+    // regex is not for its own sake: `bind()` rewrites EVERY TypeLine regex (this one and the
+    // user's own `t:/…/`) into a `TypeLineMatch` by running it over the ~1,519 distinct type lines
+    // in the corpus, which is both the case folding and the narrowing. See `TypeLineIndex`.
+    //
+    // WHICH OPERATORS. `:` and `>=` are containment and `=` is measurably the same substring test
+    // on Scryfall (`t=creature` 151, `t="legendary creature"` 32 — set equality would answer 0
+    // there, since no card's type array is exactly ["Creature"] once subtypes exist). `<`, `<=`,
+    // `>` and `!=` keep upstream's set-comparison meaning: Scryfall has no answer to compare
+    // against (`t>=creature` and `t!=creature` both return zero rows there), so there is nothing
+    // to follow, and this port's superset stays.
+    if matches!(attr, "card_types" | "card_subtypes") && matches!(op, ":" | ">=" | "=") {
         let raw = rhs.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()).unwrap_or("");
-        let mut words = raw.split_whitespace();
-        let (first, second) = (words.next(), words.next());
-        if let (Some(first), Some(second)) = (first, second) {
-            let needle = std::iter::once(first).chain(std::iter::once(second)).chain(words).collect::<Vec<_>>().join(" ");
-            let re = CompiledRegex::new(&regex::escape(&needle))?;
-            return Ok(FilterExpr::TextRegex { field: TextField::TypeLine, regex: re });
+        let needle = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !needle.is_empty() {
+            return Ok(FilterExpr::TypeLineContains { needle: needle.to_lowercase() });
         }
     }
 
