@@ -112,14 +112,22 @@ def create_test_card(  # noqa: PLR0913, PLR0917
 class TestCardProcessing:
     """Test card processing functions."""
 
-    def test_preprocess_card_filters_non_paper_cards(self) -> None:
-        """Test preprocess_card filters out non-paper cards."""
-        invalid_card = create_test_card(
+    def test_preprocess_card_keeps_non_paper_cards(self) -> None:
+        """A digital-only printing is IMPORTED: Scryfall serves it with default parameters.
+
+        Measured against api.scryfall.com 2026-08-16: `q=!"A-Tyvar Kell"` answers khm/A-198 and
+        `q=is:rebalanced` answers 216 cards, both from a bare `/cards/search`. Unlike the tokens,
+        funny sets and memorabilia the other filters here stand in for, nothing hides a digital
+        printing behind `include_extras` — so dropping the row was the one filter in
+        `preprocess_card` that made an ordinary query disagree.
+        """
+        digital_card = create_test_card(
             games=["mtgo"],  # Not paper
         )
 
-        result = preprocess_card(invalid_card)
-        assert result == []
+        result = preprocess_card(digital_card)
+        assert len(result) == 1
+        assert result[0]["card_name"] == "Test Card"
 
     def test_preprocess_card_merges_double_faced_cards_into_one_row(self) -> None:
         """A multi-face card produces exactly ONE row, so faces no longer fight for the PK.

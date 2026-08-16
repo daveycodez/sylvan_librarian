@@ -208,11 +208,19 @@ _EXTERNAL_ID_COLUMNS: dict[str, tuple[str, ...]] = {
 
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
-# Thresholds for the typo-tolerant stage of `?fuzzy=`. A candidate must score at least the floor,
-# and the best must lead the next distinct card name by at least the lead — closer than that and
-# the query does not identify either card, so it is `ambiguous` rather than a guess. The floor sits
-# deliberately above pg_trgm's default 0.3 similarity_threshold, so the index-assisted `%`
-# prefilter always admits a strict superset of what the floor keeps.
+# Thresholds for the SQL fallback's typo-tolerant `?fuzzy=` stage, which scores with pg_trgm. A
+# candidate must score at least the floor, and the best must lead the next distinct card name by at
+# least the lead — closer than that and the query does not identify either card, so it is
+# `ambiguous` rather than a guess. The floor sits deliberately above pg_trgm's default 0.3
+# similarity_threshold, so the index-assisted `%` prefilter always admits a strict superset of what
+# the floor keeps.
+#
+# THESE ARE NO LONGER THE ENGINE'S. The engine scores a different metric — Scryfall's, derived from
+# 86 probed needles; see card_engine's `Fuzzy name matching` module comment — with its own fitted
+# floor and lead, which it now supplies as the defaults of `fuzzy_card_by_name`. The two paths
+# therefore resolve a handful of needles differently (`fuzzy=bolt lightning` is Blightning through
+# the engine and Lightning Bolt through pg_trgm, and Scryfall says Blightning). That is deliberate:
+# the engine is the path that serves, and matching Scryfall is what this surface is for.
 FUZZY_SIMILARITY_FLOOR = 0.4
 FUZZY_SIMILARITY_LEAD = 0.05
 
@@ -1163,12 +1171,10 @@ class ScryfallCardsRoutes:
             engine = self._engine_for_lookup()
             if engine is not None:
                 try:
-                    status, row = engine.fuzzy_card_by_name(
-                        needle,
-                        FUZZY_SIMILARITY_FLOOR,
-                        FUZZY_SIMILARITY_LEAD,
-                        list(CARD_OBJECT_FIELDS),
-                    )
+                    # No thresholds: they belong to the engine's own metric, which is not
+                    # pg_trgm's, and passing the SQL path's would score one metric by the other's
+                    # bar. See FUZZY_SIMILARITY_FLOOR above.
+                    status, row = engine.fuzzy_card_by_name(needle, fields=list(CARD_OBJECT_FIELDS))
                     if status == "ambiguous":
                         return _AMBIGUOUS
                     if status == "miss":

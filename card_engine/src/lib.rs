@@ -3201,22 +3201,6 @@ struct PrintedNameIndex {
     trigrams: SortedTrigramIndex,
 }
 
-/// The first record of `idx` whose folded name is exactly `folded`, or None.
-///
-/// Records are sorted by (name bytes, lang id), so this is a binary search — O(log 546) over the
-/// flavor index, O(log 247k) over the printed one. The FIRST record of a run is the answer:
-/// within one name the records run by language, and each record's vpids are best-prefer-first,
-/// so record.vpids[0] of the first record is the printing Scryfall names.
-pub(crate) fn record_of_exact_name(idx: &Archived<PrintedNameIndex>, strings: &AStrings, folded: &str) -> Option<usize> {
-    let name_of = |rec: usize| str_at(strings, u32::from(idx.name_ids[rec])).unwrap_or("");
-    let (mut lo, mut hi) = (0usize, idx.name_ids.len());
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if name_of(mid) < folded { lo = mid + 1 } else { hi = mid }
-    }
-    (lo < idx.name_ids.len() && name_of(lo) == folded).then_some(lo)
-}
-
 /// Build a name-record index from both spaces, keyed by whichever folded name `key_of` picks —
 /// `printed_name_folded_id` for `CardIndexes::printed_names`, `flavor_name_folded_id` for
 /// `flavor_names`. One temporary entry per printing carrying that name, so both are
@@ -3479,16 +3463,6 @@ impl<'a> FuzzyRace<'a> {
             (Some((score, _, _, _)), Some(second)) if score - second < lead => FuzzyOutcome::Ambiguous,
             (Some((_, cid, vpid, _)), _) => FuzzyOutcome::Hit { cid, vpid },
         }
-    }
-}
-
-/// The owning card of a virtual printing id, via the direct arrays of whichever space it is in.
-pub(crate) fn card_of_vpid(data: &Archived<CardData>, vpid: u32) -> u32 {
-    let n = data.printings.len() as u32;
-    if vpid < n {
-        u32::from(data.indexes.printing_to_card[vpid as usize])
-    } else {
-        u32::from(data.indexes.foreign_to_card[(vpid - n) as usize])
     }
 }
 
@@ -14964,7 +14938,10 @@ impl QueryEngine {
     /// Returns `(status, card)` where status is "hit", "ambiguous" or "miss". Ambiguous is a
     /// distinct answer rather than a miss: Scryfall reports it with the candidates it could not
     /// separate, and collapsing it to "not found" would tell the client the card does not exist.
-    #[pyo3(signature = (name, floor, lead, fields=None))]
+    /// `floor` and `lead` DEFAULT to the fitted thresholds (see the `Fuzzy name matching` module
+    /// comment): they belong to the metric, not to the caller, and a Python-side copy of them
+    /// drifts the moment the metric is refitted. They stay arguments so a test can sweep them.
+    #[pyo3(signature = (name, floor=FUZZY_SCORE_FLOOR, lead=FUZZY_SCORE_LEAD, fields=None))]
     fn fuzzy_card_by_name<'py>(
         &self,
         py: Python<'py>,
