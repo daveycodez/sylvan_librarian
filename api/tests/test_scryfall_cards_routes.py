@@ -985,19 +985,28 @@ class TestCollection:
         )
         assert body["data"][0]["id"] == BOLT_ID
 
-    def test_over_the_limit_is_a_422(self, compat_corpus: APIResource):
+    def test_over_the_limit_is_scryfalls_400_not_a_422(self, compat_corpus: APIResource):
+        """`400 bad_request` with Scryfall's own sentence, measured 2026-08-16.
+
+        This asserted a `422 validation_error` with wording of its own, so a client string-matching
+        Scryfall's message saw neither the status nor the text it was matching on.
+        """
         resp = dispatch(
             compat_corpus,
             "/cards/collection",
             method="POST",
             body={"identifiers": [{"id": BOLT_ID}] * 76},
         )
-        assert resp.status == falcon.HTTP_422
-        assert payload(resp)["code"] == "validation_error"
+        assert resp.status == falcon.HTTP_400
+        body = payload(resp)
+        assert body["code"] == "bad_request"
+        assert body["details"] == "The `identifiers` list must have at least 1 and no more than 75 references."
 
-    def test_a_body_without_identifiers_is_a_422(self, compat_corpus: APIResource):
+    def test_a_body_without_identifiers_is_the_count_sentence(self, compat_corpus: APIResource):
+        """An ABSENT list reads as an empty one, so it earns the count sentence rather than its own."""
         resp = dispatch(compat_corpus, "/cards/collection", method="POST", body={"cards": []})
-        assert resp.status == falcon.HTTP_422
+        assert resp.status == falcon.HTTP_400
+        assert payload(resp)["details"] == "The `identifiers` list must have at least 1 and no more than 75 references."
 
     def test_get_is_not_allowed(self, compat_corpus: APIResource):
         with pytest.raises(falcon.HTTPMethodNotAllowed):
