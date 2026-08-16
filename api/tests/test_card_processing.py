@@ -811,10 +811,18 @@ class TestEngineCardObjects:
     """
 
     @staticmethod
-    def _two_faced() -> dict:
-        """A transform card whose two faces disagree on every per-face field that matters."""
+    def _two_faced(
+        artist: str | None = None,
+        face_artists: tuple[str, str] = ("Front Artist", "Back Artist"),
+    ) -> dict:
+        """A transform card whose two faces disagree on every per-face field that matters.
+
+        `artist` is the CARD-level credit Scryfall sends beside the faces — joined with " & " when
+        the two faces have different artists, and the single name when they share one.
+        """
         return create_test_card(
             name="Front Test // Back Test",
+            artist=artist,
             layout="transform",
             lang="en",
             set_type="expansion",
@@ -831,7 +839,7 @@ class TestEngineCardObjects:
                     "toughness": "2",
                     "oracle_text": "Front text.",
                     "flavor_text": "Front flavor.",
-                    "artist": "Front Artist",
+                    "artist": face_artists[0],
                     "illustration_id": "11111111-1111-1111-1111-111111111111",
                 },
                 {
@@ -842,7 +850,7 @@ class TestEngineCardObjects:
                     "power": "3",
                     "toughness": "3",
                     "oracle_text": "Back text.",
-                    "artist": "Back Artist",
+                    "artist": face_artists[1],
                     "illustration_id": "22222222-2222-2222-2222-222222222222",
                 },
             ],
@@ -856,6 +864,23 @@ class TestEngineCardObjects:
         assert faces[1]["illustration_id"] == "22222222-2222-2222-2222-222222222222"
         assert faces[0]["artist"] == "Front Artist"
         assert faces[1]["artist"] == "Back Artist"
+
+    def test_a_cards_artist_is_scryfalls_and_never_a_faces(self) -> None:
+        """The card's joined credit survives the face overlay, and a shared one is not doubled.
+
+        `card_artist` is read off the merged dict, and the face overlay had already put face 0's
+        `artist` there — so a card drawn by two people was credited to the front one alone. Taking
+        Scryfall's own card-level string rather than joining the faces is what makes the shared
+        case right for free: two faces by one artist keep the single name.
+        """
+        two = preprocess_card(self._two_faced(artist="Front Artist & Back Artist"))[0]
+        assert two["card_artist"] == "Front Artist & Back Artist"
+        assert [face["artist"] for face in two["card_faces"]] == ["Front Artist", "Back Artist"]
+
+        shared = preprocess_card(
+            self._two_faced(artist="Solo Artist", face_artists=("Solo Artist", "Solo Artist")),
+        )[0]
+        assert shared["card_artist"] == "Solo Artist"
 
     def test_back_face_stats_survive_the_merge(self) -> None:
         """Both faces' stats stay reachable, retiring the merge's documented residual.

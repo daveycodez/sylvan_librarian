@@ -500,6 +500,20 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
         # The printed-language COLUMNS are the card-level triple. The per-face recursion above
         # merged each face's own printed keys into its row, so without this the front face's
         # printed_name would masquerade as the card's — the per-face halves ride card_faces.
+        # ...and so is the ARTIST. A card drawn by two people carries the JOINED credit at card
+        # level ("David Martin & Franz Vohwinkel" on Fire // Ice, dmr/215) and the per-face credit
+        # inside card_faces, so the same face overlay put face 0's artist on the merged row and
+        # `card_artist` came out "David Martin". 1,158 printings in the 2026-08-16 default_cards
+        # bulk carry a two-artist credit, and three surfaces read this one column: the card
+        # object's `artist`, `order=artist` (api.scryfall.com sorts Fire // Ice AFTER all six
+        # plain "David Martin" dmr cards, i.e. on the joined string), and `a:` (`a:"franz
+        # vohwinkel"` returns it there — artist search covers non-front faces).
+        #
+        # Scryfall's own string, never a join recomputed over the faces: that is what keeps the
+        # 4,951 multi-faced cards whose faces share one artist on a single name rather than
+        # "X & X", and the string is not re-splittable afterwards either — "Hari & Deepti" is ONE
+        # artist of ten printings.
+        merged_row["card_artist"] = card.get("artist")
         merged_row["printed_name"] = card.get("printed_name")
         merged_row["flavor_name"] = card.get("flavor_name")
         merged_row["printed_type_line"] = card.get("printed_type_line")
