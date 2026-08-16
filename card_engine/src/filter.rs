@@ -517,6 +517,22 @@ pub(crate) enum FilterExpr {
         any: bool,
     },
 
+    /// `st:<type>` — a printing's SET TYPE equals `value` (Scryfall's `set_type`, stored as
+    /// `CompatFields.set_type_id`). `LangMatch`'s shape exactly, minus the widening: both live in
+    /// the compat blob rather than in a column of their own, both intern into `coll_vocab`, and
+    /// both resolve to an id in `bind()` so `tri()` is one integer equality.
+    ///
+    /// It is the predicate five `is:` values turn out to BE — `is:masterpiece` is `st:masterpiece`
+    /// exactly (measured against api.scryfall.com, both set differences empty), and `is:alchemy`
+    /// and `is:funny` are their set types — so it retires a family of stored tags rather than
+    /// adding one.
+    SetTypeMatch {
+        value: String,
+        /// `value` resolved to its coll_vocab id by bind(), the LangMatch shape exactly: None
+        /// means no loaded printing carries the set type, which matches nothing.
+        vid: Option<u16>,
+    },
+
     /// `oracleid:<uuid>` — the oracle card whose `oracle_id` equals `id` (`parse_uuid_or_hash`'s
     /// u128, 0 for an unparseable value, which no stored id ever equals). Card-level and total,
     /// with nothing for `bind()` to resolve — bind() sees the vocab tables, not `CardIndexes` —
@@ -656,6 +672,8 @@ pub(crate) fn verify_cost_tier(f: &FilterExpr) -> u32 {
         | FilterExpr::Legality { .. }
         // A LangMatch is one integer equality against a resolved vocab id.
         | FilterExpr::LangMatch { .. }
+        // ...and a SetTypeMatch is the same equality against a different id in the same vocab.
+        | FilterExpr::SetTypeMatch { .. }
         // An OracleIdMatch is one 128-bit integer equality against a field already in the card.
         | FilterExpr::OracleIdMatch { .. }
         | FilterExpr::DateCmp { .. }
@@ -790,6 +808,8 @@ fn leaf_compares_printing_field(f: &FilterExpr) -> bool {
         FilterExpr::Legality { .. } => false,
         // The language is a per-printing fact (CompatFields.lang_id).
         FilterExpr::LangMatch { .. } => true,
+        // The set type is the PRINTING's set, so it can only settle once one is in hand.
+        FilterExpr::SetTypeMatch { .. } => true,
         // Composites are composed by the two callers, which differ on `all` vs `any`; reaching here with
         // one is a bug in whichever caller forgot to handle it, not a case to answer silently.
         FilterExpr::And(_) | FilterExpr::Or(_) | FilterExpr::Not(_) => {
@@ -958,6 +978,15 @@ impl FilterExpr {
             // The language lives in the same vocab the collection values do (CompatFields.lang_id
             // interns into coll_vocab), so this is CollectionCmp's resolution verbatim.
             FilterExpr::LangMatch { value, vid, any: false } => {
+                let i = sorted_ids.partition_point(|id| vocab[u16::from(*id) as usize].as_str() < value.as_str());
+                *vid = sorted_ids
+                    .get(i)
+                    .map(|id| u16::from(*id))
+                    .filter(|&id| vocab[id as usize].as_str() == value.as_str());
+            }
+            // The set type interns into that same vocab (CompatFields.set_type_id), so this is
+            // the resolution above verbatim.
+            FilterExpr::SetTypeMatch { value, vid } => {
                 let i = sorted_ids.partition_point(|id| vocab[u16::from(*id) as usize].as_str() < value.as_str());
                 *vid = sorted_ids
                     .get(i)
@@ -1225,6 +1254,14 @@ impl FilterExpr {
         self.tri(card, None, strings)
     }
 
+    /// Printing-level pass, the plain form, kept for tests: the same evaluation the residual walk
+    /// performs, with a printing in hand. `eval_card`'s twin — the one-printing question a
+    /// printing-scoped leaf (set code, watermark, set type) is the only way to ask directly.
+    #[cfg(test)]
+    pub(crate) fn eval_printing(&self, card: &AOracleCard, printing: &APrinting, strings: &AStrings) -> Tri {
+        self.tri(card, Some(printing), strings)
+    }
+
     /// Card pass with one-level residual extraction. For a top-level And/Or,
     /// children are classified individually: decided children are dropped (a
     /// False/Null child settles an And, a True child settles an Or — and at the
@@ -1437,6 +1474,16 @@ impl FilterExpr {
                     Tri::Null // no artist: SQL NULL, like the missing-string case before
                 } else {
                     tri_bool(ids.binary_search(&vid).is_ok())
+                }
+            }
+
+            FilterExpr::SetTypeMatch { vid, .. } => {
+                let Some(p) = printing else { return Tri::PrintingDep };
+                if u16::from(p.compat.set_type_id) == super::VOCAB_NONE {
+                    Tri::Null // no set type recorded: SQL NULL, like the missing-string cases above
+                } else {
+                    // `vid` None = the set type exists on no loaded printing; matches nothing.
+                    tri_bool(vid.is_some_and(|v| u16::from(p.compat.set_type_id) == v))
                 }
             }
 
@@ -1915,6 +1962,18 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
         let value = rhs_value_str(rhs).to_lowercase();
         let any = value == "any";
         return Ok(FilterExpr::LangMatch { value, vid: None, any });
+    }
+
+    if attr == "card_set_type" {
+        // Equality only, the surface upstream's parser grants `st:` — same as `lang:`, and for the
+        // same reason: it is a string column, and ordered comparisons on those error in the parser.
+        if !matches!(op, ":" | "=") {
+            return Err(format!("operator {op:?} is not supported on set_type"));
+        }
+        // Scryfall spells the set types with underscores (`draft_innovation`, `duel_deck`) and
+        // accepts the hyphenated form too; the stored value is Scryfall's own, lowercased.
+        let value = rhs_value_str(rhs).to_lowercase().replace('-', "_");
+        return Ok(FilterExpr::SetTypeMatch { value, vid: None });
     }
 
     if attr == "oracle_id" {

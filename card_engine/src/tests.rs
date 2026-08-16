@@ -11684,6 +11684,75 @@ fn the_id_permutation_is_a_permutation() {
     assert_eq!(perm, (0..ids.len() as u32).collect::<Vec<_>>());
 }
 
+#[test]
+fn set_type_matches_through_the_compat_vocab() {
+    // `st:` is `lang:`'s shape: both live in the compat blob rather than a column, both intern
+    // into coll_vocab, and both resolve to an id in bind() so tri() is one integer equality. This
+    // pins the three answers that shape has to give — hit, miss, and "no set type recorded".
+    let leaf = |value: &str| {
+        super::build_filter(&serde_json::json!({
+            "node_type": "CardBinaryOperatorNode",
+            "kwargs": {
+                "op": ":",
+                "lhs": {"node_type": "CardAttributeNode", "kwargs": {"attribute_name": "card_set_type", "original_attribute": "st"}},
+                "rhs": {"node_type": "StringValueNode", "kwargs": {"value": value}},
+            }
+        }))
+        .expect("st: must build")
+    };
+
+    // Scryfall spells the multi-word types with underscores and accepts the hyphen too.
+    match leaf("Draft-Innovation") {
+        FilterExpr::SetTypeMatch { value, vid } => {
+            assert_eq!(value, "draft_innovation", "hyphens fold to underscores, and the value lowercases");
+            assert!(vid.is_none(), "unbound: bind() is what resolves the vocab id");
+        }
+        other => panic!("st: built a {:?}, not SetTypeMatch", std::mem::discriminant(&other)),
+    }
+
+    // Ordered comparisons are not a thing on a string column, exactly as on lang:.
+    let ordered = serde_json::json!({
+        "node_type": "CardBinaryOperatorNode",
+        "kwargs": {
+            "op": ">=",
+            "lhs": {"node_type": "CardAttributeNode", "kwargs": {"attribute_name": "card_set_type", "original_attribute": "st"}},
+            "rhs": {"node_type": "StringValueNode", "kwargs": {"value": "promo"}},
+        }
+    });
+    assert!(super::build_filter(&ordered).is_err(), "st:>= must decline, like lang:");
+
+    // Evaluation, against a printing that carries a set type and one that does not.
+    let mut vocab = VocabInterner::new();
+    let masterpiece = vocab.intern("masterpiece".to_string()).unwrap();
+    let mut card = stub_card(1, TYPE_CREATURE, &[], &mut vocab);
+    card.card_name_lower = InlineStr::from_str("kozilek");
+    let mut data = store_of(vec![card], &[2], vocab);
+    data.printings[0].compat.set_type_id = masterpiece;
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let bind = |f: &mut FilterExpr| {
+        f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    };
+
+    let mut hit = leaf("masterpiece");
+    bind(&mut hit);
+    assert!(hit.eval_printing(&archived.cards[0], &archived.printings[0], &archived.strings) == Tri::True);
+    assert!(
+        hit.eval_printing(&archived.cards[0], &archived.printings[1], &archived.strings) == Tri::Null,
+        "a printing with no set type is SQL NULL, not False"
+    );
+    assert!(
+        hit.eval_card(&archived.cards[0], &archived.strings) == Tri::PrintingDep,
+        "the set type is the PRINTING's set, so it cannot settle at card level"
+    );
+
+    // A value no loaded printing carries binds to None and matches nothing — not everything.
+    let mut absent = leaf("vanguard");
+    bind(&mut absent);
+    assert!(matches!(absent, FilterExpr::SetTypeMatch { vid: None, .. }));
+    assert!(absent.eval_printing(&archived.cards[0], &archived.printings[0], &archived.strings) == Tri::False);
+}
+
 // ─── Compat residue ───────────────────────────────────────────────────────────
 
 #[test]
