@@ -46,6 +46,7 @@ from api.scryfall_compat.objects import (
     card_list,
     card_to_text,
     catalog_object,
+    collection_list,
     error_object,
     not_found_error,
     ruling_object,
@@ -208,6 +209,39 @@ _EXTERNAL_ID_COLUMNS: dict[str, tuple[str, ...]] = {
 
 _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
+# The STRICTER shape a `/cards/collection` identifier's UUID must have: RFC 4122 VERSION 4.
+#
+# Not the same rule as `_UUID_RE` above, and the difference is measured rather than assumed
+# (api.scryfall.com, 2026-08-16, one identifier per request):
+#
+#   00000000-0000-4000-8000-000000000000   200, in `not_found`   version 4, variant 8
+#   3f2c8e5d-91b7-4a6e-9d12-4f5a9c7e8b01   200, in `not_found`   variant 9
+#   00000000-0000-0000-0000-000000000000   400 bad_request       version 0
+#   00000000-0000-0000-0000-000000000001   400 bad_request       version 0
+#   00000000-0000-4000-0000-000000000000   400 bad_request       variant 0
+#   3f2c8e5d-91b7-{0,1,5,6,7,8}a6e-bd12-.  400 bad_request       every other version nibble
+#   3f2c8e5d-91b7-4a6e-cd12-4f5a9c7e8b01   400 bad_request       variant c
+#
+# So it is the SHAPE and not the all-zero value: a nil UUID wearing v4's version and variant nibbles
+# is accepted and answered in `not_found`, and a v1 UUID is rejected. A syntactically valid but
+# UNKNOWN v4 belongs in `not_found` and must not 400 -- that is what makes this a validation rule
+# rather than a lookup one.
+#
+# `_UUID_RE` stays as it is: it decides which 404 sentence a `/cards/:id` miss gets, and Scryfall
+# reads that path segment with the looser rule (`/cards/00000000-0000-0000-0000-000000000000` is a
+# card miss, not a bad request). Two rules because Scryfall has two.
+_COLLECTION_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-4[0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")
+
+# The collection identifier keys Scryfall validates as UUIDs, in the order it checks them -- the
+# same order `_resolve_identifier` dispatches on, so the key REPORTED is the key that would have
+# been used.
+_COLLECTION_UUID_KEYS = ("id", "oracle_id", "illustration_id")
+
+# How much of a rejected value Scryfall echoes back: 30 characters, then U+2026. Measured with the
+# same requests above -- `not-a-uuid` comes back whole and every 36-character UUID comes back cut at
+# exactly 30 with an ellipsis.
+_COLLECTION_ECHO_LIMIT = 30
+
 # Thresholds for the typo-tolerant stage of `?fuzzy=`. A candidate must score at least the floor,
 # and the best must lead the next distinct card name by at least the lead — closer than that and
 # the query does not identify either card, so it is `ambiguous` rather than a guess. The floor sits
@@ -307,6 +341,37 @@ def _is_uuid(value: str) -> bool:
         True when the segment is a canonical 8-4-4-4-12 UUID.
     """
     return bool(_UUID_RE.match(value))
+
+
+def _collection_identifier_error(identifiers: list[Any]) -> dict[str, Any] | None:
+    """Return the `bad_request` a malformed collection identifier earns, or None when all are well formed.
+
+    ONE error for the whole request, from the FIRST malformed identifier -- measured: a batch of a
+    real id followed by the nil UUID 400s and reports the nil one, and the same batch reversed 400s
+    and reports it too, so nothing is resolved and no partial List comes back.
+
+    The article is always "An" because all three keys start with a vowel. (Scryfall picks it per
+    field: `multiverse_id`'s own non-integer error reads "A `multiverse_id` identifier must be an
+    integer: abc" -- a separate rule this surface does not yet implement.)
+
+    Args:
+        identifiers: The request's `identifiers` array, unvalidated.
+
+    Returns:
+        A Scryfall error object, or None.
+    """
+    for identifier in identifiers:
+        if not isinstance(identifier, dict):
+            continue
+        for key in _COLLECTION_UUID_KEYS:
+            if key not in identifier:
+                continue
+            value = str(identifier[key])
+            if _COLLECTION_UUID_RE.match(value):
+                break
+            echoed = f"{value[:_COLLECTION_ECHO_LIMIT]}…" if len(value) > _COLLECTION_ECHO_LIMIT else value
+            return bad_request_error(f"An `{key}` identifier must be a valid UUID: {echoed}")
+    return None
 
 
 def _as_bool(value: str | None, *, default: bool = False) -> bool:
@@ -1428,6 +1493,13 @@ class ScryfallCardsRoutes:
                 pretty=is_pretty,
             )
 
+        # Validation runs over the WHOLE batch before anything is resolved: Scryfall's answer to a
+        # malformed identifier is one 400 for the request, not a per-identifier miss, so a batch
+        # that carries one must not cost a query either.
+        malformed = _collection_identifier_error(identifiers)
+        if malformed is not None:
+            return self._scryfall_respond(falcon_response, malformed, pretty=is_pretty)
+
         found: list[dict[str, Any]] = []
         not_found: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -1441,7 +1513,7 @@ class ScryfallCardsRoutes:
             seen.add(card["id"])
             found.append(card)
 
-        return self._scryfall_respond(falcon_response, card_list(found, not_found=not_found), pretty=is_pretty)
+        return self._scryfall_respond(falcon_response, collection_list(found, not_found), pretty=is_pretty)
 
     def _resolve_identifier(self, identifier: dict[str, Any]) -> dict[str, Any] | None:
         """Resolve one collection identifier to a card.

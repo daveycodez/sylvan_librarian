@@ -15,6 +15,7 @@ from api.scryfall_compat.objects import (
     card_list,
     card_to_text,
     catalog_object,
+    collection_list,
     error_object,
     image_uri,
     ruling_object,
@@ -217,8 +218,18 @@ class TestEnvelopes:
         assert card_list([]) == {"object": "list", "has_more": False, "data": []}
 
     def test_collection_list_carries_not_found(self):
-        listing = card_list([], not_found=[{"name": "Nope"}])
+        listing = collection_list([], [{"name": "Nope"}])
         assert listing["not_found"] == [{"name": "Nope"}]
+
+    def test_collection_list_has_no_has_more(self):
+        """Scryfall does not paginate `/cards/collection` and does not send the key (measured 2026-08-16)."""
+        assert list(collection_list([{"object": "card"}], [])) == ["object", "not_found", "data"]
+        assert collection_list([], []) == {"object": "list", "not_found": [], "data": []}
+
+    def test_the_two_envelopes_share_one_key_order(self):
+        """Both are built by `_list_object`, so the keys they share cannot fall into different orders."""
+        paged = [k for k in card_list([], not_found=[]) if k != "has_more"]
+        assert paged == list(collection_list([], []))
 
     def test_catalog_object_counts_its_values(self):
         assert catalog_object(["Bolt", "Shock"]) == {"object": "catalog", "total_values": 2, "data": ["Bolt", "Shock"]}

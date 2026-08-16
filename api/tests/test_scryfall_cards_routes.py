@@ -700,6 +700,78 @@ class TestThroughTheFullApp:
         assert [card["id"] for card in body["data"]] == [BOLT_ID]
         assert body["not_found"] == [{"name": "Nothing At All Compat"}]
 
+    def test_collection_envelope_has_no_has_more(self, compat_corpus: APIResource):
+        """Scryfall's collection List is `{object, not_found, data}` -- it does not paginate."""
+        result = self._client(compat_corpus).simulate_post("/cards/collection", json={"identifiers": [{"id": BOLT_ID}]})
+        assert list(orjson.loads(result.content)) == ["object", "not_found", "data"]
+
+    @pytest.mark.parametrize(
+        ("identifier", "why"),
+        [
+            ("00000000-0000-0000-0000-000000000000", "nil uuid: version 0"),
+            ("00000000-0000-0000-0000-000000000001", "not the zero VALUE: version 0"),
+            ("3f2c8e5d-91b7-1a6e-bd12-4f5a9c7e8b01", "version 1"),
+            ("3f2c8e5d-91b7-7a6e-bd12-4f5a9c7e8b01", "version 7"),
+            ("3f2c8e5d-91b7-4a6e-cd12-4f5a9c7e8b01", "variant c"),
+            ("3f2c8e5d-91b7-4a6e-0d12-4f5a9c7e8b01", "variant 0"),
+            ("not-a-uuid", "not a uuid at all"),
+            ("", "empty string"),
+            ("7673784edb4b43a18d551bb9fc1e284f", "no dashes"),
+        ],
+    )
+    def test_collection_rejects_a_non_v4_identifier(self, compat_corpus: APIResource, identifier: str, why: str):
+        """Measured against api.scryfall.com 2026-08-16: a malformed identifier UUID 400s the request."""
+        result = self._client(compat_corpus).simulate_post("/cards/collection", json={"identifiers": [{"id": identifier}]})
+        assert result.status_code == 400, why
+        assert orjson.loads(result.content)["code"] == "bad_request"
+
+    @pytest.mark.parametrize(
+        ("identifier", "why"),
+        [
+            ("00000000-0000-4000-8000-000000000000", "the ZERO value wearing v4's nibbles"),
+            ("3f2c8e5d-91b7-4a6e-9d12-4f5a9c7e8b01", "valid, unknown: variant 9"),
+            ("3f2c8e5d-91b7-4a6e-bd12-4f5a9c7e8b01", "valid, unknown: variant b"),
+        ],
+    )
+    def test_collection_reports_a_valid_unknown_uuid_as_not_found(self, compat_corpus: APIResource, identifier: str, why: str):
+        """The other half of the boundary: the rule is the SHAPE, not the value and not existence."""
+        result = self._client(compat_corpus).simulate_post("/cards/collection", json={"identifiers": [{"id": identifier}]})
+        assert result.status_code == 200, why
+        body = orjson.loads(result.content)
+        assert body["not_found"] == [{"id": identifier}]
+        assert body["data"] == []
+
+    def test_collection_echoes_the_offending_key_and_value(self, compat_corpus: APIResource):
+        """30 characters then U+2026, and a short value whole -- both measured."""
+        client = self._client(compat_corpus)
+        long_value = client.simulate_post(
+            "/cards/collection", json={"identifiers": [{"id": "00000000-0000-0000-0000-000000000000"}]}
+        )
+        assert (
+            orjson.loads(long_value.content)["details"]
+            == "An `id` identifier must be a valid UUID: 00000000-0000-0000-0000-000000\u2026"
+        )
+        short = client.simulate_post("/cards/collection", json={"identifiers": [{"oracle_id": "not-a-uuid"}]})
+        assert orjson.loads(short.content)["details"] == "An `oracle_id` identifier must be a valid UUID: not-a-uuid"
+
+    def test_one_malformed_identifier_400s_the_whole_batch(self, compat_corpus: APIResource):
+        """Wherever it sits, and the FIRST malformed one is the one reported."""
+        client = self._client(compat_corpus)
+        bad = {"id": "00000000-0000-0000-0000-000000000000"}
+        for identifiers in ([{"id": BOLT_ID}, bad], [bad, {"id": BOLT_ID}]):
+            result = client.simulate_post("/cards/collection", json={"identifiers": identifiers})
+            assert result.status_code == 400
+            assert "00000000-0000-0000-0000-000000" in orjson.loads(result.content)["details"]
+
+    def test_non_uuid_identifier_kinds_are_untouched_by_the_uuid_rule(self, compat_corpus: APIResource):
+        """`{set, collector_number}` nonsense is a MISS, not a bad request -- only the three UUID keys are checked."""
+        result = self._client(compat_corpus).simulate_post(
+            "/cards/collection",
+            json={"identifiers": [{"set": SET_CODE, "collector_number": "zzz"}, {"name": "Nothing At All Compat"}]},
+        )
+        assert result.status_code == 200
+        assert len(orjson.loads(result.content)["not_found"]) == 2
+
     def test_next_page_addresses_this_host(self, compat_corpus: APIResource, monkeypatch):
         """Every other URI in the payload stays Scryfall's; this one has to point back here.
 

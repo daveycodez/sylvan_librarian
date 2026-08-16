@@ -530,23 +530,25 @@ def bad_request_error(details: str, *, warnings: list[str] | None = None) -> dic
     return error_object(code="bad_request", status=400, details=details, warnings=warnings)
 
 
-def card_list(  # noqa: PLR0913
+def _list_object(  # noqa: PLR0913
     cards: list[dict[str, Any]],
     *,
     total_cards: int | None = None,
-    has_more: bool = False,
+    has_more: bool | None = None,
     next_page: str | None = None,
     not_found: list[dict[str, Any]] | None = None,
     warnings: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Build Scryfall's List object.
+    """Build a List object, the one definition of its key order.
 
-    Key order follows Scryfall's own so a byte-comparing client sees the same document.
+    `has_more` is written IFF the caller supplies one. That is the only difference between the two
+    List envelopes Scryfall answers with, and it is a difference in the key SET rather than in the
+    value -- see `collection_list`. Every other key keeps its position here so the two cannot drift.
 
     Args:
         cards: The page of objects.
         total_cards: Unpaginated match count; omitted on lists that do not paginate.
-        has_more: Whether a further page exists.
+        has_more: Whether a further page exists; omitted entirely when None.
         next_page: Absolute URL of the next page, when there is one.
         not_found: Identifiers a collection request could not resolve.
         warnings: Non-fatal notes about the request.
@@ -559,13 +561,72 @@ def card_list(  # noqa: PLR0913
         result["total_cards"] = total_cards
     if not_found is not None:
         result["not_found"] = not_found
-    result["has_more"] = has_more
+    if has_more is not None:
+        result["has_more"] = has_more
     if next_page is not None:
         result["next_page"] = next_page
     if warnings:
         result["warnings"] = warnings
     result["data"] = cards
     return result
+
+
+def card_list(  # noqa: PLR0913
+    cards: list[dict[str, Any]],
+    *,
+    total_cards: int | None = None,
+    has_more: bool = False,
+    next_page: str | None = None,
+    not_found: list[dict[str, Any]] | None = None,
+    warnings: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build Scryfall's paginated List object.
+
+    Key order follows Scryfall's own so a byte-comparing client sees the same document. `has_more`
+    is always present: a paginated list says whether there is more even when there is not.
+
+    Args:
+        cards: The page of objects.
+        total_cards: Unpaginated match count; omitted on lists that do not paginate.
+        has_more: Whether a further page exists.
+        next_page: Absolute URL of the next page, when there is one.
+        not_found: Identifiers a collection request could not resolve.
+        warnings: Non-fatal notes about the request.
+
+    Returns:
+        The List object.
+    """
+    return _list_object(
+        cards,
+        total_cards=total_cards,
+        has_more=has_more,
+        next_page=next_page,
+        not_found=not_found,
+        warnings=warnings,
+    )
+
+
+def collection_list(cards: list[dict[str, Any]], not_found: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build the List `POST /cards/collection` answers with: `{object, not_found, data}`.
+
+    NO `has_more`. Measured against api.scryfall.com on 2026-08-16 -- every collection response's
+    key set is exactly those three, whether or not anything was found. It is the one List Scryfall
+    does not paginate: the request carries at most `MAX_COLLECTION_IDENTIFIERS` identifiers and the
+    answer carries all of them, so there is no further page for a `has_more` to describe.
+
+    A separate entry point rather than a keyword at the call site, because omitting a key is the
+    kind of thing a keyword hides: `card_list(found, not_found=not_found)` read as correct and
+    quietly emitted `has_more: false`. Both build the same object through `_list_object`, so the key
+    ORDER still has exactly one definition.
+
+    Args:
+        cards: The cards that resolved.
+        not_found: The identifiers that resolved to nothing, in request order.
+
+    Returns:
+        The List object.
+    """
+    return _list_object(cards, not_found=not_found)
 
 
 def catalog_object(values: list[str]) -> dict[str, Any]:
