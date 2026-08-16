@@ -165,9 +165,9 @@ STATIC_VALUES: dict[str, list[str]] = {
     # this module ships in the client image, which contains no `api/`.
     #
     # Anything outside this set parses but falls through to a `card_is_tags` lookup, and that column
-    # carries only the two booleans the import syncs from the bulk blob — `is:reserved` is the one to
-    # reach for. Values with no key there still match zero cards, as `is:reprint`, `is:token` and
-    # `is:spell` did in the old load-generator list. All 48 are kept rather
+    # carries only the booleans the import syncs from the bulk blob (db_info.BOOLEAN_IS_TAGS) —
+    # `is:reserved` and `is:reprint` are the ones to reach for. Values with no key there match zero
+    # cards AND now raise a warning, as `is:token` does. All 49 are kept rather
     # than a token few: the family's share of traffic is set by its weight, not by how many values
     # it holds, and each expands to a genuinely different shape — layout lookups, type unions, an
     # oracle-text heuristic, a numeric conjunction.
@@ -178,6 +178,7 @@ STATIC_VALUES: dict[str, list[str]] = {
         "is:bikeland",
         "is:bondland",
         "is:bounceland",
+        "is:canland",
         "is:canopyland",
         "is:checkland",
         "is:class",
@@ -190,10 +191,13 @@ STATIC_VALUES: dict[str, list[str]] = {
         "is:fastland",
         "is:fetchland",
         "is:filterland",
+        "is:firstprint",
+        "is:firstprinting",
         "is:flip",
         "is:frenchvanilla",
         "is:gainland",
         "is:historic",
+        "is:karoo",
         "is:leveler",
         "is:manland",
         "is:mdfc",
@@ -211,6 +215,7 @@ STATIC_VALUES: dict[str, list[str]] = {
         "is:shockland",
         "is:slowland",
         "is:snarl",
+        "is:spell",
         "is:split",
         "is:storageland",
         "is:surveilland",
