@@ -99,6 +99,23 @@ EQUIVALENCES = [
     # Spelling aliases of stored tags: the expansion is the OTHER is: value, which stays a leaf.
     ("is:full", "is:fullart"),
     ("is:promostamped", "is:stamped"),
+    # Set types: `st:` is the operator these five turn out to BE.
+    ("is:masterpiece", "st:masterpiece"),
+    ("is:alchemy", "st:alchemy"),
+    ("is:funny", "st:funny"),
+    ("is:watermark", "has:watermark"),
+    # Eligibility, each count-validated on its own rather than rewritten to the format filter.
+    ("is:oathbreaker", "t:planeswalker f:oathbreaker"),
+    ("is:brawler", '((t:legendary (toughness>=0 or t:background)) or o:"can be your commander") f:brawl'),
+    ("is:duelcommander", '((t:legendary (toughness>=0 or t:background)) or o:"can be your commander") f:duel'),
+    # The `has:` family: presence on a regex-capable column, or the is: tag that answers the same
+    # question off the same stored value.
+    ("has:watermark", "watermark:/./"),
+    ("has:artist", "artist:/./"),
+    ("has:flavor", "flavor:/./"),
+    ("has:foil", "is:foil"),
+    ("has:highres", "is:hires"),
+    ("has:story", "is:spotlight"),
     # composes under negation and inside compounds
     ("-frame:old", "-(frame:1993 or frame:1997)"),
     ("t:goblin frame:modern", "t:goblin frame:2003"),
@@ -322,6 +339,36 @@ def test_unsupported_is_value_warns_once_per_leaf() -> None:
 
     # A supported value in the same query does not add one.
     assert len(parse_scryfall_query("is:nope is:reprint").warnings) == 1
+
+
+@pytest.mark.parametrize(
+    argnames="query",
+    argvalues=["has:watermark", "has:artist", "has:flavor", "has:foil", "has:booster", "has:etched", "has:story"],
+)
+def test_supported_has_values_do_not_warn(query: str) -> None:
+    """The `has:` family gets the same treatment `is:` does — supported means silent."""
+    assert parse_scryfall_query(query).warnings == ()
+
+
+def test_unsupported_has_value_warns_like_an_is_value() -> None:
+    """`has:` shares `is:`'s column, so an unmapped value would otherwise be the same silent zero.
+
+    `has:illustration` is the case to hold onto: the column IS stored, and the value is one
+    api.scryfall.com answers — what is missing is a presence predicate over an id, which no
+    rewrite can express. Warning says that; returning zero does not.
+    """
+    (warning,) = parse_scryfall_query("has:illustration").warnings
+    assert "has:illustration" in warning
+    assert len(parse_scryfall_query("has:notarealfield t:creature").warnings) == 1
+
+
+def test_set_type_parses_as_its_own_column() -> None:
+    """`st:` is a column, not a tag: it must not land in card_is_tags with the is:/has: family."""
+    node = parse_scryfall_query("st:masterpiece").root
+    assert node.lhs.attribute_name == "card_set_type"
+    # Every alias Scryfall accepts for it reaches the same column.
+    for alias in ("set_type", "settype", "st"):
+        assert parse_scryfall_query(f"{alias}:promo").root.lhs.attribute_name == "card_set_type"
 
 
 def test_type_operator_is_not_an_is_value() -> None:

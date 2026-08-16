@@ -53,7 +53,9 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     ("is", "permanent"): "t:creature or t:artifact or t:enchantment or t:land or t:planeswalker or t:battle",  # +2 / 25954
     ("is", "party"): "t:creature (t:cleric or t:rogue or t:warrior or t:wizard or kw:changeling)",  # exact
     ("is", "outlaw"): "t:assassin or t:mercenary or t:pirate or t:rogue or t:warlock or kw:changeling",  # exact
-    ("is", "vanilla"): 't:creature o=""',  # empty-oracle equality; -11 subset (Adventure/DFC textless faces + Dryad Arbor)
+    # empty-oracle equality; -11 subset (Adventure/DFC textless faces + Dryad Arbor)
+    ("is", "vanilla"): 't:creature o=""',
+    ("is", "watermark"): "has:watermark",  # Scryfall accepts both spellings; 4,656 = 4,656
     # The intuitive "2/2 for 2" bear. Deliberately NOT exactly Scryfall's is:bear (which is
     # single-faced and includes Vehicles/Spacecraft): vs Scryfall this is +~14 DFC creatures
     # and -4 Vehicles/Spacecraft. Scryfall's exact count isn't cross-verifiable anyway (their
@@ -183,6 +185,33 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     # from it") while missing modal cards worded otherwise (Sieges, Confluences).
     # Not an exact mirror of theirs, just a much closer one.
     ("is", "modal"): "otag:modal",
+    # ── Set types (the `st:` operator, added alongside) ───────────────────
+    # `is:masterpiece` and `is:alchemy` ARE their set types: both set differences against
+    # `st:masterpiece` / `st:alchemy` are empty on api.scryfall.com (2026-08-16). `is:funny` is
+    # close rather than equal -- 151 cards Scryfall calls funny are not in a funny SET, and 190
+    # funny-set cards are not is:funny -- but the funny sets are not imported at all, so the
+    # difference is unobservable here and the mapping is what makes the answer an honest zero
+    # instead of an unexplained one.
+    ("is", "alchemy"): "st:alchemy",
+    ("is", "funny"): "st:funny",  # 151/190 residual, unobservable in this corpus
+    ("is", "masterpiece"): "st:masterpiece",  # exact
+    # ── Eligibility, in the shape is:commander already uses ───────────────
+    # Each validated separately against its own live list rather than rewritten to the format
+    # filter -- they are strict SUBSETS of `f:oathbreaker` / `f:brawl` / `f:duel`, not equal to
+    # them. Measured 2026-08-16: every card Scryfall names is matched (the "is: minus shape"
+    # difference is ZERO in all three), and the shapes over-catch by 15 / 27 / 121 on 287 / 2,318
+    # / 3,323. Adding the format banlist does not close the gap, so it is recorded rather than
+    # papered over -- the same standing the filterland (20 vs 22) and gainland (43 vs 15) entries
+    # already have.
+    ("is", "oathbreaker"): "t:planeswalker f:oathbreaker",  # +15 / 287
+    (
+        "is",
+        "brawler",
+    ): '((t:legendary (toughness>=0 or t:background)) or o:"can be your commander") f:brawl',  # +27 / 2,318
+    (
+        "is",
+        "duelcommander",
+    ): '((t:legendary (toughness>=0 or t:background)) or o:"can be your commander") f:duel',  # +121 / 3,323
     # Everything with a castable primary type on some face. Scryfall's own is:spell is FACE-level
     # and this type union is not, so the two differ on the merged type lines: +48 / 31,760 measured
     # against api.scryfall.com on 2026-08-16 (excluding funny sets, which are not imported), with
@@ -206,6 +235,41 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     ("is", "full"): "is:fullart",
     ("is", "promostamped"): "is:stamped",
 }
+
+# Scryfall's `has:` family, which asks whether a field is PRESENT rather than what it holds. The
+# vocabulary was read off the live API rather than the syntax docs, which list only two of it:
+# every candidate was probed on 2026-08-16 and the ones it accepts recorded here.
+#
+# Two shapes. The boolean half (`has:foil`, `has:booster`, …) is the SAME question `is:` asks and
+# answers with the same stored tag, so it rewrites to the `is:` value. The presence half is a
+# non-empty test on a text column, which `<field>:/./` already expresses -- an unanchored
+# one-character regex over a column matches exactly the rows that have one.
+#
+# NOT here, and warning for a stated reason: `has:illustration` / `has:stamp` / `has:multiverse` /
+# `has:tcgplayer` / `has:cardmarket` / `has:image` / `has:printedname` / `has:indicator` are
+# presence tests on columns with no regex path (ids, interned compat scalars, the annex), and
+# `has:attraction_lights` / `has:partner` have no stored column at all. Each needs a presence
+# predicate in the engine, not a rewrite.
+_HAS_EXPANSIONS: dict[str, str] = {
+    # Presence on a regex-capable text column.
+    "artist": "artist:/./",
+    "flavor": "flavor:/./",
+    "watermark": "watermark:/./",
+    # The same question `is:` answers, off the same stored tag.
+    "booster": "is:booster",
+    "etched": "is:etched",
+    "foil": "is:foil",
+    "glossy": "is:glossy",
+    "highres": "is:hires",
+    "nonfoil": "is:nonfoil",
+    "spotlight": "is:spotlight",
+    "story": "is:spotlight",
+}
+_DERIVED_EXPANSIONS.update({("has", value): dsl for value, dsl in _HAS_EXPANSIONS.items()})
+
+# Every `has:` value this parser can answer. Same contract as SUPPORTED_IS_VALUES, and the same
+# consequence for anything outside it: a warning rather than a silent zero.
+SUPPORTED_HAS_VALUES: frozenset[str] = frozenset(_HAS_EXPANSIONS)
 
 # Every `is:` value this parser can answer at all: the derivable expansions above plus the booleans
 # the importer stores on the row. Anything else reaches the engine as a tag no row carries and comes
@@ -381,7 +445,7 @@ def expand_derived_predicates(query: Query) -> Query:
 
 
 def _collect_unsupported_is(node: QueryNode, found: list[str]) -> None:
-    """Append a warning for every `is:` leaf naming a value this server cannot answer."""
+    """Append a warning for every `is:`/`has:` leaf naming a value this server cannot answer."""
     cls = node.__class__
     if cls is AndNode or cls is OrNode:
         for op in node.operands:
@@ -391,14 +455,18 @@ def _collect_unsupported_is(node: QueryNode, found: list[str]) -> None:
         _collect_unsupported_is(node.operand, found)
         return
     key = _leaf_key(node)
-    if key is not None and key[0] == "is" and key[1] not in SUPPORTED_IS_VALUES:
+    if key is None:
+        return
+    alias, value = key
+    supported = {"is": SUPPORTED_IS_VALUES, "has": SUPPORTED_HAS_VALUES}.get(alias)
+    if supported is not None and value not in supported:
         found.append(
-            f"Unsupported term \u201cis:{key[1]}\u201d: this server has no data for that predicate, so it matched no cards.",
+            f"Unsupported term \u201c{alias}:{value}\u201d: this server has no data for that predicate, so it matched no cards.",
         )
 
 
 def unsupported_is_warnings(query: Query) -> tuple[str, ...]:
-    """Warnings for the `is:` values in `query` that this server cannot answer, in source order.
+    """Warnings for the `is:`/`has:` values in `query` this server cannot answer, in source order.
 
     A tag no row carries is indistinguishable from a tag every row happens to miss: both come back
     as zero results, and the caller cannot tell an empty answer from an unimplemented predicate.

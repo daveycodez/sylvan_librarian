@@ -167,12 +167,13 @@ STATIC_VALUES: dict[str, list[str]] = {
     # Anything outside this set parses but falls through to a `card_is_tags` lookup, and that column
     # carries only the booleans the import syncs from the bulk blob (db_info.BOOLEAN_IS_TAGS) —
     # `is:reserved` and `is:reprint` are the ones to reach for. Values with no key there match zero
-    # cards AND now raise a warning, as `is:token` does. All 66 are kept rather
+    # cards AND now raise a warning, as `is:token` does. All 73 are kept rather
     # than a token few: the family's share of traffic is set by its weight, not by how many values
     # it holds, and each expands to a genuinely different shape — layout lookups, type unions, an
     # oracle-text heuristic, a numeric conjunction.
     "tag": [
         "is:adventure",
+        "is:alchemy",
         "is:artseries",
         "is:augmentation",
         "is:battleland",
@@ -181,6 +182,7 @@ STATIC_VALUES: dict[str, list[str]] = {
         "is:bikeland",
         "is:bondland",
         "is:bounceland",
+        "is:brawler",
         "is:canland",
         "is:canopyland",
         "is:checkland",
@@ -192,6 +194,7 @@ STATIC_VALUES: dict[str, list[str]] = {
         "is:cycleland",
         "is:dfc",
         "is:dual",
+        "is:duelcommander",
         "is:extendedart",
         "is:fastland",
         "is:fetchland",
@@ -201,16 +204,19 @@ STATIC_VALUES: dict[str, list[str]] = {
         "is:flip",
         "is:frenchvanilla",
         "is:full",
+        "is:funny",
         "is:gainland",
         "is:historic",
         "is:host",
         "is:karoo",
         "is:leveler",
         "is:manland",
+        "is:masterpiece",
         "is:mdfc",
         "is:meld",
         "is:modal",
         "is:new",
+        "is:oathbreaker",
         "is:old",
         "is:outlaw",
         "is:painland",
@@ -238,6 +244,7 @@ STATIC_VALUES: dict[str, list[str]] = {
         "is:triland",
         "is:triome",
         "is:vanilla",
+        "is:watermark",
     ],
     "devotion": [
         "devotion:w",
