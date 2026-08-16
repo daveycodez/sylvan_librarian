@@ -457,18 +457,63 @@ def _escape_like_pattern(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
 
 
+# The Latin letters NFKD leaves WHOLE, and the spellings a name comparison has to read them as.
+#
+# NFKD is a decomposition, and a decomposition can only ever separate a base letter from its marks.
+# "æ" is not "a" with a mark on it — it is its own letter with no decomposition at all — so every
+# one of these survived fold_accents() untouched and `name:æther` found nothing where Scryfall
+# finds 90. MEASURED against api.scryfall.com on 2026-08-16, one probe per character, each against
+# its expanded spelling: æ/ae 90, œ/oe 167, ß/ss 2051, ø/o 22111, ł/l 18748, đ/d 14591, þ/th 5689,
+# ð/d 14591, ħ/h 14176, ŋ/ng 4834, ŧ/t 22261, U+0131/i 22954, ĸ/k 6616 — equal totals on both
+# every pair. (ĳ folds too, at 22 — NFKD already reaches that one, so it is not listed here.)
+#
+# The three characters DELIBERATELY ABSENT, each measured to 404 on Scryfall: U+00D7 and U+00F7,
+# which are symbols rather than letters and which collate_name() would delete anyway; and U+017F
+# (long s), which Scryfall does not fold and NFKD does. Known residual divergences, all on
+# characters no card in the corpus contains: U+017F, the presentation ligatures U+FB00..U+FB02,
+# "½", "№" and "ǽ" — NFKD folds each of them and Scryfall folds none.
+_LIGATURE_FOLD = str.maketrans(
+    {
+        "Æ": "AE",
+        "æ": "ae",
+        "Œ": "OE",
+        "œ": "oe",
+        "ß": "ss",
+        "Ø": "O",
+        "ø": "o",
+        "Ł": "L",
+        "ł": "l",
+        "Đ": "D",
+        "đ": "d",
+        "Ð": "D",
+        "ð": "d",
+        "Þ": "Th",
+        "þ": "th",
+        "Ħ": "H",
+        "ħ": "h",
+        "Ŋ": "NG",
+        "ŋ": "ng",
+        "Ŧ": "T",
+        "ŧ": "t",
+        "ı": "i",  # noqa: RUF001 -- U+0131 DOTLESS I is the point of the entry
+        "ĸ": "k",
+    }
+)
+
+
 def fold_accents(value: str) -> str:
     """Strip Latin diacritics so accented and unaccented spellings compare equal.
 
     NFKD-decomposes each character into base letter + combining marks, then drops
-    the marks (unicodedata.combining(c) != 0). This is the single source of truth
+    the marks (unicodedata.combining(c) != 0), then expands the undecomposable
+    Latin letters through _LIGATURE_FOLD. This is the single source of truth
     for accent folding: it's used to precompute card_name_folded at import time
     (see preprocess_card()) and to fold the search term for fuzzy card_name:
     queries in both the SQL and Rust engine paths, so the two sides never diverge
     on what counts as "the same" name (#649).
     """
     decomposed = unicodedata.normalize("NFKD", value)
-    return "".join(c for c in decomposed if not unicodedata.combining(c))
+    return "".join(c for c in decomposed if not unicodedata.combining(c)).translate(_LIGATURE_FOLD)
 
 
 class ExactNameNode(QueryNode):
