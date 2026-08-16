@@ -546,6 +546,7 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     // after `legalities`, and key position is part of the parity contract here the same way
     // security_stamp's position was (see the note at the tail).
     write_opt_str(out, &mut first, "printed_name", str_of(row, "printed_name"));
+    write_opt_str(out, &mut first, "flavor_name", str_of(row, "flavor_name"));
     write_key(out, &mut first, "lang");
     write_json_str(out, lang);
     write_str_or_null(out, &mut first, "released_at", str_of(row, "released_at"));
@@ -633,8 +634,21 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     write_key(out, &mut first, "related_uris");
     let multiverse_first = list_of(row, "multiverse_ids").and_then(|ids| ids.first()).and_then(Value::as_u64);
     write_related_uris(out, name, edhrec_name, multiverse_first, lang);
-    write_key(out, &mut first, "purchase_uris");
-    write_purchase_uris(out, row);
+    // A printing NO MARKETPLACE SELLS omits the key rather than carrying three dead links, and
+    // the rule is the marketplaces rather than `digital` — measured on api.scryfall.com
+    // 2026-08-16: prm/80925 (games ["mtgo"], digital true) HAS purchase_uris, ymid/59 and
+    // khm/A-198 (games ["arena"], digital true) do not. tcgplayer and cardmarket sell cardboard,
+    // cardhoarder sells MTGO, and nothing sells Arena.
+    //
+    // An ABSENT or empty `games` emits: the omission is a positive statement ("this printing is
+    // sold nowhere"), and a row that never carried the column has made no such statement.
+    let sold = list_of(row, "games").is_none_or(|gs| {
+        gs.is_empty() || gs.iter().any(|g| matches!(g.as_str(), Some("paper") | Some("mtgo")))
+    });
+    if sold {
+        write_key(out, &mut first, "purchase_uris");
+        write_purchase_uris(out, row);
+    }
 
     // A multi-face card carries its faces and NOT the top-level ORACLE TEXT they replace; a
     // single-faced one carries the text and no `card_faces`. Which keys sit at top level varies by
@@ -964,6 +978,7 @@ mod tests {
             "printed_name": "Ego à Deriva", "type_line": "Sorcery",
             "printed_type_line": "Feitiço", "oracle_text": "Choose a card name.",
             "printed_text": "Escolha um nome de card.", "multiverse_ids": [454775],
+            "flavor_name": "Ego Solto",
         }) else {
             panic!()
         };
@@ -981,7 +996,11 @@ mod tests {
         // printed_text after oracle_text.
         let at = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("{needle} missing"));
         assert!(at(r#""name":"#) < at(r#""printed_name":"#));
-        assert!(at(r#""printed_name":"#) < at(r#""lang":"#));
+        // `flavor_name` sits between `printed_name` and `lang` — Scryfall's own position, which
+        // is "immediately before lang" on all 669 top-level occurrences in the all_cards bulk
+        // (verified live on prm/80925 with no printed_name and sld/2236/ja with one).
+        assert!(at(r#""printed_name":"#) < at(r#""flavor_name":"#));
+        assert!(at(r#""flavor_name":"#) < at(r#""lang":"#));
         assert!(at(r#""type_line":"#) < at(r#""printed_type_line":"#));
         assert!(at(r#""oracle_text":"#) < at(r#""printed_text":"#));
         assert!(at(r#""printed_text":"#) < at(r#""image_uris":"#));

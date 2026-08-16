@@ -47,7 +47,7 @@ MAX_AUTOCOMPLETE_VALUES = 20
 # lookup, so the engine emits exactly this and nothing is fetched that is never read.
 CARD_OBJECT_FIELDS = (
     "name", "scryfall_id", "oracle_id", "layout", "mana_cost", "cmc", "type_line", "oracle_text",
-    "printed_name", "printed_type_line", "printed_text",
+    "printed_name", "printed_type_line", "printed_text", "flavor_name",
     "power", "toughness", "loyalty", "colors", "color_identity", "card_keywords", "set_code", "set_name",
     "collector_number", "rarity", "flavor_text", "artist", "illustration_id", "released_at",
     "legalities", "edhrec_rank", "price_usd", "price_eur", "price_tix", "watermark",
@@ -322,6 +322,28 @@ def _related_uris(name: str, edhrec_name: str, multiverse_ids: list[int], lang: 
     return out
 
 
+def _sold_somewhere(row: dict[str, Any]) -> bool:
+    """Whether some marketplace sells this printing — the condition `purchase_uris` is emitted under.
+
+    A printing no marketplace sells omits the key rather than carrying three dead links, and the
+    rule is the marketplaces rather than `digital` — measured on api.scryfall.com 2026-08-16:
+    prm/80925 (games ["mtgo"], digital true) HAS purchase_uris; ymid/59 and khm/A-198
+    (games ["arena"], digital true) do not. tcgplayer and cardmarket sell cardboard, cardhoarder
+    sells MTGO, and nothing sells Arena.
+
+    An absent or empty `games` emits: the omission is a positive statement about the printing, and
+    a row that never carried the column has made no such statement.
+
+    Args:
+        row: The engine row.
+
+    Returns:
+        True when the key should be emitted.
+    """
+    games = row.get("games") or []
+    return not games or bool({"paper", "mtgo"} & set(games))
+
+
 def _purchase_uris(row: dict[str, Any]) -> dict[str, str]:
     """Scryfall's `purchase_uris`, rebuilt from the marketplace ids. Same affiliate reasoning."""
     out: dict[str, str] = {}
@@ -492,6 +514,12 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
         # put them after `legalities`, and key position is part of the parity contract here the
         # same way security_stamp's position was.
         **({"printed_name": row["printed_name"]} if row.get("printed_name") else {}),
+        # Scryfall's `flavor_name` — the alternate name a printing is SOLD under (the Godzilla
+        # series, Stranger Things, the Secret Lair crossovers), which is a different thing from a
+        # printed_name and can sit beside one. Its position is "immediately before `lang`" on all
+        # 669 top-level occurrences in the 2026-08-16 all_cards bulk, verified live on prm/80925
+        # (no printed_name) and sld/2236/ja (one). The FACE-level variant rides card_faces.
+        **({"flavor_name": row["flavor_name"]} if row.get("flavor_name") else {}),
         "lang": lang,
         "released_at": row.get("released_at"),
         "uri": f"{base_url}/cards/{scryfall_id}",
@@ -542,7 +570,7 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
         "story_spotlight": bool(row.get("story_spotlight")),
         "prices": _prices(row),
         "related_uris": _related_uris(name, edhrec_name, row.get("multiverse_ids") or [], lang),
-        "purchase_uris": _purchase_uris(row),
+        **({"purchase_uris": _purchase_uris(row)} if _sold_somewhere(row) else {}),
     }
 
     # A multi-face card carries its faces and NOT the top-level ORACLE TEXT they replace; a
