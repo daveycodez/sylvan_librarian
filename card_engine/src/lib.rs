@@ -612,6 +612,17 @@ struct Printing {
     // printing carries a printed name. Backs PrintedNameIndex and is never rendered into a card
     // object — the display values are the three ids above.
     printed_name_folded_id: u32,
+    // Scryfall's top-level `flavor_name`: the alternate name a printing is SOLD under (the
+    // Godzilla series, Stranger Things, the Secret Lair crossovers). Printing-level and quite
+    // separate from the printed triple above — a printing may carry both, and 669 of the
+    // 540,484 all_cards rows carry this one, 609 of them English. `_folded_id` is the search
+    // key, indexed by `CardIndexes.flavor_names`; `_id` is what the card object emits.
+    //
+    // The FACE-level variant (28 face occurrences on 15 printings, `transform` and
+    // `reversible_card` only, and never on a printing that also has the top-level key) rides
+    // `PrintingFace` instead, because that is where Scryfall puts it.
+    flavor_name_id: u32,
+    flavor_name_folded_id: u32,
     // Parallel to the owning OracleCard's `faces` when ANY face carries a printed key; empty
     // otherwise (single-faced cards, and the all-English common case, where per-row Vec contents
     // would buy nothing).
@@ -702,6 +713,8 @@ struct CardRow {
     printed_type_line_id: u32,
     printed_text_id: u32,
     printed_name_folded_id: u32,
+    flavor_name_id: u32,
+    flavor_name_folded_id: u32,
     // Whether this row is one of Scryfall's canonical (default_cards) printings. Canonical rows
     // become `CardData.printings`; the rest become the `foreign` annex. Decided by the importer
     // (id-membership in default_cards), never re-derived here.
@@ -1341,6 +1354,9 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
         printed_text_id: it.intern_opt(opt_str(d, "printed_text")),
         // Already lowercased + accent-folded by the importer, like card_name_folded above.
         printed_name_folded_id: it.intern_opt(opt_str(d, "printed_name_folded")),
+        flavor_name_id: it.intern_opt(opt_str(d, "flavor_name")),
+        // Already lowercased + accent-folded by the importer, like the two above.
+        flavor_name_folded_id: it.intern_opt(opt_str(d, "flavor_name_folded")),
         // An ABSENT key reads canonical: every pre-multilingual feed is canonical-only, so
         // absence means "there is no annex", not "this row belongs in it".
         is_canonical: d
@@ -3185,17 +3201,41 @@ struct PrintedNameIndex {
     trigrams: SortedTrigramIndex,
 }
 
-/// Build the printed-name records from both spaces. One temporary entry per printing carrying a
-/// folded printed name — annex-proportional, not corpus-proportional: an all-English build
-/// contributes nothing here.
-fn build_printed_name_index(printings: &[Printing], foreign: &[Printing], strings: &[String]) -> PrintedNameIndex {
+/// The first record of `idx` whose folded name is exactly `folded`, or None.
+///
+/// Records are sorted by (name bytes, lang id), so this is a binary search — O(log 546) over the
+/// flavor index, O(log 247k) over the printed one. The FIRST record of a run is the answer:
+/// within one name the records run by language, and each record's vpids are best-prefer-first,
+/// so record.vpids[0] of the first record is the printing Scryfall names.
+pub(crate) fn record_of_exact_name(idx: &Archived<PrintedNameIndex>, strings: &AStrings, folded: &str) -> Option<usize> {
+    let name_of = |rec: usize| str_at(strings, u32::from(idx.name_ids[rec])).unwrap_or("");
+    let (mut lo, mut hi) = (0usize, idx.name_ids.len());
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if name_of(mid) < folded { lo = mid + 1 } else { hi = mid }
+    }
+    (lo < idx.name_ids.len() && name_of(lo) == folded).then_some(lo)
+}
+
+/// Build a name-record index from both spaces, keyed by whichever folded name `key_of` picks —
+/// `printed_name_folded_id` for `CardIndexes::printed_names`, `flavor_name_folded_id` for
+/// `flavor_names`. One temporary entry per printing carrying that name, so both are
+/// participant-proportional rather than corpus-proportional: an all-English build contributes
+/// nothing to the first, and the second is ~546 records at full corpus scale.
+fn build_printed_name_index(
+    printings: &[Printing],
+    foreign: &[Printing],
+    strings: &[String],
+    key_of: impl Fn(&Printing) -> u32,
+) -> PrintedNameIndex {
     let n_printings = printings.len() as u32;
     // (name_id, lang_id, vpid) per participating printing, either space.
     let mut entries: Vec<(u32, u16, u32)> = Vec::new();
     for (space, base) in [(printings, 0u32), (foreign, n_printings)] {
         for (i, p) in space.iter().enumerate() {
-            if p.printed_name_folded_id != NONE_STR {
-                entries.push((p.printed_name_folded_id, p.compat.lang_id, base + i as u32));
+            let name_id = key_of(p);
+            if name_id != NONE_STR {
+                entries.push((name_id, p.compat.lang_id, base + i as u32));
             }
         }
     }
@@ -5008,6 +5048,15 @@ struct CardIndexes {
     foreign_external_ids: Vec<(u8, u64, u32)>,
     /// (folded printed name, lang) -> virtual printing ids, both spaces — see PrintedNameIndex.
     printed_names: PrintedNameIndex,
+    /// (folded `flavor_name`, lang) -> virtual printing ids, same structure and the same build,
+    /// keyed on the OTHER folded name a printing can carry. Separate rather than merged into
+    /// `printed_names` because the two are read by different sets of stages: `/cards/named?exact=`
+    /// reads oracle names and FLAVOR names and refuses printed ones (measured on
+    /// api.scryfall.com 2026-08-16: `exact=Godzilla, Primeval Champion` -> 200 prm/80925,
+    /// `exact=Ego à Deriva` -> 404), while the containment stage reads all three.
+    ///
+    /// ~546 records at full corpus scale, so its trigram index is noise next to `printed_names`'s.
+    flavor_names: PrintedNameIndex,
 }
 
 
@@ -14358,6 +14407,8 @@ impl QueryEngine {
                 printed_type_line_id: row.printed_type_line_id,
                 printed_text_id: row.printed_text_id,
                 printed_name_folded_id: row.printed_name_folded_id,
+            flavor_name_id: row.flavor_name_id,
+            flavor_name_folded_id: row.flavor_name_folded_id,
                 printed_faces,
                 all_parts: row.all_parts,
 
@@ -14467,7 +14518,8 @@ impl QueryEngine {
         // all-canonical feed builds empty structures here.
         let langs_idx = build_lang_index(&printings, &coll_vocab);
         let foreign_langs_idx = build_lang_index(&foreign, &coll_vocab);
-        let printed_names_idx = build_printed_name_index(&printings, &foreign, &strings);
+        let printed_names_idx = build_printed_name_index(&printings, &foreign, &strings, |p| p.printed_name_folded_id);
+    let flavor_names_idx = build_printed_name_index(&printings, &foreign, &strings, |p| p.flavor_name_folded_id);
         let indexes = CardIndexes {
             name_trigram:   build_trigram_index(&cards, |c| c.card_name_folded.as_str()),
             oracle_trigram: build_oracle_text_index(&cards, &strings),
@@ -14544,6 +14596,7 @@ impl QueryEngine {
             foreign_by_scryfall_id: build_printing_by_scryfall_id(&foreign),
             foreign_external_ids: build_external_id_index(&foreign),
             printed_names: printed_names_idx,
+        flavor_names: flavor_names_idx,
         };
 
         #[cfg(feature = "alloc-counter")]

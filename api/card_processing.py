@@ -138,6 +138,10 @@ _FACE_OBJECT_FIELDS = (
     # line and NOTHING else — and _face_records keeps absent keys absent, so the absence
     # round-trips exactly instead of becoming null or borrowed English.
     "printed_name",
+    # Scryfall's face key order is name -> flavor_name -> mana_cost, verified live on vow/338
+    # (transform) and sld/1079 (reversible_card) 2026-08-16. A printing carries the flavor name at
+    # the CARD level or on its faces, never both.
+    "flavor_name",
     "mana_cost",
     "type_line",
     "printed_type_line",
@@ -170,6 +174,21 @@ def _face_records(card_faces: list[dict[str, Any]]) -> list[dict[str, Any]]:
         agree key-for-key.
     """
     return [{field: face[field] for field in _FACE_OBJECT_FIELDS if field in face} for face in card_faces]
+
+
+def _fold_name(value: str | None) -> str | None:
+    """Lowercase and accent-fold a name for the engine's name indexes, or None.
+
+    The same fold `card_name_folded` and `printed_name_folded` use, factored out because
+    `flavor_name_folded` is a third caller and the three must agree exactly.
+
+    Args:
+        value: The name as Scryfall sent it, or None when the key was absent.
+
+    Returns:
+        The folded name, or None when there was none to fold.
+    """
+    return fold_accents(value.lower()) if value else None
 
 
 def _printed_name_folded(card: dict[str, Any], face_records: list[dict[str, Any]]) -> str | None:
@@ -364,9 +383,11 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
         # merged each face's own printed keys into its row, so without this the front face's
         # printed_name would masquerade as the card's — the per-face halves ride card_faces.
         merged_row["printed_name"] = card.get("printed_name")
+        merged_row["flavor_name"] = card.get("flavor_name")
         merged_row["printed_type_line"] = card.get("printed_type_line")
         merged_row["printed_text"] = card.get("printed_text")
         merged_row["printed_name_folded"] = _printed_name_folded(card, merged_row["card_faces"])
+        merged_row["flavor_name_folded"] = _fold_name(merged_row["flavor_name"])
         return [merged_row]
 
     # Single face case - set defaults
@@ -468,9 +489,16 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
     # key, so an upsert overrides any stale value instead of keeping it, same reasoning as the
     # creature stat columns above.
     card["printed_name"] = card.get("printed_name")
+    # Scryfall's `flavor_name`: the alternate name a printing is SOLD under (the Godzilla series,
+    # Stranger Things, the Secret Lair crossovers). PRINTING-level and quite separate from the
+    # printed triple — a printing may carry both — and `_folded` is the name-lookup key that makes
+    # `/cards/named?exact=Godzilla, Primeval Champion` resolve prm/80925, which it does on
+    # api.scryfall.com and did not here. The FACE-level variant rides card_faces.
+    card["flavor_name"] = card.get("flavor_name")
     card["printed_type_line"] = card.get("printed_type_line")
     card["printed_text"] = card.get("printed_text")
     card["printed_name_folded"] = _printed_name_folded(card, [])
+    card["flavor_name_folded"] = _fold_name(card["flavor_name"])
 
     mana_cost_text = card.get("mana_cost", "")
     card["mana_cost_jsonb"] = mana_cost_str_to_dict(mana_cost_text)

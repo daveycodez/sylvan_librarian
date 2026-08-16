@@ -233,6 +233,8 @@ fn stub_card(oracle_id: u128, card_types: u16, subtypes: &[&str], vocab: &mut Vo
 fn stub_printing(scryfall_id: u128, illustration_id: u128, prefer_score: Option<f32>) -> Printing {
     Printing {
         scryfall_id,
+        flavor_name_id: NONE_STR,
+        flavor_name_folded_id: NONE_STR,
         illustration_id,
         flavor_text_id: NONE_STR,
         flavor_text_lower_id: NONE_STR,
@@ -307,6 +309,7 @@ fn store_of(cards: Vec<OracleCard>, printing_counts: &[usize], vocab: VocabInter
     // Real planes and bigrams so narrowing tests see the same store shape
     // reload_commit builds (type narrowing goes through the planes since #637).
     let indexes = CardIndexes {
+        flavor_names: Default::default(),
         artwork_base,
         // No printing sets card_border_id away from NONE_STR at this point (any
         // border values a fixture wants get set after store_of returns, same as
@@ -6412,6 +6415,7 @@ fn bench_checked_vs_unchecked_access() {
     let artwork_base = build_artwork_base_from(&artwork_groups);
 
     let indexes = CardIndexes {
+        flavor_names: Default::default(),
         artwork_base,
         name_trigram:   build_trigram_index(&cards, |c| c.card_name_folded.as_str()),
         name_unigrams:  build_name_unigram_index(&cards),
@@ -12174,7 +12178,7 @@ fn bilingual_store() -> (CardData, u16, u16) {
     data.indexes.langs = build_lang_index(&data.printings, &data.coll_vocab);
     data.indexes.foreign_langs = build_lang_index(&data.foreign, &data.coll_vocab);
     data.indexes.foreign_to_card = build_printing_to_card(&data.foreign_offsets);
-    data.indexes.printed_names = build_printed_name_index(&data.printings, &data.foreign, &data.strings);
+    data.indexes.printed_names = build_printed_name_index(&data.printings, &data.foreign, &data.strings, |p| p.printed_name_folded_id);
     (data, en, fr)
 }
 
@@ -12342,7 +12346,7 @@ fn cross_set_language_store() -> (CardData, u16, u16) {
     data.indexes.langs = build_lang_index(&data.printings, &data.coll_vocab);
     data.indexes.foreign_langs = build_lang_index(&data.foreign, &data.coll_vocab);
     data.indexes.foreign_to_card = build_printing_to_card(&data.foreign_offsets);
-    data.indexes.printed_names = build_printed_name_index(&data.printings, &data.foreign, &data.strings);
+    data.indexes.printed_names = build_printed_name_index(&data.printings, &data.foreign, &data.strings, |p| p.printed_name_folded_id);
     (data, en, ja)
 }
 
