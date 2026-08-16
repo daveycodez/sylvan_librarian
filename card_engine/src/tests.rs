@@ -196,6 +196,7 @@ fn stub_card(oracle_id: u128, card_types: u16, subtypes: &[&str], vocab: &mut Vo
     OracleCard {
         card_name_lower: InlineStr::from_str(""),
         card_name_folded: InlineStr::from_str(""),
+        card_name_collated_id: NONE_STR,
         card_colors: 0,
         card_color_identity: 0,
         produced_mana: 0,
@@ -317,8 +318,8 @@ fn store_of(cards: Vec<OracleCard>, printing_counts: &[usize], vocab: VocabInter
         // border_planes_fixture_store already does), so an empty string table is
         // safe here -- the border-scatter loop skips every printing regardless.
         planes: build_bit_planes(&cards, &printings, &offsets, &[]),
-        name_bigrams: build_name_bigram_index(&cards),
-        name_unigrams: build_name_unigram_index(&cards),
+        name_bigrams: build_name_bigram_index(&cards, &[]),
+        name_unigrams: build_name_unigram_index(&cards, &[]),
         legal_divergent: build_divergent_ids(&cards),
         sort_perms: build_sort_permutations(&cards),
         max_artwork_groups: artwork_groups.iter().copied().max().unwrap_or(0),
@@ -328,7 +329,7 @@ fn store_of(cards: Vec<OracleCard>, printing_counts: &[usize], vocab: VocabInter
         ..Default::default()
     };
     let foreign_offsets = vec![0u32; cards.len() + 1];
-    CardData {
+    let mut data = CardData {
         cards,
         printings,
         offsets,
@@ -342,7 +343,31 @@ fn store_of(cards: Vec<OracleCard>, printing_counts: &[usize], vocab: VocabInter
         mana_vocab: vec![],
         indexes,
         format_shifts: HashMap::new(),
+    };
+    derive_name_collation(&mut data);
+    data
+}
+
+/// Fill `card_name_collated_id` and rebuild the name tiers over it — the fixture twin of what
+/// `reload_commit` does for a real archive.
+///
+/// Fixtures that rewrite a name AFTER `store_of` returns have to call this again, for the same
+/// reason the builder derives the column rather than importing it: the collated name is a function
+/// of the folded one, and an index built over a stale collation narrows a `name:` needle to
+/// silence.
+pub(crate) fn derive_name_collation(data: &mut CardData) {
+    for i in 0..data.cards.len() {
+        let folded = data.cards[i].card_name_folded.as_str().to_owned();
+        let collated = crate::collate_name(&folded);
+        data.cards[i].card_name_collated_id = if collated == folded {
+            crate::NONE_STR
+        } else {
+            data.strings.push(collated);
+            (data.strings.len() - 1) as u32
+        };
     }
+    data.indexes.name_bigrams = build_name_bigram_index(&data.cards, &data.strings);
+    data.indexes.name_unigrams = build_name_unigram_index(&data.cards, &data.strings);
 }
 
 /// Recompute both artwork-grouping-derived index fields (per-card counts and the per-printing
@@ -1866,7 +1891,7 @@ fn fuzz_text_needle(rng: &mut rand::rngs::SmallRng, field: TextSearchField) -> S
     for _ in 0..8 {
         let t = corpus[rng.random_range(0..corpus.len())];
         let text = match field {
-            TextSearchField::NameLower => t.0,
+            TextSearchField::NameLower | TextSearchField::NameCollated => t.0,
             TextSearchField::OracleTextLower => t.1,
             TextSearchField::FlavorTextLower => t.2,
             TextSearchField::ArtistLower => t.0, // artist has its own leaf; not reached here
@@ -1992,7 +2017,7 @@ fn fuzz_leaf(rng: &mut rand::rngs::SmallRng) -> FuzzSpec {
         17 => fuzz_leaf_collection(rng, CollField::IsTags, &FUZZ_IS_TAGS),
         18 => fuzz_leaf_collection(rng, CollField::FrameData, &FUZZ_FRAME_DATA),
         19 => fuzz_leaf_artist(rng),
-        20 => fuzz_leaf_text_contains(rng, TextSearchField::NameLower),
+        20 => fuzz_leaf_text_contains(rng, TextSearchField::NameCollated),
         21 => fuzz_leaf_text_contains(rng, TextSearchField::OracleTextLower),
         22 => fuzz_leaf_text_contains(rng, TextSearchField::FlavorTextLower),
         23 => fuzz_leaf_name_exact(rng),
@@ -2182,6 +2207,9 @@ fn fuzz_describe(spec: &FuzzSpec) -> String {
         FuzzSpec::Leaf(FuzzLeaf::Artist { word }) => format!("artist:{word}"),
         FuzzSpec::Leaf(FuzzLeaf::TextContains { field, needle }) => {
             let f = match field {
+                // The bare-word spelling; `NameLower` is what a QUOTED value compiles to, which
+                // the round-trip below re-quotes.
+                TextSearchField::NameCollated => "name",
                 TextSearchField::NameLower => "name",
                 TextSearchField::OracleTextLower => "oracle",
                 TextSearchField::FlavorTextLower => "flavor",
@@ -2465,6 +2493,7 @@ fn fuzz_store_n(rng: &mut rand::rngs::SmallRng, ncards: usize) -> CardData {
         data.printings[idx].flavor_text_lower_id = flavor_meta[idx];
     }
     data.strings = interner.strings;
+    derive_name_collation(&mut data); // the assignment above discarded the collated ids store_of derived
     // store_of built indexes from the placeholder printings and left the numeric/range indexes at
     // empty defaults; rebuild everything the mutated fields feed. The range indexes are load-bearing
     // for correctness, not just coverage: an empty range index narrows a matching predicate to the
@@ -2482,9 +2511,9 @@ fn fuzz_store_n(rng: &mut rand::rngs::SmallRng, ncards: usize) -> CardData {
     data.indexes.artists = build_artist_index(&data.printings, data.artist_vocab.len());
     // Text narrowing indexes — same load-bearing property. name/oracle drive trigram + bigram
     // narrowing and the full-scan memoization; flavor is the printing-space CSR bind() resolves against.
-    data.indexes.name_trigram = build_trigram_index(&data.cards, |c| c.card_name_folded.as_str());
-    data.indexes.name_bigrams = build_name_bigram_index(&data.cards);
-    data.indexes.name_unigrams = build_name_unigram_index(&data.cards);
+    data.indexes.name_trigram = build_trigram_index(&data.cards, |c| crate::collated_name_of(c, &data.strings));
+    data.indexes.name_bigrams = build_name_bigram_index(&data.cards, &data.strings);
+    data.indexes.name_unigrams = build_name_unigram_index(&data.cards, &data.strings);
     data.indexes.oracle_trigram = build_oracle_text_index(&data.cards, &data.strings);
     data.indexes.flavor = build_flavor_index(&data.printings, &data.strings);
     data.indexes.planes = build_bit_planes(&data.cards, &data.printings, &data.offsets, &data.strings);
@@ -4246,7 +4275,7 @@ fn materializing_plans_agree_on_the_counters_they_share() {
         FuzzSpec::And(vec![fuzz_leaf_type(&mut rng), fuzz_leaf_rarity(&mut rng)]),
         FuzzSpec::Leaf(FuzzLeaf::Border { value: "black".to_string() }),
         fuzz_leaf_text_contains(&mut rng, TextSearchField::OracleTextLower),
-        fuzz_leaf_text_contains(&mut rng, TextSearchField::NameLower),
+        fuzz_leaf_text_contains(&mut rng, TextSearchField::NameCollated),
         fuzz_leaf_arith(&mut rng),
         FuzzSpec::And(vec![fuzz_leaf_type(&mut rng), fuzz_leaf_text_contains(&mut rng, TextSearchField::OracleTextLower)]),
     ];
@@ -4870,7 +4899,7 @@ fn calibration_queries() -> Vec<(&'static str, FuzzSpec)> {
     let price = |op, val| FuzzSpec::Leaf(FuzzLeaf::Price { field: NumField::PriceUsd, op, val });
     let year   = |op, y: i32| FuzzSpec::Leaf(FuzzLeaf::Year { op, year: y });
     let otext  = |needle: &str| FuzzSpec::Leaf(FuzzLeaf::TextContains { field: TextSearchField::OracleTextLower, needle: needle.to_string() });
-    let ntext  = |needle: &str| FuzzSpec::Leaf(FuzzLeaf::TextContains { field: TextSearchField::NameLower, needle: needle.to_string() });
+    let ntext  = |needle: &str| FuzzSpec::Leaf(FuzzLeaf::TextContains { field: TextSearchField::NameCollated, needle: needle.to_string() });
     let rarity = |op, val| FuzzSpec::Leaf(FuzzLeaf::Rarity { op, val });
     let kw     = |value: &str| FuzzSpec::Leaf(FuzzLeaf::Collection { field: CollField::Keywords, op: CmpOp::Ge, value: value.to_string() });
 
@@ -6418,8 +6447,8 @@ fn bench_checked_vs_unchecked_access() {
     let indexes = CardIndexes {
         flavor_names: Default::default(),
         artwork_base,
-        name_trigram:   build_trigram_index(&cards, |c| c.card_name_folded.as_str()),
-        name_unigrams:  build_name_unigram_index(&cards),
+        name_trigram:   build_trigram_index(&cards, |c| crate::collated_name_of(c, &[])),
+        name_unigrams:  build_name_unigram_index(&cards, &[]),
         oracle_trigram: build_oracle_text_index(&cards, &strings),
         cmc:            build_numeric_index(&cards, |c| c.cmc.map(|v| v as i16)),
         power:          build_numeric_index(&cards, |c| c.creature_power.map(|v| v as i16)),
@@ -6458,7 +6487,7 @@ fn bench_checked_vs_unchecked_access() {
         border_printing: build_border_printing_planes(&printings, &strings),
         rarity_printing: build_rarity_printing_planes(&printings),
         rarity_printing_ordered: build_printing_value_index(&printings, &cards, &offsets, |p| p.card_rarity_int.map(u32::from)),
-        name_bigrams:   build_name_bigram_index(&cards),
+        name_bigrams:   build_name_bigram_index(&cards, &[]),
         legal_divergent: build_divergent_ids(&cards),
         arith_tuple:    build_arith_tuple_index(&cards),
         printing_by_scryfall_id: build_printing_by_scryfall_id(&printings),
@@ -6650,6 +6679,7 @@ fn flavor_match_bind_eval_and_narrow() {
     data.printings[1].flavor_text_lower_id = interner.intern("a quiet forest".to_string());
     // printings[3] keeps NONE_STR: no flavor text at all
     data.strings = interner.strings;
+    derive_name_collation(&mut data); // the assignment above discarded the collated ids store_of derived
     data.indexes.flavor = build_flavor_index(&data.printings, &data.strings);
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
@@ -6910,7 +6940,7 @@ fn tie_break_fixture() -> (Vec<OracleCard>, VocabInterner) {
     card4.edhrec_rank = Some(1);
     card4.card_name_folded = InlineStr::from_str("esolo");
     let mut cards = vec![card0, card1, card2, card3, card4];
-    assign_name_ranks(&mut cards);
+    assign_name_ranks(&mut cards, &[]);
     (cards, vocab)
 }
 
@@ -7401,6 +7431,7 @@ fn watermark_narrowing() {
     data.printings[1].card_watermark_id = interner.intern("set".to_string());
     data.printings[2].card_watermark_id = NONE_STR; // no watermark — must not appear in any postings list
     data.strings = interner.strings;
+    derive_name_collation(&mut data); // the assignment above discarded the collated ids store_of derived
     let mut watermarks: TagIndex = HashMap::new();
     for (i, p) in data.printings.iter().enumerate() {
         if p.card_watermark_id != NONE_STR {
@@ -7468,6 +7499,7 @@ fn set_watermark_compose_leaves() {
         p.card_watermark_id = wm.map_or(NONE_STR, |s| interner.intern(s.to_string()));
     }
     data.strings = interner.strings;
+    derive_name_collation(&mut data); // the assignment above discarded the collated ids store_of derived
     // Released dates give a mix of years for the range-leaf mixes (pid4 dateless — fails any year).
     let year_by_pid = [Some(20200101), Some(20230101), Some(20200101), Some(20230101), None, Some(20240101)];
     for (p, y) in data.printings.iter_mut().zip(year_by_pid) {
@@ -8814,7 +8846,8 @@ fn text_fixture_store() -> CardData {
         .collect();
     let mut data = store_of(cards, &[1usize; 6], vocab);
     data.strings = interner.strings;
-    data.indexes.name_trigram = build_trigram_index(&data.cards, |c| c.card_name_folded.as_str());
+    derive_name_collation(&mut data); // the assignment above discarded the collated ids store_of derived
+    data.indexes.name_trigram = build_trigram_index(&data.cards, |c| crate::collated_name_of(c, &data.strings));
     data.indexes.oracle_trigram = build_oracle_text_index(&data.cards, &data.strings);
     data
 }
@@ -8832,7 +8865,7 @@ fn memoize_text_predicates_parity() {
         f
     };
     let oracle = |w: &str| FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: w.to_string() };
-    let name = |w: &str| FilterExpr::TextContains { field: TextSearchField::NameLower, word: w.to_string() };
+    let name = |w: &str| FilterExpr::TextContains { field: TextSearchField::NameCollated, word: w.to_string() };
 
     for needle in ["damage", "draw", "goblin", "abcde", "card.", "zzz"] {
         let rewritten = memo(oracle(needle));
@@ -8977,6 +9010,7 @@ fn oracle_word_fixture_store() -> CardData {
         .collect();
     let mut data = store_of(cards, &[1usize; 17], vocab);
     data.strings = interner.strings;
+    derive_name_collation(&mut data); // the assignment above discarded the collated ids store_of derived
     data.indexes.oracle_trigram = build_oracle_text_index(&data.cards, &data.strings);
     data
 }
@@ -9011,6 +9045,7 @@ fn oracle_word_multi_dense_fixture_store() -> CardData {
         .collect();
     let mut data = store_of(cards, &[1usize; 6], vocab);
     data.strings = interner.strings;
+    derive_name_collation(&mut data); // the assignment above discarded the collated ids store_of derived
     data.indexes.oracle_trigram = build_oracle_text_index(&data.cards, &data.strings);
     data
 }
@@ -9209,6 +9244,7 @@ fn border_planes_fixture_store() -> CardData {
         }
     }
     data.strings = interner.strings;
+    derive_name_collation(&mut data); // the assignment above discarded the collated ids store_of derived
     data.indexes.planes = build_bit_planes(&data.cards, &data.printings, &data.offsets, &data.strings);
     data
 }
@@ -9374,6 +9410,7 @@ fn border_broadness_fixture_store() -> CardData {
         data.printings[i].card_border_id = interner.intern(border.to_string());
     }
     data.strings = interner.strings;
+    derive_name_collation(&mut data); // the assignment above discarded the collated ids store_of derived
     data.indexes.planes = build_bit_planes(&data.cards, &data.printings, &data.offsets, &data.strings);
     data
 }
@@ -9642,7 +9679,7 @@ fn not_over_partial_and_is_blocked() {
     // the total below pins. Not a 1-byte needle any more -- those resolve exactly through the unigram
     // index now (#858) -- and not an oracle needle either, since this fixture leaves oracle text unset,
     // making it Null rather than False and changing what the negation matches.
-    let unindexable = || FilterExpr::TextContains { field: TextSearchField::NameLower, word: "qqqq".into() };
+    let unindexable = || FilterExpr::TextContains { field: TextSearchField::NameCollated, word: "qqqq".into() };
 
     // Static check: And with an unrepresentable child can't be tight → Not
     // must refuse to narrow at all.
@@ -9716,7 +9753,7 @@ fn name_bigrams_tiers_and_exactness() {
     assert!(idx.postings.get(b"qx").is_some(), "64-name bigram stays a posting list");
 
     let rec = |w: &str| {
-        let f = FilterExpr::TextContains { field: TextSearchField::NameLower, word: w.to_string() };
+        let f = FilterExpr::TextContains { field: TextSearchField::NameCollated, word: w.to_string() };
         super::narrow_rec(&f, &archived.indexes, &archived.offsets, &archived.cards, false)
     };
     // Dense tier: exact bitmap, tight.
@@ -9764,7 +9801,7 @@ fn not_over_unigram_is_tight_but_oracle_stays_loose() {
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
     let rec = |f: &FilterExpr| super::narrow_rec(f, &archived.indexes, &archived.offsets, &archived.cards, true);
 
-    let name_q = || FilterExpr::TextContains { field: TextSearchField::NameLower, word: "q".into() };
+    let name_q = || FilterExpr::TextContains { field: TextSearchField::NameCollated, word: "q".into() };
     let n = rec(&FilterExpr::Not(Box::new(name_q()))).expect("-name:q must narrow");
     assert!(n.tight, "name is never Null, so the complement of a tight 1-byte set is exact");
     let cand = n.set.into_cards(&archived.offsets, &archived.indexes.printing_to_card);
@@ -9778,7 +9815,7 @@ fn not_over_unigram_is_tight_but_oracle_stays_loose() {
     assert_eq!(cand, brute, "-name:q must be exactly the cards whose name lacks 'q'");
 
     // An absent byte complements to every card, and that must stay exact rather than trip a breadth guard.
-    let name_v = FilterExpr::TextContains { field: TextSearchField::NameLower, word: "v".into() };
+    let name_v = FilterExpr::TextContains { field: TextSearchField::NameCollated, word: "v".into() };
     let n = rec(&FilterExpr::Not(Box::new(name_v))).expect("-name:v must narrow");
     assert!(n.tight);
     assert_eq!(n.set.len(), archived.cards.len(), "no name contains 'v', so its negation is every card");
@@ -9814,7 +9851,7 @@ fn name_unigrams_tiers_and_exactness() {
     assert!(idx.postings.get(&b'q').is_some(), "a byte in 64 names stays a posting list");
 
     let rec = |w: &str| {
-        let f = FilterExpr::TextContains { field: TextSearchField::NameLower, word: w.to_string() };
+        let f = FilterExpr::TextContains { field: TextSearchField::NameCollated, word: w.to_string() };
         super::narrow_rec(&f, &archived.indexes, &archived.offsets, &archived.cards, false)
     };
     // Dense tier: exact bitmap, tight.
@@ -9854,10 +9891,11 @@ fn name_bigrams_compose_and_memoize() {
     }).collect();
     let mut data = store_of(cards, &[1usize; 6], vocab);
     data.strings = interner.strings;
+    derive_name_collation(&mut data); // the assignment above discarded the collated ids store_of derived
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
-    let name2 = |w: &str| FilterExpr::TextContains { field: TextSearchField::NameLower, word: w.to_string() };
+    let name2 = |w: &str| FilterExpr::TextContains { field: TextSearchField::NameCollated, word: w.to_string() };
 
     // Or of two bigram children composes: "fi" → {0,1,4}, "dr" → {0,2}.
     let or = FilterExpr::Or(vec![name2("fi"), name2("dr")]);
@@ -10114,12 +10152,12 @@ fn named_store() -> CardData {
             c
         })
         .collect();
-    assign_name_ranks(&mut cards);
+    assign_name_ranks(&mut cards, &[]);
     let mut data = store_of(cards, &[1; 6], vocab);
     data.indexes.sort_perms = build_sort_permutations(&data.cards);
     // ExactName narrows through this index, not the permutation — a face name is not addressable
     // by a range over the joined name (see narrow_rec's ExactName arm).
-    data.indexes.name_trigram = build_trigram_index(&data.cards, |c| c.card_name_folded.as_str());
+    data.indexes.name_trigram = build_trigram_index(&data.cards, |c| crate::collated_name_of(c, &data.strings));
     data
 }
 
@@ -10147,14 +10185,16 @@ fn exact_name_narrows_tight() {
             .expect("exact name must narrow")
     };
 
+    // Needles are COLLATED, which is the form the parser emits — "sol ring" reaches the engine as
+    // "solring".
     for (name, mut want) in [
         ("fog", vec![0u32]),
-        ("sol ring", vec![1, 3]),
+        ("solring", vec![1, 3]),
         ("atog", vec![2]),          // first in sorted order
         ("cancel", vec![5]),        // adjacent to the last block
-        ("zzz past the end", vec![]),
-        ("aaa before the start", vec![]),
-        ("sol rin", vec![]),        // prefix of a real name is still a miss
+        ("zzzpasttheend", vec![]),
+        ("aaabeforethestart", vec![]),
+        ("solrin", vec![]),         // prefix of a real name is still a miss
     ] {
         let n = narrow(name);
         assert!(n.tight, "{name}: candidates are verified in the narrow, so the set is exact");
@@ -10167,11 +10207,11 @@ fn exact_name_narrows_tight() {
     // Composition: the tight set participates in the candidate algebra, and
     // run_query totals agree with a full scan on every shape.
     let mut shapes: Vec<FilterExpr> = vec![
-        exact("sol ring"),
-        exact("no such card"),
-        FilterExpr::Or(vec![exact("sol ring"), FilterExpr::TypeCmp { mask: TYPE_CREATURE, op: CmpOp::Ge }]),
+        exact("solring"),
+        exact("nosuchcard"),
+        FilterExpr::Or(vec![exact("solring"), FilterExpr::TypeCmp { mask: TYPE_CREATURE, op: CmpOp::Ge }]),
         FilterExpr::And(vec![exact("fog"), FilterExpr::TypeCmp { mask: TYPE_CREATURE, op: CmpOp::Ge }]),
-        FilterExpr::Not(Box::new(exact("sol ring"))),
+        FilterExpr::Not(Box::new(exact("solring"))),
     ];
     for (i, f) in shapes.iter_mut().enumerate() {
         let brute = archived
@@ -10208,21 +10248,35 @@ fn accent_folded_name_search_matches_unaccented_query() {
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
-    // A query word already folded by Python (whether the user typed "eowyn" or
-    // "Éowyn") must find the accented card and only it.
-    let contains_eowyn = FilterExpr::TextContains { field: TextSearchField::NameLower, word: "eowyn".to_string() };
-    let matches: Vec<u32> = archived.cards.iter().enumerate()
-        .filter(|(_, c)| contains_eowyn.eval_card(c, &archived.strings) == Tri::True)
-        .map(|(i, _)| i as u32)
-        .collect();
-    assert_eq!(matches, vec![0], "unaccented fuzzy query must find only the accented card");
+    let hits = |f: &FilterExpr| -> Vec<u32> {
+        archived.cards.iter().enumerate()
+            .filter(|(_, c)| f.eval_card(c, &archived.strings) == Tri::True)
+            .map(|(i, _)| i as u32)
+            .collect()
+    };
 
-    // Exact match stays accent-sensitive: typing the accent finds it; typing
-    // without the accent does not.
-    let exact_accented = FilterExpr::ExactName("éowyn, fearless knight".to_string());
-    let exact_unaccented = FilterExpr::ExactName("eowyn, fearless knight".to_string());
-    assert!(exact_accented.eval_card(&archived.cards[0], &archived.strings) == Tri::True);
-    assert!(exact_unaccented.eval_card(&archived.cards[0], &archived.strings) == Tri::False);
+    // A BARE query word — collated by Python, whether the user typed "eowyn" or "Éowyn" — finds
+    // the accented card and only it. `name:eowyn` and `name:éowyn` both answer 3 cards on
+    // api.scryfall.com (2026-08-16).
+    let collated = |w: &str| FilterExpr::TextContains { field: TextSearchField::NameCollated, word: w.to_string() };
+    assert_eq!(hits(&collated("eowyn")), vec![0], "an unaccented bare word must find the accented card");
+    // ...including across the separators the fold removes: `name:eowynfearless` is a hit, which is
+    // the whole reason `name:ft` answers 1,628 there and this port used to answer 359.
+    assert_eq!(hits(&collated("eowynfearless")), vec![0], "the collated word crosses the comma and the space");
+
+    // A QUOTED value is LITERAL: `name:"eowyn"` answers 0 on api.scryfall.com while
+    // `name:"éowyn"` answers 3, and neither crosses a separator.
+    let literal = |w: &str| FilterExpr::TextContains { field: TextSearchField::NameLower, word: w.to_string() };
+    assert_eq!(hits(&literal("eowyn")), Vec::<u32>::new(), "a quoted value does not fold the accent away");
+    assert_eq!(hits(&literal("éowyn")), vec![0], "typing the accent finds it");
+    assert_eq!(hits(&literal("eowyn, fearless")), Vec::<u32>::new(), "and the separators still count");
+    assert_eq!(hits(&literal("éowyn, fearless")), vec![0]);
+
+    // `!"…"` is COLLATED, so typing the name without its accent — or without its comma — finds the
+    // card. `!"eowyn, lady of rohan"` answers "Éowyn, Lady of Rohan" on api.scryfall.com.
+    let exact = |w: &str| FilterExpr::ExactName(w.to_string());
+    assert!(exact("eowynfearlessknight").eval_card(&archived.cards[0], &archived.strings) == Tri::True);
+    assert!(exact("eowynfearless").eval_card(&archived.cards[0], &archived.strings) == Tri::False, "exact, not a prefix");
 }
 
 // order:name sorts pages by name in both directions, breaks the duplicate-name
@@ -10705,7 +10759,7 @@ fn printing_range_fixture(seed: u64, n_cards: usize) -> CardData {
         c.card_name_folded = InlineStr::from_str(&format!("card{:05}", names[i]));
         cards.push(c);
     }
-    assign_name_ranks(&mut cards);
+    assign_name_ranks(&mut cards, &[]);
     let counts: Vec<usize> = (0..n_cards).map(|_| rng.random_range(1..=4)).collect();
     let mut data = store_of(cards, &counts, vocab);
     // cents; 5000 == $50.00, which usd<50 excludes (strict). Hot values 15/100 form big buckets.
@@ -11431,17 +11485,26 @@ fn exact_name_matches_either_face() {
     // `Emeritus of Conflict // Lightning Bolt` (sos/113), whose SECOND face carries the name. The
     // same rule answers `!"Fire"` with `Fire // Ice`, `!"Stomp"` with `Bonecrusher Giant // Stomp`
     // and `!"Insectile Aberration"` with `Delver of Secrets // Insectile Aberration`.
+    //
+    // The needle arrives COLLATED (`collate_name(fold_accents(value.lower()))`, done in Python),
+    // which is why `!"lim-dul's vault"` and `!"limduls vault"` are the same search on Scryfall —
+    // and the stored side is collated here, per face, before the comparison.
     use super::filter::exact_name_matches;
     let joined = "emeritus of conflict // lightning bolt";
-    assert!(exact_name_matches(joined, joined));
-    assert!(exact_name_matches(joined, "lightning bolt"), "the back face names the card");
-    assert!(exact_name_matches(joined, "emeritus of conflict"), "so does the front face");
-    assert!(exact_name_matches("lightning bolt", "lightning bolt"));
+    assert!(exact_name_matches(joined, "emeritusofconflictlightningbolt"));
+    assert!(exact_name_matches(joined, "lightningbolt"), "the back face names the card");
+    assert!(exact_name_matches(joined, "emeritusofconflict"), "so does the front face");
+    assert!(exact_name_matches("lightning bolt", "lightningbolt"));
+    // The separators are gone from the needle too, so the punctuation a searcher skips no longer
+    // decides the answer. The STORED side arrives already accent-folded (`folded_name`), so
+    // "Lim-Dûl's Vault" reaches here as "lim-dul's vault" and all four spellings of it — with or
+    // without the circumflex, with or without the hyphen and apostrophe — collate to one string.
+    assert!(exact_name_matches("lim-dul's vault", "limdulsvault"));
     // Still EXACT, per face: a prefix, a suffix or a substring of a face name is not a match.
     assert!(!exact_name_matches(joined, "lightning"));
     assert!(!exact_name_matches(joined, "bolt"));
-    assert!(!exact_name_matches(joined, "conflict // lightning bolt"));
-    assert!(!exact_name_matches("lightning bolt", "lightning bol"));
+    assert!(!exact_name_matches(joined, "conflictlightningbolt"));
+    assert!(!exact_name_matches("lightning bolt", "lightningbol"));
     // A one-sided separator is not the join, so nothing splits on it.
     assert!(!exact_name_matches("who//what//when", "what"));
 }
@@ -11464,10 +11527,10 @@ fn exact_name_narrow_finds_a_back_face_and_declines_where_it_cannot() {
             c
         })
         .collect();
-    assign_name_ranks(&mut cards);
+    assign_name_ranks(&mut cards, &[]);
     let mut data = store_of(cards, &[1; 4], vocab);
     data.indexes.sort_perms = build_sort_permutations(&data.cards);
-    data.indexes.name_trigram = build_trigram_index(&data.cards, |c| c.card_name_folded.as_str());
+    data.indexes.name_trigram = build_trigram_index(&data.cards, |c| crate::collated_name_of(c, &data.strings));
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
@@ -11486,14 +11549,14 @@ fn exact_name_narrow_finds_a_back_face_and_declines_where_it_cannot() {
         got
     };
 
-    let n = narrow("lightning bolt").expect("must narrow");
+    let n = narrow("lightningbolt").expect("must narrow");
     assert!(n.tight);
     assert_eq!(cards_of(n), vec![0, 1], "both the card and the card whose back face is named");
-    let n = narrow("emeritus of conflict").expect("must narrow");
+    let n = narrow("emeritusofconflict").expect("must narrow");
     assert_eq!(cards_of(n), vec![1]);
     let n = narrow("fog").expect("must narrow");
     assert_eq!(cards_of(n), vec![2]);
-    let n = narrow("no such card").expect("must narrow");
+    let n = narrow("nosuchcard").expect("must narrow");
     assert_eq!(cards_of(n), Vec::<u32>::new());
 
     // Under three bytes there is no trigram window, so there is nothing to narrow through and the

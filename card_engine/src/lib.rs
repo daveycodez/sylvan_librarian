@@ -456,6 +456,23 @@ struct OracleCard {
     // fold_accents() (#649). Backs fuzzy name: search (name_trigram/name_bigrams/TextContains)
     // so "eowyn" matches "Éowyn"; exact-match paths deliberately keep using card_name_lower.
     card_name_folded: InlineStr<61>,
+    // COLLATED card_name_folded: the folded name with every non-alphanumeric character removed
+    // ("lim-dul's vault" -> "limdulsvault"), DERIVED at build time rather than imported --
+    // `collate_name` is a pure function of the folded name, so a second column on the wire would
+    // only be a second thing to drift.
+    //
+    // This is the string a BARE `name:` word matches, the string `!"…"` compares against, and the
+    // string `assign_name_ranks` already ordered `order=name` by -- Scryfall matches and orders
+    // names with their separators gone (measured 2026-08-16: `name:ft` 1,628 against
+    // `name:"ft"` 362, because "Sword **of the** Ages" reads as "swordoftheages"). Storing it
+    // rather than folding per card per query is what keeps
+    // `name_trigram`/`name_bigrams`/`name_unigrams` -- all three built over THIS string -- exact
+    // tiers rather than candidate generators.
+    //
+    // INTERNED, not a third inline copy: the folded name is already 61 bytes a card, and the
+    // collated form differs from it on every name that has a separator to lose. `NONE_STR` means
+    // "the same as the folded name". Resolve with `collated_name`, never directly.
+    card_name_collated_id: u32,
     card_colors: u8,
     card_color_identity: u8,
     produced_mana: u8,
@@ -781,6 +798,26 @@ pub(crate) type APrinting = Archived<Printing>;
 pub(crate) type AStrings = Archived<Vec<String>>;
 // Archived CSR boundary table (CardData.offsets)
 pub(crate) type AOffsets = Archived<Vec<u32>>;
+
+/// A card's COLLATED name — the folded name with every non-alphanumeric character removed.
+///
+/// `NONE_STR` in `card_name_collated_id` means "the same as `card_name_folded`", which is true of
+/// every single-word name. Every reader goes through here.
+/// Build-time twin of `collated_name`, over unarchived rows and the interner's plain `Vec<String>`.
+fn collated_name_of<'a>(card: &'a OracleCard, strings: &'a [String]) -> &'a str {
+    if card.card_name_collated_id == NONE_STR {
+        return card.card_name_folded.as_str();
+    }
+    strings.get(card.card_name_collated_id as usize).map_or_else(|| card.card_name_folded.as_str(), String::as_str)
+}
+
+fn collated_name<'a>(card: &'a AOracleCard, strings: &'a AStrings) -> &'a str {
+    let id = u32::from(card.card_name_collated_id);
+    if id == NONE_STR {
+        return card.card_name_folded.as_str();
+    }
+    str_at(strings, id).unwrap_or_else(|| card.card_name_folded.as_str())
+}
 
 /// Sentinel id for absent optional strings (a card never has 4 billion distinct strings).
 const NONE_STR: u32 = u32::MAX;
@@ -1828,11 +1865,12 @@ struct NameBigramIndex {
     n_cards: u32,
 }
 
-fn build_name_bigram_index(cards: &[OracleCard]) -> NameBigramIndex {
+fn build_name_bigram_index(cards: &[OracleCard], strings: &[String]) -> NameBigramIndex {
     let mut lists: HashMap<[u8; 2], Vec<u32>> = HashMap::new();
     for (i, card) in cards.iter().enumerate() {
-        // Folded (#649) — this index backs the same fuzzy name: path as name_trigram.
-        let bytes = card.card_name_folded.as_str().as_bytes();
+        // COLLATED — this index backs the same `name:` path as name_trigram, over the same
+        // string; see the note there.
+        let bytes = collated_name_of(card, strings).as_bytes();
         let mut seen: Vec<[u8; 2]> = Vec::new(); // names are short; a vec beats a set
         for w in bytes.windows(2) {
             let bg = [w[0], w[1]];
@@ -1892,13 +1930,13 @@ struct NameUnigramIndex {
     n_cards: u32,
 }
 
-fn build_name_unigram_index(cards: &[OracleCard]) -> NameUnigramIndex {
+fn build_name_unigram_index(cards: &[OracleCard], strings: &[String]) -> NameUnigramIndex {
     let mut lists: HashMap<u8, Vec<u32>> = HashMap::new();
     for (i, card) in cards.iter().enumerate() {
-        // Folded (#649), matching what `name_trigram` / `name_bigrams` index and what the walk evaluates
+        // COLLATED, matching what `name_trigram` / `name_bigrams` index and what the walk evaluates
         // — that agreement is what makes the tight narrowing sound.
         let mut seen = [false; 256];
-        for &b in card.card_name_folded.as_str().as_bytes() {
+        for &b in collated_name_of(card, strings).as_bytes() {
             if !seen[b as usize] {
                 seen[b as usize] = true;
                 lists.entry(b).or_default().push(i as u32);
@@ -2793,8 +2831,8 @@ pub(crate) fn collate_name(folded_lower: &str) -> String {
 /// Dense rank of `collate_name(folded name)` onto each card (equal collated names share a rank; the
 /// standard sort secondaries break their ties). Every card has a name, so unlike the other sort
 /// columns the rank is never absent.
-fn assign_name_ranks(cards: &mut [OracleCard]) {
-    let key = |c: &OracleCard| collate_name(c.card_name_folded.as_str());
+fn assign_name_ranks(cards: &mut [OracleCard], strings: &[String]) {
+    let key = |c: &OracleCard| collated_name_of(c, strings).to_owned();
     let mut ids: Vec<u32> = (0..cards.len() as u32).collect();
     ids.sort_unstable_by(|&a, &b| key(&cards[a as usize]).cmp(&key(&cards[b as usize])));
     let mut rank = 0u32;
@@ -5528,7 +5566,7 @@ fn or_all(mut sets: Vec<Narrowed>, n: usize) -> Option<Narrowed> {
 /// `tight_narrow_space` had to drop `released_at` for being nullable, and excludes price for the same
 /// class of reason. Add a field only with the `str_val_of` / accessor line that proves totality.
 fn never_null(f: &FilterExpr) -> bool {
-    matches!(f, FilterExpr::TextContains { field: TextSearchField::NameLower, .. })
+    matches!(f, FilterExpr::TextContains { field: TextSearchField::NameLower | TextSearchField::NameCollated, .. })
 }
 
 /// Static answer to "could narrow_rec(f) produce a tight set, and in which
@@ -5543,8 +5581,10 @@ fn tight_narrow_space(f: &FilterExpr) -> Option<bool> {
         FilterExpr::ExactName(_) => Some(false),
         // An oracle id resolves exactly through the sorted oracle_id permutation, to 0 or 1 card.
         FilterExpr::OracleIdMatch { .. } => Some(false),
-        // 1- and 2-byte name needles resolve exactly through the unigram / bigram indexes.
-        FilterExpr::TextContains { field: TextSearchField::NameLower, word } if word.len() <= 2 => Some(false),
+        // 1- and 2-byte COLLATED name needles resolve exactly through the unigram / bigram
+        // indexes; the literal predicate only borrows them as candidates and must re-verify, so
+        // it is never tight.
+        FilterExpr::TextContains { field: TextSearchField::NameCollated, word } if word.len() <= 2 => Some(false),
         // Ge-only guard is deliberate (#700): narrow_rec's CollectionCmp arm
         // now also narrows Eq/Gt through the same containment postings, but
         // only loosely — the postings prove `contains(value)`, not the
@@ -6052,14 +6092,13 @@ fn narrow_rec(
             // verify ever ran, which is exactly how `!"Lightning Bolt"` came back without
             // `Emeritus of Conflict // Lightning Bolt`.
             //
-            // The folded-name trigram index does answer it: a face-name match means the needle is a
-            // CONTIGUOUS substring of the stored name, so the card carries every trigram of it. The
-            // index is built over card_name_folded while the comparison is on card_name_lower, and
-            // that is sound in one direction only — folding leaves ASCII alone and only ever ADDS
-            // ASCII (é→e, æ→ae), so an ASCII needle inside the lower name is still inside the folded
-            // one. A non-ASCII needle has no such guarantee ("éowyn" has no window in common with
-            // the folded "eowyn"), and a needle under 3 bytes has no window at all: both decline to
-            // narrow rather than narrow unsoundly, and the scan verifies every card instead.
+            // The collated-name trigram index does answer it: a face-name match means the needle is
+            // a CONTIGUOUS substring of the collated stored name (a face's collated form is a
+            // contiguous run of the whole name's), so the card carries every trigram of it — and
+            // the needle arrives collated from the parser, over the same string the index is built
+            // from, so this is now exact rather than sound-in-one-direction. A needle under 3 bytes
+            // has no window at all, and a non-ASCII one keeps its own decline: both fall back to
+            // the scan, which verifies every card instead.
             //
             // Candidates are verified here with the same predicate the walk uses, so the result is
             // exact — `tight_narrow_space` still reports ExactName as tight card space, and the Not
@@ -6073,7 +6112,7 @@ fn narrow_rec(
             }
             let mut ids = trigram_candidates(idx, needle)?;
             ids.retain(|&cid| {
-                crate::filter::exact_name_matches(cards[cid as usize].card_name_lower.as_str(), needle)
+                crate::filter::exact_name_matches(cards[cid as usize].card_name_folded.as_str(), needle)
             });
             Narrowed::tight(Candidates::Cards(ids))
         }
@@ -6089,10 +6128,14 @@ fn narrow_rec(
             Narrowed::tight(Candidates::Cards(find_oracle_by_oracle_id(perm, cards, *id).into_iter().collect()))
         }
 
-        FilterExpr::TextContains { field: TextSearchField::NameLower, word } if word.len() == 1 => {
+        FilterExpr::TextContains { field: TextSearchField::NameCollated, word } if word.len() == 1 => {
             // A 1-byte needle's containment IS byte membership, so the tier lookup is the complete
             // answer — tight, exactly as the 2-byte arm below. A byte absent from the index appears in
             // no name, so the empty narrowing is exact too. (#858)
+            //
+            // COLLATED only. The literal `name:"…"` predicate shares these tiers, but only as a
+            // candidate generator that must be re-verified, which `Narrowed::tight` would forbid;
+            // it narrows through the arm below instead.
             let idx = &indexes.name_unigrams;
             if u32::from(idx.n_cards) as usize != n_cards {
                 return None; // archive without unigrams for this store
@@ -6111,7 +6154,7 @@ fn narrow_rec(
             Narrowed::tight(Candidates::Cards(ids))
         }
 
-        FilterExpr::TextContains { field: TextSearchField::NameLower, word } if word.len() == 2 => {
+        FilterExpr::TextContains { field: TextSearchField::NameCollated, word } if word.len() == 2 => {
             // A 2-byte needle's containment IS bigram membership, so the tier
             // lookup is the complete answer — tight, with no false positives
             // for the walk to reject. A bigram absent from the index appears
@@ -6190,14 +6233,28 @@ fn narrow_rec(
 
         FilterExpr::TextContains { field, word }
             if word.len() >= 3
-                && matches!(field, TextSearchField::NameLower | TextSearchField::OracleTextLower) =>
+                && matches!(field, TextSearchField::NameLower | TextSearchField::NameCollated | TextSearchField::OracleTextLower) =>
         {
             // A needle of exactly 3 bytes is exactly ONE trigram, so the posting list IS the containment
             // set — no false positives to verify away. At 4+ bytes the intersection of several trigrams
             // really is a superset ("the" AND "her" without "ther"), so those stay loose. (#859)
             let mk = if word.len() == 3 { Narrowed::tight } else { Narrowed::loose };
             match field {
-                TextSearchField::NameLower => trigram_candidates(&indexes.name_trigram, word).and_then(|v| mk(Candidates::Cards(v))),
+                // The LITERAL name predicate narrows through the SAME collated index, with the
+                // needle collated to match — sound as a superset (see the memoize arm) but never
+                // tight, because the collated tier answered a looser question than the one the
+                // walk will ask of `card_name_lower`.
+                TextSearchField::NameLower => {
+                    // Non-ASCII declines, for the reason the memoize arm states: the index folds
+                    // accents and the literal predicate does not, so "éowyn" would narrow to
+                    // nothing rather than to the card it names.
+                    let collated = collate_name(word);
+                    if collated.is_empty() || !word.is_ascii() {
+                        return None;
+                    }
+                    trigram_candidates(&indexes.name_trigram, &collated).and_then(|v| Narrowed::loose(Candidates::Cards(v)))
+                }
+                TextSearchField::NameCollated => trigram_candidates(&indexes.name_trigram, word).and_then(|v| mk(Candidates::Cards(v))),
                 // Oracle postings are in dense text-id space (see OracleTextIndex);
                 // intersect there, then expand the survivors to card indices
                 // through the CSR table.
@@ -6229,8 +6286,18 @@ fn narrow_rec(
             }
             let mut acc: Option<Vec<u32>> = None;
             for f in &factors {
+                // COLLATED for the name index, which is built over `card_name_collated` — a
+                // regex runs against the name as written, so a required factor that straddles a
+                // space ("of the") has no window in the collated index and would narrow to
+                // nothing. Collating the factor keeps the narrowing a sound superset, which is
+                // all `Narrowed::loose` needs; the walk still runs the real regex.
+                let collated_factor;
                 let cand = if is_name {
-                    trigram_candidates(&indexes.name_trigram, f)
+                    collated_factor = collate_name(f);
+                    if collated_factor.is_empty() {
+                        continue;
+                    }
+                    trigram_candidates(&indexes.name_trigram, &collated_factor)
                 } else {
                     trigram_candidates(&indexes.oracle_trigram.trigrams, f)
                 };
@@ -13853,7 +13920,19 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 //
 //                (`is:localizedname` landed in the same unit of work and needed NO archive change:
 //                it reads `Printing.printed_name_folded_id`, which the annex already carries.)
-const ARCHIVE_FORMAT_VERSION: u32 = 2026081606;
+//   2026081607 — `name:` IS TWO SEARCHES, and the name indexes moved under the one that matters.
+//                `OracleCard` gains `card_name_collated_id` — the folded name with every
+//                non-alphanumeric character removed, derived at build time — and `name_trigram`,
+//                `name_bigrams` and `name_unigrams` are all rebuilt over THAT string instead of
+//                the folded one. A reader pairing this code with an older archive would narrow a
+//                collated needle through a spaced index and answer with silence, and the struct
+//                grew, so both halves need the rebuild this constant forces.
+//                Scryfall matches a BARE `name:` word against the collated name and a QUOTED one
+//                literally (measured 2026-08-16: `name:ft` 1,628 against `name:"ft"` 362,
+//                `name:ofthe` 1,109 against `name:"ofthe"` 0, `name:limdul` 8 against
+//                `name:"limdul"` 0), and `!"…"` is collated too — so `!"Lim-Dul's Vault"` and
+//                `!"limduls vault"` now find the card that only `!"Lim-Dûl's Vault"` used to.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026081607;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -14295,7 +14374,7 @@ impl QueryEngine {
         let staging = self.staging.lock().unwrap().take().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err("reload_commit called without reload_begin")
         })?;
-        let Staging { mut rows, interner, vocab, artists, mana, lock_file } = staging;
+        let Staging { mut rows, mut interner, vocab, artists, mana, lock_file } = staging;
 
         // The store groups printings by oracle_id, so rows without one would all
         // collapse into a single card. The DB enforces NOT NULL; fail loudly here
@@ -14397,6 +14476,18 @@ impl QueryEngine {
                 cards.push(OracleCard {
                     card_name_lower: row.card_name_lower,
                     card_name_folded: row.card_name_folded,
+                    // DERIVED from the folded name by the same `collate_name` the query side folds
+                    // the needle with: one interned string per name that has a separator to lose,
+                    // NONE_STR for the ones that do not.
+                    card_name_collated_id: {
+                        let collated = collate_name(row.card_name_folded.as_str());
+                        if collated == row.card_name_folded.as_str() {
+                            NONE_STR
+                        } else {
+                            interner.strings.push(collated);
+                            (interner.strings.len() - 1) as u32
+                        }
+                    },
                     card_colors: row.card_colors,
                     card_color_identity: row.card_color_identity,
                     produced_mana: row.produced_mana,
@@ -14558,7 +14649,7 @@ impl QueryEngine {
         );
         offsets.push(printings.len() as u32);
         foreign_offsets.push(foreign.len() as u32);
-        assign_name_ranks(&mut cards);
+        assign_name_ranks(&mut cards, &interner.strings);
 
         #[cfg(feature = "alloc-counter")]
         let stats_after_cards = (alloc_stats::live(), alloc_stats::allocs());
@@ -14645,7 +14736,12 @@ impl QueryEngine {
         let printed_names_idx = build_printed_name_index(&printings, &foreign, &strings, |p| p.printed_name_folded_id);
     let flavor_names_idx = build_printed_name_index(&printings, &foreign, &strings, |p| p.flavor_name_folded_id);
         let indexes = CardIndexes {
-            name_trigram:   build_trigram_index(&cards, |c| c.card_name_folded.as_str()),
+            // COLLATED, and so are the bigram and unigram tiers below: all three narrow `name:`,
+            // and a needle collated by the query side has no window in common with a folded name
+            // that kept its spaces. Callers collate their own needle before asking; the LITERAL
+            // `name:"…"` predicate does the same and re-verifies, which is sound because deleting
+            // the same character class from both sides preserves containment.
+            name_trigram:   build_trigram_index(&cards, |c| collated_name_of(c, &strings)),
             oracle_trigram: build_oracle_text_index(&cards, &strings),
             cmc:            build_numeric_index(&cards, |c| c.cmc.map(|v| v as i16)),
             power:          build_numeric_index(&cards, |c| c.creature_power.map(|v| v as i16)),
@@ -14707,8 +14803,8 @@ impl QueryEngine {
             rarity_cards,
             value_totals,
             pair_totals,
-            name_bigrams:   build_name_bigram_index(&cards),
-            name_unigrams:  build_name_unigram_index(&cards),
+            name_bigrams:   build_name_bigram_index(&cards, &strings),
+            name_unigrams:  build_name_unigram_index(&cards, &strings),
             legal_divergent: build_divergent_ids(&cards),
             arith_tuple:    build_arith_tuple_index(&cards),
             printing_by_scryfall_id: build_printing_by_scryfall_id(&printings),

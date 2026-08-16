@@ -335,7 +335,16 @@ fn collection<'a>(
 #[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum TextSearchField {
+    /// `name:"…"` — the LITERAL name match, `card_name_lower` and nothing folded past its case.
+    /// Measured on api.scryfall.com 2026-08-16: `name:"eowyn"` answers 0 while `name:"éowyn"`
+    /// answers 3, and `name:"lim-dul"` answers 0 while `name:"lim-dûl"` answers 8 — a quoted
+    /// value reaches only the spelling the searcher typed.
     NameLower,
+    /// `name:word` — the BARE-word match, against `card_name_collated`: diacritics folded and
+    /// every non-alphanumeric character removed. The overwhelmingly common form (a bare word in
+    /// a query IS this predicate), and the one that makes `ft` answer 1,628 rather than 362 by
+    /// reaching "Sword **of the** Ages" through the vanished space.
+    NameCollated,
     OracleTextLower,
     FlavorTextLower,
     ArtistLower,
@@ -359,9 +368,13 @@ fn text_search_field_value<'a>(
     field: TextSearchField,
 ) -> StrVal<'a> {
     match field {
-        // Accent-folded (#649): the query word is folded the same way in Python
-        // before it reaches TextContains/NameMatch, so this must match.
-        TextSearchField::NameLower       => StrVal::Known(card.card_name_folded.as_str()),
+        // LITERAL (`name:"…"`, and a plain-literal regex lowered to one): the stored lowercase
+        // name, with neither fold. The query value keeps its diacritics in Python for the same
+        // reason.
+        TextSearchField::NameLower       => StrVal::Known(card.card_name_lower.as_str()),
+        // COLLATED (`name:word`): accent-folded (#649) AND separator-folded, the query word
+        // through `collate_name(fold_accents(...))` in Python, so this must match.
+        TextSearchField::NameCollated    => StrVal::Known(crate::collated_name(card, strings)),
         TextSearchField::OracleTextLower => opt_sv(str_at(strings, u32::from(card.oracle_text_lower_id))),
         TextSearchField::FlavorTextLower => printing.map_or(StrVal::PDep, |p| opt_sv(str_at(strings, u32::from(p.flavor_text_lower_id)))),
         // Rewritten to ArtistMatch by bind(); printings carry no artist strings.
@@ -820,7 +833,7 @@ fn leaf_compares_printing_field(f: &FilterExpr) -> bool {
         // Exhaustive over TextSearchField (no `matches!`), same reason as num_pdep.
         FilterExpr::TextContains { field, .. } => match field {
             TextSearchField::FlavorTextLower => true,
-            TextSearchField::NameLower | TextSearchField::OracleTextLower | TextSearchField::ArtistLower => false,
+            TextSearchField::NameLower | TextSearchField::NameCollated | TextSearchField::OracleTextLower | TextSearchField::ArtistLower => false,
         },
         // Exhaustive over TextField (no `matches!`), same reason as num_pdep.
         FilterExpr::TextExact { field, .. } | FilterExpr::TextRegex { field, .. } => match field {
@@ -1127,61 +1140,88 @@ impl FilterExpr {
                 }
             }
             FilterExpr::Not(inner) => inner.memoize_text_predicates(cards, strings, name_trigram, name_bigrams, oracle, eval_domain),
-            FilterExpr::TextContains { field: TextSearchField::NameLower, word } if word.len() == 2 => {
-                // 2-byte needles resolve exactly through the bigram index: the
-                // member cards are the complete match set (containment IS
-                // bigram membership), so no contains() verification runs at
-                // all — the ids just re-key to card_name_id for eval.
-                if u32::from(name_bigrams.n_cards) as usize != cards.len() {
+            FilterExpr::TextContains { field: field @ (TextSearchField::NameLower | TextSearchField::NameCollated), word } => {
+                // BOTH name predicates narrow through the SAME collated tiers, because both
+                // indexes are built over `card_name_collated`. The COLLATED predicate is answered
+                // by them; the LITERAL one only gets its candidates there and re-verifies against
+                // the name as written.
+                //
+                // Narrowing the literal predicate through a collated index is sound in the one
+                // direction it is used: deleting the same character class from both sides
+                // preserves containment, so a name containing `word` literally contains
+                // `collate_name(word)` collated, and the collated tier can only ever be a
+                // SUPERSET. `name:"of the"` narrows through `ofthe` and is then checked against
+                // the space. An all-punctuation needle collates to nothing and has no tier at
+                // all, so it declines to the walk rather than narrowing to everything.
+                // A NON-ASCII literal needle declines to narrow at all. The index is built over
+                // the ACCENT-FOLDED collated name, and folding is not a deletion — "éowyn" has no
+                // window in common with the stored "eowynladyofrohan", so narrowing would drop
+                // the very card `name:"éowyn"` names (measured: 3 on api.scryfall.com). The
+                // separator argument below survives folding only for ASCII, which is why the two
+                // guards are separate.
+                let literal = *field == TextSearchField::NameLower;
+                let collated = if literal { crate::collate_name(word) } else { word.clone() };
+                if collated.is_empty() || (literal && !word.is_ascii()) {
                     return;
                 }
-                let bg = [word.as_bytes()[0], word.as_bytes()[1]];
-                let bind_bound = name_bigrams.postings.get(&bg).map_or_else(
-                    || name_bigrams.plane_of.get(&bg).map_or(0, |_| cards.len() / 8),
-                    |v| v.len(),
-                );
-                if !Self::memoize_pays(bind_bound, eval_domain, cards.len()) {
-                    return;
-                }
-                let mut ids: Vec<u32> = if let Some(p) = name_bigrams.plane_of.get(&bg) {
-                    let wpp = cards.len().div_ceil(64);
-                    let start = u32::from(*p) as usize * wpp;
-                    let mut out = Vec::new();
-                    for (i, w) in name_bigrams.plane_words[start..start + wpp].iter().enumerate() {
-                        let mut w = u64::from(*w);
-                        while w != 0 {
-                            let cid = ((i as u32) << 6) | w.trailing_zeros();
-                            w &= w - 1;
-                            out.push(u32::from(cards[cid as usize].card_name_id));
-                        }
-                    }
-                    out
-                } else {
-                    name_bigrams
-                        .postings
-                        .get(&bg)
-                        .map_or_else(Vec::new, |v| v.iter().map(|x| u32::from(cards[u16::from(*x) as usize].card_name_id)).collect())
-                };
-                ids.sort_unstable();
-                ids.dedup();
-                *self = FilterExpr::NameMatch { ids };
-            }
-            FilterExpr::TextContains { field: TextSearchField::NameLower, word } => {
-                // The intersection is bounded by the shortest posting list, so
-                // checking that bound first makes the decline path free — no
-                // gather, no intersection. Declining when only the *bound*
-                // (not the exact count) exceeds half the corpus is deliberate:
-                // it can only happen when every trigram of the needle is
-                // ultra-common, where the match set is broad anyway.
-                match trigram_min_posting(name_trigram, word) {
-                    Some(min) if min <= cards.len() / 2 && Self::memoize_pays(min, eval_domain, cards.len()) => {}
-                    _ => return,
-                }
-                let Some(cand) = trigram_candidates(name_trigram, word) else { return };
+                // Verifies against the string THIS predicate compares, not the one the index is
+                // built from — the whole point of the split.
                 let finder = memmem::Finder::new(word.as_bytes()); // built once, reused across the verify scan
+                let verify = |cid: u32| -> bool {
+                    let card = &cards[cid as usize];
+                    let hay = if literal { card.card_name_lower.as_str() } else { crate::collated_name(card, strings) };
+                    finder.find(hay.as_bytes()).is_some()
+                };
+
+                let cand: Vec<u32> = if collated.len() == 2 {
+                    // 2-byte needles resolve exactly through the bigram index: containment IS
+                    // bigram membership over the indexed string, so the collated predicate skips
+                    // verification entirely and the ids just re-key to card_name_id for eval.
+                    if u32::from(name_bigrams.n_cards) as usize != cards.len() {
+                        return;
+                    }
+                    let bg = [collated.as_bytes()[0], collated.as_bytes()[1]];
+                    let bind_bound = name_bigrams.postings.get(&bg).map_or_else(
+                        || name_bigrams.plane_of.get(&bg).map_or(0, |_| cards.len() / 8),
+                        |v| v.len(),
+                    );
+                    if !Self::memoize_pays(bind_bound, eval_domain, cards.len()) {
+                        return;
+                    }
+                    if let Some(p) = name_bigrams.plane_of.get(&bg) {
+                        let wpp = cards.len().div_ceil(64);
+                        let start = u32::from(*p) as usize * wpp;
+                        let mut out = Vec::new();
+                        for (i, w) in name_bigrams.plane_words[start..start + wpp].iter().enumerate() {
+                            let mut w = u64::from(*w);
+                            while w != 0 {
+                                out.push(((i as u32) << 6) | w.trailing_zeros());
+                                w &= w - 1;
+                            }
+                        }
+                        out
+                    } else {
+                        name_bigrams.postings.get(&bg).map_or_else(Vec::new, |v| v.iter().map(|x| u32::from(u16::from(*x))).collect())
+                    }
+                } else {
+                    // The intersection is bounded by the shortest posting list, so
+                    // checking that bound first makes the decline path free — no
+                    // gather, no intersection. Declining when only the *bound*
+                    // (not the exact count) exceeds half the corpus is deliberate:
+                    // it can only happen when every trigram of the needle is
+                    // ultra-common, where the match set is broad anyway.
+                    match trigram_min_posting(name_trigram, &collated) {
+                        Some(min) if min <= cards.len() / 2 && Self::memoize_pays(min, eval_domain, cards.len()) => {}
+                        _ => return,
+                    }
+                    let Some(cand) = trigram_candidates(name_trigram, &collated) else { return };
+                    cand
+                };
+
+                let exact_tier = !literal && collated.len() == 2;
                 let mut ids: Vec<u32> = cand
                     .into_iter()
-                    .filter(|&cid| finder.find(cards[cid as usize].card_name_folded.as_str().as_bytes()).is_some())
+                    .filter(|&cid| exact_tier || verify(cid))
                     .map(|cid| u32::from(cards[cid as usize].card_name_id))
                     .collect();
                 ids.sort_unstable();
@@ -1496,7 +1536,7 @@ impl FilterExpr {
                 Tri::PrintingDep => Tri::PrintingDep,
             },
 
-            FilterExpr::ExactName(lower) => tri_bool(exact_name_matches(card.card_name_lower.as_str(), lower)),
+            FilterExpr::ExactName(lower) => tri_bool(exact_name_matches(card.card_name_folded.as_str(), lower)),
 
             FilterExpr::NumericCmp { lhs, op, rhs } => {
                 numeric_cmp_tri(lhs, *op, rhs, &|f| field_num(card, printing, f))
@@ -2078,8 +2118,19 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
     build_text_filter(attr, op, rhs)
 }
 
-/// Does `!"needle"` name this card? `stored` is `card_name_lower`, `needle` the query's own
-/// lowercased spelling.
+/// Does `!"needle"` name this card? `stored` is the card's FOLDED name, `needle` the query's own
+/// collated spelling (`collate_name(fold_accents(value.lower()))`, done in Python).
+///
+/// COLLATED on both sides — diacritics folded, every non-alphanumeric character removed — which
+/// is how Scryfall compares it. Measured on api.scryfall.com 2026-08-16, all four of
+/// `!"Lim-Dûl's Vault"`, `!"lim-dul's vault"`, `!"limduls vault"` and `!"Lim-Dul's Vault"` answer
+/// the same one card, and `!"eowyn, lady of rohan"` answers "Éowyn, Lady of Rohan". Comparing
+/// `card_name_lower` — what this did before — answered only the accented, fully punctuated
+/// spelling, so a searcher who typed the name off the card and skipped the circumflex got
+/// nothing.
+///
+/// The faces are split BEFORE collating, because the `" // "` join is itself non-alphanumeric:
+/// collapsing first would make every face boundary vanish and let a needle straddle it.
 ///
 /// The whole name, or **either side of the `" // "` join** — a multi-face card answers to each of
 /// its face names on its own. Measured against api.scryfall.com on 2026-08-16:
@@ -2094,7 +2145,7 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
 /// surfaces share a rule shape, not a scope, and conflating them would widen a route Scryfall keeps
 /// narrow.
 pub(crate) fn exact_name_matches(stored: &str, needle: &str) -> bool {
-    stored == needle || stored.split(" // ").any(|face| face == needle)
+    crate::collate_name(stored) == needle || stored.split(" // ").any(|face| crate::collate_name(face) == needle)
 }
 
 fn rhs_value_str(rhs: &Value) -> &str {
@@ -2140,6 +2191,11 @@ fn build_text_filter(attr: &str, op: &str, rhs: &Value) -> Result<FilterExpr, St
     let lower_word = raw_value.to_lowercase();
     if op == ":" {
         let tsf = match attr {
+            // `CollatedNameValueNode` is the parser's spelling of "the user typed a BARE word
+            // here"; a `StringValueNode` under `name:` means they quoted it (or wrote a
+            // plain-literal regex, which lowers to the same). The two are different searches —
+            // see `TextSearchField::NameLower` / `NameCollated` for the live measurements.
+            "card_name" if rhs_node_type == "CollatedNameValueNode" => TextSearchField::NameCollated,
             "card_name"   => TextSearchField::NameLower,
             "oracle_text" => TextSearchField::OracleTextLower,
             "flavor_text" => TextSearchField::FlavorTextLower,
