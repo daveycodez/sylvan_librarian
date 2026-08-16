@@ -231,21 +231,22 @@ class TestCatalog:
         assert dispatch(reference_corpus, "/catalog/not-a-catalog").headers["cache-control"] == "no-cache"
         assert dispatch(reference_corpus, "/sets/zzzz").headers["cache-control"] == "public"
 
-    def test_a_wrong_method_on_the_scryfall_surface_is_a_scryfall_error_object(self, reference_corpus: APIResource) -> None:
-        """405 is KEPT where api.scryfall.com answers 404; only the body follows the surface.
+    def test_a_wrong_method_on_the_scryfall_surface_is_scryfalls_404(self, reference_corpus: APIResource) -> None:
+        """404 with the ordinary `not_found` object and NO `Allow`, which is what Scryfall answers.
 
-        405 is the correct HTTP answer and strictly more informative, and a client that would have
-        seen Scryfall's 404 here is already using a method Scryfall does not serve. `method_not_allowed`
-        is the one error code with no measurement behind it -- api.scryfall.com never emits a 405.
+        Measured 2026-08-16 across eight requests -- POST, PUT, DELETE and PATCH against
+        `/cards/search`, `/cards/named`, `/cards/collection`, `/cards/:id` and `/sets`. Not one
+        carries `Allow`. 405 is the more correct HTTP answer in the abstract and would have needed an
+        error code no measurement backs, since api.scryfall.com never emits a 405 to measure.
         """
         resp = dispatch(reference_corpus, "/sets", method="DELETE")
-        assert resp.status == falcon.HTTP_405
-        assert resp.headers["allow"] == "GET, HEAD"
+        assert resp.status == falcon.HTTP_404
+        assert "allow" not in resp.headers
         assert payload(resp) == {
             "object": "error",
-            "code": "method_not_allowed",
-            "status": 405,
-            "details": "Allowed methods: GET, HEAD",
+            "code": "not_found",
+            "status": 404,
+            "details": "The requested object or REST method was not found.",
         }
 
     def test_an_over_long_path_is_a_route_miss_not_a_set_miss(self, reference_corpus: APIResource) -> None:

@@ -904,32 +904,31 @@ class APIResource(ScryfallCardsRoutes, ScryfallReferenceRoutes):
     def _reject_method(self, resp: falcon.Response, *, path: str, allowed: list[str]) -> None:
         """Answer a method this route does not accept.
 
-        405 and the `Allow` header are KEPT where api.scryfall.com answers 404: 405 is the correct
-        HTTP answer, it is strictly more informative, and a client that would have seen Scryfall's
-        404 here is already using a method Scryfall does not serve. Only the BODY follows the surface.
+        On the Scryfall surface this is a 404 carrying the ordinary `not_found` object, with NO
+        `Allow` header -- which is what api.scryfall.com answers, measured 2026-08-16 across eight
+        requests: POST, PUT, DELETE and PATCH against `/cards/search`, `/cards/named`,
+        `/cards/collection`, `/cards/:id` and `/sets`. Not one of them carries `Allow`.
 
-        `method_not_allowed` is the one error `code` on the Scryfall surface with NO measurement
-        behind it, because api.scryfall.com never emits a 405 to measure. It is named for the status
-        rather than invented from nothing, and flagged here so a later reader does not mistake it for
-        a captured string.
+        405 is the more correct HTTP answer in the abstract, and it is deliberately not used here.
+        Sending one would have meant inventing an error `code` for it, since Scryfall never emits a
+        405 and there is therefore nothing to measure -- and an error body nobody checked is the same
+        defect as a column set nobody checked. A client that branches on 404-versus-405 has to see
+        what Scryfall shows it.
+
+        This service's OWN routes keep falcon's 405 and its `Allow`: nothing there is mirroring
+        Scryfall, and 405 remains right for a route that genuinely declares its methods.
 
         Args:
             resp: The response to write to.
-            path: The resolved route key, which selects the error shape.
+            path: The resolved route key, which selects the answer.
             allowed: The methods this route does accept, sorted.
 
         Raises:
-            falcon.HTTPMethodNotAllowed: On this service's own surface, whose shape is unchanged.
+            falcon.HTTPMethodNotAllowed: On this service's own surface, whose behaviour is unchanged.
         """
         if path not in SCRYFALL_SURFACE_ROUTES:
             raise falcon.HTTPMethodNotAllowed(allowed_methods=allowed)
-        resp.set_header("Allow", ", ".join(allowed))
-        self._respond_scryfall_error(
-            resp,
-            code="method_not_allowed",
-            status=405,
-            details=f"Allowed methods: {', '.join(allowed)}",
-        )
+        self._respond_scryfall_error(resp, code="not_found", status=404, details=_SCRYFALL_NOT_FOUND_DETAILS)
 
     @staticmethod
     def _respond_scryfall_error(resp: falcon.Response, *, code: str, status: int, details: str) -> None:
