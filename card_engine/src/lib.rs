@@ -284,6 +284,16 @@ struct PrintingFace {
     illustration_id: u128,
     card_artist_vid: u16,
     flavor_text_id: u32,
+    // Scryfall's FACE-level `flavor_name`, interned (NONE_STR = absent). The card-level twin is
+    // `Printing.flavor_name_id`, and a printing carries one or the other, never both: 28 face
+    // occurrences on 15 printings in the 2026-08-16 all_cards bulk, all `transform` or
+    // `reversible_card` (vow/338 "Dracula, Lord of Blood" // "Dracula, Lord of Bats").
+    //
+    // NOT INDEXED, and that is Scryfall's own split rather than a shortcut:
+    // `exact=Dracula, Lord of Blood` answers 404 there while `exact=Godzilla, Primeval Champion`
+    // (a card-level flavor name) answers prm/80925. Only the card-level one reaches the name
+    // routes; this one is emission-only, like `flavor_text` beside it.
+    flavor_name_id: u32,
     // The face's artist AS SCRYFALL PRINTS IT (interned; NONE_STR = absent) — the string a card
     // object emits. `card_artist_vid` above cannot stand in for it twice over: it indexes the
     // ARTIST vocab, not the collection vocab a coll_str lookup reads, and that vocab holds only
@@ -456,6 +466,25 @@ struct OracleCard {
     // `card_name_lower`'s, and every one of them already holds a `strings` table. Resolve with
     // `folded_name`, never by reading this field.
     card_name_folded_id: u32,
+    // COLLATED card_name_folded: the folded name with every non-alphanumeric character removed
+    // ("lim-dul's vault" -> "limdulsvault"), DERIVED at build time rather than imported --
+    // `collate_name` is a pure function of the folded name, so a second column on the wire would
+    // only be a second thing to drift.
+    //
+    // This is the string a BARE `name:` word matches, the string `!"…"` compares against, and the
+    // string `assign_name_ranks` already ordered `order=name` by -- Scryfall matches and orders
+    // names with their separators gone (measured 2026-08-16: `name:ft` 1,628 against
+    // `name:"ft"` 362, because "Sword **of the** Ages" reads as "swordoftheages"). Storing it
+    // rather than folding per card per query is what keeps
+    // `name_trigram`/`name_bigrams`/`name_unigrams` -- all three built over THIS string -- exact
+    // tiers rather than candidate generators.
+    //
+    // INTERNED, like the folded id above it and for the same reason: `card_name_lower` is the one
+    // name this struct can afford inline, and the collated form differs from the folded one on
+    // every name that has a separator to lose. `NONE_STR` means "the same as the folded name",
+    // which resolves through `card_name_folded_id` in turn. Resolve with `collated_name`, never
+    // directly.
+    card_name_collated_id: u32,
     card_colors: u8,
     card_color_identity: u8,
     produced_mana: u8,
@@ -465,6 +494,15 @@ struct OracleCard {
     // the two colour masks above it; the per-FACE indicator lives on OracleFace.
     color_indicator: u8,
     card_types: u16,
+    /// True when every printing of this card -- canonical AND annex -- shares ONE set code: the
+    /// whole of `is:unique`, decided at build by `assign_single_set_flags` because no query-time
+    /// walk can see the annex from `tri()`, which holds one card and one printing and nothing else.
+    ///
+    /// A bool and not a count: the predicate asks `== 1` and nothing else asks at all, so a u16
+    /// would be 2 bytes a card for a question no operator poses. `sets=`/`prints=` would want the
+    /// count, and neither exists here yet; when one does, this is the field that widens.
+    single_set: bool,
+
     // True for the ~556 oracle ids whose printings carry different legality
     // words (non-tournament printings: 30A, Collectors' Edition, gold border).
     // When set, legality filters defer to each Printing's card_legalities; when
@@ -622,6 +660,17 @@ struct Printing {
     // printing carries a printed name. Backs PrintedNameIndex and is never rendered into a card
     // object — the display values are the three ids above.
     printed_name_folded_id: u32,
+    // Scryfall's top-level `flavor_name`: the alternate name a printing is SOLD under (the
+    // Godzilla series, Stranger Things, the Secret Lair crossovers). Printing-level and quite
+    // separate from the printed triple above — a printing may carry both, and 669 of the
+    // 540,484 all_cards rows carry this one, 609 of them English. `_folded_id` is the search
+    // key, indexed by `CardIndexes.flavor_names`; `_id` is what the card object emits.
+    //
+    // The FACE-level variant (28 face occurrences on 15 printings, `transform` and
+    // `reversible_card` only, and never on a printing that also has the top-level key) rides
+    // `PrintingFace` instead, because that is where Scryfall puts it.
+    flavor_name_id: u32,
+    flavor_name_folded_id: u32,
     // Parallel to the owning OracleCard's `faces` when ANY face carries a printed key; empty
     // otherwise (single-faced cards, and the all-English common case, where per-row Vec contents
     // would buy nothing).
@@ -665,6 +714,9 @@ struct CardRow {
     card_artist_vid: u16,
     // The original-case artist string (see Printing.card_artist_name_id).
     card_artist_name_id: u32,
+    // The accent-folded lowercase artist, interned. Transient (CardRow is never archived): the
+    // commit pass reads it once to fill `CardData.artist_vocab_collated` at this row's vid.
+    card_artist_folded_id: u32,
     card_set_code: InlineStr<8>,
     card_layout_id: u32,
     card_border_id: u32,
@@ -709,6 +761,8 @@ struct CardRow {
     printed_type_line_id: u32,
     printed_text_id: u32,
     printed_name_folded_id: u32,
+    flavor_name_id: u32,
+    flavor_name_folded_id: u32,
     // Whether this row is one of Scryfall's canonical (default_cards) printings. Canonical rows
     // become `CardData.printings`; the rest become the `foreign` annex. Decided by the importer
     // (id-membership in default_cards), never re-derived here.
@@ -742,6 +796,7 @@ struct FaceRow {
     // The face's original-case artist string (see PrintingFace.card_artist_name_id).
     card_artist_name_id: u32,
     flavor_text_id: u32,
+    flavor_name_id: u32,
     // The per-face printed-language triple (PrintedFaceText before the commit pass splits it).
     printed_name_id: u32,
     printed_type_line_id: u32,
@@ -755,6 +810,27 @@ pub(crate) type APrinting = Archived<Printing>;
 pub(crate) type AStrings = Archived<Vec<String>>;
 // Archived CSR boundary table (CardData.offsets)
 pub(crate) type AOffsets = Archived<Vec<u32>>;
+
+/// Build-time twin of `collated_name`, over unarchived rows and the interner's plain `Vec<String>`.
+fn collated_name_of<'a>(card: &'a OracleCard, strings: &'a [String]) -> &'a str {
+    if card.card_name_collated_id == NONE_STR {
+        return folded_name_of(card, strings);
+    }
+    strings.get(card.card_name_collated_id as usize).map_or_else(|| folded_name_of(card, strings), String::as_str)
+}
+
+/// A card's COLLATED name — the folded name with every non-alphanumeric character removed.
+///
+/// `NONE_STR` in `card_name_collated_id` means "the same as the folded name", which is true of
+/// every single-word name — and the folded name is itself an interned id, so the fallback goes
+/// through `folded_name` rather than reading a field. Every reader goes through here.
+fn collated_name<'a>(card: &'a AOracleCard, strings: &'a AStrings) -> &'a str {
+    let id = u32::from(card.card_name_collated_id);
+    if id == NONE_STR {
+        return folded_name(card, strings);
+    }
+    str_at(strings, id).unwrap_or_else(|| folded_name(card, strings))
+}
 
 /// Sentinel id for absent optional strings (a card never has 4 billion distinct strings).
 const NONE_STR: u32 = u32::MAX;
@@ -1274,6 +1350,7 @@ fn faces_from_pydict(d: &Bound<PyDict>, it: &mut Interner, artists: &mut VocabIn
             illustration_id: opt_str(face, "illustration_id").map_or(0, |s| parse_uuid_or_hash(&s)),
             card_artist_vid,
             flavor_text_id: it.intern_opt(opt_str(face, "flavor_text")),
+            flavor_name_id: it.intern_opt(opt_str(face, "flavor_name")),
             printed_name_id: it.intern_opt(opt_str(face, "printed_name")),
             printed_type_line_id: it.intern_opt(opt_str(face, "printed_type_line")),
             printed_text_id: it.intern_opt(opt_str(face, "printed_text")),
@@ -1298,6 +1375,7 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
     // card object — see Printing.card_artist_name_id.
     let card_artist = opt_str(d, "card_artist");
     let card_artist_name_id = it.intern_opt(card_artist.clone());
+    let card_artist_folded_id = it.intern_opt(opt_str(d, "card_artist_folded"));
     let card_artist_vid = match card_artist {
         Some(a) => artists.intern(a.to_lowercase())?,
         None => ARTIST_NONE,
@@ -1306,6 +1384,7 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
 
     Ok(CardRow {
         card_artist_name_id,
+        card_artist_folded_id,
         scryfall_id: opt_uuid(d, "scryfall_id"),
         oracle_id: opt_uuid(d, "oracle_id"),
         illustration_id: opt_uuid(d, "illustration_id"),
@@ -1367,6 +1446,9 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
         printed_text_id: it.intern_opt(opt_str(d, "printed_text")),
         // Already lowercased + accent-folded by the importer, like card_name_folded above.
         printed_name_folded_id: it.intern_opt(opt_str(d, "printed_name_folded")),
+        flavor_name_id: it.intern_opt(opt_str(d, "flavor_name")),
+        // Already lowercased + accent-folded by the importer, like the two above.
+        flavor_name_folded_id: it.intern_opt(opt_str(d, "flavor_name_folded")),
         // An ABSENT key reads canonical: every pre-multilingual feed is canonical-only, so
         // absence means "there is no annex", not "this row belongs in it".
         is_canonical: d
@@ -1820,8 +1902,9 @@ struct NameBigramIndex {
 fn build_name_bigram_index(cards: &[OracleCard], strings: &[String]) -> NameBigramIndex {
     let mut lists: HashMap<[u8; 2], Vec<u32>> = HashMap::new();
     for (i, card) in cards.iter().enumerate() {
-        // Folded (#649) — this index backs the same fuzzy name: path as name_trigram.
-        let bytes = folded_name_of(card, strings).as_bytes();
+        // COLLATED — this index backs the same `name:` path as name_trigram, over the same
+        // string; see the note there.
+        let bytes = collated_name_of(card, strings).as_bytes();
         let mut seen: Vec<[u8; 2]> = Vec::new(); // names are short; a vec beats a set
         for w in bytes.windows(2) {
             let bg = [w[0], w[1]];
@@ -1884,10 +1967,10 @@ struct NameUnigramIndex {
 fn build_name_unigram_index(cards: &[OracleCard], strings: &[String]) -> NameUnigramIndex {
     let mut lists: HashMap<u8, Vec<u32>> = HashMap::new();
     for (i, card) in cards.iter().enumerate() {
-        // Folded (#649), matching what `name_trigram` / `name_bigrams` index and what the walk evaluates
+        // COLLATED, matching what `name_trigram` / `name_bigrams` index and what the walk evaluates
         // — that agreement is what makes the tight narrowing sound.
         let mut seen = [false; 256];
-        for &b in folded_name_of(card, strings).as_bytes() {
+        for &b in collated_name_of(card, strings).as_bytes() {
             if !seen[b as usize] {
                 seen[b as usize] = true;
                 lists.entry(b).or_default().push(i as u32);
@@ -2754,19 +2837,68 @@ struct SortOrder<'a> {
     inv:  &'a Archived<Vec<u32>>,
 }
 
-/// Dense byte-order rank of card_name_lower onto each card (equal names share
-/// a rank; the standard sort secondaries break their ties). Every card has a
-/// name, so unlike the other sort columns the rank is never absent.
-fn assign_name_ranks(cards: &mut [OracleCard]) {
+/// The string `order=name` compares: the accent-folded, lowercased name with every
+/// non-alphanumeric character removed.
+///
+/// Scryfall's name collation is neither byte order nor ICU. Measured on 2026-08-16 over 1,333
+/// adjacent pairs from eight `order=name` pages chosen to stress it — LTR (diacritics), Unstable
+/// and Unfinity (underscores, quotes, digits), planeswalkers (commas), khm, and a digits-and-letters
+/// mix — this rule has **0** violations, against 133 for raw lowercase bytes, 7 for stripping
+/// without folding first, and (per the sweep) 8/5/29 for `Intl.Collator("en")`. It is what puts
+/// `Binding the Old Gods` before `Bind the Monster` (spaces go), `Ajani, Caller of the Pride`
+/// before `Ajani Goldmane` (commas go), and `Éowyn, Lady of Rohan` before `Erebor Flamesmith`
+/// (É folds to e rather than sorting past z, or vanishing).
+///
+/// Fold FIRST, then strip: stripping first would delete a letter Scryfall keeps. And the filter is
+/// `char::is_alphanumeric`, not an ASCII class, for the same reason — a letter that survives NFKD
+/// with no ASCII equivalent must be kept, not dropped. The corpus cannot tell the two apart today
+/// (all 134 non-ASCII names fold to ASCII), so this is the choice that fails safe if one arrives.
+///
+/// ONE definition, called from both `assign_name_ranks` (which ranks it into the archive) and
+/// `encode_sort_key` (which writes it onto the wire). Those two must agree exactly or a partitioned
+/// merge orders differently from a single archive, which is precisely what the differential test
+/// exists to catch.
+pub(crate) fn collate_name(folded_lower: &str) -> String {
+    folded_lower.chars().filter(|c| c.is_alphanumeric()).collect()
+}
+
+/// The `is:` value that carries the extras class, as `preprocess_card`'s `_is_extra` writes it.
+/// Spelled once there, once in the TypeScript parser's COMPUTED_IS_TAGS, and once here, where
+/// `sets_with_extras` folds it; the three must agree or the fold silently comes back empty.
+pub(crate) const EXTRA_IS_TAG: &str = "extra";
+
+/// `æ` expanded to `ae`, and nothing else — the fold the NON-collated text columns get.
+///
+/// `name:` and `a:` compare a fully transliterated string (`fold_accents`, which expands æ œ ß ø ł
+/// đ þ ð ħ ŋ ŧ ı ĸ); `o:`, `t:`, `fo:` and `ft:` do not, and the difference is MEASURED rather than
+/// assumed. On api.scryfall.com, 2026-08-16: `o:æther` and `o:aether` both answer 9, `t:"æ"` and
+/// `t:"ae"` both answer 213, `ft:æther` and `ft:aether` both answer 80 — while `o:ø`, `o:ł`,
+/// `o:þ`, `o:đ`, `o:ß`, `o:ĳ`, `t:œ`, `t:ø`, `t:ß`, `t:þ`, `t:đ`, `t:ł`, `ft:ß` and `ft:ø` each
+/// answer 404 against five-figure totals for their expanded spellings.
+///
+/// Magic's own text is the reason there is exactly one character here: the game printed "Æther"
+/// for a decade, 33 English flavor texts in the current bulk still carry it, and Scryfall reads
+/// the two spellings as one word in the text columns while leaving every other letter alone.
+///
+/// QUERY SIDE ONLY, which is measured rather than assumed: `ft:æther` answers 80 on Scryfall and
+/// `ft:aether` answers 80 too, but folding the STORED flavor text as well made this port answer
+/// 94 — it started matching the 33 English flavor texts that still spell the word "Æther", which
+/// Scryfall does not. `ft:œ` answering 1 there (a literal œ in Bloodletter's flavor text) is the
+/// same fact from the other side: the stored text is compared as printed.
+pub(crate) fn fold_ae(value: &str) -> String {
+    if value.contains(['æ', 'Æ']) { value.replace('æ', "ae").replace('Æ', "AE") } else { value.to_owned() }
+}
+
+/// Dense rank of `collate_name(folded name)` onto each card (equal collated names share a rank; the
+/// standard sort secondaries break their ties). Every card has a name, so unlike the other sort
+/// columns the rank is never absent.
+fn assign_name_ranks(cards: &mut [OracleCard], strings: &[String]) {
+    let key = |c: &OracleCard| collated_name_of(c, strings).to_owned();
     let mut ids: Vec<u32> = (0..cards.len() as u32).collect();
-    ids.sort_unstable_by(|&a, &b| {
-        cards[a as usize].card_name_lower.as_str().cmp(cards[b as usize].card_name_lower.as_str())
-    });
+    ids.sort_unstable_by(|&a, &b| key(&cards[a as usize]).cmp(&key(&cards[b as usize])));
     let mut rank = 0u32;
     for i in 0..ids.len() {
-        if i > 0
-            && cards[ids[i - 1] as usize].card_name_lower.as_str() != cards[ids[i] as usize].card_name_lower.as_str()
-        {
+        if i > 0 && key(&cards[ids[i - 1] as usize]) != key(&cards[ids[i] as usize]) {
             rank += 1;
         }
         cards[ids[i] as usize].name_rank = rank;
@@ -2819,6 +2951,82 @@ fn assign_set_ranks(printings: &mut [Printing], foreign: &mut [Printing]) {
     assign_printing_ranks(printings, foreign, |p| p.card_set_code.as_str().to_owned(), |p, r| p.set_rank = r);
 }
 
+/// Decide `OracleCard.single_set` — the whole of `is:unique` — for every card.
+///
+/// One set code across the card's canonical printings AND its annex rows. The annex half is the
+/// half that makes it correct rather than nearly correct: 130 cards in the 2026-08-16 bulk have
+/// exactly one ENGLISH set and a second set that exists only in another language (the Salvat
+/// magazine inserts, ps11, pmei), and api.scryfall.com calls none of those 130 unique. Counting
+/// canonical rows alone would have answered "unique" for all 130.
+///
+/// A set COUNT and not a printing count, which is Scryfall's own definition ("cards that have only
+/// been in a single set" — syntax page, read 2026-08-16) and not a paraphrase of it: the two differ
+/// on 2,847 of Scryfall's 16,318 matches, `!"Forest"` being the shape (two lea printings, one set).
+///
+/// Two codes end the walk, so a heavily reprinted card costs two comparisons, not a HashSet.
+fn assign_single_set_flags(
+    cards: &mut [OracleCard],
+    printings: &[Printing],
+    offsets: &[u32],
+    foreign: &[Printing],
+    foreign_offsets: &[u32],
+) {
+    for (cid, card) in cards.iter_mut().enumerate() {
+        let mut first: Option<&str> = None;
+        let mut one = true;
+        let mut rows = printings[offsets[cid] as usize..offsets[cid + 1] as usize]
+            .iter()
+            .chain(foreign[foreign_offsets[cid] as usize..foreign_offsets[cid + 1] as usize].iter());
+        for p in &mut rows {
+            let code = p.card_set_code.as_str();
+            match first {
+                None => first = Some(code),
+                Some(f) if f != code => {
+                    one = false;
+                    break;
+                }
+                Some(_) => {}
+            }
+        }
+        // A card with no rows at all cannot have been printed in one set; `drop_group_if_annex_only`
+        // means it should not exist, and answering False keeps it out of `is:unique` if it does.
+        card.single_set = one && first.is_some();
+    }
+}
+
+/// Order each card's ANNEX rows by language, which is the order Scryfall serves them in.
+///
+/// Measured 2026-08-16: `e:khm cn:1 include_multilingual=true` answers en, de, es, fr, it, ja, ko,
+/// pt, ru, zhs, zht — English first, then alphabetical by code. English rows are canonical and so
+/// live in the other space entirely, and `select_page`'s vpid tiebreak already puts a card's
+/// canonical rows ahead of its annex rows; so "English first" falls out of the split and only the
+/// alphabetical tail has to be arranged here. The `!= "en"` term is belt and braces for a store
+/// where an English printing is ever non-canonical.
+///
+/// Done as STORE ORDER rather than as a fifth sort-key lane, and the choice is evidence-led: the
+/// four 32-bit lanes are full, `page_cmp` compares the top three and then falls to (cid, vpid), so
+/// within one (set, collector number) slot of one card the vpid order IS the tiebreak — arranging
+/// the rows is enough, and widening `Match` to u192 would have cost every match in every query.
+/// The "prefer-desc store order is load-bearing" note on `widened_rows` was read rather than
+/// assumed: what depends on it is (a) ties in the widened driver's best-row selection, which
+/// `annex_representative` now decides by slot before store order is consulted, and (b)
+/// `unique=prints` row order within a card, which is exactly what this is fixing. The canonical
+/// space — every "printings are stored prefer-desc, so the first match wins" fast path in the
+/// routed driver — is untouched, because none of it reads the annex.
+///
+/// A STABLE sort, so rows of one language keep the prefer-desc order they arrived in.
+fn order_annex_by_language(foreign: &mut [Printing], foreign_offsets: &[u32], coll_vocab: &[String]) {
+    let lang_of = |p: &Printing| -> (bool, &str) {
+        let vid = p.compat.lang_id;
+        let code = if vid == VOCAB_NONE { "" } else { coll_vocab.get(vid as usize).map_or("", String::as_str) };
+        (code != "en", code)
+    };
+    for w in foreign_offsets.windows(2) {
+        let (start, end) = (w[0] as usize, w[1] as usize);
+        foreign[start..end].sort_by(|a, b| lang_of(a).cmp(&lang_of(b)));
+    }
+}
+
 /// Rank printings by collector number, `order=set`'s second key.
 ///
 /// The key is `(collector_number_int, collector_number)` — the extracted integer first, the raw
@@ -2848,10 +3056,24 @@ fn assign_collector_ranks(printings: &mut [Printing], foreign: &mut [Printing], 
 ///
 /// Resolved through the vocab rather than sorting on `card_artist_vid`, which is intern order.
 /// A printing with no artist ranks last, matching how the absent side of every other order sorts.
-fn assign_artist_ranks(printings: &mut [Printing], foreign: &mut [Printing], artist_vocab: &[String]) {
+///
+/// Collated like a card name, because Scryfall collates it the same way: measured 2026-08-16 over
+/// 348 adjacent pairs from `e:khm` and `e:ltr` ordered by artist, stripping non-alphanumerics has
+/// 0 violations against 4 for raw bytes — `Alexander Mokhov` before `Alex Konstad`, `Steven
+/// Belledin` before `Steve Prescott`, `Daniel Zrom` before `Dan Murayama Scott`, each the reverse
+/// of what the space-bearing byte order gives. Those four pairs were the last `ordering-primary`
+/// findings left in the sweep.
+///
+/// RESIDUAL, recorded rather than approximated: the vocab holds the artist lowercased but NOT
+/// accent-folded, and this engine has no NFKD (the builder owns that, which is why `card_name_folded`
+/// arrives pre-folded). So an accented artist still sorts on its raw letter — 116 of the corpus's
+/// 2,540 artists carry one (`Volkan Baǵa`, `Tomáš Honz`, `Loïc Canavaggia`). Closing it means the
+/// builder supplying a folded artist alongside the vocab; the sample above cannot see it, because
+/// no adjacent pair in it is decided by an accent.
+fn assign_artist_ranks(printings: &mut [Printing], foreign: &mut [Printing], artist_vocab_collated: &[String]) {
     let name_of = |p: &Printing| match p.card_artist_vid {
         ARTIST_NONE => None,
-        vid => artist_vocab.get(vid as usize).cloned(),
+        vid => artist_vocab_collated.get(vid as usize).map(ToOwned::to_owned),
     };
     assign_printing_ranks(printings, foreign, |p| (name_of(p).is_none(), name_of(p)), |p, r| p.artist_rank = r);
 }
@@ -3142,17 +3364,25 @@ struct PrintedNameIndex {
     trigrams: SortedTrigramIndex,
 }
 
-/// Build the printed-name records from both spaces. One temporary entry per printing carrying a
-/// folded printed name — annex-proportional, not corpus-proportional: an all-English build
-/// contributes nothing here.
-fn build_printed_name_index(printings: &[Printing], foreign: &[Printing], strings: &[String]) -> PrintedNameIndex {
+/// Build a name-record index from both spaces, keyed by whichever folded name `key_of` picks —
+/// `printed_name_folded_id` for `CardIndexes::printed_names`, `flavor_name_folded_id` for
+/// `flavor_names`. One temporary entry per printing carrying that name, so both are
+/// participant-proportional rather than corpus-proportional: an all-English build contributes
+/// nothing to the first, and the second is ~546 records at full corpus scale.
+fn build_printed_name_index(
+    printings: &[Printing],
+    foreign: &[Printing],
+    strings: &[String],
+    key_of: impl Fn(&Printing) -> u32,
+) -> PrintedNameIndex {
     let n_printings = printings.len() as u32;
     // (name_id, lang_id, vpid) per participating printing, either space.
     let mut entries: Vec<(u32, u16, u32)> = Vec::new();
     for (space, base) in [(printings, 0u32), (foreign, n_printings)] {
         for (i, p) in space.iter().enumerate() {
-            if p.printed_name_folded_id != NONE_STR {
-                entries.push((p.printed_name_folded_id, p.compat.lang_id, base + i as u32));
+            let name_id = key_of(p);
+            if name_id != NONE_STR {
+                entries.push((name_id, p.compat.lang_id, base + i as u32));
             }
         }
     }
@@ -3204,78 +3434,159 @@ fn build_printed_name_index(printings: &[Printing], foreign: &[Printing], string
 }
 
 // ─── Fuzzy name matching ─────────────────────────────────────────────────────
-// A reimplementation of pg_trgm's similarity(), because the SQL path is a FALLBACK and the engine
-// has to answer `?fuzzy=` itself. Matching pg_trgm exactly matters: if the two paths scored
-// differently, the same query would resolve to different cards depending on which one served it.
+// SCRYFALL'S `?fuzzy=` METRIC, DERIVED FROM 86 PROBED NEEDLES (api.scryfall.com, 2026-08-16) —
+// NOT pg_trgm's similarity(), which is what this scan used to compute.
 //
-// pg_trgm's algorithm: split on non-alphanumerics, pad each word with two leading spaces and one
-// trailing, take every 3-byte window, deduplicate, and score |intersection| / |union|.
+// The old code reimplemented pg_trgm exactly so the engine and upstream's Postgres FALLBACK would
+// resolve a needle the same way. It does not: pg_trgm splits on non-alphanumerics and pads each
+// WORD with "  x ", which makes its trigram set a set of WORDS and therefore blind to word order.
+// The clean proof is one needle:
+//
+//     /cards/named?fuzzy=bolt+lightning  ->  Blightning
+//
+// pg_trgm scores `bolt lightning` against `Lightning Bolt` at 1.0 — the two have identical word
+// sets — so no threshold and no tiebreak can ever let Blightning win. Scryfall answers Blightning,
+// so Scryfall is not scoring word sets.
+//
+// WHAT IT IS SCORING, fitted over the whole 86-needle set (the fit lives in this repo's history
+// as scratchpad/fit3.ts; the probe corpus is the cached Scryfall responses it reads):
+//
+//     fold  = accents folded, lowercased, EVERY non-alphanumeric removed  ("Ego à Deriva" ->
+//             "egoaderiva", "bolt lightning" -> "boltlightning")
+//     J     = Jaccard over the distinct raw 3-byte windows of the WHOLE folded string
+//             (no word split, no padding — this is where word order survives)
+//     L     = 1 - levenshtein(a, b) / max(|a|, |b|)
+//     score = (J + L) / 2                    FLOOR 0.625   LEAD 0.01
+//
+// Neither half alone reproduces the set: J alone puts `Lightning Bolt` (0.692) above `Blightning`
+// (0.583) for `bolt lightning`; L alone puts `Ball Lightning` (0.846) above it. Their mean puts
+// Blightning first (0.676 vs 0.664), and does so for 85 of the 86 needles. The one it does not
+// reproduce is `fuzzy=austere` — see `cards_containing_all_words`, which is the stage that
+// actually answers it.
+//
+// THE STAGE ORDER CHANGED WITH THE METRIC, and had to: `/cards/named?fuzzy=` is exact ->
+// TYPO -> containment, not exact -> containment -> typo. `fuzzy=primeval titanoth` is the proof
+// in one needle — containment answers `Titanoth Rex` (its flavor name carries "primeval", its
+// oracle name carries "titanoth") and Scryfall answers `Primeval Titan`, which only the typo
+// stage can produce. Reordering without the metric change is not an option either: it turns
+// `bolt` and `jac bel`, which Scryfall calls ambiguous, into hits.
+//
+// THE TYPO STAGE IS ENGLISH-ONLY. Scryfall gives foreign printed names no typo tolerance at all:
+// `fuzzy=blitzschlag` resolves the German printing of Lightning Bolt, `fuzzy=blitzschlagg`
+// answers 404, and `fuzzy=ego a derva` (one letter off the Portuguese name) answers 404 while
+// `fuzzy=ego a deriva` resolves it. So printed names reach `?fuzzy=` through the EXACT and
+// CONTAINMENT stages only, and this scan reads oracle names — which also takes ~247k records off
+// the hot path it used to walk.
+//
+// UPSTREAM CONSEQUENCE, deliberate and owner-approved (PR #927): upstream's SQL fallback still
+// scores with pg_trgm, so the two paths now disagree on needles like `bolt lightning`. The engine
+// is what this port serves and Scryfall is what it has to match, so the engine matches Scryfall.
 //
 // Nothing is stored for this. The name vocabulary is ~31,700 oracle names, so scoring the whole
 // corpus per request is a few milliseconds -- cheaper than carrying a trigram index for a route
-// that is a small fraction of traffic.
+// that is a small fraction of traffic. It runs in the Durable Object (30 s), never the isolate.
 
-/// Every distinct trigram of `s`, pg_trgm's way.
-fn trigrams(s: &str) -> std::collections::BTreeSet<[u8; 3]> {
-    let mut out = std::collections::BTreeSet::new();
-    for word in s.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()) {
-        // pg_trgm pads "  word " and windows over the bytes.
-        let mut padded = Vec::with_capacity(word.len() + 3);
-        padded.extend_from_slice(b"  ");
-        padded.extend_from_slice(word.as_bytes());
-        padded.push(b' ');
-        for w in padded.windows(3) {
-            out.insert([w[0], w[1], w[2]]);
-        }
-    }
-    out
+/// The score at or above which a candidate is eligible at all, and the margin the winner must
+/// hold over the best DIFFERENT answer. Fitted, not chosen: 0.625 sits in the middle of the
+/// 0.60–0.65 plateau over which the 86-needle set scores identically.
+///
+/// THE LEAD WAS REFITTED WHEN THE CORPUS GREW. It was 0.01 while the extras classes were refused
+/// at import; importing them put `Lightning Bolt // Lightning Bolt` (astx/76, an art-series
+/// printing Scryfall also has) into the name space at 0.6731 against Blightning's 0.6763 for
+/// `fuzzy=bolt lightning` — a 0.0032 gap, so a 0.01 lead called the headline needle ambiguous.
+/// Scryfall answers Blightning with that card in its own corpus, so the metric's separation is
+/// real and the threshold was simply too coarse for it. 0.002 sits inside the 0.0005–0.003
+/// plateau the refit found, and still leaves an EXACT tie (difference 0) ambiguous, which is the
+/// only thing the lead has to catch.
+pub(crate) const FUZZY_SCORE_FLOOR: f32 = 0.625;
+pub(crate) const FUZZY_SCORE_LEAD: f32 = 0.002;
+
+/// `s` with every non-alphanumeric ASCII byte removed, written into a caller-owned buffer.
+///
+/// Multi-byte UTF-8 is kept whole (a continuation byte is never ASCII), so a CJK printed name
+/// survives this unchanged while `"ego à deriva"` — already accent-folded by the caller — becomes
+/// `"egoaderiva"`. This is the same separator fold `core_api::strip_separators` applies to the
+/// containment stage's words, spelled for bytes because the windows below are byte windows.
+fn fold_separators_into(s: &str, out: &mut Vec<u8>) {
+    out.clear();
+    out.extend(s.bytes().filter(|b| !b.is_ascii() || b.is_ascii_alphanumeric()));
 }
 
-/// pg_trgm's `similarity(a, b)`: Jaccard over trigram sets. 0.0 when both are empty.
-/// `trigrams`, written into a caller-owned buffer as a sorted, deduped run.
+/// The distinct 3-byte windows of an already-separator-folded string, as a sorted, deduped run so
+/// a merge can stand in for a set intersection.
 ///
-/// Same trigram definition as `trigrams` (pg_trgm's `"  word "` padding, windowed over bytes), and
-/// `fuzzy_name_match` reuses one buffer across every card so its scan allocates once instead of
-/// 31,724 times. Sorted+deduped so a merge can stand in for a set intersection.
-fn trigrams_into(s: &str, out: &mut Vec<[u8; 3]>) {
+/// A string under three bytes has no windows, so it is right-padded with NUL — a byte no folded
+/// name contains — which gives it exactly one gram that only an identical short string shares.
+fn name_trigrams_into(folded: &[u8], out: &mut Vec<[u8; 3]>) {
     out.clear();
-    for word in s.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()) {
-        let bytes = word.as_bytes();
-        // The padded form is "  word ", so the windows are: two leading pairs that need no buffer,
-        // then the word's own windows, then the trailing one. Materialising the padded Vec was the
-        // other per-name allocation.
-        out.push([b' ', b' ', bytes[0]]);
-        if bytes.len() >= 2 {
-            out.push([b' ', bytes[0], bytes[1]]);
-        } else {
-            out.push([b' ', bytes[0], b' ']);
-        }
-        for w in bytes.windows(3) {
-            out.push([w[0], w[1], w[2]]);
-        }
-        if bytes.len() >= 2 {
-            let n = bytes.len();
-            out.push([bytes[n - 2], bytes[n - 1], b' ']);
-        }
+    if folded.is_empty() {
+        return;
+    }
+    if folded.len() < 3 {
+        out.push([folded[0], *folded.get(1).unwrap_or(&0), 0]);
+        return;
+    }
+    for w in folded.windows(3) {
+        out.push([w[0], w[1], w[2]]);
     }
     out.sort_unstable();
     out.dedup();
 }
 
-/// TEST-ONLY since the fuzzy scan stopped calling it: this is the REFERENCE statement of
-/// pg_trgm's similarity, pinned by `trigram_similarity_matches_pg_trgm` and used by
-/// `trigrams_into_matches_the_padded_definition` to hold the scan's faster route to it. Kept
-/// rather than deleted because a definition the tests check against is worth more than the call
-/// site it lost.
+/// Levenshtein distance over bytes, two rolling rows in a caller-owned buffer so the scan
+/// allocates once rather than once per name. Bytes rather than chars for the same reason the
+/// trigram windows are byte windows: the strings this compares are accent-folded oracle names,
+/// which are ASCII but for a handful of names whose non-ASCII bytes then simply compare as bytes.
+fn levenshtein_bytes(a: &[u8], b: &[u8], buf: &mut Vec<u32>) -> u32 {
+    if a.is_empty() {
+        return b.len() as u32;
+    }
+    if b.is_empty() {
+        return a.len() as u32;
+    }
+    let m = b.len();
+    buf.clear();
+    buf.extend(0..=m as u32);
+    for (i, &ca) in a.iter().enumerate() {
+        let mut diag = buf[0];
+        buf[0] = i as u32 + 1;
+        for j in 1..=m {
+            let up = buf[j];
+            let cost = u32::from(ca != b[j - 1]);
+            buf[j] = (buf[j] + 1).min(buf[j - 1] + 1).min(diag + cost);
+            diag = up;
+        }
+    }
+    buf[m]
+}
+
+/// TEST-ONLY: the REFERENCE statement of the metric above, written the obvious way (sets and a
+/// full DP) so the scan's faster route to it — sorted-run merge, rolling rows, the Jaccard
+/// prefilter — has something to be pinned against. See `fuzzy_score_matches_the_reference`.
 #[cfg(test)]
-pub(crate) fn trigram_similarity(a: &str, b: &str) -> f32 {
-    let (ta, tb) = (trigrams(a), trigrams(b));
-    if ta.is_empty() || tb.is_empty() {
+pub(crate) fn fuzzy_similarity(a: &str, b: &str) -> f32 {
+    let fold = |s: &str| -> Vec<u8> {
+        let mut v = Vec::new();
+        fold_separators_into(s, &mut v);
+        v
+    };
+    let (fa, fb) = (fold(a), fold(b));
+    if fa.is_empty() || fb.is_empty() {
         return 0.0;
     }
-    let shared = ta.intersection(&tb).count();
-    let union = ta.len() + tb.len() - shared;
-    if union == 0 { 0.0 } else { shared as f32 / union as f32 }
+    let grams = |v: &[u8]| -> std::collections::BTreeSet<[u8; 3]> {
+        let mut g = Vec::new();
+        name_trigrams_into(v, &mut g);
+        g.into_iter().collect()
+    };
+    let (ga, gb) = (grams(&fa), grams(&fb));
+    let shared = ga.intersection(&gb).count();
+    let union = ga.len() + gb.len() - shared;
+    let jaccard = if union == 0 { 0.0 } else { shared as f32 / union as f32 };
+    let mut buf = Vec::new();
+    let dist = levenshtein_bytes(&fa, &fb, &mut buf) as f32;
+    let lev = 1.0 - dist / fa.len().max(fb.len()) as f32;
+    (jaccard + lev) / 2.0
 }
 
 /// What a `?fuzzy=` lookup resolved to.
@@ -3339,9 +3650,18 @@ impl<'a> FuzzyRace<'a> {
 /// stage uses `contains`), so a matching name holds every trigram of the needle and cannot lie
 /// outside the intersection. Callers still re-verify; this only decides who gets asked.
 ///
-/// `None` from `trigram_candidates` means the needle is under 3 bytes, where the index has nothing
-/// to say and the full scan is the only answer. NOT usable for `autocomplete_names`, which matches
-/// `card_name_lower` while this index is built over `card_name_folded`.
+/// THE NEEDLE IS COLLATED HERE because the index is: `name_trigram` is built over
+/// `card_name_collated`, and a folded needle that kept its spaces has no window in common with it
+/// ("lightning bolt" against "lightningbolt"). Narrowing a FOLDED predicate through the COLLATED
+/// tier stays sound in the one direction it is used -- deleting the same character class from both
+/// sides preserves containment, so a folded name containing the folded needle contains the
+/// collated needle collated, and the candidate set can only ever be a SUPERSET. That is the same
+/// argument the literal `name:"…"` predicate rides on in `memoize_text_predicates`, and the
+/// callers here re-verify against the unfolded string exactly as it does.
+///
+/// A needle that collates to nothing (all punctuation), or to under 3 bytes, has no window at all
+/// and falls back to the full scan, which verifies every card instead. NOT usable for
+/// `autocomplete_names`, which matches `card_name_lower`.
 fn name_scan_candidates(data: &Archived<CardData>, needle: &str) -> Vec<u32> {
     let idx = &data.indexes.name_trigram;
     // APPLICABILITY CHECK, the same shape every other index gets (`sort_perms::order` length-checks
@@ -3352,7 +3672,14 @@ fn name_scan_candidates(data: &Archived<CardData>, needle: &str) -> Vec<u32> {
     if u32::from(idx.domain) as usize != data.cards.len() {
         return (0..data.cards.len() as u32).collect();
     }
-    trigram_candidates(idx, needle).unwrap_or_else(|| (0..data.cards.len() as u32).collect())
+    // A non-ASCII needle declines, for the reason the literal name predicate declines: the index is
+    // built over the ACCENT-FOLDED collated name and folding is not a deletion, so the windows do
+    // not correspond. Callers here already fold their needle in Python, so this is belt to braces.
+    let collated = collate_name(needle);
+    if collated.is_empty() || !collated.is_ascii() {
+        return (0..data.cards.len() as u32).collect();
+    }
+    trigram_candidates(idx, &collated).unwrap_or_else(|| (0..data.cards.len() as u32).collect())
 }
 
 /// Scryfall's exact-name rule: the whole stored name, or either side of a " // " split.
@@ -3441,22 +3768,30 @@ pub(crate) fn names_containing_all_words(
     by_name.into_iter().take(limit).map(|(_, _, cid, pid)| (cid, pid)).collect()
 }
 
-/// The owning card of a virtual printing id, via the direct arrays of whichever space it is in.
-pub(crate) fn card_of_vpid(data: &Archived<CardData>, vpid: u32) -> u32 {
-    let n = data.printings.len() as u32;
-    if vpid < n {
-        u32::from(data.indexes.printing_to_card[vpid as usize])
-    } else {
-        u32::from(data.indexes.foreign_to_card[(vpid - n) as usize])
-    }
-}
-
-/// pg_trgm's Jaccard over two sorted, deduped trigram runs, or None when it cannot clear
-/// `floor`. The size-ratio ceiling (`shared <= min(|a|,|b|)`, `union >= max`) makes the skip
-/// exact rather than approximate — no candidate that could clear the floor is dropped.
-fn jaccard_cleared(name_tg: &[[u8; 3]], needle_tg: &[[u8; 3]], floor: f32) -> Option<f32> {
+/// `(J + L) / 2` for one candidate, or None when it cannot clear `floor`.
+///
+/// Two exact skips, in the order that makes the cheap one pay for the dear one:
+///
+///   1. THE JACCARD PREFILTER. `L` is at most 1, so a candidate cannot reach `floor` unless
+///      `J >= 2 * floor - 1` — 0.25 at the fitted floor. The Jaccard is a merge of two sorted
+///      runs; the Levenshtein is a `|a| x |b|` DP, so paying the merge to skip the DP is the
+///      whole reason the scan stays in the low milliseconds over ~31,700 names.
+///   2. THE SIZE-RATIO CEILING inside it (`shared <= min(|a|,|b|)`, `union >= max`), which drops
+///      wildly mismatched lengths without touching either run.
+///
+/// Both are ceilings on the true score, never approximations of it: nothing that could clear the
+/// floor is skipped.
+fn fuzzy_score_cleared(
+    name_tg: &[[u8; 3]],
+    needle_tg: &[[u8; 3]],
+    name: &[u8],
+    needle: &[u8],
+    floor: f32,
+    dp: &mut Vec<u32>,
+) -> Option<f32> {
     let (la, lb) = (name_tg.len(), needle_tg.len());
-    if la == 0 || (la.min(lb) as f32) < floor * la.max(lb) as f32 {
+    let jaccard_floor = (2.0 * floor - 1.0).max(0.0);
+    if la == 0 || lb == 0 || (la.min(lb) as f32) < jaccard_floor * la.max(lb) as f32 {
         return None;
     }
     // Two sorted runs merged: no set, no allocation, no hashing.
@@ -3473,100 +3808,83 @@ fn jaccard_cleared(name_tg: &[[u8; 3]], needle_tg: &[[u8; 3]], floor: f32) -> Op
         }
     }
     let union = la + lb - shared;
-    let score = if union == 0 { 0.0 } else { shared as f32 / union as f32 };
+    let jaccard = if union == 0 { 0.0 } else { shared as f32 / union as f32 };
+    if jaccard < jaccard_floor {
+        return None;
+    }
+    let longest = name.len().max(needle.len());
+    if longest == 0 {
+        return None;
+    }
+    let lev = 1.0 - levenshtein_bytes(name, needle, dp) as f32 / longest as f32;
+    let score = (jaccard + lev) / 2.0;
     (score >= floor).then_some(score)
 }
 
-/// Printed-name records worth scoring against `needle`: the union of the trigram index's
-/// postings over the needle's raw 3-byte windows — any record sharing NO window with the
-/// needle is skipped without being resolved or scored, which is what keeps the foreign pass
-/// at candidate scale (~a few posting lists) instead of ~247k Jaccard evaluations.
+/// The card's PREFERRED canonical printing as a virtual printing id, or None when its canonical
+/// range is empty.
 ///
-/// Union, not intersection: fuzzy tolerates typos, so requiring EVERY window (the containment
-/// rule `trigram_candidates` enforces) would drop real matches. A needle under 3 bytes has no
-/// windows and falls back to every record, like the English scan's own short-needle behavior.
-/// KNOWN EDGE: a record whose folded name is under 3 bytes contributes no windows at build and
-/// is unreachable here — printed names that short do not occur in the real corpus, and the
-/// English pass (which scans) is unaffected.
-fn printed_record_candidates(pn: &Archived<PrintedNameIndex>, needle: &str) -> Vec<u32> {
-    let n_records = pn.name_ids.len();
-    // Applicability check, same shape as name_scan_candidates: an index built for a different
-    // record count (a hand-built fixture) must widen to a scan, never silently drop candidates.
-    if u32::from(pn.trigrams.domain) as usize != n_records || needle.len() < 3 {
-        return (0..n_records as u32).collect();
-    }
-    let mut bits = vec![0u64; n_records.div_ceil(64)];
-    let mut seen: Vec<[u8; 3]> = needle.as_bytes().windows(3).map(|w| [w[0], w[1], w[2]]).collect();
-    seen.sort_unstable();
-    seen.dedup();
-    for tri in seen {
-        match lookup_trigram(&pn.trigrams, tri) {
-            Some(TriOperand::Posting(ids)) => {
-                for id in ids {
-                    bits[(id >> 6) as usize] |= 1u64 << (id & 63);
-                }
-            }
-            Some(TriOperand::Plane(words)) => or_bits_into(&mut bits, &words),
-            None => {}
-        }
-    }
-    let mut out = Vec::new();
-    for (wi, word) in bits.iter().enumerate() {
-        let mut w = *word;
-        while w != 0 {
-            out.push((wi as u32) << 6 | w.trailing_zeros());
-            w &= w - 1;
-        }
-    }
-    out
+/// An `Option` rather than a bare index, and the reason is that the failure is SILENT otherwise.
+/// Printings are stored prefer-desc, so `offsets[cid]` is the answer whenever the range is
+/// non-empty — but on an empty one it equals `offsets[cid + 1]`, and `printing_at`'s vpid
+/// convention then reinterprets that number: `vpid == printings.len()` falls into the annex
+/// branch and returns `foreign[0]`, an unrelated card's row, with no panic and no marker. Every
+/// caller that used to write `u32::from(data.offsets[cid])` inline could produce that, so the
+/// index is only handed out behind a check.
+///
+/// `drop_group_if_annex_only` is what keeps empty ranges out of a built store in the first place;
+/// this is the belt to its braces, and the two are cheap enough to keep even once the corpus
+/// stops producing the state (see that function's comment).
+pub(crate) fn preferred_vpid(data: &Archived<CardData>, cid: usize) -> Option<u32> {
+    let start = u32::from(data.offsets[cid]);
+    (start < u32::from(data.offsets[cid + 1])).then_some(start)
 }
 
-/// The typo-tolerant name match, with Scryfall's thresholds, over BOTH name spaces: every
-/// card's folded English name (a scan, as ever) plus every distinct (folded printed name, lang)
-/// record, trigram-narrowed to the records sharing a window with the needle.
+/// The needle, in the form both scans below compare against: lowercased, separator-folded bytes
+/// plus their sorted trigram run. Empty when nothing alphanumeric survives.
+fn fuzzy_needle(needle: &str) -> Option<(Vec<u8>, Vec<[u8; 3]>)> {
+    let lowered = needle.to_lowercase();
+    let mut bytes = Vec::with_capacity(lowered.len());
+    fold_separators_into(&lowered, &mut bytes);
+    let mut tg = Vec::with_capacity(32);
+    name_trigrams_into(&bytes, &mut tg);
+    (!tg.is_empty()).then_some((bytes, tg))
+}
+
+/// The typo-tolerant name match, with Scryfall's thresholds, over every card's folded ENGLISH
+/// name — and only those. Printed names get no typo tolerance on Scryfall (`fuzzy=blitzschlagg`
+/// and `fuzzy=ego a derva` both answer 404 while the exact foreign spellings resolve), so they
+/// reach `?fuzzy=` through the exact and containment stages instead; see the module comment.
 ///
 /// A candidate must clear `floor`, and the best must lead the runner-up by `lead`. The
 /// runner-up rule is FuzzyRace's: only a different name on a different CARD competes — several
 /// printings of one card are the same answer, a card's own foreign and English names are too,
 /// and two cards sharing a name stay one answer.
-pub(crate) fn fuzzy_name_match(data: &Archived<CardData>, needle: &str, floor: f32, lead: f32) -> FuzzyOutcome {
-    let needle = needle.to_lowercase();
-    // The needle's trigrams are LOOP-INVARIANT, and a sorted Vec is the shape this scan wants
-    // rather than the BTreeSet `trigram_similarity` returns. Calling that helper per card rebuilt
-    // this set 31,724 times and heap-allocated a fresh BTreeSet (plus a padded Vec per word) for
-    // every name besides — on a path that is one linear pass over every card in the corpus.
-    // Measured on the real corpus: 25,350 us for one `?fuzzy=` lookup before this.
-    //
-    // `trigram_similarity` itself is deliberately untouched: it is pinned to pg_trgm's definition
-    // by `trigram_similarity_matches_pg_trgm`, and jaccard_cleared computes the identical ratio
-    // by a different route (two sorted runs merged, instead of two sets intersected).
-    let mut needle_tg: Vec<[u8; 3]> = trigrams(&needle).into_iter().collect();
-    needle_tg.sort_unstable();
-    needle_tg.dedup();
-    if needle_tg.is_empty() {
-        return FuzzyOutcome::Miss;
-    }
+pub(crate) fn fuzzy_name_match(
+    data: &Archived<CardData>,
+    needle: &str,
+    floor: f32,
+    lead: f32,
+) -> FuzzyOutcome {
+    // The needle's folded bytes and trigrams are LOOP-INVARIANT. Rebuilding them per card is what
+    // made one `?fuzzy=` lookup cost 25,350 us on the real corpus before this scan was written.
+    let Some((needle_bytes, needle_tg)) = fuzzy_needle(needle) else { return FuzzyOutcome::Miss };
     // Reused across every candidate, so the scan allocates once rather than per name.
+    let mut name_bytes: Vec<u8> = Vec::with_capacity(64);
     let mut name_tg: Vec<[u8; 3]> = Vec::with_capacity(64);
+    let mut dp: Vec<u32> = Vec::with_capacity(64);
     let mut race = FuzzyRace { best: None, runner_up: None };
     for (cid, card) in data.cards.iter().enumerate() {
         let name = folded_name(card, &data.strings);
-        trigrams_into(name, &mut name_tg);
-        if let Some(score) = jaccard_cleared(&name_tg, &needle_tg, floor) {
+        fold_separators_into(name, &mut name_bytes);
+        name_trigrams_into(&name_bytes, &mut name_tg);
+        if let Some(score) =
+            fuzzy_score_cleared(&name_tg, &needle_tg, &name_bytes, &needle_bytes, floor, &mut dp)
+        {
             // An English-name hit materializes what it always has: the card's preferred printing.
-            race.offer(score, cid as u32, u32::from(data.offsets[cid]), name);
-        }
-    }
-    let pn = &data.indexes.printed_names;
-    for rec in printed_record_candidates(pn, &needle) {
-        let rec = rec as usize;
-        let Some(name) = str_at(&data.strings, u32::from(pn.name_ids[rec])) else { continue };
-        trigrams_into(name, &mut name_tg);
-        if let Some(score) = jaccard_cleared(&name_tg, &needle_tg, floor) {
-            // The record's first vpid is its best-prefer printing — the object a foreign hit
-            // materializes.
-            let vpid = u32::from(pn.vpids[u32::from(pn.offsets[rec]) as usize]);
-            race.offer(score, card_of_vpid(data, vpid), vpid, name);
+            if let Some(vpid) = preferred_vpid(data, cid) {
+                race.offer(score, cid as u32, vpid, name);
+            }
         }
     }
     race.outcome(lead)
@@ -3765,7 +4083,7 @@ fn build_sort_permutations(cards: &[OracleCard]) -> SortPermutations {
         ids.sort_unstable_by_key(|&i| {
             let c = &cards[i as usize];
             let pk = perm_primary_key(get(c), descending);
-            let e = c.edhrec_rank.unwrap_or(u32::MAX);
+            let e = c.name_rank;
             // Canonical secondary: the first (store-preferred) printing's
             // default prefer score, matching sort_key_bits' third component
             // for the printing the default prefer chooses.
@@ -4609,12 +4927,12 @@ fn build_printing_value_index(
     get: impl Fn(&Printing) -> Option<u32>,
 ) -> PrintingValueIndex {
     let printing_to_card = build_printing_to_card(offsets);
+    // The SAME tiebreak `sort_key_bits` puts in lane 3, because a run of this index is walked as
+    // if it were already page-ordered. It was `edhrec_rank`; Scryfall's is the name (see
+    // `sort_key_bits`), and an index still grouped the old way would hand `walk_printing_page` a
+    // run in an order the gathered path no longer produces.
     let tiebreak = |pid: usize| -> u32 {
-        printing_to_card
-            .get(pid)
-            .and_then(|&cid| cards.get(cid as usize))
-            .and_then(|c| c.edhrec_rank)
-            .unwrap_or(u32::MAX)
+        printing_to_card.get(pid).and_then(|&cid| cards.get(cid as usize)).map_or(u32::MAX, |c| c.name_rank)
     };
     // (key, tiebreak rank, pid) — one `sort_unstable` on the lexicographic tuple establishes both
     // the value-major grouping and the within-value order at once.
@@ -5001,6 +5319,18 @@ struct CardIndexes {
     artists:        ArtistIndex,     // printing space (CSR by artist vocab id)
     flavor:         FlavorIndex,     // printing space (CSR by dense flavor text id)
     set_codes:      TagIndex,        // printing space
+    /// The set codes holding at least one `is:extra` printing, sorted — a build-time fold of
+    /// `is_tags` over `set_codes`, ~1 KB.
+    ///
+    /// It exists because Scryfall's `include_extras` AUTO-ENABLE asks exactly this question. A
+    /// query naming a set turns the flag on — overriding an explicit `include_extras=false`, in
+    /// the echo and in the results — if and only if that set contains an extra. Measured over 18
+    /// sets on 2026-08-16 and the split is perfect: lea/leb/2ed/3ed/sum 1, 4ed/5ed/6ed 2, leg 4,
+    /// j21 16, hbg 122, unk 506 all enable; ust/ice/war/unf/por/7ed are 0 and none of them does.
+    /// A route cannot answer that from the query text, and asking the engine per request would be
+    /// a second round trip on the hottest path — so the answer is folded once, here, and read as
+    /// a table.
+    sets_with_extras: Vec<String>,
     watermarks:     TagIndex,        // printing space
     released_at:    PrintingValueIndex,       // printing space
     price_usd:      PrintingValueIndex,       // printing space (integer cents, already order-preserving)
@@ -5090,6 +5420,27 @@ struct CardIndexes {
     foreign_external_ids: Vec<(u8, u64, u32)>,
     /// (folded printed name, lang) -> virtual printing ids, both spaces — see PrintedNameIndex.
     printed_names: PrintedNameIndex,
+    /// (folded `flavor_name`, lang) -> virtual printing ids, same structure and the same build,
+    /// keyed on the OTHER folded name a printing can carry. Separate rather than merged into
+    /// `printed_names` because the two are read by different sets of stages: `/cards/named?exact=`
+    /// reads oracle names and FLAVOR names and refuses printed ones (measured on
+    /// api.scryfall.com 2026-08-16: `exact=Godzilla, Primeval Champion` -> 200 prm/80925,
+    /// `exact=Ego à Deriva` -> 404), while the containment stage reads all three.
+    ///
+    /// ~546 records at full corpus scale, so its trigram index is noise next to `printed_names`'s.
+    flavor_names: PrintedNameIndex,
+    /// Parallel to `flavor_names.name_ids`: each record's name `collate_name`d, so `name:` can be
+    /// answered against it with no per-query allocation.
+    ///
+    /// `name:` REACHES A PRINTING'S FLAVOR NAME. Measured on api.scryfall.com 2026-08-16:
+    /// `name:croft` answers 2 (Lara Croft AND Command Tower, whose "Croft Manor" printings are 2
+    /// of its 112), `name:godzilla` is 8 cards / 14 printings, `!"croft manor"` is 1. That makes
+    /// `name:` — the hottest predicate there is — printing-dependent, which is exactly what the
+    /// query plan must not become for the 99.9% of needles that hit no flavor name. This table is
+    /// the escape: `bind_flavor_names` scans these ~546 short strings once per name predicate and
+    /// grows the printing-dependent arm ONLY on a hit. Interning would not help — the collated
+    /// forms are distinct from the folded ones and there are 546 of them, ~9 KB.
+    flavor_names_collated: Vec<String>,
 }
 
 
@@ -5126,6 +5477,14 @@ struct CardData {
     // Artist predicates (contains/exact/regex) evaluate against these ~2.2k
     // strings once per query instead of per printing.
     artist_vocab: Vec<String>,
+    // Parallel to `artist_vocab` BY VID: the same artist, accent-folded AND separator-folded —
+    // `collate_name(fold_accents(lower))`, the string Scryfall compares an artist against.
+    // `order=artist` ranks on it (assign_artist_ranks) and `a:word` MATCHES on it: measured
+    // 2026-08-16, `a:gawel` answers 10 there exactly as `a:gaweł` does, `a:rebecca-guay` answers
+    // `a:"rebecca guay"`'s 166, and `a:gu*ay` answers `a:guay`'s 197 — the same collation `name:`
+    // gets, on the same evidence. `a=`, `a!=` and `a:/…/` keep binding against the raw
+    // `artist_vocab`: a regex is compared as written. ~2.5k strings, ~35KB.
+    artist_vocab_collated: Vec<String>,
     // Distinct hybrid mana symbols, indexed by ManaCost.hybrids ids (~29
     // entries). ManaCostCmp binds query symbols against these (see
     // MANA_SYM_UNKNOWN for symbols no card carries).
@@ -5489,7 +5848,7 @@ fn or_all(mut sets: Vec<Narrowed>, n: usize) -> Option<Narrowed> {
 /// `tight_narrow_space` had to drop `released_at` for being nullable, and excludes price for the same
 /// class of reason. Add a field only with the `str_val_of` / accessor line that proves totality.
 fn never_null(f: &FilterExpr) -> bool {
-    matches!(f, FilterExpr::TextContains { field: TextSearchField::NameLower, .. })
+    matches!(f, FilterExpr::TextContains { field: TextSearchField::NameLower | TextSearchField::NameCollated, .. })
 }
 
 /// Static answer to "could narrow_rec(f) produce a tight set, and in which
@@ -5504,8 +5863,10 @@ fn tight_narrow_space(f: &FilterExpr) -> Option<bool> {
         FilterExpr::ExactName(_) => Some(false),
         // An oracle id resolves exactly through the sorted oracle_id permutation, to 0 or 1 card.
         FilterExpr::OracleIdMatch { .. } => Some(false),
-        // 1- and 2-byte name needles resolve exactly through the unigram / bigram indexes.
-        FilterExpr::TextContains { field: TextSearchField::NameLower, word } if word.len() <= 2 => Some(false),
+        // 1- and 2-byte COLLATED name needles resolve exactly through the unigram / bigram
+        // indexes; the literal predicate only borrows them as candidates and must re-verify, so
+        // it is never tight.
+        FilterExpr::TextContains { field: TextSearchField::NameCollated, word } if word.len() <= 2 => Some(false),
         // Ge-only guard is deliberate (#700): narrow_rec's CollectionCmp arm
         // now also narrows Eq/Gt through the same containment postings, but
         // only loosely — the postings prove `contains(value)`, not the
@@ -5592,10 +5953,11 @@ fn narrow_candidates_exact(
     indexes: &Archived<CardIndexes>,
     offsets: &AOffsets,
     cards: &[AOracleCard],
+    strings: &AStrings,
 ) -> (Option<Candidates>, bool, u64) {
     let n_cards = offsets.len().saturating_sub(1);
     let n_printings = if n_cards == 0 { 0 } else { u32::from(offsets[n_cards]) as usize };
-    match narrow_rec(filter, indexes, offsets, cards, false) {
+    match narrow_rec(filter, indexes, offsets, cards, strings, false) {
         None => (None, false, 0),
         Some(n) => {
             let printing_space = n.set.is_printing_space();
@@ -5625,8 +5987,9 @@ fn narrow_candidates(
     indexes: &Archived<CardIndexes>,
     offsets: &AOffsets,
     cards: &[AOracleCard],
+    strings: &AStrings,
 ) -> Option<Candidates> {
-    narrow_candidates_exact(filter, indexes, offsets, cards).0
+    narrow_candidates_exact(filter, indexes, offsets, cards, strings).0
 }
 
 /// Once any candidate source in an And is this selective, evaluating further
@@ -5958,6 +6321,7 @@ fn narrow_rec(
     indexes: &Archived<CardIndexes>,
     offsets: &AOffsets,
     cards: &[AOracleCard],
+    strings: &AStrings,
     broad_ok: bool,
 ) -> Option<Narrowed> {
     let n_cards = offsets.len().saturating_sub(1);
@@ -6004,18 +6368,37 @@ fn narrow_rec(
 
     match filter {
         FilterExpr::ExactName(needle) => {
-            // The ascending name permutation is keyed on name_rank — i.e. on
-            // card_name_lower byte order — so equal-name blocks are contiguous
-            // and equality is a binary-searched range: an exact, tight card
-            // set. A miss proves the empty set (names are never null).
-            let perm = &indexes.sort_perms.name[0];
-            if perm.len() != n_cards || cards.len() != n_cards || n_cards == 0 {
-                return None; // store without name permutations
+            // `!"…"` names a card by its whole name OR by either side of the `" // "` join
+            // (filter::exact_name_matches, with the live measurements). The ascending name
+            // permutation answers only the first of those: it is keyed on name_rank — i.e. on
+            // card_name_lower byte order — so an equal-name block is a contiguous binary-searched
+            // range, but a card whose *back* face carries the needle sorts under its front face's
+            // name and is nowhere near it. Narrowing on the range alone would drop it before the
+            // verify ever ran, which is exactly how `!"Lightning Bolt"` came back without
+            // `Emeritus of Conflict // Lightning Bolt`.
+            //
+            // The collated-name trigram index does answer it: a face-name match means the needle is
+            // a CONTIGUOUS substring of the collated stored name (a face's collated form is a
+            // contiguous run of the whole name's), so the card carries every trigram of it — and
+            // the needle arrives collated from the parser, over the same string the index is built
+            // from, so this is now exact rather than sound-in-one-direction. A needle under 3 bytes
+            // has no window at all, and a non-ASCII one keeps its own decline: both fall back to
+            // the scan, which verifies every card instead.
+            //
+            // Candidates are verified here with the same predicate the walk uses, so the result is
+            // exact — `tight_narrow_space` still reports ExactName as tight card space, and the Not
+            // arm's complement stays sound.
+            if cards.len() != n_cards || n_cards == 0 {
+                return None;
             }
-            let name_of = |cid: &Archived<u32>| cards[u32::from(*cid) as usize].card_name_lower.as_str();
-            let lo = perm.partition_point(|cid| name_of(cid) < needle.as_str());
-            let width = perm[lo..].partition_point(|cid| name_of(cid) == needle.as_str());
-            let ids: Vec<u32> = perm[lo..lo + width].iter().map(|x| u32::from(*x)).collect();
+            let idx = &indexes.name_trigram;
+            if !needle.is_ascii() || u32::from(idx.domain) as usize != n_cards {
+                return None;
+            }
+            let mut ids = trigram_candidates(idx, needle)?;
+            ids.retain(|&cid| {
+                crate::filter::exact_name_matches(folded_name(&cards[cid as usize], strings), needle)
+            });
             Narrowed::tight(Candidates::Cards(ids))
         }
 
@@ -6030,10 +6413,14 @@ fn narrow_rec(
             Narrowed::tight(Candidates::Cards(find_oracle_by_oracle_id(perm, cards, *id).into_iter().collect()))
         }
 
-        FilterExpr::TextContains { field: TextSearchField::NameLower, word } if word.len() == 1 => {
+        FilterExpr::TextContains { field: TextSearchField::NameCollated, word } if word.len() == 1 => {
             // A 1-byte needle's containment IS byte membership, so the tier lookup is the complete
             // answer — tight, exactly as the 2-byte arm below. A byte absent from the index appears in
             // no name, so the empty narrowing is exact too. (#858)
+            //
+            // COLLATED only. The literal `name:"…"` predicate shares these tiers, but only as a
+            // candidate generator that must be re-verified, which `Narrowed::tight` would forbid;
+            // it narrows through the arm below instead.
             let idx = &indexes.name_unigrams;
             if u32::from(idx.n_cards) as usize != n_cards {
                 return None; // archive without unigrams for this store
@@ -6052,7 +6439,7 @@ fn narrow_rec(
             Narrowed::tight(Candidates::Cards(ids))
         }
 
-        FilterExpr::TextContains { field: TextSearchField::NameLower, word } if word.len() == 2 => {
+        FilterExpr::TextContains { field: TextSearchField::NameCollated, word } if word.len() == 2 => {
             // A 2-byte needle's containment IS bigram membership, so the tier
             // lookup is the complete answer — tight, with no false positives
             // for the walk to reject. A bigram absent from the index appears
@@ -6131,14 +6518,28 @@ fn narrow_rec(
 
         FilterExpr::TextContains { field, word }
             if word.len() >= 3
-                && matches!(field, TextSearchField::NameLower | TextSearchField::OracleTextLower) =>
+                && matches!(field, TextSearchField::NameLower | TextSearchField::NameCollated | TextSearchField::OracleTextLower) =>
         {
             // A needle of exactly 3 bytes is exactly ONE trigram, so the posting list IS the containment
             // set — no false positives to verify away. At 4+ bytes the intersection of several trigrams
             // really is a superset ("the" AND "her" without "ther"), so those stay loose. (#859)
             let mk = if word.len() == 3 { Narrowed::tight } else { Narrowed::loose };
             match field {
-                TextSearchField::NameLower => trigram_candidates(&indexes.name_trigram, word).and_then(|v| mk(Candidates::Cards(v))),
+                // The LITERAL name predicate narrows through the SAME collated index, with the
+                // needle collated to match — sound as a superset (see the memoize arm) but never
+                // tight, because the collated tier answered a looser question than the one the
+                // walk will ask of `card_name_lower`.
+                TextSearchField::NameLower => {
+                    // Non-ASCII declines, for the reason the memoize arm states: the index folds
+                    // accents and the literal predicate does not, so "éowyn" would narrow to
+                    // nothing rather than to the card it names.
+                    let collated = collate_name(word);
+                    if collated.is_empty() || !word.is_ascii() {
+                        return None;
+                    }
+                    trigram_candidates(&indexes.name_trigram, &collated).and_then(|v| Narrowed::loose(Candidates::Cards(v)))
+                }
+                TextSearchField::NameCollated => trigram_candidates(&indexes.name_trigram, word).and_then(|v| mk(Candidates::Cards(v))),
                 // Oracle postings are in dense text-id space (see OracleTextIndex);
                 // intersect there, then expand the survivors to card indices
                 // through the CSR table.
@@ -6170,8 +6571,18 @@ fn narrow_rec(
             }
             let mut acc: Option<Vec<u32>> = None;
             for f in &factors {
+                // COLLATED for the name index, which is built over `card_name_collated` — a
+                // regex runs against the name as written, so a required factor that straddles a
+                // space ("of the") has no window in the collated index and would narrow to
+                // nothing. Collating the factor keeps the narrowing a sound superset, which is
+                // all `Narrowed::loose` needs; the walk still runs the real regex.
+                let collated_factor;
                 let cand = if is_name {
-                    trigram_candidates(&indexes.name_trigram, f)
+                    collated_factor = collate_name(f);
+                    if collated_factor.is_empty() {
+                        continue;
+                    }
+                    trigram_candidates(&indexes.name_trigram, &collated_factor)
                 } else {
                     trigram_candidates(&indexes.oracle_trigram.trigrams, f)
                 };
@@ -6640,7 +7051,7 @@ fn narrow_rec(
                     _ => broad_ok,
                 };
                 let narrowed = match src {
-                    AndSource::Child(c) => narrow_rec(c, indexes, offsets, cards, child_broad_ok),
+                    AndSource::Child(c) => narrow_rec(c, indexes, offsets, cards, strings, child_broad_ok),
                     // `range_narrowed` is what every unfused range child reaches too, with the same
                     // `exact: true` (the bounds come from the same `int_range_bounds`/
                     // `date_range_bounds`/`year_range_bounds` derivations).
@@ -6724,7 +7135,7 @@ fn narrow_rec(
             // loosening-only, and the driver re-verifies).
             let mut sets: Vec<Narrowed> = Vec::with_capacity(children.len());
             for child in children {
-                let n = narrow_rec(child, indexes, offsets, cards, true)?;
+                let n = narrow_rec(child, indexes, offsets, cards, strings, true)?;
                 // One near-total child makes the union near-total: the
                 // \"candidates\" would visit almost every card while paying
                 // union, projection, and materialization on the way.
@@ -6766,7 +7177,7 @@ fn narrow_rec(
             // be computed to be discarded — sometimes at real cost (a
             // mixed-space Or pays vec sorts and a projection).
             tight_narrow_space(inner)?;
-            let n = narrow_rec(inner, indexes, offsets, cards, true)?;
+            let n = narrow_rec(inner, indexes, offsets, cards, strings, true)?;
             if !n.tight {
                 return None;
             }
@@ -6919,7 +7330,10 @@ fn f32_sort_bits(v: f32) -> u32 {
 /// any comparison, so their order is bit-for-bit what it was before this key existed.
 fn sort_col_secondary(p: &APrinting, sort_col: SortCol, descending: bool) -> u32 {
     match sort_col {
-        SortCol::Set => {
+        // `released` shares `set`'s second key, measured 2026-08-16: within one release date khm
+        // answers 407, 406, 405 … under `dir=desc` and 1, 2, 3 … under `dir=asc`, so the collector
+        // number follows the primary's direction here exactly as it does under `order=set`.
+        SortCol::Set | SortCol::Released => {
             let rank = u32::from(u16::from(p.collector_rank));
             if descending { !rank } else { rank }
         }
@@ -6930,7 +7344,7 @@ fn sort_col_secondary(p: &APrinting, sort_col: SortCol, descending: bool) -> u32
 /// Order-preserving integer sort key, computed once per match instead of inside the
 /// comparator: primary column (direction folded in by negation, missing sorts last),
 /// then the column's second key (direction folded in likewise; 0 where it has none),
-/// then edhrec rank ascending (missing last), then prefer score descending (missing
+/// then NAME rank ascending, then prefer score descending (missing
 /// last). Card-level columns read the OracleCard; printing-level columns (rarity,
 /// usd) read the chosen printing, matching the pre-split semantics where the
 /// group's representative printing supplied them. Full ties fall back to printing
@@ -6964,9 +7378,9 @@ fn sort_key_bits(card: &AOracleCard, p: &APrinting, sort_col: SortCol, descendin
     };
     let pk = primary.map_or(u32::MAX, |v| f32_sort_bits(if descending { -v } else { v }));
     let sk = sort_col_secondary(p, sort_col, descending);
-    let e = card.edhrec_rank.as_ref().map(|v| u32::from(*v)).unwrap_or(u32::MAX);
+    let n = u32::from(card.name_rank);
     let sc = p.prefer_score.as_ref().map_or(u32::MAX, |v| f32_sort_bits(-f32::from(*v)));
-    ((pk as u128) << 96) | ((sk as u128) << 64) | ((e as u128) << 32) | (sc as u128)
+    ((pk as u128) << 96) | ((sk as u128) << 64) | ((n as u128) << 32) | (sc as u128)
 }
 
 /// One query match: (sort key, card index, printing index). Ties on the sort key
@@ -10046,7 +10460,7 @@ fn prepare_candidates(ctx: &QueryCtx, params: &QueryParams, filter: &mut FilterE
     // Vec<u32>) here so the plane branch below can AND two card-space bitmaps
     // directly instead of paying to materialize one of them first.
     let (raw_candidates, residual_exact, proven_conjuncts): (Option<Candidates>, bool, u64) =
-        narrow_candidates_exact(filter, indexes, offsets, cards);
+        narrow_candidates_exact(filter, indexes, offsets, cards, strings);
     // Captured before the flattening below consumes it — see PreparedCandidates::narrowed_repr.
     let narrowed_repr = raw_candidates.as_ref().map_or(NarrowedRepr::None, Candidates::repr);
     // A present plane is always exact (that's what compile_plane guarantees),
@@ -13463,13 +13877,17 @@ const FIELD_TABLE: &[(&str, FieldExtractor)] = &[
 ];
 
 /// Mirror of magic.rarity_int_to_text -- the import stores 0-5, Scryfall speaks words.
+///
+/// The INVERSE of `rarity_text_to_int`, and it has to be turned over with it: the ints are an
+/// ordered ladder (`order=rarity`, `r>=rare`) and 3/4 were transposed against Scryfall's, so
+/// correcting the ladder without correcting this renders every mythic card as "special".
 fn rarity_int_to_text(value: u8) -> Option<&'static str> {
     match value {
         0 => Some("common"),
         1 => Some("uncommon"),
         2 => Some("rare"),
-        3 => Some("mythic"),
-        4 => Some("special"),
+        3 => Some("special"),
+        4 => Some("mythic"),
         5 => Some("bonus"),
         _ => None,
     }
@@ -13613,6 +14031,9 @@ fn faces_to_pylist<'py>(
             d.set_item("artist", str_at(strings, u32::from(art.card_artist_name_id)))?;
             d.set_item("illustration_id", uuid_from_u128(u128::from(art.illustration_id)))?;
             d.set_item("flavor_text", str_at(strings, u32::from(art.flavor_text_id)))?;
+            if let Some(v) = str_at(strings, u32::from(art.flavor_name_id)) {
+                d.set_item("flavor_name", v)?;
+            }
         }
         // The printed-language triple, inserted only when this printing's face carries the key:
         // absence is exact per face (a prepare-layout Spanish printing localizes the front
@@ -13744,7 +14165,65 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 //                `OracleCard` also gains `color_indicator`, the printed colour dot Scryfall sends
 //                on 546 printings and the card object emitted on none; it lands in the padding
 //                beside `produced_mana`, so it moves no size either.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026081602;
+//   2026081603 — the ORDERING itself, from the broad differential sweep. Nothing about the row
+//                layout moves, which is exactly why the constant has to: every change here is a
+//                stored VALUE or a bucket assignment a stale reader would misread as still meaning
+//                what it used to. (1) `name_rank` now ranks `collate_name(folded name)` —
+//                accents folded, every non-alphanumeric dropped — which is Scryfall's collation
+//                and reorders the DEFAULT order of every query. (2) `sort_key_bits`' third lane is
+//                that name rank instead of `edhrec_rank`, and `build_sort_permutations` and
+//                `build_printing_value_index` follow it, so a store built before this has its
+//                orderby runs pre-sorted by a tiebreak the executors no longer use. (3)
+//                `rarity_text_to_int` puts `special`=3 below `mythic`=4, Scryfall's ladder rather
+//                than the transposed one, which moves both `order=rarity` and `r>=mythic`; the
+//                rarity plane prefix grew to five so `mythic` keeps its plane.
+//   2026081604 — two more orderings, same sweep. (1) `order=artist` collates like `order=name`
+//                now (0 violations of the strip rule over 348 adjacent pairs against 4 for raw
+//                bytes), so `artist_rank`'s VALUES move. (2) the annex is stored in language order
+//                rather than prefer-desc, because that is the order Scryfall serves a slot's
+//                languages in and `page_cmp` reaches it as the (cid, vpid) tiebreak — a stored
+//                ORDER, so nothing about the layout moves and only this constant can catch it.
+//   2026081605 — `CardData` gains `artist_vocab_collated`, the artist vocab accent-folded and
+//                parallel BY VID, so `order=artist` can collate the way `order=name` does. The
+//                engine has no NFKD -- the builder owns folding, which is why `card_name_folded`
+//                arrives pre-folded -- so the fold now arrives with the row (`card_artist_folded`)
+//                and the commit pass fills the vocab from it. `a:` predicates keep binding against
+//                the UNFOLDED `artist_vocab`, so search semantics are untouched; only the sort
+//                moves. ~2.5k strings, ~40KB. No struct size changes, so only this constant can
+//                catch a stale archive -- one whose `artist_vocab_collated` is empty would rank
+//                every artist as the empty string and answer one arbitrary order for `order=artist`.
+//
+//                The deployment's vendored copy carries this as 2026081607; the two trees'
+//                in-flight stacks differ, so the numbers are no longer in step.
+//   2026081606 — `is:unique` gets the field it needs. `OracleCard` gains `single_set`, true when
+//                every printing of the card — canonical AND annex — shares one set code, decided
+//                at build by `assign_single_set_flags`. Stored rather than walked at query time
+//                because `tri()` is handed one card and one printing and can reach neither the
+//                card's other rows nor the annex. It costs ZERO bytes: the bool lands in the
+//                padding `legality_divergent` already left, so no archived row grows.
+//                Scryfall's own definition is a SET count ("cards that have only been in a single
+//                set"), which is not a printing count — the two differ on 2,847 of its 16,318 —
+//                and it spans languages: 130 cards have one English set plus a foreign-only second
+//                one (Salvat, ps11, pmei) and api.scryfall.com calls none of them unique.
+//                AND SO THE HEADER CANNOT CATCH IT: no struct size moves, so a reader pairing this
+//                code with a pre-`single_set` archive would read whatever the padding held and
+//                answer `is:unique` from noise. This constant is the only thing that stops it.
+//
+//                (`is:localizedname` landed in the same unit of work and needed NO archive change:
+//                it reads `Printing.printed_name_folded_id`, which the annex already carries.)
+//   2026081607 — `name:` IS TWO SEARCHES, and the name indexes moved under the one that matters.
+//                `OracleCard` gains `card_name_collated_id` — the folded name with every
+//                non-alphanumeric character removed, derived at build time — and `name_trigram`,
+//                `name_bigrams` and `name_unigrams` are all rebuilt over THAT string instead of
+//                the folded one. A reader pairing this code with an older archive would narrow a
+//                collated needle through a spaced index and answer with silence, and the struct
+//                grew, so both halves need the rebuild this constant forces.
+//                Scryfall matches a BARE `name:` word against the collated name and a QUOTED one
+//                literally (measured 2026-08-16: `name:ft` 1,628 against `name:"ft"` 362,
+//                `name:ofthe` 1,109 against `name:"ofthe"` 0, `name:limdul` 8 against
+//                `name:"limdul"` 0), and `!"…"` is collated too — so `!"Lim-Dul's Vault"` and
+//                `!"limduls vault"` now find the card that only `!"Lim-Dûl's Vault"` used to.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026081607;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -13881,7 +14360,8 @@ fn bind_and_split_filter(
     sync_format_shifts(&data.format_shifts);
     let mut filter_expr = build_filter(&json_val)
         .map_err(|e| QueryError::new_err(format!("build_filter: {e}")))?;
-    filter_expr.bind(&data.coll_vocab, &data.coll_vocab_sorted, &data.artist_vocab, &data.mana_vocab, &data.indexes.flavor, &data.strings);
+    filter_expr.bind(&data.coll_vocab, &data.coll_vocab_sorted, &data.artist_vocab, &data.artist_vocab_collated, &data.mana_vocab, &data.indexes.flavor, &data.strings);
+    filter_expr.bind_flavor_names(&data.indexes.flavor_names, &data.indexes.flavor_names_collated);
 
     // Read before the split consumes the tree.
     let sort_bound = sort_col_bound(&filter_expr, sort_col);
@@ -14222,6 +14702,8 @@ impl QueryEngine {
         // printing's value). Legality is the exception: a group whose rows
         // disagree gets legality_divergent set, deferring legality filters to
         // each printing's own word.
+        // Parallel to `artist_vocab` BY VID, filled from each row's fold as the commit loop walks them.
+        let mut artist_vocab_collated: Vec<String> = Vec::new();
         let mut cards: Vec<OracleCard> = Vec::new();
         let mut printings: Vec<Printing> = Vec::with_capacity(rows.len());
         let mut offsets: Vec<u32> = Vec::new();
@@ -14230,10 +14712,41 @@ impl QueryEngine {
         // each side's relative order). See CardData.foreign.
         let mut foreign: Vec<Printing> = Vec::new();
         let mut foreign_offsets: Vec<u32> = Vec::new();
-        // A group that closes with ZERO canonical rows is dropped whole, annex rows included —
-        // see drop_group_if_annex_only for the mechanism and the real-corpus trigger (the ja 4ED
-        // ante cards, whose every canonical printing the never-legal filter removes).
-        let mut annex_only_oracles_dropped = 0usize;
+        // A group that closes with ZERO canonical rows is dropped whole, annex rows included: this is
+    // what enforces the every-card-has-a-canonical-representative invariant the entire canonical
+    // space is built on.
+    //
+    // WHAT IT PREVENTS, audited site by site rather than asserted — an empty canonical range is
+    // three panics and five silent wrongnesses, and the silent half is why the guard is worth its
+    // lines even when nothing produces the state:
+    //
+    //   PANIC     `divergent_formats_of` (planes.rs) reads `printings[start]` on the zero-width
+    //             window. Now guarded there too, so this one is loud-then-skipped rather than a
+    //             crash, but the guard here is what makes it unreachable.
+    //   SILENT    every "the card's preferred printing is `offsets[cid]`" read. `printing_at`'s
+    //             vpid convention reinterprets `vpid == printings.len()` as ANNEX row 0 — an
+    //             unrelated card's printing — so the read succeeds and answers the wrong card.
+    //             `preferred_vpid` now hands that index out behind an Option so it cannot be
+    //             written by accident.
+    //   SILENT    `run_query_streamed_popcount`: a card-space plan's match set never consults
+    //             printings, so an empty-ranged card inflates `total` and shortens every page
+    //             behind it — a wrong count with no error anywhere.
+    //   DESIGN    `PlanePopcountOrder` would need a build-time mask to exclude such cards from
+    //             its planes. That is the ONE site that would need real work if this invariant
+    //             were ever deliberately relaxed; nothing else on the list would.
+    //
+    // HISTORICALLY reachable through a real Scryfall data quirk: the ja 4th Edition printings of
+    // the three ante cards (Bronze Tablet, Rebirth, Tempest Efreet) carry
+    // `legalities.oldschool = "legal"` while every OTHER printing is never-legal, so the
+    // never-legal import filter kept only rows outside default_cards and the oracle arrived here
+    // annex-only.
+    //
+    // THOSE THREE ARE GONE now that the never-legal filter is relaxed (see transform.rs): the
+    // cards import as ordinary cards with canonical rows, and a build reports 0 drops. The guard
+    // stays anyway — it costs one comparison per group, it is the only thing standing between a
+    // reintroduced filter and five failures that do not announce themselves, and the counter
+    // below turns "it happened" into a number a build prints rather than a silence.
+    let mut annex_only_oracles_dropped = 0usize;
         // The ROW count those drops removed, so the completeness assert below can account for
         // every staged row exactly (canonical + annex + dropped == staged).
         let mut annex_only_rows_dropped = 0usize;
@@ -14263,11 +14776,23 @@ impl QueryEngine {
                     } else {
                         interner.intern(row.card_name_folded.as_str().to_owned())
                     },
+                    // DERIVED from the folded name by the same `collate_name` the query side folds
+                    // the needle with: one interned string per name that has a separator to lose,
+                    // NONE_STR for the ones that do not.
+                    card_name_collated_id: {
+                        let collated = collate_name(row.card_name_folded.as_str());
+                        if collated == row.card_name_folded.as_str() {
+                            NONE_STR
+                        } else {
+                            interner.intern(collated)
+                        }
+                    },
                     card_colors: row.card_colors,
                     card_color_identity: row.card_color_identity,
                     produced_mana: row.produced_mana,
                 color_indicator: row.color_indicator,
                     card_types: row.card_types,
+                    single_set: false, // decided after grouping by assign_single_set_flags
                     legality_divergent: false,
                     oracle_id: row.oracle_id,
                     card_name_id: row.card_name_id,
@@ -14333,6 +14858,18 @@ impl QueryEngine {
             } else {
                 Vec::new()
             };
+            // `artist_vocab_collated[vid]`, filled the first time a row names that vid. Grown here
+            // rather than pre-sized because the artist vocab is not final until the loop ends; it
+            // is squared up to the vocab's length right after.
+            if row.card_artist_vid != ARTIST_NONE && row.card_artist_folded_id != NONE_STR {
+                let vid = row.card_artist_vid as usize;
+                if artist_vocab_collated.len() <= vid {
+                    artist_vocab_collated.resize(vid + 1, String::new());
+                }
+                if artist_vocab_collated[vid].is_empty() {
+                    artist_vocab_collated[vid] = collate_name(&interner.strings[row.card_artist_folded_id as usize]);
+                }
+            }
             let is_canonical = row.is_canonical;
             let printing = Printing {
                 scryfall_id: row.scryfall_id,
@@ -14373,12 +14910,15 @@ impl QueryEngine {
                         card_artist_vid: f.card_artist_vid,
                         card_artist_name_id: f.card_artist_name_id,
                         flavor_text_id: f.flavor_text_id,
+                        flavor_name_id: f.flavor_name_id,
                     })
                     .collect(),
                 printed_name_id: row.printed_name_id,
                 printed_type_line_id: row.printed_type_line_id,
                 printed_text_id: row.printed_text_id,
                 printed_name_folded_id: row.printed_name_folded_id,
+            flavor_name_id: row.flavor_name_id,
+            flavor_name_folded_id: row.flavor_name_folded_id,
                 printed_faces,
                 all_parts: row.all_parts,
 
@@ -14408,7 +14948,7 @@ impl QueryEngine {
         );
         offsets.push(printings.len() as u32);
         foreign_offsets.push(foreign.len() as u32);
-        assign_name_ranks(&mut cards);
+        assign_name_ranks(&mut cards, &interner.strings);
 
         #[cfg(feature = "alloc-counter")]
         let stats_after_cards = (alloc_stats::live(), alloc_stats::allocs());
@@ -14418,14 +14958,27 @@ impl QueryEngine {
         let coll_vocab = vocab.strings;
         drop(vocab.map);
         let artist_vocab = artists.strings;
+        // Square up to the vocab: a vid whose rows all lacked a fold keeps the unfolded string,
+        // which is the pre-fold behaviour rather than an empty sort key.
+        artist_vocab_collated.resize(artist_vocab.len(), String::new());
+        for (vid, collated) in artist_vocab_collated.iter_mut().enumerate() {
+            if collated.is_empty() {
+                *collated = collate_name(&artist_vocab[vid]);
+            }
+        }
         drop(artists.map);
         // After the vocab is final, before the printings are archived: both ranks are stored on the
         // printing and must be in place when it is written out. Both rank over the canonical+annex
         // union — see assign_printing_ranks for why that is safe for the canonical sort order and
         // necessary for the widened one.
         assign_set_ranks(&mut printings, &mut foreign);
-        assign_artist_ranks(&mut printings, &mut foreign, &artist_vocab);
+    // Needs both offset arrays complete and nothing else; placed with the other post-grouping
+    // passes because it is one, and stored on the card because `tri()` sees one card and one
+    // printing -- never the card's other rows, and never the annex.
+    assign_single_set_flags(&mut cards, &printings, &offsets, &foreign, &foreign_offsets);
+        assign_artist_ranks(&mut printings, &mut foreign, &artist_vocab_collated);
         assign_collector_ranks(&mut printings, &mut foreign, &strings);
+        order_annex_by_language(&mut foreign, &foreign_offsets, &coll_vocab);
         let mana_vocab = mana.strings;
         drop(mana.map);
         // String-sorted permutation of the vocab ids; VocabInterner caps the
@@ -14479,9 +15032,17 @@ impl QueryEngine {
         // all-canonical feed builds empty structures here.
         let langs_idx = build_lang_index(&printings, &coll_vocab);
         let foreign_langs_idx = build_lang_index(&foreign, &coll_vocab);
-        let printed_names_idx = build_printed_name_index(&printings, &foreign, &strings);
+        let printed_names_idx = build_printed_name_index(&printings, &foreign, &strings, |p| p.printed_name_folded_id);
+    let flavor_names_idx = build_printed_name_index(&printings, &foreign, &strings, |p| p.flavor_name_folded_id);
+    let flavor_names_collated: Vec<String> =
+        flavor_names_idx.name_ids.iter().map(|&id| collate_name(&strings[id as usize])).collect();
         let indexes = CardIndexes {
-            name_trigram:   build_trigram_index(&cards, |c| folded_name_of(c, &strings)),
+            // COLLATED, and so are the bigram and unigram tiers below: all three narrow `name:`,
+            // and a needle collated by the query side has no window in common with a folded name
+            // that kept its spaces. Callers collate their own needle before asking; the LITERAL
+            // `name:"…"` predicate does the same and re-verifies, which is sound because deleting
+            // the same character class from both sides preserves containment.
+            name_trigram:   build_trigram_index(&cards, |c| collated_name_of(c, &strings)),
             oracle_trigram: build_oracle_text_index(&cards, &strings),
             cmc:            build_numeric_index(&cards, |c| c.cmc.map(|v| v as i16)),
             power:          build_numeric_index(&cards, |c| c.creature_power.map(|v| v as i16)),
@@ -14504,6 +15065,25 @@ impl QueryEngine {
                     }
                 }
                 idx
+            },
+            sets_with_extras: {
+                // The fold that answers `include_extras`'s auto-enable — see the field's own comment.
+                // Canonical printings only: `e:X` is an English/canonical query unless the caller
+                // widens it, and the annex rows share their set codes with the canonical ones anyway.
+                let mut codes: Vec<String> = match coll_vocab.iter().position(|s| s == EXTRA_IS_TAG) {
+                    None => Vec::new(),
+                    Some(pos) => {
+                        let extra_vid = pos as u16;
+                        printings
+                            .iter()
+                            .filter(|p| !p.card_set_code.as_str().is_empty() && p.card_is_tags.contains(&extra_vid))
+                            .map(|p| p.card_set_code.as_str().to_owned())
+                            .collect()
+                    }
+                };
+                codes.sort_unstable();
+                codes.dedup();
+                codes
             },
             watermarks:     {
                 let mut idx: TagIndex = HashMap::new();
@@ -14557,6 +15137,8 @@ impl QueryEngine {
             foreign_by_scryfall_id: build_printing_by_scryfall_id(&foreign),
             foreign_external_ids: build_external_id_index(&foreign),
             printed_names: printed_names_idx,
+            flavor_names: flavor_names_idx,
+            flavor_names_collated,
         };
 
         #[cfg(feature = "alloc-counter")]
@@ -14576,6 +15158,7 @@ impl QueryEngine {
             coll_vocab,
             coll_vocab_sorted,
             artist_vocab,
+            artist_vocab_collated,
             mana_vocab,
             indexes,
             format_shifts: format_shifts_snapshot,
@@ -14710,7 +15293,7 @@ impl QueryEngine {
         // (detected on the compiled tree, so the flag and the operator cannot widen differently),
         // sends the query to the widened multilingual driver over both printing spaces. With
         // neither trigger the routed driver runs bit-for-bit as before and never reads the annex.
-        let (total, page) = if include_multilingual || unsplit.mentions_lang() {
+        let (total, page) = if include_multilingual || unsplit.widens_to_annex() {
             run_query_widened(data, &params.with_sort_bound(sort_bound), &unsplit)
         } else {
             run_query_routed(&ctx, &params.with_sort_bound(sort_bound), &mut filter_expr, Some(&unsplit), plane_expr.as_ref())
@@ -14875,7 +15458,9 @@ impl QueryEngine {
         let dicts: Vec<Bound<PyDict>> = chosen.iter()
             .map(|&cid| {
                 let card = &data.cards[cid];
-                let preferred = u32::from(data.offsets[cid]) as usize;
+                // The random pool is built from cards, so a card with no canonical printing would
+                // read an unrelated row rather than fail; see preferred_vpid.
+                let preferred = preferred_vpid(data, cid).unwrap_or_default() as usize;
                 card_to_pydict(py, card, &data.printings[preferred], &data.strings, &data.coll_vocab, &resolved_fields)
             })
             .collect::<PyResult<_>>()?;
@@ -14961,7 +15546,10 @@ impl QueryEngine {
     /// Returns `(status, card)` where status is "hit", "ambiguous" or "miss". Ambiguous is a
     /// distinct answer rather than a miss: Scryfall reports it with the candidates it could not
     /// separate, and collapsing it to "not found" would tell the client the card does not exist.
-    #[pyo3(signature = (name, floor, lead, fields=None))]
+    /// `floor` and `lead` DEFAULT to the fitted thresholds (see the `Fuzzy name matching` module
+    /// comment): they belong to the metric, not to the caller, and a Python-side copy of them
+    /// drifts the moment the metric is refitted. They stay arguments so a test can sweep them.
+    #[pyo3(signature = (name, floor=FUZZY_SCORE_FLOOR, lead=FUZZY_SCORE_LEAD, fields=None))]
     fn fuzzy_card_by_name<'py>(
         &self,
         py: Python<'py>,

@@ -112,14 +112,57 @@ def create_test_card(  # noqa: PLR0913, PLR0917
 class TestCardProcessing:
     """Test card processing functions."""
 
-    def test_preprocess_card_filters_non_paper_cards(self) -> None:
-        """Test preprocess_card filters out non-paper cards."""
-        invalid_card = create_test_card(
+    def test_preprocess_card_tags_extras_instead_of_dropping_them(self) -> None:
+        """Nothing is filtered out any more; the classes that were become `is:extra`.
+
+        api.scryfall.com serves every class this function used to refuse, and hides four of them
+        from a default `/cards/search` behind `include_extras=false` — a query-time gate an absent
+        row cannot reproduce in either direction (`/cards/named?exact=` answers all of them, and
+        `include_extras=true` has nothing to include). Probed one class at a time, 2026-08-16.
+        """
+
+        def tags(**overrides: object) -> dict[str, object]:
+            rows = preprocess_card(create_test_card(**overrides))
+            assert len(rows) == 1, "every row is imported now"
+            return rows[0].get("card_is_tags", {})
+
+        # ORDINARY — served by a bare `/cards/search`.
+        assert "extra" not in tags(legalities={"vintage": "not_legal"}), "cn2/6 is 200 bare"
+        assert "extra" not in tags(set_type="funny"), "e:ust answers 249 with and without the flag"
+        assert "extra" not in tags(layout="reversible_card", name="Echo // Echo"), "tdm/380 is 200 bare"
+        assert "extra" not in tags(promo_types=["sldbonus", "playtest"]), "sld/SCTLR is legal and served"
+        # Unstable's Hosts and Augments: `is:extra e:ust` answers 0, and both layouts were in
+        # _EXTRA_LAYOUTS until 2026-08-16. Asserted as a pair so re-adding either fails here.
+        assert "extra" not in tags(layout="host", set_type="funny"), "is:extra e:ust is 0"
+        assert "extra" not in tags(layout="augment", set_type="funny"), "is:extra e:ust is 0"
+
+        # EXTRA — 404 bare, 200 with include_extras=true.
+        assert "extra" in tags(set_type="memorabilia"), "ced/78 appears only with extras"
+        assert "extra" in tags(type_line="Card"), "tmkc/31"
+        assert "extra" in tags(type_line="Token Creature — Goblin"), "thob/4"
+        assert "extra" in tags(layout="planar"), "opc2/38"
+        assert "extra" in tags(layout="art_series", name="Echo // Echo"), "unlike its reversible cousin"
+        assert "extra" in tags(promo_types=["playtest"], legalities={"vintage": "not_legal"}), "mb2/536"
+        # `content_warning`, the flag with no other signal behind it: layout `normal`, an ordinary
+        # type line, legal somewhere. `is:extra e:lea` answers 1 and that one card is Crusade.
+        assert "extra" in tags(content_warning=True), "lea/61 Crusade"
+
+    def test_preprocess_card_keeps_non_paper_cards(self) -> None:
+        """A digital-only printing is IMPORTED: Scryfall serves it with default parameters.
+
+        Measured against api.scryfall.com 2026-08-16: `q=!"A-Tyvar Kell"` answers khm/A-198 and
+        `q=is:rebalanced` answers 216 cards, both from a bare `/cards/search`. Unlike the tokens,
+        funny sets and memorabilia the other filters here stand in for, nothing hides a digital
+        printing behind `include_extras` — so dropping the row was the one filter in
+        `preprocess_card` that made an ordinary query disagree.
+        """
+        digital_card = create_test_card(
             games=["mtgo"],  # Not paper
         )
 
-        result = preprocess_card(invalid_card)
-        assert result == []
+        result = preprocess_card(digital_card)
+        assert len(result) == 1
+        assert result[0]["card_name"] == "Test Card"
 
     def test_preprocess_card_merges_double_faced_cards_into_one_row(self) -> None:
         """A multi-face card produces exactly ONE row, so faces no longer fight for the PK.
@@ -140,19 +183,19 @@ class TestCardProcessing:
         assert merged["card_subtypes"] == ["Human", "Werewolf"]
         assert merged["type_line"] == "Creature — Human // Creature — Werewolf"
 
-    def test_preprocess_card_filters_same_faced_double_side_cards(self) -> None:
-        """Test preprocess_card filters out cards with the same name on both faces (X // X)."""
-        same_faced_card = create_test_card(name="Soulflayer // Soulflayer")
+    def test_preprocess_card_keeps_same_faced_double_side_cards(self) -> None:
+        """An "X // X" printing is a reversible card Scryfall serves from a bare search.
 
-        result = preprocess_card(same_faced_card)
-        assert result == []
+        `q=!"Magmatic Hellkite // Magmatic Hellkite"` answers 200 (tdm/380) with no flag, as do the
+        Secret Lair and Ravnica-land reversibles. Its art_series cousins ARE extras, by layout.
+        """
+        rows = preprocess_card(create_test_card(name="Soulflayer // Soulflayer"))
+        assert len(rows) == 1
+        assert "extra" not in rows[0].get("card_is_tags", {})
 
-    def test_preprocess_card_filters_same_faced_cards_with_extra_whitespace(self) -> None:
-        """Test preprocess_card filters out X // X cards regardless of whitespace."""
-        same_faced_card = create_test_card(name="Aberrant  //  Aberrant")
-
-        result = preprocess_card(same_faced_card)
-        assert result == []
+    def test_preprocess_card_keeps_same_faced_cards_with_extra_whitespace(self) -> None:
+        """The whitespace variant is kept too — same reason as the case above."""
+        assert len(preprocess_card(create_test_card(name="Aberrant  //  Aberrant"))) == 1
 
     def test_preprocess_card_allows_different_faced_double_side_cards(self) -> None:
         """Test preprocess_card does NOT filter out cards with different names on each face."""
@@ -168,17 +211,18 @@ class TestCardProcessing:
         assert len(result) == 1
         assert result[0]["card_name"] == "Hound Tamer // Untamed Pup"
 
-    def test_preprocess_card_filters_all_not_legal_cards(self) -> None:
-        """Test preprocess_card filters out cards that are not legal in any format."""
-        no_legal_card = create_test_card(
-            legalities=dict.fromkeys(["standard", "modern", "legacy", "vintage", "commander"], "not_legal"),
+    def test_preprocess_card_keeps_all_not_legal_cards(self) -> None:
+        """Never-legal is not a hiding criterion: `q=!"Hold the Perimeter"` (cn2/6) answers 200."""
+        rows = preprocess_card(
+            create_test_card(
+                legalities=dict.fromkeys(["standard", "modern", "legacy", "vintage", "commander"], "not_legal"),
+            ),
         )
+        assert len(rows) == 1
+        assert "extra" not in rows[0].get("card_is_tags", {})
 
-        result = preprocess_card(no_legal_card)
-        assert result == []
-
-    def test_preprocess_card_filters_cards_only_banned(self) -> None:
-        """Test preprocess_card filters out cards that are only banned (legal in no format)."""
+    def test_preprocess_card_keeps_cards_only_banned(self) -> None:
+        """A banned-everywhere card is served too — same axis as never-legal above."""
         only_banned_card = create_test_card(
             legalities={
                 "standard": "not_legal",
@@ -189,8 +233,7 @@ class TestCardProcessing:
             },
         )
 
-        result = preprocess_card(only_banned_card)
-        assert result == []
+        assert len(preprocess_card(only_banned_card)) == 1
 
     def test_preprocess_card_allows_restricted_cards(self) -> None:
         """Test preprocess_card keeps cards that are legal or restricted in at least one format."""
@@ -207,32 +250,23 @@ class TestCardProcessing:
         result = preprocess_card(restricted_card)
         assert len(result) == 1
 
-    def test_preprocess_card_filters_funny_sets(self) -> None:
-        """Test preprocess_card filters out funny set types."""
-        invalid_card = create_test_card(
-            set_type="funny",  # Funny set type
-        )
+    def test_preprocess_card_keeps_funny_sets(self) -> None:
+        """A funny set is ordinary: `q=e:ust` answers 249 with and without `include_extras`."""
+        rows = preprocess_card(create_test_card(set_type="funny"))
+        assert len(rows) == 1
+        assert "extra" not in rows[0].get("card_is_tags", {})
 
-        result = preprocess_card(invalid_card)
-        assert result == []
+    def test_preprocess_card_tags_card_type_as_extra(self) -> None:
+        """`q=!"The Monarch"` (tmkc/31) is 404 bare and 200 with `include_extras=true`."""
+        rows = preprocess_card(create_test_card(type_line="Card"))
+        assert len(rows) == 1
+        assert rows[0]["card_is_tags"]["extra"] is True
 
-    def test_preprocess_card_filters_card_type(self) -> None:
-        """Test preprocess_card filters out cards with Card type."""
-        invalid_card = create_test_card(
-            type_line="Card",
-        )
-
-        result = preprocess_card(invalid_card)
-        assert result == []
-
-    def test_preprocess_card_filters_token_type(self) -> None:
-        """Test preprocess_card filters out cards with Token type."""
-        invalid_card = create_test_card(
-            type_line="Token Creature — Goblin",
-        )
-
-        result = preprocess_card(invalid_card)
-        assert result == []
+    def test_preprocess_card_tags_token_type_as_extra(self) -> None:
+        """`q=!"Goblin Army"` (thob/4) is 404 bare and 200 with `include_extras=true`."""
+        rows = preprocess_card(create_test_card(type_line="Token Creature — Goblin"))
+        assert len(rows) == 1
+        assert rows[0]["card_is_tags"]["extra"] is True
 
     def test_preprocess_card_processes_valid_card(self) -> None:
         """Test preprocess_card processes valid cards correctly."""
@@ -603,8 +637,12 @@ class TestFaceMerging:
         assert merged["card_types"] == ["Sorcery", "Land"]
         assert merged["mana_cost_text"] == "{X}{B}{B}{B}"
 
-    def test_all_faces_filtered_drops_the_card(self) -> None:
-        """A card whose every face is filtered (e.g. Token type lines) yields no row."""
+    def test_an_all_token_faced_card_is_kept_and_tagged(self) -> None:
+        """No face is filtered any more — the whole card is imported and tagged `is:extra`.
+
+        The extras class is a property of the PRINTING, decided once from the card object, so a
+        multi-face token yields one row like any other multi-face card rather than none.
+        """
         card = create_test_card(
             name="Test A // Test B",
             card_faces=[
@@ -612,7 +650,9 @@ class TestFaceMerging:
                 {"name": "Test B", "type_line": "Token Creature — Elf"},
             ],
         )
-        assert preprocess_card(card) == []
+        rows = preprocess_card(card)
+        assert len(rows) == 1
+        assert rows[0]["card_is_tags"]["extra"] is True
 
 
 class TestMultiFaceRawBlob:

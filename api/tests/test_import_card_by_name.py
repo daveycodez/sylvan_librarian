@@ -151,7 +151,11 @@ class TestImportCardByName(unittest.TestCase):
 
     @patch.object(APIResource, "_run_query")
     @patch.object(APIResource, "_scryfall_search")
-    @patch("api.card_processing.preprocess_card")
+    # `api_resource` imports the name by value (`from api.card_processing import preprocess_card`),
+    # so patching it in its defining module never reached the call site — the mock was inert and the
+    # test passed only because the REAL function filtered a never-legal card to []. It no longer
+    # does (nothing is filtered), which is what exposed the dead patch. Patch where it is USED.
+    @patch("api.api_resource.preprocess_card")
     def test_import_card_by_name_returns_filtered_out_for_invalid_cards(
         self,
         mock_preprocess: MagicMock,

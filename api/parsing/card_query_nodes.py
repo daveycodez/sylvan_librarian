@@ -82,10 +82,10 @@ RARITY_TO_NUMBER = {
     "u": 1,
     "rare": 2,
     "r": 2,
-    "mythic": 3,
-    "m": 3,
-    "special": 4,
-    "s": 4,
+    "special": 3,
+    "s": 3,
+    "mythic": 4,
+    "m": 4,
     "bonus": 5,
     "b": 5,
 }
@@ -494,6 +494,21 @@ def fold_accents(value: str) -> str:
     return "".join(c for c in decomposed if not unicodedata.combining(c))
 
 
+def collate_name(value: str) -> str:
+    """Strip every non-alphanumeric character, so separators stop deciding a name match.
+
+    The SEPARATOR half of the fold a bare ``name:`` word gets (fold_accents() is the other half).
+    Scryfall compares a bare name word with diacritics folded and separators gone, which is what
+    lets ``ft`` find "Sword **of the** Ages" (1,628 results against ``name:"ft"``'s 362) and
+    ``limdul`` find "Lim-Dul's Vault". ``!"..."`` is compared the same way, which is why
+    ``!"limduls vault"`` and ``!"Lim-Dul's Vault"`` both find the card that only the fully
+    accented, fully punctuated spelling used to.
+
+    The engine's ``collate_name`` (card_engine/src/lib.rs) is the twin that folds the STORED side.
+    """
+    return "".join(c for c in value if c.isalnum())
+
+
 class ExactNameNode(QueryNode):
     """Represents an exact card name search using the ! prefix syntax from Scryfall.
 
@@ -505,18 +520,30 @@ class ExactNameNode(QueryNode):
         self.value = value
 
     def kwargs(self) -> dict:
-        """Return this node's kwargs dict for Rust engine JSON serialization."""
-        return {"value": self.value.lower()}
+        """Return this node's kwargs dict for Rust engine JSON serialization.
+
+        COLLATED -- lowercased, diacritics folded, every non-alphanumeric character removed --
+        because that is the name Scryfall compares ``!`` against. Measured on api.scryfall.com
+        2026-08-16, all four of ``!"Lim-Dul's Vault"`` (with and without the circumflex),
+        ``!"lim-dul's vault"`` and ``!"limduls vault"`` answer the same single card, and
+        ``!"eowyn, lady of rohan"`` answers "Eowyn, Lady of Rohan". Comparing the literal lowercase
+        name -- what this emitted before -- answered only the first of those, so typing a card's
+        name without its accent or its punctuation found nothing.
+        """
+        return {"value": collate_name(fold_accents(self.value.lower()))}
 
     def to_sql(self, context: QueryContext) -> str:
         """Generate SQL for exact name matching (case-insensitive, no wildcards).
 
-        LIKE special characters (backslash, %, _) are escaped so the value is matched
-        literally rather than as a pattern.
+        COLLATED on both sides, matching kwargs() and the engine: Scryfall answers ``!"limduls
+        vault"`` with the same card as ``!"Lim-Dul's Vault"``. There is no stored column for the
+        collated name, so the fold is expressed inline; see the card_name: branch of
+        CardBinaryOperatorNode.to_sql for the indexing note. LIKE special characters (backslash,
+        %, _) are escaped so the value is matched literally rather than as a pattern.
         """
-        escaped = _escape_like_pattern(self.value.lower())
+        escaped = _escape_like_pattern(collate_name(fold_accents(self.value.lower())))
         placeholder = context.add(escaped)
-        return f"(lower(card.card_name) LIKE {placeholder})"
+        return f"(lower(regexp_replace(card.card_name_folded, '[^[:alnum:]]', '', 'g')) LIKE {placeholder})"
 
     def __repr__(self) -> str:
         """Return a string representation of the ExactNameNode."""
@@ -568,7 +595,7 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
 
         return {"lhs": self.lhs.to_json(), "op": self.operator, "rhs": self._rhs_to_json()}
 
-    def _rhs_to_json(self) -> object:  # noqa: PLR0912
+    def _rhs_to_json(self) -> object:  # noqa: PLR0911, PLR0912
         """Compute the JSON-serializable rhs for non-JSONB_ARRAY CardAttributeNode LHS."""
         if not self.lhs.field_infos:
             return _node_to_json(self.rhs)
@@ -601,11 +628,20 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
 
         if attr in ("card_name", "card_artist") and isinstance(self.rhs, StringValueNode):
             value = titlecase(self.rhs.value)
-            # Fold diacritics for fuzzy card_name: search so the Rust engine's
-            # TextContains matches the same way the SQL path does via card_name_folded
-            # (#649); exact/comparison ops keep the literal value, accent-sensitive.
-            if attr == "card_name" and self.operator == ":":
-                value = fold_accents(value)
+            # A BARE card_name: word is COLLATED -- diacritics folded (#649) AND every
+            # non-alphanumeric character removed -- because that is the string Scryfall matches a
+            # bare word against. A QUOTED value (and a plain-literal regex lowered to one) is
+            # matched literally instead, so it keeps neither fold; see StringValueNode. Measured on
+            # api.scryfall.com 2026-08-16: `name:ft` 1,628 against `name:"ft"` 362, `name:ofthe`
+            # 1,109 against `name:"ofthe"` 0, `name:limdul` 8 against `name:"limdul"` 0.
+            # Comparison ops (name=, name!=) keep the literal value on both sides,
+            # accent-sensitive, exactly as before.
+            # `a:` gets the SAME split, on the same kind of evidence (api.scryfall.com, 2026-08-16):
+            # `a:gawel` answers 10 exactly as `a:gaweł` does, `a:rebecca-guay` answers
+            # `a:"rebecca guay"`'s 166, and `a:gu*ay` answers `a:guay`'s 197. An artist could only be
+            # found under their own diacritics and punctuation before this.
+            if attr in ("card_name", "card_artist") and self.operator == ":" and not self.rhs.literal:
+                return {"node_type": "CollatedNameValueNode", "kwargs": {"value": collate_name(fold_accents(value))}}
             return {"node_type": "StringValueNode", "kwargs": {"value": value}}
 
         return _node_to_json(self.rhs)
@@ -968,13 +1004,25 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
             msg = f"Unknown type: {type(self.rhs)}, {locals()}"
             raise TypeError(msg)
 
-        # card_name fuzzy search is accent-folded so "eowyn" matches "Éowyn" (#649);
-        # card_name_folded is precomputed at import time from the same fold_accents().
-        # Exact-match paths (ExactNameNode, name=) deliberately keep using card_name/
-        # card_name_lower so typing the accent still finds only the accented spelling.
-        if attr == "card_name":
-            lhs_sql = "card.card_name_folded"
-            txt_val = fold_accents(txt_val)
+        # card_name: is TWO searches, and which one this is was decided by the quotes.
+        #
+        # A BARE word is compared against the name with diacritics folded (#649, card_name_folded,
+        # precomputed at import) AND every non-alphanumeric character removed -- the separator fold
+        # Scryfall applies, which is what makes `name:ft` answer 1,628 rather than `name:"ft"`'s
+        # 362 by reaching "Sword of the Ages" through the vanished space. There is no stored column
+        # for that string, so the fold is expressed inline; a deployment that wants it indexed
+        # wants a trigram index on the same expression (or a generated card_name_collated column),
+        # which is what the Rust engine stores.
+        #
+        # A QUOTED value is compared against the name AS WRITTEN: `name:"eowyn"` answers 0 on
+        # api.scryfall.com while `name:"eowyn"` with the accent answers 3.
+        #
+        # Exact-match paths (name=, name!=) are unchanged and keep using card_name/card_name_lower.
+        if attr == "card_name" and isinstance(self.rhs, StringValueNode) and self.rhs.literal:
+            lhs_sql = "card.card_name"
+        elif attr == "card_name":
+            lhs_sql = "regexp_replace(card.card_name_folded, '[^[:alnum:]]', '', 'g')"
+            txt_val = collate_name(fold_accents(txt_val))
 
         words = ["", *(_escape_like_pattern(w) for w in txt_val.lower().split()), ""]
         pattern = "%".join(words)

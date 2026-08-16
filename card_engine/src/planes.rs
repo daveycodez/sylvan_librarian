@@ -26,8 +26,8 @@
 //! `_ILLEGAL` plane ("some printing doesn't"), both computed directly from
 //! printings so they're correct for every card including ones whose
 //! printings disagree, unlike a single card-level bit. Rarity is one-hot for
-//! the 4 tracked values (common/uncommon/rare/mythic) plus one shared
-//! "above mythic" plane for special/bonus -- see `PLANE_RARITY_HI`.
+//! the 5 tracked values (common/uncommon/rare/special/mythic) plus one
+//! shared "above mythic" plane for bonus -- see `PLANE_RARITY_HI`.
 
 use rkyv::{Archive, Deserialize, Serialize};
 
@@ -129,7 +129,7 @@ pub(crate) const PLANE_TOUGHNESS_HI: usize = PLANE_TOUGHNESS + NUM_INTERIOR_WIDT
 /// answered from the hi plane alone and declines, falling back to
 /// `RarityIndex`/`rarity_candidates` (`lib.rs`) exactly as today -- unaffected,
 /// still the fastest path for those two rarely-queried, very sparse values.
-pub(crate) const RARITY_INTERIOR: usize = 4;
+pub(crate) const RARITY_INTERIOR: usize = 5;
 pub(crate) const PLANE_RARITY: usize = PLANE_TOUGHNESS_HI + 1;
 pub(crate) const PLANE_RARITY_HI: usize = PLANE_RARITY + RARITY_INTERIOR;
 
@@ -181,7 +181,7 @@ pub(crate) const BORDER_PRINTING_PLANE_VALUES: [&str; 3] = ["black", "borderless
 /// the density analogue of border's gold/yellow. Only the equality case (`r:rare`) is planed here;
 /// ordinal comparisons (`r>=rare`) still take the existing rarity path. Parallels
 /// `BORDER_PRINTING_PLANE_VALUES` — see docs/issues/00724-engine-printing-existential-planes.md.
-pub(crate) const RARITY_PRINTING_PLANE_INTS: [u8; RARITY_INTERIOR] = [0, 1, 2, 3];
+pub(crate) const RARITY_PRINTING_PLANE_INTS: [u8; RARITY_INTERIOR] = [0, 1, 2, 3, 4];
 
 /// The observed [min,max] of whatever cards landed in one bucket plane,
 /// recomputed on every build/reload (never hardcoded from a one-time data
@@ -300,6 +300,15 @@ pub(crate) fn divergent_formats_of(printings: &[Printing], offsets: &[u32]) -> u
     let mut mask = 0u64;
     for w in offsets.windows(2) {
         let (start, end) = (w[0] as usize, w[1] as usize);
+        // A ZERO-WIDTH window has no first printing to XOR against, and reading one anyway is the
+        // only true structural panic in the empty-canonical-range family: `printings[start]`
+        // silently reads the NEXT card's first printing when the empty group is interior, and
+        // panics outright when it is last. `drop_group_if_annex_only` is what stops such a group
+        // reaching here, and this is the belt to its braces — an XOR over no pairs contributes
+        // nothing to the mask, so skipping is also the arithmetically correct answer.
+        if start >= end {
+            continue;
+        }
         // XOR every printing against the group's first: a field that ever differs shows up in some XOR,
         // and a field that never does contributes nothing from any pair.
         let first = printings[start].card_legalities;

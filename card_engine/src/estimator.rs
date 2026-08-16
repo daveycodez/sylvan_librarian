@@ -106,7 +106,9 @@ pub(crate) fn has_printing_varying_leaf(f: &FilterExpr) -> bool {
         }
         FilterExpr::Legality { .. } => true,
         // The language is a per-printing fact (CompatFields.lang_id).
-        FilterExpr::LangMatch { .. } => true,
+        FilterExpr::LangMatch { .. } | FilterExpr::SetTypeMatch { .. } => true,
+        // ...and so is the printed name (Printing.printed_name_folded_id).
+        FilterExpr::PrintedNamePresent | FilterExpr::FlavorNameIn { .. } => true,
         FilterExpr::And(children) | FilterExpr::Or(children) => children.iter().any(has_printing_varying_leaf),
         FilterExpr::Not(inner) => has_printing_varying_leaf(inner),
         // Exhaustive, not `_ => false`: a new variant must get a considered
@@ -117,6 +119,8 @@ pub(crate) fn has_printing_varying_leaf(f: &FilterExpr) -> bool {
         | FilterExpr::OracleMatch { .. }
         // The oracle id is the card's own identity — every printing of it shares one.
         | FilterExpr::OracleIdMatch { .. }
+        // ...and so is its set count: `single_set` is decided once, at build, over every printing.
+        | FilterExpr::SingleSet
         | FilterExpr::ColorCmp { .. }
         | FilterExpr::TypeCmp { .. }
         | FilterExpr::ManaCostCmp { .. }
@@ -464,7 +468,12 @@ fn estimate_leaf(f: &FilterExpr, indexes: &Archived<CardIndexes>, n_cards: u32, 
         // Unreachable on the routed path — a LangMatch anywhere in the filter sends the whole
         // query to the widened (multilingual) driver, which does not consult the estimator.
         // "Unknown" is the sound answer if that ever changes.
-        FilterExpr::LangMatch { .. } => unknown(n),
+        FilterExpr::LangMatch { .. } | FilterExpr::SetTypeMatch { .. } => unknown(n),
+
+        // Neither has an index to count through: `is:localizedname` reads a field on the printing
+        // (and widens, so it is unreachable here for the same reason LangMatch is), and `is:unique`
+        // a bool on the card. Both are a full-scan verify, and "unknown" says exactly that.
+        FilterExpr::PrintedNamePresent | FilterExpr::SingleSet | FilterExpr::FlavorNameIn { .. } => unknown(n),
 
         // Printing-space CSR width sums → project (varying).
         FilterExpr::ArtistMatch { ids } => {
@@ -536,16 +545,29 @@ fn estimate_leaf(f: &FilterExpr, indexes: &Archived<CardIndexes>, n_cards: u32, 
         // texts carrying the needle's RAREST trigram, so `trigram_min_posting`
         // (min over the needle's trigrams, no intersection) is a cheap bound.
         // `None` = needle < 3 bytes (no trigrams) → unknown.
-        FilterExpr::TextContains { field: TextSearchField::NameLower, word } => {
+        FilterExpr::TextContains { field: field @ (TextSearchField::NameLower | TextSearchField::NameCollated), word } => {
+            // COLLATED needle, because the name indexes are built over `card_name_collated`. For
+            // the LITERAL predicate that makes the count an over-estimate rather than exact — the
+            // collated tier answers a looser question — so it is reported as a bound, not as
+            // `exact`.
+            let literal = *field == TextSearchField::NameLower;
+            // Same two guards the narrowing arms carry: an all-punctuation needle collates to
+            // nothing, and a non-ASCII literal needle cannot be counted through an accent-folded
+            // index at all.
+            let collated = if literal { crate::collate_name(word) } else { word.clone() };
+            if collated.is_empty() || (literal && !word.is_ascii()) {
+                return unknown(n);
+            }
+            let settle = |c: u32| if literal { finalize(0, c / 2, c, n) } else { exact(c) };
             // name_trigram postings are CARD ids (one name per card, no dedup),
             // so the min is a sound card-space upper bound: tight hi AND est.
-            match trigram_min_posting(&indexes.name_trigram, word) {
-                Some(c) => exact((c as u32).min(n)),
+            match trigram_min_posting(&indexes.name_trigram, &collated) {
+                Some(c) => settle((c as u32).min(n)),
                 // 2-byte needle: no trigram, but containment IS bigram membership
                 // (#639) — exact card count. <2 bytes: no index → unknown.
-                None if word.len() == 2 => {
-                    let bg = [word.as_bytes()[0], word.as_bytes()[1]];
-                    name_bigram_count(indexes, bg, n).map_or_else(|| unknown(n), exact)
+                None if collated.len() == 2 => {
+                    let bg = [collated.as_bytes()[0], collated.as_bytes()[1]];
+                    name_bigram_count(indexes, bg, n).map_or_else(|| unknown(n), settle)
                 }
                 None => unknown(n),
             }

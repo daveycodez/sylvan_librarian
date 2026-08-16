@@ -2,7 +2,7 @@ use super::{
     and_child_rank, assign_name_ranks,
     build_numeric_index, build_oracle_text_index, build_tag_index, build_trigram_index,
     build_rarity_index, build_flavor_index, build_hybrid_tag_index, bitmap_beats_postings, HybridTagIndex, build_sort_permutations,
-    assign_artwork_groups, assign_collector_ranks, assign_set_ranks, assign_foreign_artwork_groups, build_artwork_base_from, build_lang_index, build_printed_name_index, drop_group_if_annex_only, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
+    assign_artist_ranks, assign_artwork_groups, assign_collector_ranks, assign_set_ranks, assign_single_set_flags, order_annex_by_language, assign_foreign_artwork_groups, build_artwork_base_from, build_lang_index, build_printed_name_index, drop_group_if_annex_only, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
     cards_of_printings, count_common_keywords, count_common_types,
     build_artist_index, build_printing_value_index, build_arith_tuple_index, is_arith_tuple_route, range_candidates, narrow_candidates, narrow_candidates_exact, rarity_candidates,
     range_too_broad_to_narrow, run_query, run_query_routed, run_query_widened, run_query_with_plan, explain, explain_analyze, AcquireFacts, PlanEstimate, PlanTrial,
@@ -19,7 +19,7 @@ use super::{
     CollField, CmpOp, FilterExpr, InlineStr, Interner, ManaCost, CompatFields, OracleCard, OracleFace, Printing, PrintingFace, RelatedCard, TagIndex,
     build_printing_by_scryfall_id, build_oracle_by_oracle_id, find_printing_by_scryfall_id, find_oracle_by_oracle_id,
     build_external_id_index, find_printing_by_external_id, EXT_MULTIVERSE, EXT_MTGO, EXT_ARENA, EXT_TCGPLAYER,
-    trigram_similarity, fuzzy_name_match, autocomplete_names, FuzzyOutcome,
+    fuzzy_similarity, fuzzy_name_match, autocomplete_names, FuzzyOutcome,
     exact_name_match, names_containing_all_words,
     VOCAB_NONE, COMPAT_PROMO, COMPAT_REPRINT, COMPAT_TEXTLESS, GAME_PAPER, GAME_ARENA, FINISH_FOIL, FINISH_NONFOIL,
     TextField, TextSearchField, Tri, SortedTrigramIndex, VocabInterner, ARTIST_NONE, NONE_STR, TYPE_ARTIFACT, TYPE_CREATURE,
@@ -197,11 +197,13 @@ fn stub_card(oracle_id: u128, card_types: u16, subtypes: &[&str], vocab: &mut Vo
     OracleCard {
         card_name_lower: InlineStr::from_str(""),
         card_name_folded_id: NONE_STR,
+        card_name_collated_id: NONE_STR,
         card_colors: 0,
         card_color_identity: 0,
         produced_mana: 0,
         color_indicator: 0,
         card_types,
+        single_set: false,
         legality_divergent: false,
         oracle_id,
         card_name_id: NONE_STR,
@@ -234,6 +236,8 @@ fn stub_card(oracle_id: u128, card_types: u16, subtypes: &[&str], vocab: &mut Vo
 fn stub_printing(scryfall_id: u128, illustration_id: u128, prefer_score: Option<f32>) -> Printing {
     Printing {
         scryfall_id,
+        flavor_name_id: NONE_STR,
+        flavor_name_folded_id: NONE_STR,
         illustration_id,
         flavor_text_id: NONE_STR,
         flavor_text_lower_id: NONE_STR,
@@ -308,6 +312,9 @@ fn store_of(cards: Vec<OracleCard>, printing_counts: &[usize], vocab: VocabInter
     // Real planes and bigrams so narrowing tests see the same store shape
     // reload_commit builds (type narrowing goes through the planes since #637).
     let indexes = CardIndexes {
+        flavor_names: Default::default(),
+        flavor_names_collated: Default::default(),
+        sets_with_extras: Default::default(),
         artwork_base,
         // No printing sets card_border_id away from NONE_STR at this point (any
         // border values a fixture wants get set after store_of returns, same as
@@ -325,7 +332,7 @@ fn store_of(cards: Vec<OracleCard>, printing_counts: &[usize], vocab: VocabInter
         ..Default::default()
     };
     let foreign_offsets = vec![0u32; cards.len() + 1];
-    CardData {
+    let mut data = CardData {
         cards,
         printings,
         offsets,
@@ -335,10 +342,35 @@ fn store_of(cards: Vec<OracleCard>, printing_counts: &[usize], vocab: VocabInter
         coll_vocab_sorted: sorted_vocab_ids(&vocab.strings),
         coll_vocab: vocab.strings,
         artist_vocab: vec![],
+        artist_vocab_collated: vec![],
         mana_vocab: vec![],
         indexes,
         format_shifts: HashMap::new(),
+    };
+    derive_name_collation(&mut data);
+    data
+}
+
+/// Fill `card_name_collated_id` and rebuild the name tiers over it — the fixture twin of what
+/// `reload_commit` does for a real archive.
+///
+/// Fixtures that rewrite a name AFTER `store_of` returns have to call this again, for the same
+/// reason the builder derives the column rather than importing it: the collated name is a function
+/// of the folded one, and an index built over a stale collation narrows a `name:` needle to
+/// silence.
+pub(crate) fn derive_name_collation(data: &mut CardData) {
+    for i in 0..data.cards.len() {
+        let folded = crate::folded_name_of(&data.cards[i], &data.strings).to_owned();
+        let collated = crate::collate_name(&folded);
+        data.cards[i].card_name_collated_id = if collated == folded {
+            crate::NONE_STR
+        } else {
+            data.strings.push(collated);
+            (data.strings.len() - 1) as u32
+        };
     }
+    data.indexes.name_bigrams = build_name_bigram_index(&data.cards, &data.strings);
+    data.indexes.name_unigrams = build_name_unigram_index(&data.cards, &data.strings);
 }
 
 /// Recompute both artwork-grouping-derived index fields (per-card counts and the per-printing
@@ -370,6 +402,10 @@ fn narrow_candidates_spaces() {
     let archived = rkyv::access::<Archived<CardIndexes>, Error>(&bytes).expect("access");
     let offsets_bytes = rkyv::to_bytes::<Error>(&raw_offsets).expect("serialize offsets");
     let offsets = rkyv::access::<Archived<Vec<u32>>, Error>(&offsets_bytes).expect("access offsets");
+    // No cards in this fixture, so no name predicate can reach the string table -- but the
+    // narrowing entry points take one, so it gets an empty archived table rather than a fake.
+    let strings_bytes = rkyv::to_bytes::<Error>(&Vec::<String>::new()).expect("serialize strings");
+    let strings = rkyv::access::<crate::AStrings, Error>(&strings_bytes).expect("access strings");
 
     let coll = |field, value: &str| FilterExpr::CollectionCmp {
         field,
@@ -378,23 +414,23 @@ fn narrow_candidates_spaces() {
         value_id: None,
     };
 
-    match narrow_candidates(&coll(CollField::ArtTags, "wolf"), archived, offsets, &[]) {
+    match narrow_candidates(&coll(CollField::ArtTags, "wolf"), archived, offsets, &[], strings) {
         Some(Candidates::Printings(v)) => assert_eq!(v, vec![0, 2]),
         _ => panic!("art tag must narrow in printing space"),
     }
-    match narrow_candidates(&coll(CollField::Keywords, "Flying"), archived, offsets, &[]) {
+    match narrow_candidates(&coll(CollField::Keywords, "Flying"), archived, offsets, &[], strings) {
         Some(Candidates::Cards(v)) => assert_eq!(v, vec![1]),
         _ => panic!("keyword must narrow in card space"),
     }
     // A tag with no postings in a complete index proves the empty set (an
     // unbound value_id matches nothing at eval either).
-    match narrow_candidates(&coll(CollField::ArtTags, "zombie"), archived, offsets, &[]) {
+    match narrow_candidates(&coll(CollField::ArtTags, "zombie"), archived, offsets, &[], strings) {
         Some(Candidates::Printings(v)) => assert!(v.is_empty(), "absent tag narrows to the exact empty set"),
         _ => panic!("absent tag must narrow to empty, not decline"),
     }
     // frame_data stores every value now (`HybridTagIndex`), so absence proves emptiness here exactly as
     // it does for every other collection index. It used to be the sole exception.
-    match narrow_candidates(&coll(CollField::FrameData, "zombie"), archived, offsets, &[]) {
+    match narrow_candidates(&coll(CollField::FrameData, "zombie"), archived, offsets, &[], strings) {
         Some(Candidates::Printings(v)) => assert!(v.is_empty(), "frame_data is complete: absence is a proof"),
         other => panic!("an absent frame value must narrow to empty, got {other:?}"),
     }
@@ -402,7 +438,7 @@ fn narrow_candidates_spaces() {
     // And of mixed spaces projects the printing product up and intersects in
     // card space: art printings {0,2} → cards {0,1}, ∩ keyword cards {1} = {1}.
     let and = FilterExpr::And(vec![coll(CollField::ArtTags, "wolf"), coll(CollField::Keywords, "Flying")]);
-    match narrow_candidates(&and, archived, offsets, &[]) {
+    match narrow_candidates(&and, archived, offsets, &[], strings) {
         Some(Candidates::Cards(v)) => assert_eq!(v, vec![1]),
         _ => panic!("mixed And must produce card-space candidates"),
     }
@@ -427,11 +463,15 @@ fn narrow_candidates_eq_gt_reuse_ge_postings_loosely() {
     let archived = rkyv::access::<Archived<CardIndexes>, Error>(&bytes).expect("access");
     let offsets_bytes = rkyv::to_bytes::<Error>(&raw_offsets).expect("serialize offsets");
     let offsets = rkyv::access::<Archived<Vec<u32>>, Error>(&offsets_bytes).expect("access offsets");
+    // No cards in this fixture, so no name predicate can reach the string table -- but the
+    // narrowing entry points take one, so it gets an empty archived table rather than a fake.
+    let strings_bytes = rkyv::to_bytes::<Error>(&Vec::<String>::new()).expect("serialize strings");
+    let strings = rkyv::access::<crate::AStrings, Error>(&strings_bytes).expect("access strings");
 
     let coll = |op, value: &str| FilterExpr::CollectionCmp { field: CollField::Keywords, op, value: value.to_string(), value_id: None };
 
     for op in [CmpOp::Eq, CmpOp::Gt] {
-        match narrow_candidates_exact(&coll(op, "Flying"), archived, offsets, &[]) {
+        match narrow_candidates_exact(&coll(op, "Flying"), archived, offsets, &[], strings) {
             (Some(Candidates::Cards(v)), tight, _) => {
                 assert_eq!(v, vec![1], "{op:?} must reuse Ge's exact postings as a candidate superset");
                 assert!(!tight, "{op:?} postings only prove containment, not the length condition — must narrow loose");
@@ -440,7 +480,7 @@ fn narrow_candidates_eq_gt_reuse_ge_postings_loosely() {
         }
     }
     // Ge itself stays tight over the same postings.
-    match narrow_candidates_exact(&coll(CmpOp::Ge, "Flying"), archived, offsets, &[]) {
+    match narrow_candidates_exact(&coll(CmpOp::Ge, "Flying"), archived, offsets, &[], strings) {
         (Some(Candidates::Cards(v)), tight, _) => {
             assert_eq!(v, vec![1]);
             assert!(tight, "Ge's postings are exact containment, must stay tight");
@@ -450,7 +490,7 @@ fn narrow_candidates_eq_gt_reuse_ge_postings_loosely() {
     // A value absent from a complete index proves the empty set for Eq/Gt
     // too — no row can satisfy either without first satisfying containment.
     for op in [CmpOp::Eq, CmpOp::Gt, CmpOp::Ge] {
-        match narrow_candidates_exact(&coll(op, "Trample"), archived, offsets, &[]) {
+        match narrow_candidates_exact(&coll(op, "Trample"), archived, offsets, &[], strings) {
             (Some(Candidates::Cards(v)), tight, _) => {
                 assert!(v.is_empty(), "{op:?} over an absent value narrows to the exact empty set");
                 assert!(tight, "{op:?} empty-postings narrowing is exact, not just advisory");
@@ -462,7 +502,7 @@ fn narrow_candidates_eq_gt_reuse_ge_postings_loosely() {
     // containment, so it cannot satisfy Eq or Gt either, and the empty set is exact for all three.
     let frame = |op| FilterExpr::CollectionCmp { field: CollField::FrameData, op, value: "zombie".to_string(), value_id: None };
     for op in [CmpOp::Eq, CmpOp::Gt, CmpOp::Ge] {
-        match narrow_candidates(&frame(op), archived, offsets, &[]) {
+        match narrow_candidates(&frame(op), archived, offsets, &[], strings) {
             Some(Candidates::Printings(v)) => assert!(v.is_empty(), "{op:?} over an absent value is empty"),
             other => panic!("{op:?} over frame_data must narrow to empty, got {other:?}"),
         }
@@ -530,13 +570,17 @@ fn narrow_candidates_rarity_card_space() {
     let archived = rkyv::access::<Archived<CardIndexes>, Error>(&bytes).expect("access");
     let offsets_bytes = rkyv::to_bytes::<Error>(&vec![0u32, 2, 4, 6]).expect("serialize offsets");
     let offsets = rkyv::access::<Archived<Vec<u32>>, Error>(&offsets_bytes).expect("access offsets");
+    // No cards in this fixture, so no name predicate can reach the string table -- but the
+    // narrowing entry points take one, so it gets an empty archived table rather than a fake.
+    let strings_bytes = rkyv::to_bytes::<Error>(&Vec::<String>::new()).expect("serialize strings");
+    let strings = rkyv::access::<crate::AStrings, Error>(&strings_bytes).expect("access strings");
 
     let cmp = FilterExpr::NumericCmp {
         lhs: NumExpr::Field(NumField::RarityInt),
         op: CmpOp::Ge,
         rhs: NumExpr::Const(2.0),
     };
-    match narrow_candidates(&cmp, archived, offsets, &[]) {
+    match narrow_candidates(&cmp, archived, offsets, &[], strings) {
         Some(Candidates::Cards(v)) => assert_eq!(v, vec![0, 1, 2]),
         _ => panic!("rarity must narrow in card space"),
     }
@@ -547,7 +591,7 @@ fn narrow_candidates_rarity_card_space() {
         op: CmpOp::Le,
         rhs: NumExpr::Field(NumField::RarityInt),
     };
-    match narrow_candidates(&flipped, archived, offsets, &[]) {
+    match narrow_candidates(&flipped, archived, offsets, &[], strings) {
         Some(Candidates::Cards(v)) => assert_eq!(v, vec![1]),
         _ => panic!("flipped rarity must narrow in card space"),
     }
@@ -806,7 +850,7 @@ fn rarity_not_arm_matches_existence_projection() {
                 op,
                 rhs: NumExpr::Const(val),
             }));
-            let Some(n) = super::narrow_rec(&filter, &archived.indexes, &archived.offsets, &archived.cards, true) else {
+            let Some(n) = super::narrow_rec(&filter, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings, true) else {
                 continue;
             };
             let cand = n.set.into_cards(&archived.offsets, &archived.indexes.printing_to_card);
@@ -833,7 +877,7 @@ fn rarity_not_arm_matches_existence_projection() {
                 op: super::flip_op(op),
                 rhs: NumExpr::Field(NumField::RarityInt),
             }));
-            let n2 = super::narrow_rec(&filter_flipped, &archived.indexes, &archived.offsets, &archived.cards, true)
+            let n2 = super::narrow_rec(&filter_flipped, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings, true)
                 .unwrap_or_else(|| panic!("Not({val} {name} field) must narrow given Not(field {name} {val}) did"));
             let cand2 = n2.set.into_cards(&archived.offsets, &archived.indexes.printing_to_card);
             assert_eq!(cand, cand2, "operand order must not change the result: {name} {val}");
@@ -987,7 +1031,7 @@ fn collection_cmp_binds_vocab_ids_and_matches() {
             value: value.to_string(),
             value_id: None,
         };
-        f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+        f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
         archived.cards.iter().map(|c| f.eval_card(c, &archived.strings) == Tri::True).collect()
     };
 
@@ -1017,7 +1061,7 @@ fn printing_level_predicates_are_printing_dep_in_card_pass() {
         value: "wolf".to_string(),
         value_id: None,
     };
-    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
 
     let card = &archived.cards[0];
     // Card pass can't decide an art-tag predicate...
@@ -1102,7 +1146,7 @@ fn legal_plane_narrows_positive_includes_divergent() {
     // Format A (shift 0): card0 (truly legal) + card2 (divergent, has a legal
     // printing) narrow in; card1 (legal only in format B) must not.
     let f = FilterExpr::Legality { shift: Some(0), expected: 0b01 };
-    match narrow_candidates(&f, &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&f, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::CardBits(bits)) => {
             assert!(bitmap_contains(&bits, 0), "truly legal card must narrow in");
             assert!(!bitmap_contains(&bits, 1), "card legal only in a different format must not narrow in");
@@ -1115,7 +1159,7 @@ fn legal_plane_narrows_positive_includes_divergent() {
     // (its printings only vary on format A; shift math must independently
     // address each format's plane).
     let g = FilterExpr::Legality { shift: Some(2), expected: 0b01 };
-    match narrow_candidates(&g, &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&g, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::CardBits(bits)) => {
             assert!(!bitmap_contains(&bits, 0));
             assert!(bitmap_contains(&bits, 1));
@@ -1135,7 +1179,7 @@ fn legal_plane_narrows_negated_includes_divergent() {
     // narrow in; card1 (not legal in A) and card2 (divergent, has a
     // not-legal printing too) must.
     let not_a = FilterExpr::Not(Box::new(FilterExpr::Legality { shift: Some(0), expected: 0b01 }));
-    match narrow_candidates(&not_a, &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&not_a, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::CardBits(bits)) => {
             assert!(!bitmap_contains(&bits, 0), "truly legal card must not narrow into the negation");
             assert!(bitmap_contains(&bits, 1), "truly not-legal card must narrow into the negation");
@@ -1156,7 +1200,7 @@ fn banned_restricted_plane_narrows_positive_includes_divergent() {
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
     let banned_c = FilterExpr::Legality { shift: Some(4), expected: 0b11 };
-    match narrow_candidates(&banned_c, &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&banned_c, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::CardBits(bits)) => {
             assert!(bitmap_contains(&bits, 0), "card0 truly banned in C must narrow in");
             assert!(!bitmap_contains(&bits, 1), "card1 is restricted, not banned, in C");
@@ -1166,7 +1210,7 @@ fn banned_restricted_plane_narrows_positive_includes_divergent() {
     }
 
     let restricted_c = FilterExpr::Legality { shift: Some(4), expected: 0b10 };
-    match narrow_candidates(&restricted_c, &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&restricted_c, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::CardBits(bits)) => {
             assert!(!bitmap_contains(&bits, 0), "card0 is banned, not restricted, in C");
             assert!(bitmap_contains(&bits, 1), "card1 truly restricted in C must narrow in");
@@ -1179,9 +1223,9 @@ fn banned_restricted_plane_narrows_positive_includes_divergent() {
     // eval and isn't plane-narrowed either — falls to the (cheap, correct)
     // full scan, for every indexed status.
     let absent_banned = FilterExpr::Legality { shift: None, expected: 0b11 };
-    assert!(narrow_candidates(&absent_banned, &archived.indexes, &archived.offsets, &archived.cards).is_none());
+    assert!(narrow_candidates(&absent_banned, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings).is_none());
     let absent_restricted = FilterExpr::Legality { shift: None, expected: 0b10 };
-    assert!(narrow_candidates(&absent_restricted, &archived.indexes, &archived.offsets, &archived.cards).is_none());
+    assert!(narrow_candidates(&absent_restricted, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings).is_none());
 }
 
 /// -banned:C: card0 (truly banned) must not narrow in; card1 (restricted, so
@@ -1193,7 +1237,7 @@ fn banned_restricted_plane_narrows_negated_includes_divergent() {
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
     let not_banned_c = FilterExpr::Not(Box::new(FilterExpr::Legality { shift: Some(4), expected: 0b11 }));
-    match narrow_candidates(&not_banned_c, &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&not_banned_c, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::CardBits(bits)) => {
             assert!(!bitmap_contains(&bits, 0), "truly banned-in-C card must not narrow into the negation");
             assert!(bitmap_contains(&bits, 1), "restricted (not banned) card must narrow into the negation");
@@ -1366,7 +1410,7 @@ fn legal_plane_narrows_correctly_across_word_boundary() {
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
     let f = FilterExpr::Legality { shift: Some(2), expected: 0b01 };
-    match narrow_candidates(&f, &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&f, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::CardBits(bits)) => {
             for i in 0..n {
                 assert_eq!(bitmap_contains(&bits, i as u32), i % 2 == 0, "card {i} narrowing mismatch");
@@ -1862,10 +1906,10 @@ fn fuzz_text_needle(rng: &mut rand::rngs::SmallRng, field: TextSearchField) -> S
     for _ in 0..8 {
         let t = corpus[rng.random_range(0..corpus.len())];
         let text = match field {
-            TextSearchField::NameLower => t.0,
+            TextSearchField::NameLower | TextSearchField::NameCollated => t.0,
             TextSearchField::OracleTextLower => t.1,
             TextSearchField::FlavorTextLower => t.2,
-            TextSearchField::ArtistLower => t.0, // artist has its own leaf; not reached here
+            TextSearchField::ArtistLower | TextSearchField::ArtistCollated => t.0, // artist has its own leaf; not reached here
         };
         let words: Vec<&str> = text
             .split_whitespace()
@@ -1988,7 +2032,7 @@ fn fuzz_leaf(rng: &mut rand::rngs::SmallRng) -> FuzzSpec {
         17 => fuzz_leaf_collection(rng, CollField::IsTags, &FUZZ_IS_TAGS),
         18 => fuzz_leaf_collection(rng, CollField::FrameData, &FUZZ_FRAME_DATA),
         19 => fuzz_leaf_artist(rng),
-        20 => fuzz_leaf_text_contains(rng, TextSearchField::NameLower),
+        20 => fuzz_leaf_text_contains(rng, TextSearchField::NameCollated),
         21 => fuzz_leaf_text_contains(rng, TextSearchField::OracleTextLower),
         22 => fuzz_leaf_text_contains(rng, TextSearchField::FlavorTextLower),
         23 => fuzz_leaf_name_exact(rng),
@@ -2124,7 +2168,7 @@ fn fuzz_bound_filter(spec: &FuzzSpec, archived: &Archived<CardData>) -> FilterEx
     let mut f = fuzz_build_filter(spec);
     f.bind(
         &archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab,
-        &archived.mana_vocab, &archived.indexes.flavor, &archived.strings,
+        &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings,
     );
     f
 }
@@ -2178,10 +2222,13 @@ fn fuzz_describe(spec: &FuzzSpec) -> String {
         FuzzSpec::Leaf(FuzzLeaf::Artist { word }) => format!("artist:{word}"),
         FuzzSpec::Leaf(FuzzLeaf::TextContains { field, needle }) => {
             let f = match field {
+                // The bare-word spelling; `NameLower` is what a QUOTED value compiles to, which
+                // the round-trip below re-quotes.
+                TextSearchField::NameCollated => "name",
                 TextSearchField::NameLower => "name",
                 TextSearchField::OracleTextLower => "oracle",
                 TextSearchField::FlavorTextLower => "flavor",
-                TextSearchField::ArtistLower => "artist",
+                TextSearchField::ArtistLower | TextSearchField::ArtistCollated => "artist",
             };
             format!("{f}:{needle}")
         }
@@ -2460,6 +2507,7 @@ fn fuzz_store_n(rng: &mut rand::rngs::SmallRng, ncards: usize) -> CardData {
         data.printings[idx].flavor_text_lower_id = flavor_meta[idx];
     }
     data.strings = interner.strings;
+    derive_name_collation(&mut data); // the assignment above discarded the collated ids store_of derived
     // store_of built indexes from the placeholder printings and left the numeric/range indexes at
     // empty defaults; rebuild everything the mutated fields feed. The range indexes are load-bearing
     // for correctness, not just coverage: an empty range index narrows a matching predicate to the
@@ -2477,7 +2525,7 @@ fn fuzz_store_n(rng: &mut rand::rngs::SmallRng, ncards: usize) -> CardData {
     data.indexes.artists = build_artist_index(&data.printings, data.artist_vocab.len());
     // Text narrowing indexes — same load-bearing property. name/oracle drive trigram + bigram
     // narrowing and the full-scan memoization; flavor is the printing-space CSR bind() resolves against.
-    data.indexes.name_trigram = build_trigram_index(&data.cards, |c| crate::folded_name_of(c, &data.strings));
+    data.indexes.name_trigram = build_trigram_index(&data.cards, |c| crate::collated_name_of(c, &data.strings));
     data.indexes.name_bigrams = build_name_bigram_index(&data.cards, &data.strings);
     data.indexes.name_unigrams = build_name_unigram_index(&data.cards, &data.strings);
     data.indexes.oracle_trigram = build_oracle_text_index(&data.cards, &data.strings);
@@ -2832,6 +2880,7 @@ fn arith_tuple_narrowing_matches_reference() {
         let indexes = &archived.indexes;
         let offsets = &archived.offsets;
         let cards = &archived.cards[..];
+        let strings = &archived.strings;
         let n_cards = cards.len();
         // narrow_candidates_exact declines (None) above this breadth — the >75%-of-domain cap. A
         // decline for an in-scope filter is only ever this cap, never a narrowing failure.
@@ -2854,7 +2903,7 @@ fn arith_tuple_narrowing_matches_reference() {
                     let filter = if negated { FilterExpr::Not(Box::new(mk())) } else { mk() };
                     let ref_set = reference(archived, &filter);
                     let ctx = format!("seed={seed} {label} {op:?} negated={negated}");
-                    match narrow_candidates_exact(&filter, indexes, offsets, cards) {
+                    match narrow_candidates_exact(&filter, indexes, offsets, cards, strings) {
                         (Some(Candidates::Cards(v)), tight, _) => {
                             assert!(tight, "{ctx}: card-level in-scope narrowing must be tight (exact)");
                             assert_eq!(v, ref_set, "{ctx}: tuple narrowing must equal the per-card reference");
@@ -2877,8 +2926,8 @@ fn arith_tuple_narrowing_matches_reference() {
         let pure_oos = || cmp(arith(field(NumField::PriceUsd), ArithOp::Mul, konst(2.0)), CmpOp::Lt, field(NumField::Cmc));
         assert!(!is_arith_tuple_route(&mixed()), "seed={seed}: mixed in/out-of-scope arith must not route to the tuple index");
         assert!(!is_arith_tuple_route(&pure_oos()), "seed={seed}: pure out-of-scope arith must not route to the tuple index");
-        assert!(narrow_candidates(&mixed(), indexes, offsets, cards).is_none(), "seed={seed}: mixed-field arith must decline (full scan)");
-        assert!(narrow_candidates(&pure_oos(), indexes, offsets, cards).is_none(), "seed={seed}: out-of-scope arith must decline (full scan)");
+        assert!(narrow_candidates(&mixed(), indexes, offsets, cards, strings).is_none(), "seed={seed}: mixed-field arith must decline (full scan)");
+        assert!(narrow_candidates(&pure_oos(), indexes, offsets, cards, strings).is_none(), "seed={seed}: out-of-scope arith must decline (full scan)");
         // The negated arm gates on is_arith_tuple_route(inner) too, so a negated mixed expression also
         // stays off the tuple path.
         assert!(!is_arith_tuple_route(&mixed()), "seed={seed}: -(mixed) inner must not route either");
@@ -3348,7 +3397,7 @@ fn a_proven_conjunct_holds_for_every_candidate() {
             for order in [[c.clone(), p.clone()], [p.clone(), c.clone()]] {
                 let spec = FuzzSpec::And(order.into_iter().map(FuzzSpec::Leaf).collect());
                 let filter = fuzz_bound_filter(&spec, archived);
-                let (Some(set), _, proven) = narrow_candidates_exact(&filter, indexes, offsets, cards) else {
+                let (Some(set), _, proven) = narrow_candidates_exact(&filter, indexes, offsets, cards, strings) else {
                     continue;
                 };
                 if set.is_printing_space() {
@@ -3412,9 +3461,9 @@ fn a_dense_but_not_broad_frame_value_narrows_without_broad_ok() {
         };
         f.bind(
             &archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab,
-            &archived.mana_vocab, &archived.indexes.flavor, &archived.strings,
+            &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings,
         );
-        let got = narrow_rec(&f, &archived.indexes, offsets, cards, false);
+        let got = narrow_rec(&f, &archived.indexes, offsets, cards, &archived.strings, false);
         if range_too_broad_to_narrow(k, n_printings) {
             assert!(got.is_none(), "frame:{value} is broad ({k} of {n_printings}) and must decline without broad_ok");
             checked.1 += 1;
@@ -3493,7 +3542,7 @@ fn value_totals_are_exact_in_all_three_spaces() {
         let mut f = leaf.clone();
         f.bind(
             &archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab,
-            &archived.mana_vocab, &archived.indexes.flavor, &archived.strings,
+            &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings,
         );
         for (mode_label, mode) in [("printing", Mode::Printing), ("card", Mode::Card), ("artwork", Mode::Artwork)] {
             let got = exact_result_total(&f, &archived.indexes, mode)
@@ -4241,7 +4290,7 @@ fn materializing_plans_agree_on_the_counters_they_share() {
         FuzzSpec::And(vec![fuzz_leaf_type(&mut rng), fuzz_leaf_rarity(&mut rng)]),
         FuzzSpec::Leaf(FuzzLeaf::Border { value: "black".to_string() }),
         fuzz_leaf_text_contains(&mut rng, TextSearchField::OracleTextLower),
-        fuzz_leaf_text_contains(&mut rng, TextSearchField::NameLower),
+        fuzz_leaf_text_contains(&mut rng, TextSearchField::NameCollated),
         fuzz_leaf_arith(&mut rng),
         FuzzSpec::And(vec![fuzz_leaf_type(&mut rng), fuzz_leaf_text_contains(&mut rng, TextSearchField::OracleTextLower)]),
     ];
@@ -4865,7 +4914,7 @@ fn calibration_queries() -> Vec<(&'static str, FuzzSpec)> {
     let price = |op, val| FuzzSpec::Leaf(FuzzLeaf::Price { field: NumField::PriceUsd, op, val });
     let year   = |op, y: i32| FuzzSpec::Leaf(FuzzLeaf::Year { op, year: y });
     let otext  = |needle: &str| FuzzSpec::Leaf(FuzzLeaf::TextContains { field: TextSearchField::OracleTextLower, needle: needle.to_string() });
-    let ntext  = |needle: &str| FuzzSpec::Leaf(FuzzLeaf::TextContains { field: TextSearchField::NameLower, needle: needle.to_string() });
+    let ntext  = |needle: &str| FuzzSpec::Leaf(FuzzLeaf::TextContains { field: TextSearchField::NameCollated, needle: needle.to_string() });
     let rarity = |op, val| FuzzSpec::Leaf(FuzzLeaf::Rarity { op, val });
     let kw     = |value: &str| FuzzSpec::Leaf(FuzzLeaf::Collection { field: CollField::Keywords, op: CmpOp::Ge, value: value.to_string() });
 
@@ -6410,8 +6459,11 @@ fn bench_checked_vs_unchecked_access() {
     let artwork_base = build_artwork_base_from(&artwork_groups);
 
     let indexes = CardIndexes {
+        flavor_names: Default::default(),
+        flavor_names_collated: Default::default(),
+        sets_with_extras: Default::default(),
         artwork_base,
-        name_trigram:   build_trigram_index(&cards, |c| crate::folded_name_of(c, &[])),
+        name_trigram:   build_trigram_index(&cards, |c| crate::collated_name_of(c, &[])),
         name_unigrams:  build_name_unigram_index(&cards, &[]),
         oracle_trigram: build_oracle_text_index(&cards, &strings),
         cmc:            build_numeric_index(&cards, |c| c.cmc.map(|v| v as i16)),
@@ -6476,6 +6528,7 @@ fn bench_checked_vs_unchecked_access() {
         coll_vocab_sorted: sorted_vocab_ids(&vocab.strings),
         coll_vocab: vocab.strings,
         artist_vocab: vec![],
+        artist_vocab_collated: vec![],
         mana_vocab: vec![],
         indexes,
         format_shifts: HashMap::new(),
@@ -6522,7 +6575,7 @@ fn card_pass_extracts_residual_and_matches() {
         value: "wolf".to_string(),
         value_id: None,
     };
-    wolf.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    wolf.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     let creature = || FilterExpr::TypeCmp { mask: TYPE_CREATURE, op: CmpOp::Ge };
 
     // And[t:creature, art:wolf]: the type check is proven at card level and
@@ -6550,7 +6603,7 @@ fn card_pass_extracts_residual_and_matches() {
         value: "wolf".to_string(),
         value_id: None,
     };
-    wolf2.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    wolf2.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     let or = FilterExpr::Or(vec![creature(), wolf2]);
     let t = or.card_pass(&archived.cards[0], &archived.strings, &mut residual, &mut is_or, 0);
     assert!(t == Tri::True && residual.is_empty());
@@ -6581,7 +6634,7 @@ fn artist_predicates_bind_to_vocab_ids_and_narrow() {
         field: super::TextSearchField::ArtistLower,
         word: "rebecca".to_string(),
     };
-    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     // bind rewrites the contains into an id-set match
     let FilterExpr::ArtistMatch { ref ids } = f else { panic!("expected ArtistMatch after bind") };
     assert_eq!(ids, &vec![rebecca]);
@@ -6594,7 +6647,7 @@ fn artist_predicates_bind_to_vocab_ids_and_narrow() {
     assert!(f.eval_card(card, &archived.strings) == Tri::PrintingDep);
 
     // narrowing expands the CSR rows to sorted printing ids
-    match narrow_candidates(&f, &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&f, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::Printings(v)) => assert_eq!(v, vec![0, 2]),
         _ => panic!("artist predicate must narrow in printing space"),
     }
@@ -6604,8 +6657,8 @@ fn artist_predicates_bind_to_vocab_ids_and_narrow() {
         field: super::TextSearchField::ArtistLower,
         word: "zzz".to_string(),
     };
-    g.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
-    match narrow_candidates(&g, &archived.indexes, &archived.offsets, &archived.cards) {
+    g.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    match narrow_candidates(&g, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::Printings(v)) => assert!(v.is_empty()),
         _ => panic!("empty artist match must narrow to the empty set"),
     }
@@ -6643,12 +6696,13 @@ fn flavor_match_bind_eval_and_narrow() {
     data.printings[1].flavor_text_lower_id = interner.intern("a quiet forest".to_string());
     // printings[3] keeps NONE_STR: no flavor text at all
     data.strings = interner.strings;
+    derive_name_collation(&mut data); // the assignment above discarded the collated ids store_of derived
     data.indexes.flavor = build_flavor_index(&data.printings, &data.strings);
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
     let bound = |f: &mut FilterExpr| {
-        f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+        f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     };
 
     let mut f = FilterExpr::TextContains {
@@ -6683,7 +6737,7 @@ fn flavor_match_bind_eval_and_narrow() {
 
     // Narrowing expands the matched texts' CSR rows to sorted printing ids —
     // this is what makes ft: participate in Or narrowing.
-    match narrow_candidates(&f, &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&f, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::Printings(v)) => assert_eq!(v, vec![0, 2]),
         _ => panic!("flavor predicate must narrow in printing space"),
     }
@@ -6695,7 +6749,7 @@ fn flavor_match_bind_eval_and_narrow() {
         value: "a quiet forest".to_string(),
     };
     bound(&mut ex);
-    match narrow_candidates(&ex, &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&ex, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::Printings(v)) => assert_eq!(v, vec![1]),
         _ => panic!("exact flavor must narrow"),
     }
@@ -6705,7 +6759,7 @@ fn flavor_match_bind_eval_and_narrow() {
     };
     bound(&mut rx);
     assert!(rx.matches(card0, &archived.printings[1], &archived.strings));
-    match narrow_candidates(&rx, &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&rx, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::Printings(v)) => assert_eq!(v, vec![1]),
         _ => panic!("regex flavor must narrow"),
     }
@@ -6716,7 +6770,7 @@ fn flavor_match_bind_eval_and_narrow() {
         word: "zzzqqq".to_string(),
     };
     bound(&mut none);
-    match narrow_candidates(&none, &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&none, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::Printings(v)) => assert!(v.is_empty()),
         _ => panic!("empty flavor match must narrow to the empty set"),
     }
@@ -6752,7 +6806,7 @@ fn collector_number_narrowing() {
         op,
         rhs: NumExpr::Const(v),
     };
-    let narrow = |f: &FilterExpr| match narrow_candidates(f, &archived.indexes, &archived.offsets, &archived.cards) {
+    let narrow = |f: &FilterExpr| match narrow_candidates(f, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::Printings(v)) => Some(v),
         // Bitmaps materialize in ascending id order, so both representations
         // compare against the same expected vectors.
@@ -6878,22 +6932,33 @@ fn all_match_promotion_correct_for_card_space_exact_predicate() {
 /// group's internal order would come out reversed in one direction.
 fn tie_break_fixture() -> (Vec<OracleCard>, VocabInterner) {
     let mut vocab = VocabInterner::new();
-    let mut card0 = stub_card(1, TYPE_CREATURE, &[], &mut vocab); // cmc=3, edhrec=10
+    // The tied trio is ordered by NAME, which is the tiebreak `sort_key_bits` puts in its third
+    // lane (Scryfall's own; see `sort_key_bits`). The names are chosen so the intended tie order —
+    // card1, card0, card2 — is the same one the edhrec ranks used to give, so every expectation
+    // below still reads as it did; only the reason the order holds has changed.
+    let mut card0 = stub_card(1, TYPE_CREATURE, &[], &mut vocab); // cmc=3, name "btie" (middle)
     card0.cmc = Some(3);
     card0.edhrec_rank = Some(10);
-    let mut card1 = stub_card(2, TYPE_CREATURE, &[], &mut vocab); // cmc=3, edhrec=5 (lowest in the tie)
+    card0.card_name_lower = InlineStr::from_str("btie");
+    let mut card1 = stub_card(2, TYPE_CREATURE, &[], &mut vocab); // cmc=3, name "atie" (first)
     card1.cmc = Some(3);
     card1.edhrec_rank = Some(5);
-    let mut card2 = stub_card(3, TYPE_CREATURE, &[], &mut vocab); // cmc=3, edhrec=20 (highest in the tie)
+    card1.card_name_lower = InlineStr::from_str("atie");
+    let mut card2 = stub_card(3, TYPE_CREATURE, &[], &mut vocab); // cmc=3, name "ctie" (last)
     card2.cmc = Some(3);
     card2.edhrec_rank = Some(20);
+    card2.card_name_lower = InlineStr::from_str("ctie");
     let mut card3 = stub_card(4, TYPE_CREATURE, &[], &mut vocab); // cmc=1
     card3.cmc = Some(1);
     card3.edhrec_rank = Some(1);
+    card3.card_name_lower = InlineStr::from_str("dsolo");
     let mut card4 = stub_card(5, TYPE_CREATURE, &[], &mut vocab); // cmc=5
     card4.cmc = Some(5);
     card4.edhrec_rank = Some(1);
-    (vec![card0, card1, card2, card3, card4], vocab)
+    card4.card_name_lower = InlineStr::from_str("esolo");
+    let mut cards = vec![card0, card1, card2, card3, card4];
+    assign_name_ranks(&mut cards, &[]);
+    (cards, vocab)
 }
 
 /// Expected order, by oracle_id: ascending is [card3(1), card1(3,e5),
@@ -7341,7 +7406,7 @@ fn set_code_and_date_narrowing() {
         op: CmpOp::Eq,
         value: "lea".to_string(),
     };
-    match narrow_candidates(&lea, &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&lea, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::Printings(v)) => assert_eq!(v, vec![0, 2]),
         _ => panic!("set code must narrow in printing space"),
     }
@@ -7351,23 +7416,23 @@ fn set_code_and_date_narrowing() {
         op: CmpOp::Eq,
         value: "zzz".to_string(),
     };
-    match narrow_candidates(&none, &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&none, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::Printings(v)) => assert!(v.is_empty()),
         _ => panic!("unknown set code must narrow to the empty set"),
     }
 
     let year1993 = FilterExpr::YearCmp { op: CmpOp::Eq, year: 1993 };
-    match narrow_candidates(&year1993, &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&year1993, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::Printings(v)) => assert_eq!(v, vec![0]),
         _ => panic!("year must narrow in printing space"),
     }
     let date_ge = FilterExpr::DateCmp { op: CmpOp::Ge, value: 20240101 };
-    match narrow_candidates(&date_ge, &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&date_ge, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::Printings(v)) => assert_eq!(v, vec![1]),
         _ => panic!("date must narrow in printing space"),
     }
     // Ne is not selective and must not narrow.
-    assert!(narrow_candidates(&FilterExpr::DateCmp { op: CmpOp::Ne, value: 19930805 }, &archived.indexes, &archived.offsets, &archived.cards).is_none());
+    assert!(narrow_candidates(&FilterExpr::DateCmp { op: CmpOp::Ne, value: 19930805 }, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings).is_none());
 }
 
 #[test]
@@ -7383,6 +7448,7 @@ fn watermark_narrowing() {
     data.printings[1].card_watermark_id = interner.intern("set".to_string());
     data.printings[2].card_watermark_id = NONE_STR; // no watermark — must not appear in any postings list
     data.strings = interner.strings;
+    derive_name_collation(&mut data); // the assignment above discarded the collated ids store_of derived
     let mut watermarks: TagIndex = HashMap::new();
     for (i, p) in data.printings.iter().enumerate() {
         if p.card_watermark_id != NONE_STR {
@@ -7394,7 +7460,7 @@ fn watermark_narrowing() {
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
     let wotc = FilterExpr::TextExact { field: super::TextField::Watermark, op: CmpOp::Eq, value: "wotc".to_string() };
-    match narrow_candidates(&wotc, &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&wotc, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::Printings(v)) => assert_eq!(v, vec![0]),
         _ => panic!("watermark must narrow in printing space"),
     }
@@ -7402,7 +7468,7 @@ fn watermark_narrowing() {
     // Unknown watermark: exact empty narrowing, same as an unknown set code —
     // and the short-circuit this doc's timing (~3us) relies on.
     let unknown = FilterExpr::TextExact { field: super::TextField::Watermark, op: CmpOp::Eq, value: "notarealvalue".to_string() };
-    match narrow_candidates(&unknown, &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&unknown, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::Printings(v)) => assert!(v.is_empty()),
         _ => panic!("unknown watermark must narrow to the empty set"),
     }
@@ -7411,7 +7477,7 @@ fn watermark_narrowing() {
     // case at all, so `Or([Watermark(..), <anything narrowable>])` vetoed the
     // whole Or to None (every child must narrow). Confirm the Or now composes.
     let set = FilterExpr::TextExact { field: super::TextField::Watermark, op: CmpOp::Eq, value: "set".to_string() };
-    match narrow_candidates(&FilterExpr::Or(vec![wotc, set]), &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&FilterExpr::Or(vec![wotc, set]), &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::Printings(mut v)) => {
             v.sort_unstable();
             assert_eq!(v, vec![0, 1]);
@@ -7450,6 +7516,7 @@ fn set_watermark_compose_leaves() {
         p.card_watermark_id = wm.map_or(NONE_STR, |s| interner.intern(s.to_string()));
     }
     data.strings = interner.strings;
+    derive_name_collation(&mut data); // the assignment above discarded the collated ids store_of derived
     // Released dates give a mix of years for the range-leaf mixes (pid4 dateless — fails any year).
     let year_by_pid = [Some(20200101), Some(20230101), Some(20200101), Some(20230101), None, Some(20240101)];
     for (p, y) in data.printings.iter_mut().zip(year_by_pid) {
@@ -7746,7 +7813,7 @@ fn price_narrowing_and_verification_are_exact_at_the_boundary() {
 
     // Lt must exclude the boundary printing exactly -- both in narrowing and in verification.
     let lt = cmp(CmpOp::Lt);
-    match narrow_candidates(&lt, &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&lt, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::Printings(v)) => {
             assert!(v.contains(&0));
             assert!(!v.contains(&1), "Lt must exclude the exact boundary price");
@@ -7762,7 +7829,7 @@ fn price_narrowing_and_verification_are_exact_at_the_boundary() {
     // silently excluded exact matches independent of narrowing).
     for (op, op_name, is_eq) in [(CmpOp::Le, "Le", false), (CmpOp::Ge, "Ge", false), (CmpOp::Eq, "Eq", true)] {
         let f = cmp(op);
-        match narrow_candidates(&f, &archived.indexes, &archived.offsets, &archived.cards) {
+        match narrow_candidates(&f, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
             Some(Candidates::Printings(v)) => assert!(v.contains(&1), "narrowing must include the boundary price for {op_name}"),
             None if is_eq => {} // narrow_candidates_exact's broadness filter can decline Eq on a tiny store; matches() below is what matters
             _ => panic!("usd must narrow in printing space for {op_name}"),
@@ -7775,13 +7842,13 @@ fn price_narrowing_and_verification_are_exact_at_the_boundary() {
 
     // Flipped operand order (50.0 < usd, i.e. usd > 50.0): only the $60 printing qualifies.
     let pricey = FilterExpr::NumericCmp { lhs: NumExpr::Const(50.0), op: CmpOp::Lt, rhs: NumExpr::Field(NumField::PriceUsd) };
-    match narrow_candidates(&pricey, &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&pricey, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::Printings(v)) => assert_eq!(v, vec![2]),
         _ => panic!("flipped usd comparison must narrow"),
     }
     // Ne is not selective.
     let ne = usd_cmp(CmpOp::Ne, 1.0);
-    assert!(narrow_candidates(&ne, &archived.indexes, &archived.offsets, &archived.cards).is_none());
+    assert!(narrow_candidates(&ne, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings).is_none());
 }
 
 // Direct repro of the review-caught bug: comparing a stored price widened from a lossy f32 to
@@ -7909,7 +7976,7 @@ fn negated_range_narrowing() {
     // pid1 ($0.30) and pid3 ($10.00) satisfy both forms; pid0 ($0.10) fails both directly; pid2
     // (no price) fails both -- the trivalent guarantee, not just the ordinary in-range cases.
     for (i, f) in [&not_usd_lt_25, &usd_ge_25].into_iter().enumerate() {
-        match narrow_candidates(f, &archived.indexes, &archived.offsets, &archived.cards) {
+        match narrow_candidates(f, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
             Some(Candidates::Printings(v)) => assert_eq!(v, vec![1, 3], "form {i}"),
             other => panic!("expected tight printing narrowing, got {other:?}"),
         }
@@ -7945,7 +8012,7 @@ fn negated_range_narrowing() {
         op: CmpOp::Lt,
         rhs: NumExpr::Const(50.0),
     }));
-    match narrow_candidates(&not_cn_lt_50, &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&not_cn_lt_50, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::Printings(v)) => assert_eq!(v, vec![1, 3]),
         other => panic!("expected tight printing narrowing, got {other:?}"),
     }
@@ -7958,12 +8025,13 @@ fn negated_range_narrowing() {
             &archived.indexes,
             &archived.offsets,
             &archived.cards,
+            &archived.strings,
         )
         .is_none()
     );
     // -date>=20200101 -> date<20200101: only pid0 (1993-08-05); pid2 (no date) fails both forms.
     let not_date_ge = FilterExpr::Not(Box::new(FilterExpr::DateCmp { op: CmpOp::Ge, value: 20_200_101 }));
-    match narrow_candidates(&not_date_ge, &archived.indexes, &archived.offsets, &archived.cards) {
+    match narrow_candidates(&not_date_ge, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::Printings(v)) => assert_eq!(v, vec![0]),
         other => panic!("expected tight printing narrowing, got {other:?}"),
     }
@@ -8058,13 +8126,13 @@ fn and_skip_probes_range_selectivity() {
     data.indexes.price_usd = build_printing_value_index(&data.printings, &data.cards, &data.offsets, |p| p.price_usd);
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
-    let (indexes, offsets, cards) = (&archived.indexes, &archived.offsets, &archived.cards);
+    let (indexes, offsets, cards, strings) = (&archived.indexes, &archived.offsets, &archived.cards, &archived.strings);
 
     // FilterExpr isn't Clone, so build fresh nodes per use.
     let creature = || FilterExpr::TypeCmp { mask: TYPE_CREATURE, op: CmpOp::Ge };
     let legendary = || FilterExpr::TypeCmp { mask: TYPE_LEGENDARY, op: CmpOp::Ge };
     let cmc_lt = FilterExpr::NumericCmp { lhs: NumExpr::Field(NumField::Cmc), op: CmpOp::Lt, rhs: NumExpr::Const(3.0) };
-    let len = |f: &FilterExpr| narrow_candidates(f, indexes, offsets, cards).map(|c| c.len());
+    let len = |f: &FilterExpr| narrow_candidates(f, indexes, offsets, cards, strings).map(|c| c.len());
 
     // probe_range_k reads a range child's exact selectivity; None for a non-range sibling.
     assert_eq!(probe_range_k(&usd_cmp(CmpOp::Lt, 0.21), indexes), Some(20)); // <21c -> printings 0..=19
@@ -8510,7 +8578,7 @@ fn usd_inside_arithmetic_evaluates_in_dollars_not_cents() {
         op: CmpOp::Lt,
         rhs: NumExpr::Field(NumField::Power),
     };
-    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     assert!(f.matches(card, printing, &archived.strings), "usd+1<power must evaluate in dollars: 50+1=51 < 52");
 }
 
@@ -8533,7 +8601,7 @@ fn usd_compared_directly_against_another_field_evaluates_in_dollars() {
 
     // usd<cmc: $2.00 < cmc(3) -- must match.
     let mut f = FilterExpr::NumericCmp { lhs: NumExpr::Field(NumField::PriceUsd), op: CmpOp::Lt, rhs: NumExpr::Field(NumField::Cmc) };
-    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     assert!(f.matches(card, printing, &archived.strings), "usd<cmc must evaluate in dollars: 2.00 < 3");
 }
 
@@ -8795,7 +8863,8 @@ fn text_fixture_store() -> CardData {
         .collect();
     let mut data = store_of(cards, &[1usize; 6], vocab);
     data.strings = interner.strings;
-    data.indexes.name_trigram = build_trigram_index(&data.cards, |c| crate::folded_name_of(c, &data.strings));
+    derive_name_collation(&mut data); // the assignment above discarded the collated ids store_of derived
+    data.indexes.name_trigram = build_trigram_index(&data.cards, |c| crate::collated_name_of(c, &data.strings));
     data.indexes.oracle_trigram = build_oracle_text_index(&data.cards, &data.strings);
     data
 }
@@ -8813,7 +8882,7 @@ fn memoize_text_predicates_parity() {
         f
     };
     let oracle = |w: &str| FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: w.to_string() };
-    let name = |w: &str| FilterExpr::TextContains { field: TextSearchField::NameLower, word: w.to_string() };
+    let name = |w: &str| FilterExpr::TextContains { field: TextSearchField::NameCollated, word: w.to_string() };
 
     for needle in ["damage", "draw", "goblin", "abcde", "card.", "zzz"] {
         let rewritten = memo(oracle(needle));
@@ -8958,6 +9027,7 @@ fn oracle_word_fixture_store() -> CardData {
         .collect();
     let mut data = store_of(cards, &[1usize; 17], vocab);
     data.strings = interner.strings;
+    derive_name_collation(&mut data); // the assignment above discarded the collated ids store_of derived
     data.indexes.oracle_trigram = build_oracle_text_index(&data.cards, &data.strings);
     data
 }
@@ -8992,6 +9062,7 @@ fn oracle_word_multi_dense_fixture_store() -> CardData {
         .collect();
     let mut data = store_of(cards, &[1usize; 6], vocab);
     data.strings = interner.strings;
+    derive_name_collation(&mut data); // the assignment above discarded the collated ids store_of derived
     data.indexes.oracle_trigram = build_oracle_text_index(&data.cards, &data.strings);
     data
 }
@@ -9011,7 +9082,7 @@ fn oracle_word_index_exact_union_parity() {
     let data = oracle_word_fixture_store();
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
-    let rec = |f: &FilterExpr| super::narrow_rec(f, &archived.indexes, &archived.offsets, &archived.cards, true);
+    let rec = |f: &FilterExpr| super::narrow_rec(f, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings, true);
     let oracle = |w: &str| FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: w.to_string() };
 
     for needle in ["target", "creature", "cast", "zzzzz"] {
@@ -9030,7 +9101,7 @@ fn oracle_word_index_dispatch_shapes() {
     let data = oracle_word_fixture_store();
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
-    let rec = |f: &FilterExpr| super::narrow_rec(f, &archived.indexes, &archived.offsets, &archived.cards, true);
+    let rec = |f: &FilterExpr| super::narrow_rec(f, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings, true);
     let oracle = |w: &str| FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: w.to_string() };
 
     // Single dense hit, no sparse hit: the dense word's bitmap comes back
@@ -9069,7 +9140,7 @@ fn oracle_word_index_multi_dense_no_sparse() {
     let data = oracle_word_multi_dense_fixture_store();
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
-    let rec = |f: &FilterExpr| super::narrow_rec(f, &archived.indexes, &archived.offsets, &archived.cards, true);
+    let rec = |f: &FilterExpr| super::narrow_rec(f, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings, true);
     let oracle = |w: &str| FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: w.to_string() };
 
     let expected = brute_force_oracle_contains(archived, "word");
@@ -9190,6 +9261,7 @@ fn border_planes_fixture_store() -> CardData {
         }
     }
     data.strings = interner.strings;
+    derive_name_collation(&mut data); // the assignment above discarded the collated ids store_of derived
     data.indexes.planes = build_bit_planes(&data.cards, &data.printings, &data.offsets, &data.strings);
     data
 }
@@ -9219,7 +9291,7 @@ fn border_planes_exact_union_parity() {
     let data = border_planes_fixture_store();
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
-    let rec = |f: &FilterExpr| super::narrow_rec(f, &archived.indexes, &archived.offsets, &archived.cards, true);
+    let rec = |f: &FilterExpr| super::narrow_rec(f, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings, true);
     let border = |v: &str| FilterExpr::TextExact { field: TextField::Border, op: CmpOp::Eq, value: v.to_string() };
 
     for value in ["borderless", "white", "gold"] {
@@ -9355,6 +9427,7 @@ fn border_broadness_fixture_store() -> CardData {
         data.printings[i].card_border_id = interner.intern(border.to_string());
     }
     data.strings = interner.strings;
+    derive_name_collation(&mut data); // the assignment above discarded the collated ids store_of derived
     data.indexes.planes = build_bit_planes(&data.cards, &data.printings, &data.offsets, &data.strings);
     data
 }
@@ -9372,14 +9445,14 @@ fn border_black_declines_via_broadness_guard() {
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
     let border = |v: &str| FilterExpr::TextExact { field: TextField::Border, op: CmpOp::Eq, value: v.to_string() };
 
-    let n = super::narrow_rec(&border("black"), &archived.indexes, &archived.offsets, &archived.cards, true).expect("the dedicated arm itself always narrows");
+    let n = super::narrow_rec(&border("black"), &archived.indexes, &archived.offsets, &archived.cards, &archived.strings, true).expect("the dedicated arm itself always narrows");
     assert_eq!(n.set.into_cards(&archived.offsets, &archived.indexes.printing_to_card).len(), 7);
 
     assert!(
-        narrow_candidates(&border("black"), &archived.indexes, &archived.offsets, &archived.cards).is_none(),
+        narrow_candidates(&border("black"), &archived.indexes, &archived.offsets, &archived.cards, &archived.strings).is_none(),
         "border:black alone must decline: 87.5% exceeds narrow_candidates_exact's 75% broadness cutoff"
     );
-    assert!(narrow_candidates(&border("borderless"), &archived.indexes, &archived.offsets, &archived.cards).is_some());
+    assert!(narrow_candidates(&border("borderless"), &archived.indexes, &archived.offsets, &archived.cards, &archived.strings).is_some());
 }
 
 // ─── Adaptive candidate sets (#636) ───────────────────────────────────────────
@@ -9489,7 +9562,7 @@ fn not_narrows_only_tight_children() {
     let data = narrow_fixture_store();
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
-    let rec = |f: &FilterExpr| super::narrow_rec(f, &archived.indexes, &archived.offsets, &archived.cards, true);
+    let rec = |f: &FilterExpr| super::narrow_rec(f, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings, true);
 
     // value_id bound as production's bind() would — narrowing keys on the
     // string, evaluation on the id, and they must agree.
@@ -9547,7 +9620,7 @@ fn or_composes_plane_and_complement_children() {
     let data = narrow_fixture_store();
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
-    let rec = |f: &FilterExpr| super::narrow_rec(f, &archived.indexes, &archived.offsets, &archived.cards, true);
+    let rec = |f: &FilterExpr| super::narrow_rec(f, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings, true);
 
     let goblin_id = archived.coll_vocab.iter().position(|s| s.as_str() == "goblin").map(|i| i as u16);
     let goblin = || FilterExpr::CollectionCmp { field: CollField::Subtypes, op: CmpOp::Ge, value: "goblin".into(), value_id: goblin_id };
@@ -9623,12 +9696,12 @@ fn not_over_partial_and_is_blocked() {
     // the total below pins. Not a 1-byte needle any more -- those resolve exactly through the unigram
     // index now (#858) -- and not an oracle needle either, since this fixture leaves oracle text unset,
     // making it Null rather than False and changing what the negation matches.
-    let unindexable = || FilterExpr::TextContains { field: TextSearchField::NameLower, word: "qqqq".into() };
+    let unindexable = || FilterExpr::TextContains { field: TextSearchField::NameCollated, word: "qqqq".into() };
 
     // Static check: And with an unrepresentable child can't be tight → Not
     // must refuse to narrow at all.
     let not_partial = FilterExpr::Not(Box::new(FilterExpr::And(vec![goblin(), unindexable()])));
-    assert!(super::narrow_rec(&not_partial, &archived.indexes, &archived.offsets, &archived.cards, true).is_none());
+    assert!(super::narrow_rec(&not_partial, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings, true).is_none());
 
     // Dynamic check via run_query: totals must equal brute force. Every card
     // fails `name:qqqq` here, so every card matches the negation — a complement
@@ -9696,8 +9769,8 @@ fn name_bigrams_tiers_and_exactness() {
     assert!(idx.postings.get(b"qx").is_some(), "64-name bigram stays a posting list");
 
     let rec = |w: &str| {
-        let f = FilterExpr::TextContains { field: TextSearchField::NameLower, word: w.to_string() };
-        super::narrow_rec(&f, &archived.indexes, &archived.offsets, &archived.cards, false)
+        let f = FilterExpr::TextContains { field: TextSearchField::NameCollated, word: w.to_string() };
+        super::narrow_rec(&f, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings, false)
     };
     // Dense tier: exact bitmap, tight.
     let n = rec("zz").expect("dense bigram narrows");
@@ -9719,7 +9792,7 @@ fn name_bigrams_tiers_and_exactness() {
     // 1-char is indexed too now (#858) -- see name_unigrams_tiers_and_exactness for its tiers. What
     // stays unindexable is a sub-trigram ORACLE needle, which has no unigram/bigram index.
     let f = FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: "z".to_string() };
-    assert!(super::narrow_rec(&f, &archived.indexes, &archived.offsets, &archived.cards, false).is_none());
+    assert!(super::narrow_rec(&f, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings, false).is_none());
 }
 
 /// The complement of a 1-byte NAME needle is exact, so the `Not` arm may mark it tight — and the
@@ -9741,9 +9814,9 @@ fn not_over_unigram_is_tight_but_oracle_stays_loose() {
     let data = store_of(cards, &vec![1usize; 256], vocab);
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
-    let rec = |f: &FilterExpr| super::narrow_rec(f, &archived.indexes, &archived.offsets, &archived.cards, true);
+    let rec = |f: &FilterExpr| super::narrow_rec(f, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings, true);
 
-    let name_q = || FilterExpr::TextContains { field: TextSearchField::NameLower, word: "q".into() };
+    let name_q = || FilterExpr::TextContains { field: TextSearchField::NameCollated, word: "q".into() };
     let n = rec(&FilterExpr::Not(Box::new(name_q()))).expect("-name:q must narrow");
     assert!(n.tight, "name is never Null, so the complement of a tight 1-byte set is exact");
     let cand = n.set.into_cards(&archived.offsets, &archived.indexes.printing_to_card);
@@ -9757,7 +9830,7 @@ fn not_over_unigram_is_tight_but_oracle_stays_loose() {
     assert_eq!(cand, brute, "-name:q must be exactly the cards whose name lacks 'q'");
 
     // An absent byte complements to every card, and that must stay exact rather than trip a breadth guard.
-    let name_v = FilterExpr::TextContains { field: TextSearchField::NameLower, word: "v".into() };
+    let name_v = FilterExpr::TextContains { field: TextSearchField::NameCollated, word: "v".into() };
     let n = rec(&FilterExpr::Not(Box::new(name_v))).expect("-name:v must narrow");
     assert!(n.tight);
     assert_eq!(n.set.len(), archived.cards.len(), "no name contains 'v', so its negation is every card");
@@ -9792,8 +9865,8 @@ fn name_unigrams_tiers_and_exactness() {
     assert!(idx.postings.get(&b'q').is_some(), "a byte in 64 names stays a posting list");
 
     let rec = |w: &str| {
-        let f = FilterExpr::TextContains { field: TextSearchField::NameLower, word: w.to_string() };
-        super::narrow_rec(&f, &archived.indexes, &archived.offsets, &archived.cards, false)
+        let f = FilterExpr::TextContains { field: TextSearchField::NameCollated, word: w.to_string() };
+        super::narrow_rec(&f, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings, false)
     };
     // Dense tier: exact bitmap, tight.
     let n = rec("z").expect("dense byte narrows");
@@ -9831,14 +9904,15 @@ fn name_bigrams_compose_and_memoize() {
     }).collect();
     let mut data = store_of(cards, &[1usize; 6], vocab);
     data.strings = interner.strings;
+    derive_name_collation(&mut data); // the assignment above discarded the collated ids store_of derived
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
-    let name2 = |w: &str| FilterExpr::TextContains { field: TextSearchField::NameLower, word: w.to_string() };
+    let name2 = |w: &str| FilterExpr::TextContains { field: TextSearchField::NameCollated, word: w.to_string() };
 
     // Or of two bigram children composes: "fi" → {0,1,4}, "dr" → {0,2}.
     let or = FilterExpr::Or(vec![name2("fi"), name2("dr")]);
-    let n = super::narrow_rec(&or, &archived.indexes, &archived.offsets, &archived.cards, false).expect("bigram Or composes");
+    let n = super::narrow_rec(&or, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings, false).expect("bigram Or composes");
     assert_eq!(n.set.into_cards(&archived.offsets, &archived.indexes.printing_to_card), vec![0, 1, 2, 4]);
 
     // run_query parity across the new shapes, negation included.
@@ -9889,7 +9963,7 @@ fn broad_tag_postings_scatter_or_decline() {
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
     let tag = |v: &str| FilterExpr::CollectionCmp { field: CollField::IsTags, op: CmpOp::Ge, value: v.into(), value_id: None };
-    let rec = |f: &FilterExpr, broad_ok: bool| super::narrow_rec(f, &archived.indexes, &archived.offsets, &archived.cards, broad_ok);
+    let rec = |f: &FilterExpr, broad_ok: bool| super::narrow_rec(f, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings, broad_ok);
 
     // Broad tag: bitmap under broad_ok, decline without.
     assert!(rec(&tag("spell"), false).is_none(), "broad tag without a consumer reverts to the scan");
@@ -10025,7 +10099,7 @@ fn devotion_plane_parity_and_boundaries() {
     assert!(compile_plane(&dev(CmpOp::Le, &[("U", 3)]), &archived.indexes.planes, &archived.indexes.oracle_trigram.words).is_none());
     // ...and the saturated superset covers every deep match for narrowing.
     let deep = dev(CmpOp::Ge, &[("U", 5)]);
-    let n = super::narrow_rec(&deep, &archived.indexes, &archived.offsets, &archived.cards, false).expect("deep-k narrows loosely");
+    let n = super::narrow_rec(&deep, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings, false).expect("deep-k narrows loosely");
     assert!(!n.tight);
     let cand = n.set.into_cards(&archived.offsets, &archived.indexes.printing_to_card);
     for (cid, card) in archived.cards.iter().enumerate() {
@@ -10090,9 +10164,12 @@ fn named_store() -> CardData {
             c
         })
         .collect();
-    assign_name_ranks(&mut cards);
+    assign_name_ranks(&mut cards, &[]);
     let mut data = store_of(cards, &[1; 6], vocab);
     data.indexes.sort_perms = build_sort_permutations(&data.cards);
+    // ExactName narrows through this index, not the permutation — a face name is not addressable
+    // by a range over the joined name (see narrow_rec's ExactName arm).
+    data.indexes.name_trigram = build_trigram_index(&data.cards, |c| crate::collated_name_of(c, &data.strings));
     data
 }
 
@@ -10105,9 +10182,9 @@ fn name_ranks_dense_and_shared_across_duplicates() {
     assert_eq!(ranks, vec![3, 4, 0, 4, 1, 2]);
 }
 
-// ExactName narrows to the exact, tight card set through the ascending name
-// permutation: hit (single), hit (duplicate pair), boundary names, and a miss
-// proving the empty set.
+// ExactName narrows to the exact, tight card set: hit (single), hit (duplicate pair), boundary
+// names, and a miss proving the empty set. The candidates come from the folded-name trigram index
+// and are verified in the narrow, so the set is exactly what the walk would have kept.
 #[test]
 fn exact_name_narrows_tight() {
     let data = named_store();
@@ -10116,21 +10193,23 @@ fn exact_name_narrows_tight() {
 
     let exact = |name: &str| FilterExpr::ExactName(name.to_string());
     let narrow = |name: &str| {
-        super::narrow_rec(&exact(name), &archived.indexes, &archived.offsets, &archived.cards, false)
+        super::narrow_rec(&exact(name), &archived.indexes, &archived.offsets, &archived.cards, &archived.strings, false)
             .expect("exact name must narrow")
     };
 
+    // Needles are COLLATED, which is the form the parser emits — "sol ring" reaches the engine as
+    // "solring".
     for (name, mut want) in [
         ("fog", vec![0u32]),
-        ("sol ring", vec![1, 3]),
+        ("solring", vec![1, 3]),
         ("atog", vec![2]),          // first in sorted order
         ("cancel", vec![5]),        // adjacent to the last block
-        ("zzz past the end", vec![]),
-        ("aaa before the start", vec![]),
-        ("sol rin", vec![]),        // prefix of a real name is still a miss
+        ("zzzpasttheend", vec![]),
+        ("aaabeforethestart", vec![]),
+        ("solrin", vec![]),         // prefix of a real name is still a miss
     ] {
         let n = narrow(name);
-        assert!(n.tight, "{name}: equality through the sorted permutation is exact");
+        assert!(n.tight, "{name}: candidates are verified in the narrow, so the set is exact");
         let mut got = n.set.into_cards(&archived.offsets, &archived.indexes.printing_to_card);
         got.sort_unstable();
         want.sort_unstable();
@@ -10140,11 +10219,11 @@ fn exact_name_narrows_tight() {
     // Composition: the tight set participates in the candidate algebra, and
     // run_query totals agree with a full scan on every shape.
     let mut shapes: Vec<FilterExpr> = vec![
-        exact("sol ring"),
-        exact("no such card"),
-        FilterExpr::Or(vec![exact("sol ring"), FilterExpr::TypeCmp { mask: TYPE_CREATURE, op: CmpOp::Ge }]),
+        exact("solring"),
+        exact("nosuchcard"),
+        FilterExpr::Or(vec![exact("solring"), FilterExpr::TypeCmp { mask: TYPE_CREATURE, op: CmpOp::Ge }]),
         FilterExpr::And(vec![exact("fog"), FilterExpr::TypeCmp { mask: TYPE_CREATURE, op: CmpOp::Ge }]),
-        FilterExpr::Not(Box::new(exact("sol ring"))),
+        FilterExpr::Not(Box::new(exact("solring"))),
     ];
     for (i, f) in shapes.iter_mut().enumerate() {
         let brute = archived
@@ -10185,25 +10264,42 @@ fn accent_folded_name_search_matches_unaccented_query() {
             data.cards[i].card_name_folded_id = (data.strings.len() - 1) as u32;
         }
     }
+    // The folded names only just arrived, and the collated column is DERIVED from them -- the ids
+    // store_of derived were folded==lower ones and still carry the accent.
+    derive_name_collation(&mut data);
     let data = data;
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
-    // A query word already folded by Python (whether the user typed "eowyn" or
-    // "Éowyn") must find the accented card and only it.
-    let contains_eowyn = FilterExpr::TextContains { field: TextSearchField::NameLower, word: "eowyn".to_string() };
-    let matches: Vec<u32> = archived.cards.iter().enumerate()
-        .filter(|(_, c)| contains_eowyn.eval_card(c, &archived.strings) == Tri::True)
-        .map(|(i, _)| i as u32)
-        .collect();
-    assert_eq!(matches, vec![0], "unaccented fuzzy query must find only the accented card");
+    let hits = |f: &FilterExpr| -> Vec<u32> {
+        archived.cards.iter().enumerate()
+            .filter(|(_, c)| f.eval_card(c, &archived.strings) == Tri::True)
+            .map(|(i, _)| i as u32)
+            .collect()
+    };
 
-    // Exact match stays accent-sensitive: typing the accent finds it; typing
-    // without the accent does not.
-    let exact_accented = FilterExpr::ExactName("éowyn, fearless knight".to_string());
-    let exact_unaccented = FilterExpr::ExactName("eowyn, fearless knight".to_string());
-    assert!(exact_accented.eval_card(&archived.cards[0], &archived.strings) == Tri::True);
-    assert!(exact_unaccented.eval_card(&archived.cards[0], &archived.strings) == Tri::False);
+    // A BARE query word — collated by Python, whether the user typed "eowyn" or "Éowyn" — finds
+    // the accented card and only it. `name:eowyn` and `name:éowyn` both answer 3 cards on
+    // api.scryfall.com (2026-08-16).
+    let collated = |w: &str| FilterExpr::TextContains { field: TextSearchField::NameCollated, word: w.to_string() };
+    assert_eq!(hits(&collated("eowyn")), vec![0], "an unaccented bare word must find the accented card");
+    // ...including across the separators the fold removes: `name:eowynfearless` is a hit, which is
+    // the whole reason `name:ft` answers 1,628 there and this port used to answer 359.
+    assert_eq!(hits(&collated("eowynfearless")), vec![0], "the collated word crosses the comma and the space");
+
+    // A QUOTED value is LITERAL: `name:"eowyn"` answers 0 on api.scryfall.com while
+    // `name:"éowyn"` answers 3, and neither crosses a separator.
+    let literal = |w: &str| FilterExpr::TextContains { field: TextSearchField::NameLower, word: w.to_string() };
+    assert_eq!(hits(&literal("eowyn")), Vec::<u32>::new(), "a quoted value does not fold the accent away");
+    assert_eq!(hits(&literal("éowyn")), vec![0], "typing the accent finds it");
+    assert_eq!(hits(&literal("eowyn, fearless")), Vec::<u32>::new(), "and the separators still count");
+    assert_eq!(hits(&literal("éowyn, fearless")), vec![0]);
+
+    // `!"…"` is COLLATED, so typing the name without its accent — or without its comma — finds the
+    // card. `!"eowyn, lady of rohan"` answers "Éowyn, Lady of Rohan" on api.scryfall.com.
+    let exact = |w: &str| FilterExpr::ExactName(w.to_string());
+    assert!(exact("eowynfearlessknight").eval_card(&archived.cards[0], &archived.strings) == Tri::True);
+    assert!(exact("eowynfearless").eval_card(&archived.cards[0], &archived.strings) == Tri::False, "exact, not a prefix");
 }
 
 // order:name sorts pages by name in both directions, breaks the duplicate-name
@@ -10237,8 +10333,14 @@ fn order_name_sorts_and_paginates() {
             .map(|(c, _)| u128::from(c.oracle_id))
             .collect()
     };
-    assert_eq!(ids("asc"), [4, 2], "within the tie: lower edhrec rank first");
-    assert_eq!(ids("desc"), [4, 2], "secondaries keep their order under desc");
+    // Two DISTINCT cards sharing a name tie all the way through the name lane, so the order falls
+    // to card order (oracle_id) — edhrec is no longer a tiebreak anywhere. Scryfall breaks this
+    // last tie by printing preference (measured: "Monster Mashup" tmc/117 2026 before "Monster
+    // Mash-Up" unk/RB15 2025, the two names being equal once collated); reproducing that would
+    // mean putting a printing-level value in a lane `page_cmp` deliberately keeps card-level, so
+    // it stays a recorded residual rather than a silent difference.
+    assert_eq!(ids("asc"), [2, 4], "within the tie: card order, edhrec no longer participating");
+    assert_eq!(ids("desc"), [2, 4], "secondaries keep their order under desc");
 }
 
 // ─── Verifier cost ordering ───────────────────────────────────────────────────
@@ -10658,21 +10760,29 @@ fn printing_range_fixture(seed: u64, n_cards: usize) -> CardData {
     use rand::SeedableRng;
     let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
     let mut vocab = VocabInterner::new();
-    // Distinct edhrec ranks (shuffled), as real data has — a rank is unique per card. This keeps
-    // any two cards from sharing a full (primary, edhrec) sort key, so the streamed/walk emission
-    // (per-card-contiguous) and a naive global (key, pid) sort agree; colliding ranks would let
-    // them legitimately differ on cross-card full ties, which never occur in practice.
+    // Distinct edhrec ranks AND distinct names (both shuffled), as real data has. The names are
+    // what matters now: `sort_key_bits`' tiebreak lane is `name_rank`, so distinct names are what
+    // keep any two cards from sharing a full (primary, tiebreak) sort key — which is what lets the
+    // streamed/walk emission (per-card-contiguous) and a naive global (key, pid) sort agree.
+    // Colliding names would let them legitimately differ on cross-card full ties, exactly as
+    // colliding edhrec ranks used to. edhrec stays distinct because it is still a sort COLUMN here.
     let mut ranks: Vec<u32> = (0..n_cards as u32).collect();
     for i in (1..n_cards).rev() {
         ranks.swap(i, rng.random_range(0..=i));
+    }
+    let mut names: Vec<u32> = (0..n_cards as u32).collect();
+    for i in (1..n_cards).rev() {
+        names.swap(i, rng.random_range(0..=i));
     }
     let mut cards = Vec::with_capacity(n_cards);
     for i in 0..n_cards {
         let mut c = stub_card(i as u128, 0, &[], &mut vocab);
         c.edhrec_rank = Some(ranks[i]);
         c.cmc = Some(rng.random_range(0..8u8));
+        c.card_name_lower = InlineStr::from_str(&format!("card{:05}", names[i]));
         cards.push(c);
     }
+    assign_name_ranks(&mut cards, &[]);
     let counts: Vec<usize> = (0..n_cards).map(|_| rng.random_range(1..=4)).collect();
     let mut data = store_of(cards, &counts, vocab);
     // cents; 5000 == $50.00, which usd<50 excludes (strict). Hot values 15/100 form big buckets.
@@ -11392,6 +11502,101 @@ fn arith_tuple_key_budget_catches_a_blown_domain() {
 /// clears `10*sqrt(n)+32` by a wide margin.
 const ARITH_TUPLE_BLOWUP_CARDS: usize = 6_000;
 
+#[test]
+fn exact_name_matches_either_face() {
+    // `!"Lightning Bolt"` returns TWO cards on api.scryfall.com (2026-08-16): `Lightning Bolt` and
+    // `Emeritus of Conflict // Lightning Bolt` (sos/113), whose SECOND face carries the name. The
+    // same rule answers `!"Fire"` with `Fire // Ice`, `!"Stomp"` with `Bonecrusher Giant // Stomp`
+    // and `!"Insectile Aberration"` with `Delver of Secrets // Insectile Aberration`.
+    //
+    // The needle arrives COLLATED (`collate_name(fold_accents(value.lower()))`, done in Python),
+    // which is why `!"lim-dul's vault"` and `!"limduls vault"` are the same search on Scryfall —
+    // and the stored side is collated here, per face, before the comparison.
+    use super::filter::exact_name_matches;
+    let joined = "emeritus of conflict // lightning bolt";
+    assert!(exact_name_matches(joined, "emeritusofconflictlightningbolt"));
+    assert!(exact_name_matches(joined, "lightningbolt"), "the back face names the card");
+    assert!(exact_name_matches(joined, "emeritusofconflict"), "so does the front face");
+    assert!(exact_name_matches("lightning bolt", "lightningbolt"));
+    // The separators are gone from the needle too, so the punctuation a searcher skips no longer
+    // decides the answer. The STORED side arrives already accent-folded (`folded_name`), so
+    // "Lim-Dûl's Vault" reaches here as "lim-dul's vault" and all four spellings of it — with or
+    // without the circumflex, with or without the hyphen and apostrophe — collate to one string.
+    assert!(exact_name_matches("lim-dul's vault", "limdulsvault"));
+    // Still EXACT, per face: a prefix, a suffix or a substring of a face name is not a match.
+    assert!(!exact_name_matches(joined, "lightning"));
+    assert!(!exact_name_matches(joined, "bolt"));
+    assert!(!exact_name_matches(joined, "conflictlightningbolt"));
+    assert!(!exact_name_matches("lightning bolt", "lightningbol"));
+    // A one-sided separator is not the join, so nothing splits on it.
+    assert!(!exact_name_matches("who//what//when", "what"));
+}
+
+#[test]
+fn exact_name_narrow_finds_a_back_face_and_declines_where_it_cannot() {
+    // The narrowing half of the same bug: the ascending name permutation only addresses whole-name
+    // equality, so a card named by its BACK face was dropped before the walk could verify it. The
+    // folded-name trigram index reaches it; a needle that index cannot speak for (under three
+    // bytes, or non-ASCII against a folded index) declines to narrow instead of narrowing wrongly.
+    let mut vocab = VocabInterner::new();
+    let names = ["lightning bolt", "emeritus of conflict // lightning bolt", "fog", "ow"];
+    let mut cards: Vec<OracleCard> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let mut c = stub_card((i + 1) as u128, TYPE_CREATURE, &[], &mut vocab);
+            c.card_name_lower = InlineStr::from_str(name);
+            c
+        })
+        .collect();
+    assign_name_ranks(&mut cards, &[]);
+    let mut data = store_of(cards, &[1; 4], vocab);
+    data.indexes.sort_perms = build_sort_permutations(&data.cards);
+    data.indexes.name_trigram = build_trigram_index(&data.cards, |c| crate::collated_name_of(c, &data.strings));
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+
+    let narrow = |name: &str| {
+        super::narrow_rec(
+            &FilterExpr::ExactName(name.to_string()),
+            &archived.indexes,
+            &archived.offsets,
+            &archived.cards,
+            &archived.strings,
+            false,
+        )
+    };
+    let cards_of = |n: super::Narrowed| {
+        let mut got = n.set.into_cards(&archived.offsets, &archived.indexes.printing_to_card);
+        got.sort_unstable();
+        got
+    };
+
+    let n = narrow("lightningbolt").expect("must narrow");
+    assert!(n.tight);
+    assert_eq!(cards_of(n), vec![0, 1], "both the card and the card whose back face is named");
+    let n = narrow("emeritusofconflict").expect("must narrow");
+    assert_eq!(cards_of(n), vec![1]);
+    let n = narrow("fog").expect("must narrow");
+    assert_eq!(cards_of(n), vec![2]);
+    let n = narrow("nosuchcard").expect("must narrow");
+    assert_eq!(cards_of(n), Vec::<u32>::new());
+
+    // Under three bytes there is no trigram window, so there is nothing to narrow through and the
+    // walk scans — declining is the only sound answer, and it still finds the card.
+    assert!(narrow("ow").is_none());
+    // Likewise a non-ASCII needle: folding only guarantees an ASCII substring survives.
+    assert!(narrow("éowyn").is_none());
+
+    // Whatever the narrow does, run_query agrees with a full scan.
+    for name in ["lightning bolt", "emeritus of conflict", "ow", "no such card"] {
+        let mut f = FilterExpr::ExactName(name.to_string());
+        let brute = archived.cards.iter().filter(|c| f.eval_card(c, &archived.strings) == Tri::True).count();
+        let (total, _) = run_query(&QueryCtx::from(archived), &mut f, None, "card", "default", "edhrec", "asc", 100, 0);
+        assert_eq!(total, brute, "totals parity for {name:?}");
+    }
+}
+
 // ─── Face storage ─────────────────────────────────────────────────────────────
 
 /// Two faces whose text and art both differ, so a merge-shaped answer cannot fake it.
@@ -11423,8 +11628,8 @@ fn two_faces() -> (Vec<OracleFace>, Vec<PrintingFace>) {
         },
     ];
     let printing = vec![
-        PrintingFace { illustration_id: 0xAAAA, card_artist_vid: 1, card_artist_name_id: NONE_STR, flavor_text_id: 7 },
-        PrintingFace { illustration_id: 0xBBBB, card_artist_vid: 2, card_artist_name_id: NONE_STR, flavor_text_id: NONE_STR },
+        PrintingFace { illustration_id: 0xAAAA, card_artist_vid: 1, card_artist_name_id: NONE_STR, flavor_text_id: 7, flavor_name_id: NONE_STR },
+        PrintingFace { illustration_id: 0xBBBB, card_artist_vid: 2, card_artist_name_id: NONE_STR, flavor_text_id: NONE_STR, flavor_name_id: NONE_STR },
     ];
     (oracle, printing)
 }
@@ -11570,6 +11775,75 @@ fn the_id_permutation_is_a_permutation() {
     assert_eq!(perm.len(), ids.len());
     perm.sort_unstable();
     assert_eq!(perm, (0..ids.len() as u32).collect::<Vec<_>>());
+}
+
+#[test]
+fn set_type_matches_through_the_compat_vocab() {
+    // `st:` is `lang:`'s shape: both live in the compat blob rather than a column, both intern
+    // into coll_vocab, and both resolve to an id in bind() so tri() is one integer equality. This
+    // pins the three answers that shape has to give — hit, miss, and "no set type recorded".
+    let leaf = |value: &str| {
+        super::build_filter(&serde_json::json!({
+            "node_type": "CardBinaryOperatorNode",
+            "kwargs": {
+                "op": ":",
+                "lhs": {"node_type": "CardAttributeNode", "kwargs": {"attribute_name": "card_set_type", "original_attribute": "st"}},
+                "rhs": {"node_type": "StringValueNode", "kwargs": {"value": value}},
+            }
+        }))
+        .expect("st: must build")
+    };
+
+    // Scryfall spells the multi-word types with underscores and accepts the hyphen too.
+    match leaf("Draft-Innovation") {
+        FilterExpr::SetTypeMatch { value, vid } => {
+            assert_eq!(value, "draft_innovation", "hyphens fold to underscores, and the value lowercases");
+            assert!(vid.is_none(), "unbound: bind() is what resolves the vocab id");
+        }
+        other => panic!("st: built a {:?}, not SetTypeMatch", std::mem::discriminant(&other)),
+    }
+
+    // Ordered comparisons are not a thing on a string column, exactly as on lang:.
+    let ordered = serde_json::json!({
+        "node_type": "CardBinaryOperatorNode",
+        "kwargs": {
+            "op": ">=",
+            "lhs": {"node_type": "CardAttributeNode", "kwargs": {"attribute_name": "card_set_type", "original_attribute": "st"}},
+            "rhs": {"node_type": "StringValueNode", "kwargs": {"value": "promo"}},
+        }
+    });
+    assert!(super::build_filter(&ordered).is_err(), "st:>= must decline, like lang:");
+
+    // Evaluation, against a printing that carries a set type and one that does not.
+    let mut vocab = VocabInterner::new();
+    let masterpiece = vocab.intern("masterpiece".to_string()).unwrap();
+    let mut card = stub_card(1, TYPE_CREATURE, &[], &mut vocab);
+    card.card_name_lower = InlineStr::from_str("kozilek");
+    let mut data = store_of(vec![card], &[2], vocab);
+    data.printings[0].compat.set_type_id = masterpiece;
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let bind = |f: &mut FilterExpr| {
+        f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    };
+
+    let mut hit = leaf("masterpiece");
+    bind(&mut hit);
+    assert!(hit.eval_printing(&archived.cards[0], &archived.printings[0], &archived.strings) == Tri::True);
+    assert!(
+        hit.eval_printing(&archived.cards[0], &archived.printings[1], &archived.strings) == Tri::Null,
+        "a printing with no set type is SQL NULL, not False"
+    );
+    assert!(
+        hit.eval_card(&archived.cards[0], &archived.strings) == Tri::PrintingDep,
+        "the set type is the PRINTING's set, so it cannot settle at card level"
+    );
+
+    // A value no loaded printing carries binds to None and matches nothing — not everything.
+    let mut absent = leaf("vanguard");
+    bind(&mut absent);
+    assert!(matches!(absent, FilterExpr::SetTypeMatch { vid: None, .. }));
+    assert!(absent.eval_printing(&archived.cards[0], &archived.printings[0], &archived.strings) == Tri::False);
 }
 
 // ─── Compat residue ───────────────────────────────────────────────────────────
@@ -11760,17 +12034,17 @@ fn printings_without_relations_carry_none() {
 
 // ─── Fuzzy name matching ──────────────────────────────────────────────────────
 
-/// `trigrams_into` is a hand-rolled restatement of `trigrams`'s padded-window definition that
-/// avoids materialising the `"  word "` buffer, so the two must agree EXACTLY — a single dropped
-/// or extra window would shift every fuzzy score without failing anything else.
+/// `fuzzy_score_cleared` is a hand-rolled restatement of the metric that skips work two ways (the
+/// Jaccard prefilter, the size-ratio ceiling) and merges sorted runs instead of intersecting
+/// sets. It must agree EXACTLY with `fuzzy_similarity`, the reference statement — a single
+/// dropped window or an over-eager skip would shift every fuzzy score without failing anything
+/// else.
 ///
-/// The word lengths are the interesting axis: 1 and 2 bytes are the cases where the padded form is
-/// shorter than a full 3-window and the leading/trailing windows overlap, which is precisely where
-/// an off-by-one would hide.
+/// Lengths 1 and 2 are the interesting axis: they are the cases with no full 3-window, where the
+/// NUL padding is the only thing keeping two short strings from colliding.
 #[test]
-fn trigrams_into_matches_the_padded_definition() {
-    let mut buf = Vec::new();
-    for s in [
+fn fuzzy_score_matches_the_reference() {
+    let cases = [
         "",
         "a",
         "ab",
@@ -11783,38 +12057,68 @@ fn trigrams_into_matches_the_padded_definition() {
         "  leading and trailing  ",
         "!!! ??? ---",
         "eowyn",
-        "\u{e9}owyn",
         "fire // ice",
         "x",
         "aaaa aaaa",
-        "\u{c6}therling",
-    ] {
-        crate::trigrams_into(s, &mut buf);
-        let want: Vec<[u8; 3]> = crate::trigrams(s).into_iter().collect();
-        assert_eq!(buf, want, "trigrams_into disagrees with trigrams for {s:?}");
+        "lightning bolt",
+        "bolt lightning",
+        "blightning",
+        "counterspell",
+        "counters",
+    ];
+    let mut dp = Vec::new();
+    let (mut ab, mut bb) = (Vec::new(), Vec::new());
+    let (mut at, mut bt) = (Vec::new(), Vec::new());
+    for a in cases {
+        for b in cases {
+            crate::fold_separators_into(a, &mut ab);
+            crate::fold_separators_into(b, &mut bb);
+            crate::name_trigrams_into(&ab, &mut at);
+            crate::name_trigrams_into(&bb, &mut bt);
+            let want = crate::fuzzy_similarity(a, b);
+            // Floor 0.0 asks for the score whenever one exists, so the skips are exercised
+            // against the reference rather than hidden behind them.
+            let got = crate::fuzzy_score_cleared(&at, &bt, &ab, &bb, 0.0, &mut dp);
+            match got {
+                Some(score) => assert!((score - want).abs() < 1e-6, "{a:?} vs {b:?}: {score} != {want}"),
+                None => assert_eq!(want, 0.0, "{a:?} vs {b:?}: skipped a nonzero score {want}"),
+            }
+        }
     }
 }
 
+/// The metric itself, on the needles that fixed it. Hand-computed from the definition in lib.rs's
+/// module comment: J over the whole folded string's 3-byte windows, averaged with normalized
+/// Levenshtein.
 #[test]
-fn trigram_similarity_matches_pg_trgm() {
-    // pg_trgm pads each word "  word " and windows over it, so "abc" yields exactly
-    // {"  a", " ab", "abc", "bc "}. Identical strings therefore score 1.0.
-    assert!((trigram_similarity("abc", "abc") - 1.0).abs() < 1e-6);
+fn fuzzy_similarity_is_the_derived_metric() {
+    // Identical strings score 1.0, and separators are not characters.
+    assert!((fuzzy_similarity("abc", "abc") - 1.0).abs() < 1e-6);
+    assert!((fuzzy_similarity("urza's bauble", "urza s bauble") - 1.0).abs() < 1e-6);
 
-    // "abc" vs "abd": {"  a"," ab","abc","bc "} vs {"  a"," ab","abd","bd "}.
-    // shared 2, union 4 + 4 - 2 = 6, so 1/3. Hand-computed against pg_trgm's definition.
-    assert!((trigram_similarity("abc", "abd") - 1.0 / 3.0).abs() < 1e-6);
-
-    // Non-alphanumerics are separators, not characters: punctuation between words changes nothing.
-    assert!((trigram_similarity("urza's bauble", "urza s bauble") - 1.0).abs() < 1e-6);
+    // THE NEEDLE THAT DISPROVED pg_trgm. Word-set similarity scores `bolt lightning` against
+    // `Lightning Bolt` at 1.0, so Blightning could never win; Scryfall answers Blightning, and so
+    // does this metric. Measured on api.scryfall.com 2026-08-16.
+    let blightning = fuzzy_similarity("bolt lightning", "blightning");
+    let bolt = fuzzy_similarity("bolt lightning", "lightning bolt");
+    assert!(blightning > bolt, "bolt lightning: Blightning {blightning} must beat Lightning Bolt {bolt}");
 
     // Nothing in common scores 0, and an empty side scores 0 rather than dividing by zero.
-    assert_eq!(trigram_similarity("abc", "xyz"), 0.0);
-    assert_eq!(trigram_similarity("", "abc"), 0.0);
-    assert_eq!(trigram_similarity("", ""), 0.0);
+    assert_eq!(fuzzy_similarity("abc", "xyz"), 0.0);
+    assert_eq!(fuzzy_similarity("", "abc"), 0.0);
+    assert_eq!(fuzzy_similarity("", ""), 0.0);
 
-    // Symmetric, as Jaccard is.
-    assert_eq!(trigram_similarity("lightning", "lightnin"), trigram_similarity("lightnin", "lightning"));
+    // Symmetric, as both halves are.
+    assert_eq!(fuzzy_similarity("lightning", "lightnin"), fuzzy_similarity("lightnin", "lightning"));
+
+    // The fitted floor admits the needles Scryfall resolves and rejects the ones it calls
+    // ambiguous or not_found — the plateau's two edges, on real names.
+    assert!(fuzzy_similarity("counterspellxxxxxxxxxx", "counterspell") >= crate::FUZZY_SCORE_FLOOR);
+    assert!(fuzzy_similarity("lihgtning bolt", "lightning bolt") >= crate::FUZZY_SCORE_FLOOR);
+    assert!(fuzzy_similarity("sol rin", "sol ring") >= crate::FUZZY_SCORE_FLOOR);
+    assert!(fuzzy_similarity("ring sol", "sol ring") < crate::FUZZY_SCORE_FLOOR);
+    assert!(fuzzy_similarity("red ego", "altered ego") < crate::FUZZY_SCORE_FLOOR);
+    assert!(fuzzy_similarity("bolt", "boltwave") < crate::FUZZY_SCORE_FLOOR);
 }
 
 /// The by-name lookups narrow through `name_trigram`, and narrowing must not change the answer.
@@ -11846,7 +12150,12 @@ fn name_lookups_agree_with_and_without_the_trigram_index() {
     // `store_of` does not build `name_trigram`, so this one takes the full-scan path.
     let scan_data = fixture();
     let mut idx_data = fixture();
-    idx_data.indexes.name_trigram = build_trigram_index(&idx_data.cards, |c| crate::folded_name_of(c, &[]));
+    // COLLATED, which is what the production build writes into this index and what
+    // `name_scan_candidates` collates its needle for. Building it over the folded name instead
+    // would make the narrowed path answer nothing for every needle with a space in it -- which is
+    // exactly the disagreement this differential test exists to catch.
+    idx_data.indexes.name_trigram =
+        build_trigram_index(&idx_data.cards, |c| crate::collated_name_of(c, &idx_data.strings));
 
     let scan_bytes = rkyv::to_bytes::<Error>(&scan_data).expect("serialize");
     let scan = rkyv::access::<Archived<CardData>, Error>(&scan_bytes).expect("access");
@@ -11904,7 +12213,7 @@ fn a_typo_resolves_to_the_intended_card() {
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
-    match fuzzy_name_match(a, "lightnig bolt", 0.4, 0.05) {
+    match fuzzy_name_match(a, "lightnig bolt", crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD) {
         FuzzyOutcome::Hit { cid, vpid } => {
             assert_eq!(cid, 0, "a one-letter typo still finds Lightning Bolt");
             assert_eq!(vpid, 0, "an English hit carries the card's preferred printing");
@@ -11912,17 +12221,23 @@ fn a_typo_resolves_to_the_intended_card() {
         _ => panic!("expected a hit"),
     }
     // Nothing close enough clears the floor.
-    assert!(matches!(fuzzy_name_match(a, "zzzzzzzz", 0.4, 0.05), FuzzyOutcome::Miss));
+    assert!(matches!(fuzzy_name_match(a, "zzzzzzzz", crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD), FuzzyOutcome::Miss));
 }
 
 #[test]
 fn two_close_names_are_ambiguous_not_a_guess() {
     // Scryfall reports `ambiguous` rather than picking, and collapsing that to "not found" would
     // tell the client the card does not exist.
-    let data = named_cards_store(&["fire dragon", "fire dragoon"]);
+    //
+    // The pair is SYMMETRIC around the needle — "fire dragen" is one substitution from each, and
+    // each differs from it in the same three trigrams — so the two score identically and neither
+    // can lead. An asymmetric near-miss like "fire dragoon" (two edits, one more trigram) is NOT
+    // ambiguous under the derived metric and must not be used here: it loses by 0.068, which is
+    // the metric working rather than a tie.
+    let data = named_cards_store(&["fire dragon", "fire dragan"]);
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
-    assert!(matches!(fuzzy_name_match(a, "fire dragen", 0.4, 0.05), FuzzyOutcome::Ambiguous));
+    assert!(matches!(fuzzy_name_match(a, "fire dragen", crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD), FuzzyOutcome::Ambiguous));
 }
 
 #[test]
@@ -11932,7 +12247,7 @@ fn printings_of_one_card_do_not_look_ambiguous() {
     let data = named_cards_store(&["lightning bolt", "lightning bolt", "lightning bolt"]);
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
-    assert!(matches!(fuzzy_name_match(a, "lightning bolt", 0.4, 0.05), FuzzyOutcome::Hit { .. }));
+    assert!(matches!(fuzzy_name_match(a, "lightning bolt", crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD), FuzzyOutcome::Hit { .. }));
 }
 
 #[test]
@@ -12111,7 +12426,7 @@ fn bilingual_store() -> (CardData, u16, u16) {
     data.indexes.langs = build_lang_index(&data.printings, &data.coll_vocab);
     data.indexes.foreign_langs = build_lang_index(&data.foreign, &data.coll_vocab);
     data.indexes.foreign_to_card = build_printing_to_card(&data.foreign_offsets);
-    data.indexes.printed_names = build_printed_name_index(&data.printings, &data.foreign, &data.strings);
+    data.indexes.printed_names = build_printed_name_index(&data.printings, &data.foreign, &data.strings, |p| p.printed_name_folded_id);
     (data, en, fr)
 }
 
@@ -12159,6 +12474,67 @@ fn include_multilingual_rolls_up_to_the_canonical_row() {
 /// than past every number, and `e:unk` answers `CAa, CAb, UB, CA01, ...`, so a digit-free number
 /// leads. Three shapes, one rule: integer first (9 before 10 — not a string sort), raw string
 /// breaking equal integers ("40" before "A-40" — not an integer sort), absent integer first.
+/// `order=artist` collates like `order=name` — the space is not a character.
+///
+/// Measured 2026-08-16 over 348 adjacent pairs from `e:khm` and `e:ltr` ordered by artist:
+/// stripping non-alphanumerics has 0 violations, raw byte order has 4. Each of those four is a
+/// pair where a space decides — `Alexander Mokhov` before `Alex Konstad`, `Steven Belledin`
+/// before `Steve Prescott`, `Daniel Zrom` before `Dan Murayama Scott` — and byte order gets every
+/// one of them backwards, because a space sorts below every letter.
+#[test]
+fn assign_artist_ranks_collates_like_a_name() {
+    let vocab_names = ["alex konstad", "alexander mokhov", "steve prescott", "steven belledin"];
+    // `CardData.artist_vocab_collated` is collated at BUILD now — `a:` matches against it as well
+    // as `order=artist` ranking on it — so the collation happens here rather than inside
+    // assign_artist_ranks. The ordering this asserts is unchanged.
+    let artist_vocab: Vec<String> = vocab_names.iter().map(|s| crate::collate_name(s)).collect();
+    let mut vocab = VocabInterner::new();
+    let mut printings: Vec<Printing> = (0..4)
+        .map(|i| {
+            let mut p = stub_printing(i as u128, i as u128, None);
+            p.card_artist_vid = i as u16;
+            p
+        })
+        .collect();
+    let _ = &mut vocab;
+    let mut none: Vec<Printing> = Vec::new();
+    assign_artist_ranks(&mut printings, &mut none, &artist_vocab);
+
+    let mut order: Vec<(u32, &str)> = printings.iter().zip(vocab_names).map(|(p, n)| (p.artist_rank, n)).collect();
+    order.sort_by_key(|&(r, _)| r);
+    assert_eq!(
+        order.iter().map(|&(_, n)| n).collect::<Vec<_>>(),
+        ["alexander mokhov", "alex konstad", "steven belledin", "steve prescott"],
+        "the space is dropped, so `alexander` beats `alexk` and `stevenb` beats `stevep`"
+    );
+}
+
+/// A card's annex rows are STORED in language order, which is the order Scryfall serves them in.
+///
+/// Measured 2026-08-16: `e:khm cn:1 include_multilingual=true` answers en, de, es, fr, it, ja, ko,
+/// pt, ru, zhs, zht. English is canonical and lives in the other space, so what has to be arranged
+/// here is the alphabetical tail — and it must beat prefer order, which is what it replaces: the
+/// fixture gives the LAST language alphabetically the best prefer score, so a prefer-desc store
+/// would put it first.
+#[test]
+fn the_annex_is_stored_in_language_order() {
+    let mut vocab = VocabInterner::new();
+    let ja = vocab.intern("ja".to_string()).expect("ja");
+    let de = vocab.intern("de".to_string()).expect("de");
+    let pt = vocab.intern("pt".to_string()).expect("pt");
+    let coll_vocab = vocab.strings.clone();
+    let row = |scry: u128, lang: u16, prefer: f32| {
+        let mut p = stub_printing(scry, scry, Some(prefer));
+        p.compat.lang_id = lang;
+        p
+    };
+    // Arrival order is prefer-desc, and it disagrees with language order on every pair.
+    let mut foreign = vec![row(1, pt, 90.0), row(2, ja, 80.0), row(3, de, 70.0)];
+    order_annex_by_language(&mut foreign, &[0, 3], &coll_vocab);
+    let langs: Vec<&str> = foreign.iter().map(|p| coll_vocab[p.compat.lang_id as usize].as_str()).collect();
+    assert_eq!(langs, ["de", "ja", "pt"], "alphabetical by code, not by prefer score");
+}
+
 #[test]
 fn assign_collector_ranks_follows_scryfalls_number_then_string() {
     let numbers = ["41", "A-40", "40", "10", "9", "UB"];
@@ -12222,7 +12598,7 @@ fn cross_set_language_store() -> (CardData, u16, u16) {
     data.indexes.langs = build_lang_index(&data.printings, &data.coll_vocab);
     data.indexes.foreign_langs = build_lang_index(&data.foreign, &data.coll_vocab);
     data.indexes.foreign_to_card = build_printing_to_card(&data.foreign_offsets);
-    data.indexes.printed_names = build_printed_name_index(&data.printings, &data.foreign, &data.strings);
+    data.indexes.printed_names = build_printed_name_index(&data.printings, &data.foreign, &data.strings, |p| p.printed_name_folded_id);
     (data, en, ja)
 }
 
@@ -12259,21 +12635,24 @@ fn a_language_pick_follows_the_english_row_in_the_querys_own_set() {
     assert_eq!(u128::from(page[0].1.scryfall_id), 1, "clb 865 is still the card's own pick");
 }
 
+/// A foreign printed name gets NO TYPO TOLERANCE from this scan, and that is Scryfall's rule
+/// rather than a simplification. Measured on api.scryfall.com 2026-08-16: `fuzzy=blitzschlag`
+/// resolves the German printing of Lightning Bolt and `fuzzy=blitzschlagg` answers 404;
+/// `fuzzy=ego a deriva` resolves the Portuguese printing of Unmoored Ego and `fuzzy=ego a derva`
+/// answers 404. Printed names reach `?fuzzy=` through the EXACT and CONTAINMENT stages, which
+/// index them; this scan reads oracle names, which also takes ~247k records off its hot path.
 #[test]
-fn a_foreign_printed_name_fuzzy_matches_to_its_printing() {
+fn a_foreign_printed_name_gets_no_typo_tolerance() {
     let (data, _, _) = bilingual_store();
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
-    match fuzzy_name_match(a, "eclair de fouder", 0.4, 0.05) {
-        FuzzyOutcome::Hit { cid, vpid } => {
-            assert_eq!(cid, 0);
-            assert_eq!(vpid, 1, "the annex printing (vpid = n_printings + 0), not the English row");
-        }
-        _ => panic!("expected a foreign-name hit"),
-    }
+    assert!(matches!(
+        fuzzy_name_match(a, "eclair de fouder", crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD),
+        FuzzyOutcome::Miss
+    ));
     // The card's own English and foreign names are ONE answer, never ambiguous with each other.
-    assert!(matches!(fuzzy_name_match(a, "lightning bolt", 0.4, 0.05), FuzzyOutcome::Hit { .. }));
+    assert!(matches!(fuzzy_name_match(a, "lightning bolt", crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD), FuzzyOutcome::Hit { .. }));
 }
 
 #[test]
@@ -12326,4 +12705,44 @@ fn an_annex_only_oracle_is_dropped_not_panicked() {
     assert_eq!((dropped, rows_dropped), (2, 3));
     // The accounting invariant reload_commit asserts: canonical + annex + dropped == staged.
     assert_eq!(printings.len() + foreign.len() + rows_dropped, 5);
+}
+
+/// `assign_single_set_flags` counts SETS, over the canonical rows AND the annex.
+///
+/// Three cards, each breaking a different wrong rule. A: two printings, one set — unique, so
+/// "prints == 1" is not it (`!"Forest"` is the real-corpus shape: two lea printings, one set).
+/// B: one English set plus an annex row in a set of its own — NOT unique, the case a
+/// canonical-only walk gets wrong on 130 real cards (the Salvat inserts, ps11, pmei, none of
+/// which api.scryfall.com calls unique). C: a canonical row and an annex row in the SAME set —
+/// unique, so the annex cannot simply be counted either.
+#[test]
+fn single_set_counts_sets_across_the_annex() {
+    let mut vocab = VocabInterner::new();
+    let mut cards = vec![
+        stub_card(1, 0, &[], &mut vocab),
+        stub_card(2, 0, &[], &mut vocab),
+        stub_card(3, 0, &[], &mut vocab),
+    ];
+    let set = |p: &mut Printing, code: &str| p.card_set_code = InlineStr::from_str(code);
+    let mut canonical = vec![
+        stub_printing(1, 1, None),
+        stub_printing(2, 2, None),
+        stub_printing(3, 3, None),
+        stub_printing(4, 4, None),
+    ];
+    set(&mut canonical[0], "aaa");
+    set(&mut canonical[1], "aaa");
+    set(&mut canonical[2], "aaa");
+    set(&mut canonical[3], "aaa");
+    let offsets = vec![0u32, 2, 3, 4];
+    let mut foreign = vec![stub_printing(5, 5, None), stub_printing(6, 6, None)];
+    set(&mut foreign[0], "bbb"); // B's annex row, in a set of its own
+    set(&mut foreign[1], "aaa"); // C's annex row, in the set C already has
+    let foreign_offsets = vec![0u32, 0, 1, 2];
+
+    assign_single_set_flags(&mut cards, &canonical, &offsets, &foreign, &foreign_offsets);
+
+    assert!(cards[0].single_set, "two printings of one set is still one set");
+    assert!(!cards[1].single_set, "an annex-only second set disqualifies it");
+    assert!(cards[2].single_set, "an annex row in the same set changes nothing");
 }

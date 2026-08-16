@@ -69,8 +69,8 @@ def rarity_text_to_int(rarity_text: str) -> int:
         "common": 0,
         "uncommon": 1,
         "rare": 2,
-        "mythic": 3,
-        "special": 4,
+        "special": 3,
+        "mythic": 4,
         "bonus": 5,
     }
     return rarity_map.get(rarity_text.lower(), -1)
@@ -138,6 +138,10 @@ _FACE_OBJECT_FIELDS = (
     # line and NOTHING else — and _face_records keeps absent keys absent, so the absence
     # round-trips exactly instead of becoming null or borrowed English.
     "printed_name",
+    # Scryfall's face key order is name -> flavor_name -> mana_cost, verified live on vow/338
+    # (transform) and sld/1079 (reversible_card) 2026-08-16. A printing carries the flavor name at
+    # the CARD level or on its faces, never both.
+    "flavor_name",
     "mana_cost",
     "type_line",
     "printed_type_line",
@@ -170,6 +174,21 @@ def _face_records(card_faces: list[dict[str, Any]]) -> list[dict[str, Any]]:
         agree key-for-key.
     """
     return [{field: face[field] for field in _FACE_OBJECT_FIELDS if field in face} for face in card_faces]
+
+
+def _fold_name(value: str | None) -> str | None:
+    """Lowercase and accent-fold a name for the engine's name indexes, or None.
+
+    The same fold `card_name_folded` and `printed_name_folded` use, factored out because
+    `flavor_name_folded` is a third caller and the three must agree exactly.
+
+    Args:
+        value: The name as Scryfall sent it, or None when the key was absent.
+
+    Returns:
+        The folded name, or None when there was none to fold.
+    """
+    return fold_accents(value.lower()) if value else None
 
 
 def _printed_name_folded(card: dict[str, Any], face_records: list[dict[str, Any]]) -> str | None:
@@ -272,6 +291,56 @@ def _merge_processed_faces(faces: list[dict[str, Any]]) -> dict[str, Any]:
     return merged
 
 
+# The `layout` values whose printings Scryfall hides from a default `/cards/search`, plus the two
+# non-layout signals that do the same job. Scryfall's own `is:extra` is 6,054 cards; this reaches
+# 5,873 distinct English cards, within 3% of it — and, unlike a playability filter, it is a
+# statement about the PRINTING, which is what the hiding actually tracks.
+#
+# `host` AND `augment` WERE HERE AND ARE WRONG. Unstable's Hosts and Augments are ORDINARY search
+# results: `is:extra e:ust` answers 0 on api.scryfall.com while this set counted 32, and bare
+# `e:ust` answers Unstable's full English count either way. The two layouts are unusual card FACES,
+# not printings Scryfall hides — which is the distinction this set is supposed to draw. Measured
+# 2026-08-16; 46 printings across ust/und/ulst stop carrying `is:extra`.
+_EXTRA_LAYOUTS = frozenset({"token", "double_faced_token", "emblem", "planar", "scheme", "vanguard", "art_series", "front_card"})
+
+
+def _is_extra(card: dict[str, Any]) -> bool:
+    """Whether Scryfall hides this printing from a default `/cards/search` — the `is:extra` class.
+
+    See `preprocess_card` for the per-class probe that decided each half of this.
+
+    Args:
+        card: The bulk card object.
+
+    Returns:
+        True when the printing should carry `is:extra`.
+    """
+    if card.get("layout") in _EXTRA_LAYOUTS:
+        return True
+    if card.get("set_type") == "memorabilia":
+        return True
+    # `content_warning` — the flag Scryfall sets on the printings it will not show unasked. It is an
+    # EXTRAS signal and nothing else here catches it: 91 printings across the bulk (25 English), all
+    # layout `normal`, all ordinary type lines, all legal somewhere. Missing it made nine sets look
+    # extras-free that Scryfall auto-enables `include_extras` for — lea's only extra IS a
+    # content-warning card (Crusade), and 2ed/3ed/4ed/5ed/6ed/sum/leg/arn/ddf/me1/me3/ced/cei/prm
+    # are the same story. Measured 2026-08-16: `is:extra e:lea` answers 1.
+    if card.get("content_warning") is True:
+        return True
+    # A "Card"/"Token" TYPE LINE, for the printings whose layout does not already say so: the
+    # checklist and substitute-card family ships as layout `normal` in some sets.
+    type_line = card.get("type_line")
+    if type_line:
+        card_types, _ = parse_type_line(type_line)
+        if any(t in {"Card", "Token"} for t in card_types):
+            return True
+    # A playtest promo, EXCEPT where the printing is otherwise playable: sld/SCTLR Counterspell
+    # carries `playtest`, is legal in modern, and is returned by a bare
+    # `!"Counterspell"&unique=prints` — so the flag alone hides nothing.
+    never_legal = not set(card["legalities"].values()) & {"legal", "restricted"}
+    return "playtest" in card.get("promo_types", []) and never_legal
+
+
 def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0915,C901,PLR0912
     """Preprocess a card to remove invalid cards and add necessary fields.
 
@@ -280,28 +349,42 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
     `_merge_processed_faces`. Single-faced cards return a list with one dictionary.
     Returns an empty list for invalid/filtered cards.
     """
-    if not set(card["legalities"].values()) & {"legal", "restricted"}:
-        return []
-    if "playtest" in card.get("promo_types", []):
-        return []
-    if "paper" not in card.get("games", []):
-        return []
-    if card.get("set_type") == "funny":
-        return []
-
-    # Filter out unplayable cards: Cards and Tokens
-    type_line = card.get("type_line")
-    if type_line:
-        card_types, card_subtypes = parse_type_line(type_line)
-        if "Card" in card_types or "Token" in card_types:
-            return []
-
-    # Filter out "X // X" cards (same name on both faces, e.g. "Name // Name")
-    card_name = card.get("name", "")
-    if "//" in card_name:
-        left_name, _, right_name = card_name.partition("//")
-        if left_name.strip() == right_name.strip():
-            return []
+    # NOTHING IS FILTERED OUT HERE ANY MORE, and the seven clauses that used to be are the
+    # `is:extra` predicate `_is_extra` answers instead.
+    #
+    # Every class this function refused is SERVED by api.scryfall.com, and four of them are hidden
+    # from a default `/cards/search` behind `include_extras=false` — a QUERY-TIME gate. Refusing
+    # the row cannot reproduce a query-time gate in either direction: `/cards/named?exact=`
+    # answered 200 for every single one of them, and `include_extras=true` had nothing to include.
+    # Probed one class at a time on 2026-08-16 (`q=!"<name>"` bare, then with the flag):
+    #
+    #   never-legal    !"Hold the Perimeter" (cn2/6)      200 bare       ORDINARY
+    #   funny          !"Bamboozling Beeble" (unf/37)     200 bare       ORDINARY
+    #                  !"Goblin Bowling Team" (ugl/44)    200 bare       ORDINARY (silver, never-legal)
+    #   "X // X"       !"Magmatic Hellkite // …" (tdm)    200 bare       ORDINARY (reversible_card)
+    #   playtest+legal sld/SCTLR Counterspell             in bare prints ORDINARY
+    #   memorabilia    !"Siren's Call"&unique=prints      8 bare, 12 with extras  EXTRA
+    #   type "Card"    !"The Monarch" (tmkc/31)           404 bare, 200 with      EXTRA
+    #   type "Token"   !"Goblin Army" (thob/4)            404 bare, 200 with      EXTRA
+    #   planar         !"Truga Jungle" (opc2/38)          404 bare, 200 with      EXTRA
+    #   playtest       !"Subgoyf" (mb2/536)               404 bare, 200 with      EXTRA
+    #
+    # The `games`-without-paper clause went the same way one commit earlier, for the stronger
+    # reason that nothing hides those at all: `q=!"A-Tyvar Kell"` answers khm/A-198 bare.
+    #
+    # +13,619 printings on the 2026-08-16 all_cards bulk (526,865 -> 540,484, +2.58%) and 2,986
+    # new oracle cards. It also empties the annex-only drop the engine carries: the three ja-4ED
+    # ante printings whose `oldschool: legal` left their oracle group with no canonical row now
+    # arrive as ordinary cards.
+    #
+    # DIVERGENCE FROM UPSTREAM'S IMPORT POLICY, ON PURPOSE — see the PR description. Upstream's
+    # corpus is the one its own SQL serves; this port's has to answer as Scryfall does.
+    # `is:extra` is a COMPUTED tag: no Scryfall field says "this printing is an extra", so it
+    # cannot ride BOOLEAN_IS_TAGS' one-shot sync from raw_card_blob (api_resource.py) the way
+    # `reserved` and `gamechanger` do. It is set here, on the row, and the merge below preserves
+    # it through the NOT NULL default.
+    if _is_extra(card):
+        card["card_is_tags"] = {**card.get("card_is_tags", {}), "extra": True}
 
     if "raw_card_blob" in card:
         # Already processed, don't need to re-process
@@ -353,9 +436,11 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
         # merged each face's own printed keys into its row, so without this the front face's
         # printed_name would masquerade as the card's — the per-face halves ride card_faces.
         merged_row["printed_name"] = card.get("printed_name")
+        merged_row["flavor_name"] = card.get("flavor_name")
         merged_row["printed_type_line"] = card.get("printed_type_line")
         merged_row["printed_text"] = card.get("printed_text")
         merged_row["printed_name_folded"] = _printed_name_folded(card, merged_row["card_faces"])
+        merged_row["flavor_name_folded"] = _fold_name(merged_row["flavor_name"])
         return [merged_row]
 
     # Single face case - set defaults
@@ -457,9 +542,16 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
     # key, so an upsert overrides any stale value instead of keeping it, same reasoning as the
     # creature stat columns above.
     card["printed_name"] = card.get("printed_name")
+    # Scryfall's `flavor_name`: the alternate name a printing is SOLD under (the Godzilla series,
+    # Stranger Things, the Secret Lair crossovers). PRINTING-level and quite separate from the
+    # printed triple — a printing may carry both — and `_folded` is the name-lookup key that makes
+    # `/cards/named?exact=Godzilla, Primeval Champion` resolve prm/80925, which it does on
+    # api.scryfall.com and did not here. The FACE-level variant rides card_faces.
+    card["flavor_name"] = card.get("flavor_name")
     card["printed_type_line"] = card.get("printed_type_line")
     card["printed_text"] = card.get("printed_text")
     card["printed_name_folded"] = _printed_name_folded(card, [])
+    card["flavor_name_folded"] = _fold_name(card["flavor_name"])
 
     mana_cost_text = card.get("mana_cost", "")
     card["mana_cost_jsonb"] = mana_cost_str_to_dict(mana_cost_text)

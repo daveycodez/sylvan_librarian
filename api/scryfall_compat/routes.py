@@ -302,11 +302,19 @@ _COLLECTION_UUID_KEYS = ("id", "oracle_id", "illustration_id")
 # exactly 30 with an ellipsis.
 _COLLECTION_ECHO_LIMIT = 30
 
-# Thresholds for the typo-tolerant stage of `?fuzzy=`. A candidate must score at least the floor,
-# and the best must lead the next distinct card name by at least the lead — closer than that and
-# the query does not identify either card, so it is `ambiguous` rather than a guess. The floor sits
-# deliberately above pg_trgm's default 0.3 similarity_threshold, so the index-assisted `%`
-# prefilter always admits a strict superset of what the floor keeps.
+# Thresholds for the SQL fallback's typo-tolerant `?fuzzy=` stage, which scores with pg_trgm. A
+# candidate must score at least the floor, and the best must lead the next distinct card name by at
+# least the lead — closer than that and the query does not identify either card, so it is
+# `ambiguous` rather than a guess. The floor sits deliberately above pg_trgm's default 0.3
+# similarity_threshold, so the index-assisted `%` prefilter always admits a strict superset of what
+# the floor keeps.
+#
+# THESE ARE NO LONGER THE ENGINE'S. The engine scores a different metric — Scryfall's, derived from
+# 86 probed needles; see card_engine's `Fuzzy name matching` module comment — with its own fitted
+# floor and lead, which it now supplies as the defaults of `fuzzy_card_by_name`. The two paths
+# therefore resolve a handful of needles differently (`fuzzy=bolt lightning` is Blightning through
+# the engine and Lightning Bolt through pg_trgm, and Scryfall says Blightning). That is deliberate:
+# the engine is the path that serves, and matching Scryfall is what this surface is for.
 FUZZY_SIMILARITY_FLOOR = 0.4
 FUZZY_SIMILARITY_LEAD = 0.05
 
@@ -1291,12 +1299,13 @@ class ScryfallCardsRoutes:
             pretty=pretty,
         )
 
-    def _best_printing(self, where: str, params: dict[str, Any]) -> dict[str, Any] | None:
+    def _best_printing(self, where: str, params: dict[str, Any], rank_first: str = "") -> dict[str, Any] | None:
         """Return the id and name of the best-scoring printing matching a predicate.
 
         Args:
             where: SQL predicate over `magic.cards AS card`.
             params: Bound parameters.
+            rank_first: An ORDER BY fragment ranked ABOVE prefer_score, ending in ", ".
 
         Returns:
             A row with scryfall_id and card_name, or None.
@@ -1304,7 +1313,7 @@ class ScryfallCardsRoutes:
         rows = self._run_query(
             query=(
                 f"SELECT scryfall_id, card_name FROM magic.cards AS card WHERE {where} "
-                "ORDER BY prefer_score DESC NULLS LAST, released_at DESC LIMIT 1"
+                f"ORDER BY {rank_first}prefer_score DESC NULLS LAST, released_at DESC LIMIT 1"
             ),
             params=params,
             explain=False,
@@ -1317,7 +1326,14 @@ class ScryfallCardsRoutes:
         base_clauses: list[str],
         base_params: dict[str, Any],
     ) -> dict[str, Any] | None:
-        """Return the card whose folded name is exactly the folded query, if there is one.
+        """Return the card one of whose names IS the query, separators aside, if there is one.
+
+        Separators do not count here either (see `_fuzzy_containment_candidates`):
+        `fuzzy=lightningbolt` answers Lightning Bolt on api.scryfall.com (2026-08-16) rather than
+        reporting it ambiguous with "Emeritus of Conflict // Lightning Bolt", which contains the
+        same letters. And a PRINTED name that is the query resolves to its printing --
+        `fuzzy=blitzschlag` answers the German Lightning Bolt, `fuzzy=ego à deriva` the
+        Portuguese Unmoored Ego -- while `exact=` stays scoped to oracle names.
 
         Args:
             needle: The accent-folded, lowercased query.
@@ -1327,15 +1343,21 @@ class ScryfallCardsRoutes:
         Returns:
             The matching printing, or None.
         """
-        # The ENGINE first, like every other lookup on this surface. Unlike `fuzzy_card_by_name`,
-        # `exact_card_by_name` takes the set code, so a set filter no longer forces SQL.
-        row = self._engine_exact_name(needle, base_params.get("set_code"))
-        if row is not None:
-            return row
-
-        params = {**base_params, "needle": needle}
-        clauses = [*base_clauses, "lower(card_name_folded) = %(needle)s"]
-        return self._best_printing(" AND ".join(clauses), params)
+        # NO ENGINE FAST PATH HERE, deliberately, and it is the one by-name lookup that keeps
+        # answering from SQL. `exact_card_by_name` implements `named?exact=`'s rule -- ORACLE names
+        # only, separators intact, either side of a `" // "` join -- and this stage's rule is the
+        # other one: separators do not count, and a PRINTED name counts. The two disagree on real
+        # queries (`fuzzy=fire` would resolve to "Fire // Ice" through the engine and is not a
+        # whole-name match at all under the measured rule), so calling it here would answer a
+        # different card, not the same card sooner. `named?exact=` still goes to the engine first.
+        params = {**base_params, "needle": _unseparated(needle)}
+        oracle = f"{_UNSEPARATED.format(column='card_name_folded')} = %(needle)s"
+        printed = f"{_UNSEPARATED.format(column='printed_name_folded')} = %(needle)s"
+        clauses = [*base_clauses, f"({oracle} OR {printed})"]
+        # An ORACLE name that is the query outranks a PRINTED one that is: `exact=` is scoped to
+        # oracle names (measured -- `exact=Ego à Deriva` is a 404 there while `fuzzy=` resolves
+        # it), so when both exist the English card is the one the query names.
+        return self._best_printing(" AND ".join(clauses), params, rank_first=f"({oracle}) DESC, ")
 
     def _fuzzy_containment_candidates(
         self,
@@ -1444,12 +1466,10 @@ class ScryfallCardsRoutes:
             engine = self._engine_for_lookup()
             if engine is not None:
                 try:
-                    status, row = engine.fuzzy_card_by_name(
-                        needle,
-                        FUZZY_SIMILARITY_FLOOR,
-                        FUZZY_SIMILARITY_LEAD,
-                        list(CARD_OBJECT_FIELDS),
-                    )
+                    # No thresholds: they belong to the engine's own metric, which is not
+                    # pg_trgm's, and passing the SQL path's would score one metric by the other's
+                    # bar. See FUZZY_SIMILARITY_FLOOR above.
+                    status, row = engine.fuzzy_card_by_name(needle, fields=list(CARD_OBJECT_FIELDS))
                 # Any engine failure falls back to SQL; it never 500s.
                 except Exception:
                     logger.exception("Engine fuzzy match failed, falling back to SQL")
