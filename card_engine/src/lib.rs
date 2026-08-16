@@ -11796,6 +11796,71 @@ fn widened_rows(data: &Archived<CardData>, cid: usize) -> impl Iterator<Item = (
         .chain(data.foreign[fs..fe].iter().enumerate().map(move |(i, p)| (n + (fs + i) as u32, p)))
 }
 
+/// The row that represents a card whose only MATCHING rows are in the annex: the annex row whose
+/// (set code, collector number) slot carries the best canonical row inside the query's own scope.
+///
+/// Scryfall picks a within-language representative by FOLLOWING its English one — but its English
+/// one as the QUERY sees it, not the card's global one. `e:khm lang:ja unique=cards` answers khm ja
+/// #240 for Maskwood Nexus even though the card's overall representative printing is clb 865,
+/// because #240 is the best khm English row and the ja row at that slot inherits the pick
+/// (verified against api.scryfall.com, with Tyrite Sanctum -> cmm 1049 and Crippling Fear ->
+/// cmm 862 behaving the same way).
+///
+/// A per-row score cannot express that. The representative bonus propagates by (set, collector
+/// number) and so agrees wherever the representative printing IS in the queried set; where it is
+/// not, NO row of the set carries it, and the two khm ja rows then tie down to the last bit —
+/// Scryfall's own data gives the ja extended-art printing no `frame_effects`, so the -6 that
+/// separates the English pair does not exist between the annex rows and an arbitrary tiebreak
+/// decides. The missing input is the QUERY's scope, which only the driver has.
+///
+/// So: rank each matching annex row by the prefer score of the best canonical row at its own slot
+/// under `relaxed` (the filter with its language constraint lifted — `e:khm` survives, `lang:ja`
+/// does not), and break ties on the row's own score and then on store order. An annex row whose
+/// slot has no canonical row in scope ranks below every row whose slot does, which leaves a
+/// foreign-only printing represented by the same row phase 1 chose.
+fn annex_representative(
+    data: &Archived<CardData>,
+    params: &QueryParams,
+    filter: &FilterExpr,
+    relaxed: &FilterExpr,
+    card: &AOracleCard,
+    cid: usize,
+) -> Option<u32> {
+    let n = data.printings.len() as u32;
+    let full: [&FilterExpr; 1] = [filter];
+    let loose: [&FilterExpr; 1] = [relaxed];
+    // The card's canonical rows that the query WOULD have matched but for the language, keyed by
+    // slot. Small (a card's printings), so this is a linear scan per annex row rather than a map.
+    let canonical: Vec<(&APrinting, f64)> = widened_rows(data, cid)
+        .filter(|&(vpid, _)| vpid < n)
+        .filter(|(_, p)| FilterExpr::residual_matches(card, p, &data.strings, &loose, false))
+        .map(|(_, p)| (p, prefer_score(card, p, params.prefer)))
+        .collect();
+    let slot_score = |a: &APrinting| -> Option<f64> {
+        canonical
+            .iter()
+            .filter(|(c, _)| {
+                c.card_set_code.as_str() == a.card_set_code.as_str()
+                    && u32::from(c.collector_number_id) == u32::from(a.collector_number_id)
+            })
+            .map(|&(_, s)| s)
+            .fold(None, |best: Option<f64>, s| Some(best.map_or(s, |b| b.max(s))))
+    };
+    let mut best: Option<(u32, Option<f64>, f64)> = None;
+    for (vpid, p) in widened_rows(data, cid) {
+        if vpid < n || !FilterExpr::residual_matches(card, p, &data.strings, &full, false) {
+            continue;
+        }
+        let key = (slot_score(p), prefer_score(card, p, params.prefer));
+        // Strict >, so the earliest row wins a tie — the same rule phase 1 uses, and what keeps
+        // this a REORDERING of equally-ranked rows rather than a new preference.
+        if best.is_none_or(|(_, sc, own)| (key.0, key.1) > (sc, own)) {
+            best = Some((vpid, key.0, key.1));
+        }
+    }
+    best.map(|(vpid, _, _)| vpid)
+}
+
 /// The multilingual (widened) query driver: both printing spaces, full-filter verify, no plans.
 ///
 /// Runs instead of `run_query_routed` when `include_multilingual` is set or the bound filter
@@ -11847,6 +11912,10 @@ fn run_query_widened<'a>(
     let matches = |card: &AOracleCard, p: &APrinting| {
         FilterExpr::residual_matches(card, p, &data.strings, &residual, false)
     };
+    // Built once per query, not per card: `unique=cards` needs the query's scope WITHOUT its
+    // language constraint to decide which annex row represents a card (see annex_representative).
+    let relaxed = filter.with_lang_relaxed();
+    let n_canonical = data.printings.len() as u32;
     let mut sel = GatherSelect::new(params.page_offset, params.limit);
     // Artwork scratch, reused across cards: group ids are bounded by the same
     // ARTWORK_GROUP_WORDS invariant the canonical walk relies on — asserted over the
@@ -11872,6 +11941,16 @@ fn run_query_widened<'a>(
                     }
                 }
                 if let Some((vpid, _)) = best {
+                    // When the pick is an ANNEX row, which one it is comes from the query's scope
+                    // rather than from the row — see `annex_representative`. Canonical picks skip
+                    // this entirely, so the include_multilingual lane (where the English row wins
+                    // on its +40) is untouched, as is every row of the default lane, which never
+                    // reaches this driver at all.
+                    let vpid = if vpid >= n_canonical {
+                        annex_representative(data, params, filter, &relaxed, card, cid as usize).unwrap_or(vpid)
+                    } else {
+                        vpid
+                    };
                     let p = printing_at(data, vpid);
                     sel.buf().push((sort_key_bits(card, p, params.sort_col, params.descending), cid, vpid));
                 }

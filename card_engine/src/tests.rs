@@ -11993,6 +11993,76 @@ fn assign_collector_ranks_follows_scryfalls_number_then_string() {
     assert_eq!(order.iter().map(|&(r, _)| r).collect::<Vec<_>>(), [0, 1, 2, 3, 4, 5]);
 }
 
+/// One card, four sets' worth of rows: the Maskwood Nexus shape from the multilingual ledger.
+///
+/// The card's representative printing is in clb; the query asks for khm, where the English pair is
+/// #240 (better) and #369 (extended art), and the two Japanese rows sit at those same two slots.
+fn cross_set_language_store() -> (CardData, u16, u16) {
+    let mut vocab = VocabInterner::new();
+    let en = vocab.intern("en".to_string()).expect("intern en");
+    let ja = vocab.intern("ja".to_string()).expect("intern ja");
+    let mut card = stub_card(1, 0, &[], &mut vocab);
+    card.card_name_folded = InlineStr::from_str("maskwood nexus");
+    card.card_name_lower = InlineStr::from_str("maskwood nexus");
+
+    // strings[0..] are the collector numbers the slots are keyed on.
+    let numbers = ["865", "240", "369"];
+    let row = |scry: u128, set: &str, cn: u32, prefer: f32, lang: u16| {
+        let mut p = stub_printing(scry, scry, Some(prefer));
+        p.card_set_code = InlineStr::from_str(set);
+        p.collector_number_id = cn;
+        p.compat.lang_id = lang;
+        p
+    };
+    let canonical =
+        vec![row(1, "clb", 0, 240.0, en), row(2, "khm", 1, 197.36, en), row(3, "khm", 2, 191.36, en)];
+    let mut data = store_of(vec![card], &[3], vocab);
+    data.printings = canonical;
+    data.strings = numbers.iter().map(|s| (*s).to_string()).collect();
+    // The two Japanese rows, and the WRONG one scores higher — Scryfall's data gives the ja
+    // extended-art printing no frame_effects, so nothing in the rows themselves prefers #240.
+    data.foreign = vec![row(4, "khm", 1, 90.0, ja), row(5, "khm", 2, 95.0, ja)];
+    data.foreign_offsets = vec![0, 2];
+    data.indexes.langs = build_lang_index(&data.printings, &data.coll_vocab);
+    data.indexes.foreign_langs = build_lang_index(&data.foreign, &data.coll_vocab);
+    data.indexes.foreign_to_card = build_printing_to_card(&data.foreign_offsets);
+    data.indexes.printed_names = build_printed_name_index(&data.printings, &data.foreign, &data.strings);
+    (data, en, ja)
+}
+
+/// `lang:` + `unique=cards` follows the query's OWN English pick, not the card's global one.
+///
+/// api.scryfall.com answers khm ja #240 for `e:khm lang:ja unique=cards`, even though the card's
+/// representative printing lives in clb and so no khm row carries the representative bonus. The
+/// fixture makes the wrong answer the easy one: ja #369 outscores ja #240 on its own prefer, so a
+/// per-row rule picks #369. Only reading the canonical row at each SLOT, under the query with its
+/// language lifted, gets #240.
+#[test]
+fn a_language_pick_follows_the_english_row_in_the_querys_own_set() {
+    let (data, _, ja) = cross_set_language_store();
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+
+    let khm = FilterExpr::TextExact { field: TextField::SetCode, op: CmpOp::Eq, value: "khm".to_string() };
+    let lang = FilterExpr::LangMatch { value: "ja".to_string(), vid: Some(ja), any: false };
+    let scoped = FilterExpr::And(vec![khm, lang]);
+
+    let params = QueryParams::from_strs("card", "default", "edhrec", "asc", 100, 0);
+    let (total, page) = run_query_widened(a, &params, &scoped);
+    assert_eq!(total, 1, "one card");
+    assert_eq!(u128::from(page[0].1.scryfall_id), 4, "the ja row at #240, the best khm ENGLISH slot");
+
+    // The row that outscores it is still there — this reorders the representative, it drops nothing.
+    let params = QueryParams::from_strs("printing", "default", "edhrec", "asc", 100, 0);
+    let (total, _) = run_query_widened(a, &params, &scoped);
+    assert_eq!(total, 2, "both ja rows still match");
+
+    // And the English lane is unmoved: bare widening rolls up to the card's own representative.
+    let params = QueryParams::from_strs("card", "default", "edhrec", "asc", 100, 0);
+    let (_, page) = run_query_widened(a, &params, &FilterExpr::True);
+    assert_eq!(u128::from(page[0].1.scryfall_id), 1, "clb 865 is still the card's own pick");
+}
+
 #[test]
 fn a_foreign_printed_name_fuzzy_matches_to_its_printing() {
     let (data, _, _) = bilingual_store();
