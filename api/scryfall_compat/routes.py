@@ -435,6 +435,22 @@ _COLLECTION_UUID_KEYS = ("id", "oracle_id", "illustration_id")
 # exactly 30 with an ellipsis.
 _COLLECTION_ECHO_LIMIT = 30
 
+# The two identifier keys Scryfall validates as INTEGERS, in the order it checks them.
+_COLLECTION_INTEGER_KEYS = ("mtgo_id", "multiverse_id")
+
+# Identifier keys that identify a card ON THEIR OWN -- one of these makes an identifier valid.
+_COLLECTION_SOLE_KEYS = ("id", "mtgo_id", "multiverse_id", "oracle_id", "illustration_id", "name")
+
+# Every key that is part of SOME schema, in the order Scryfall lists them back in its complaint.
+# `set` and `collector_number` are here and not above because neither identifies a card alone:
+# together they are a printing, and `set` beside `name` scopes a name.
+_COLLECTION_SCHEMA_KEYS = (*_COLLECTION_SOLE_KEYS, "set", "collector_number")
+
+# The two batch-level sentences, verbatim from api.scryfall.com (2026-08-16). The count one names
+# the bound rather than restating it and answers FOUR different mistakes, so it is written out once.
+_COLLECTION_COUNT_DETAILS = "The `identifiers` list must have at least 1 and no more than 75 references."
+_COLLECTION_NOT_AN_ARRAY_DETAILS = "The `identifiers` list must be a JSON array."
+
 # Thresholds for the SQL fallback's typo-tolerant `?fuzzy=` stage, which scores with pg_trgm. A
 # candidate must score at least the floor, and the best must lead the next distinct card name by at
 # least the lead — closer than that and the query does not identify either card, so it is
@@ -564,6 +580,53 @@ def _is_uuid(value: str) -> bool:
     return bool(_UUID_RE.match(value))
 
 
+def _echo_identifier_value(value: str) -> str:
+    """Truncate a rejected identifier value the way Scryfall echoes it back.
+
+    Args:
+        value: The value as sent.
+
+    Returns:
+        The value, cut at 30 characters with an ellipsis when longer.
+    """
+    return f"{value[:_COLLECTION_ECHO_LIMIT]}…" if len(value) > _COLLECTION_ECHO_LIMIT else value
+
+
+def _collection_schema_error(identifier: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the `Invalid identifier schema` error an identifier whose keys name no lookup earns.
+
+    This used to accept ANY object and report it in `not_found`, which reads as harmless and is not:
+    a client that sent `{"arena_id": 67330}` -- a plausible mistake, since `arena_id` is a real key
+    on a card object and simply not a collection identifier -- was told the card does not exist
+    rather than that the request was wrong, and would have gone looking in the wrong place.
+
+    The valid schemas, measured one identifier per request on 2026-08-16: `id`, `mtgo_id`,
+    `multiverse_id`, `oracle_id`, `illustration_id`, `name`, and the PAIR `set` + `collector_number`.
+    `set` may also ride with `name` (the name-scoped-to-a-set lookup), which is why `name` alone is
+    sufficient and `set` alone is not. Key ORDER does not matter (`{collector_number, set}` resolves)
+    and unrecognized keys are IGNORED beside a valid schema (`{name, zzz}` resolves) -- `lang` among
+    them, which is worth stating outright because it looks like it should work:
+    `{set: "khm", collector_number: "40", lang: "ja"}` returns the ENGLISH card.
+
+    The sentence's tail is the RECOGNIZED keys the identifier does carry, which is what makes the
+    message useful: `{set}` and `{set, lang}` both say "set" -- you are halfway to a schema -- while
+    `{}`, `{arena_id}` and `{nonsense}` all say nothing at all, because none of their keys is part of
+    any schema. Every one of those five is a measured string.
+
+    Args:
+        identifier: One entry of the request's `identifiers` array.
+
+    Returns:
+        A Scryfall error object, or None when the identifier names a lookup.
+    """
+    if any(identifier.get(key) is not None for key in _COLLECTION_SOLE_KEYS):
+        return None
+    if identifier.get("set") is not None and identifier.get("collector_number") is not None:
+        return None
+    present = ", ".join(key for key in _COLLECTION_SCHEMA_KEYS if identifier.get(key) is not None)
+    return bad_request_error(f"Invalid identifier schema: {present}")
+
+
 def _collection_identifier_error(identifiers: list[Any]) -> dict[str, Any] | None:
     """Return the `bad_request` a malformed collection identifier earns, or None when all are well formed.
 
@@ -571,27 +634,42 @@ def _collection_identifier_error(identifiers: list[Any]) -> dict[str, Any] | Non
     real id followed by the nil UUID 400s and reports the nil one, and the same batch reversed 400s
     and reports it too, so nothing is resolved and no partial List comes back.
 
-    The article is always "An" because all three keys start with a vowel. (Scryfall picks it per
-    field: `multiverse_id`'s own non-integer error reads "A `multiverse_id` identifier must be an
-    integer: abc" -- a separate rule this surface does not yet implement.)
+    The UUID article is always "An" because all three of those keys start with a vowel, and the
+    integer one is always "A" because both of those start with a consonant: Scryfall picks it per
+    field rather than per sentence.
+
+    A non-dict entry does not reach here. Scryfall answers `null` or a bare string in the list with
+    the COUNT message, as if the list were empty, so the list's SHAPE is validated before any
+    identifier's -- see the handler.
 
     Args:
-        identifiers: The request's `identifiers` array, unvalidated.
+        identifiers: The request's `identifiers` array, list shape already validated.
 
     Returns:
         A Scryfall error object, or None.
     """
     for identifier in identifiers:
-        if not isinstance(identifier, dict):
-            continue
+        schema = _collection_schema_error(identifier)
+        if schema is not None:
+            return schema
         for key in _COLLECTION_UUID_KEYS:
             if key not in identifier:
                 continue
             value = str(identifier[key])
             if _COLLECTION_UUID_RE.match(value):
                 break
-            echoed = f"{value[:_COLLECTION_ECHO_LIMIT]}…" if len(value) > _COLLECTION_ECHO_LIMIT else value
-            return bad_request_error(f"An `{key}` identifier must be a valid UUID: {echoed}")
+            return bad_request_error(f"An `{key}` identifier must be a valid UUID: {_echo_identifier_value(value)}")
+        for key in _COLLECTION_INTEGER_KEYS:
+            if key not in identifier:
+                continue
+            raw = identifier[key]
+            # Scryfall accepts the integer and the string that spells one; anything else earns the
+            # integer complaint.
+            if isinstance(raw, bool):
+                pass
+            elif isinstance(raw, int) or str(raw).strip().lstrip("+-").isdigit():
+                break
+            return bad_request_error(f"A `{key}` identifier must be an integer: {_echo_identifier_value(str(raw))}")
     return None
 
 
@@ -2077,50 +2155,66 @@ class ScryfallCardsRoutes:
             body = request.get_media() if request is not None else None
         except (falcon.MediaMalformedError, falcon.MediaNotFoundError):
             body = None
-        if not isinstance(body, dict) or not isinstance(body.get("identifiers"), list):
-            return self._scryfall_respond(
-                falcon_response,
-                error_object(
-                    code="validation_error",
-                    status=422,
-                    details="The request body must be a JSON object with an `identifiers` array.",
-                ),
-                pretty=is_pretty,
-            )
-
-        identifiers = body["identifiers"]
-        if len(identifiers) > MAX_COLLECTION_IDENTIFIERS:
-            return self._scryfall_respond(
-                falcon_response,
-                error_object(
-                    code="validation_error",
-                    status=422,
-                    details=f"A maximum of {MAX_COLLECTION_IDENTIFIERS} card references may be submitted at once.",
-                ),
-                pretty=is_pretty,
-            )
+        identifiers = body.get("identifiers") if isinstance(body, dict) else None
+        # Two SEPARATE complaints, and which one you get depends on whether `identifiers` was there
+        # at all -- measured 2026-08-16: `{}` answers the COUNT sentence (an absent list is an empty
+        # one), `{"identifiers": {}}` answers the ARRAY one. Both are `400 bad_request`, not the
+        # `422 validation_error` with wording of its own this surface sent; a client string-matching
+        # Scryfall's messages saw neither. A refused request is `no-cache` too, not the route's tier.
+        if identifiers is not None and not isinstance(identifiers, list):
+            self._set_collection_refused_cache(falcon_response)
+            return self._scryfall_respond(falcon_response, bad_request_error(_COLLECTION_NOT_AN_ARRAY_DETAILS), pretty=is_pretty)
+        # The count rule covers MORE than the count: an empty list, a missing list, a list past 75,
+        # AND a list holding anything that is not an object all answer this one sentence (`[null]`
+        # and `["Lightning Bolt"]` both measured). Scryfall validates the list's SHAPE here and the
+        # identifiers' shape afterwards.
+        if (
+            identifiers is None
+            or not identifiers
+            or len(identifiers) > MAX_COLLECTION_IDENTIFIERS
+            or any(not isinstance(identifier, dict) for identifier in identifiers)
+        ):
+            self._set_collection_refused_cache(falcon_response)
+            return self._scryfall_respond(falcon_response, bad_request_error(_COLLECTION_COUNT_DETAILS), pretty=is_pretty)
 
         # Validation runs over the WHOLE batch before anything is resolved: Scryfall's answer to a
         # malformed identifier is one 400 for the request, not a per-identifier miss, so a batch
         # that carries one must not cost a query either.
         malformed = _collection_identifier_error(identifiers)
         if malformed is not None:
+            self._set_collection_refused_cache(falcon_response)
             return self._scryfall_respond(falcon_response, malformed, pretty=is_pretty)
 
         found: list[dict[str, Any]] = []
         not_found: list[dict[str, Any]] = []
-        seen: set[str] = set()
         for identifier in identifiers:
-            card = self._resolve_identifier(identifier) if isinstance(identifier, dict) else None
+            card = self._resolve_identifier(identifier)
+            # ONE ENTRY PER IDENTIFIER, duplicates included. This deduplicated by card id, which
+            # looks like a courtesy and breaks the response's contract: `data` is the answer to the
+            # list the client sent, so a client submitting a deck list with four copies of a card
+            # got three fewer objects back than it had rows to fill. Measured 2026-08-16 -- three
+            # identical `{id}` identifiers return three card objects, and 75 identical `{name}`
+            # identifiers return 75.
             if card is None:
                 not_found.append(identifier)
-                continue
-            if card["id"] in seen:
-                continue
-            seen.add(card["id"])
-            found.append(card)
+            else:
+                found.append(card)
 
         return self._scryfall_respond(falcon_response, collection_list(found, not_found), pretty=is_pretty)
+
+    def _set_collection_refused_cache(self, falcon_response: falcon.Response | None) -> None:
+        """Mark a REFUSED collection request `no-cache`, not the route's own tier.
+
+        Measured 2026-08-16 across every 400 this route can produce -- the count sentence, the array
+        sentence, `Invalid identifier schema`, and the UUID and integer complaints. The successful
+        answer keeps `max-age=0, private, must-revalidate`. Nearly the same instruction, genuinely
+        two different strings, and this surface exists so the strings are the same.
+
+        Args:
+            falcon_response: The response to write to.
+        """
+        if falcon_response is not None:
+            falcon_response.set_header("Cache-Control", "no-cache")
 
     def _resolve_identifier(self, identifier: dict[str, Any]) -> dict[str, Any] | None:
         """Resolve one collection identifier to a card.

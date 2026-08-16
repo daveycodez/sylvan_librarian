@@ -23,7 +23,7 @@ from cachebox import LRUCache
 from api.enums import CardOrdering, SortDirection, UniqueOn, resolve_direction
 from api.parsing import parse_scryfall_query
 from api.scryfall_compat import routes as routes_module
-from api.scryfall_compat.objects import PAGE_SIZE
+from api.scryfall_compat.objects import MAX_COLLECTION_IDENTIFIERS, PAGE_SIZE
 from api.scryfall_compat.routes import _csv_cell, _csv_mana_cost, _csv_price
 from api.tests.helpers import make_raw_card
 from api.utils.generation_cache import GenerationCache
@@ -1174,6 +1174,84 @@ class TestThroughTheFullApp:
         body = orjson.loads(result.content)
         assert [card["id"] for card in body["data"]] == [BOLT_ID]
         assert body["not_found"] == [{"name": "Nothing At All Compat"}]
+
+    def test_collection_returns_one_entry_per_identifier_including_duplicates(self, compat_corpus: APIResource):
+        """`data` answers the LIST that was sent, not the set of cards it names.
+
+        Deduplicating by card id looked like a courtesy and broke the route's contract: a client
+        posting a deck list with four copies of a card got one object back. Measured 2026-08-16 --
+        three identical `{id}` identifiers return three card objects.
+        """
+        result = self._client(compat_corpus).simulate_post(
+            "/cards/collection",
+            json={"identifiers": [{"id": BOLT_ID}, {"id": BOLT_ID}, {"id": BOLT_ID}]},
+        )
+        assert result.status_code == 200
+        assert [card["id"] for card in orjson.loads(result.content)["data"]] == [BOLT_ID] * 3
+
+    @pytest.mark.parametrize(
+        ("identifier", "tail"),
+        [
+            # `arena_id` is the case worth having: a real key on a card object, and simply not a
+            # collection identifier, so a client reaching for it used to be told the card is missing.
+            ({"arena_id": 67330}, ""),
+            ({}, ""),
+            ({"nonsense": "x"}, ""),
+            ({"set": "khm"}, "set"),
+            ({"set": "khm", "lang": "ja"}, "set"),
+            ({"set": "khm", "zzz": 1}, "set"),
+            ({"collector_number": "1"}, "collector_number"),
+            ({"collector_number": "1", "lang": "en"}, "collector_number"),
+        ],
+    )
+    def test_collection_rejects_an_identifier_whose_keys_name_no_lookup(
+        self, compat_corpus: APIResource, identifier: dict, tail: str
+    ):
+        """Every string here is measured, the tail included: it lists the RECOGNIZED keys present."""
+        result = self._client(compat_corpus).simulate_post("/cards/collection", json={"identifiers": [identifier]})
+        assert result.status_code == 400
+        body = orjson.loads(result.content)
+        assert body["code"] == "bad_request"
+        assert body["details"] == f"Invalid identifier schema: {tail}"
+
+    @pytest.mark.parametrize("key", ["mtgo_id", "multiverse_id"])
+    def test_collection_rejects_a_non_integer_id(self, compat_corpus: APIResource, key: str):
+        """`A` rather than `An` -- Scryfall picks the article per field, not per sentence."""
+        result = self._client(compat_corpus).simulate_post("/cards/collection", json={"identifiers": [{key: "abc"}]})
+        assert result.status_code == 400
+        assert orjson.loads(result.content)["details"] == f"A `{key}` identifier must be an integer: abc"
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"identifiers": []},
+            {},
+            {"nope": True},
+            {"identifiers": [None]},
+            {"identifiers": ["Lightning Bolt"]},
+            {"identifiers": [{"id": "x"}] * (MAX_COLLECTION_IDENTIFIERS + 1)},
+        ],
+    )
+    def test_collection_answers_one_sentence_to_every_list_shaped_mistake(self, compat_corpus: APIResource, body: dict):
+        """An empty, absent, over-long or non-object-holding list is all the same 400.
+
+        `{"identifiers": []}` used to answer `200 {"data": []}`, telling the client its (empty)
+        question had an (empty) answer, and the over-long one used to be a `422 validation_error`
+        with wording of its own. The cap check also runs BEFORE identifier validation -- the 76
+        entries here carry `{"id": "x"}`, which is not a valid UUID, and the count sentence still wins.
+        """
+        result = self._client(compat_corpus).simulate_post("/cards/collection", json=body)
+        assert result.status_code == 400
+        payload_body = orjson.loads(result.content)
+        assert payload_body["code"] == "bad_request"
+        assert payload_body["details"] == "The `identifiers` list must have at least 1 and no more than 75 references."
+        assert result.headers["cache-control"] == "no-cache"
+
+    def test_collection_distinguishes_a_missing_list_from_a_non_array_one(self, compat_corpus: APIResource):
+        """An absent list reads as an empty one; a present-but-not-a-list one gets its own sentence."""
+        result = self._client(compat_corpus).simulate_post("/cards/collection", json={"identifiers": {}})
+        assert result.status_code == 400
+        assert orjson.loads(result.content)["details"] == "The `identifiers` list must be a JSON array."
 
     def test_collection_envelope_has_no_has_more(self, compat_corpus: APIResource):
         """Scryfall's collection List is `{object, not_found, data}` -- it does not paginate."""
