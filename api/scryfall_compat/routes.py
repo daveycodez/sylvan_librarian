@@ -176,13 +176,18 @@ _UNCONDITIONAL_EXTRAS_ATTRIBUTES = frozenset({"card_artist", "card_watermark", "
 # `card_subtypes` depending on which vocabulary the value is in, and "Token" is in both, so both
 # spellings are listed.
 #
-# `is:` HAS FOUR OF THEM, not one. Every `is:` value the parser supports (32) was probed for the
-# `include_extras` echo on 2026-08-16, one query each: `is:extra` (10,818), `is:oversized` (726),
-# `is:reserved` (1,477) and `is:rebalanced` (221) echo true, and the other 28 echo false. The
-# negative half is the load-bearing one, because several of the values that echo FALSE plainly
-# contain extras and so would look like triggers to a count-based test: `is:variation` is 93 bare
-# against 97 with the flag, `is:convention` 63 against 67, `is:judge` 173 against 176, `is:league`
-# 6 against 18.
+# `is:` HAS FIVE OF THEM, not one. Every STORED `is:` value the parser supports (32) was probed for
+# the `include_extras` echo on 2026-08-16, one query each: `is:extra` (10,818), `is:oversized`
+# (726), `is:reserved` (1,477), `is:rebalanced` (221) and `is:glossy` (7) echo true, and the other
+# 27 echo false. The negative half is the load-bearing one, because several of the values that echo
+# FALSE plainly contain extras and so would look like triggers to a count-based test:
+# `is:variation` is 93 bare against 97 with the flag, `is:convention` 63 against 67, `is:judge` 173
+# against 176, `is:league` 6 against 18.
+#
+# `glossy` was MISSED the first time, and the reason is the whole lesson of this rule. It holds no
+# extras at all, so the flag cannot move its count, and it was set aside as unfalsifiable. The ECHO
+# moves anyway -- the rule is syntactic, not a property of the result set -- so a count-based probe
+# cannot measure it and the echo is the only instrument that can.
 #
 # `border:silver` is here for the same reason and has the cleanest control in the whole rule.
 # `border:gold` answers 0 bare and 1,373 with `include_extras=true` -- every gold border is a World
@@ -194,9 +199,54 @@ _UNCONDITIONAL_EXTRAS_ATTRIBUTES = frozenset({"card_artist", "card_watermark", "
 _VALUE_EXTRAS_TRIGGERS = {
     "card_types": frozenset({"token"}),
     "card_subtypes": frozenset({"token"}),
-    "card_is_tags": frozenset({EXTRA_IS_TAG, "oversized", "reserved", "rebalanced"}),
+    "card_is_tags": frozenset({EXTRA_IS_TAG, "glossy", "oversized", "reserved", "rebalanced"}),
     "card_border": frozenset({"silver"}),
 }
+
+# The DERIVED terms that force extras on -- the ones `expand_derived_predicates` replaces with a
+# subtree, so that by the time this walk runs the spelling the rule reads is gone.
+#
+# IT IS A MEASURED LIST AND NOT A RULE, and the probe was run to find a rule. All 90 values the
+# rewrite expands (77 `is:`, 12 `has:`, 3 `frame:`) were probed one at a time against
+# api.scryfall.com on 2026-08-16 -- `<term> or cmc=3` sent with `include_extras=false`, reading the
+# resolved flag back out of the `next_page` echo -- and re-probed against a second base
+# (`<term> or t:goblin`) with identical verdicts. Twelve fire; the other 78 do not.
+#
+# EVERY STRUCTURAL HYPOTHESIS IS REFUTED BY THE TABLE, in both directions:
+#
+#  - NOT "what it expands to". `is:split`, `is:flip`, `is:transform`, `is:tdfc`, `is:meld`,
+#    `is:leveler` and `is:adventure` all expand to `layout:`, an unconditional trigger, and Scryfall
+#    fires for none of them. `has:artist` expands to `artist:/./` and does not fire either.
+#  - NOT "the population contains extras". `is:mdfc` fires with 327 printings and ZERO of them
+#    `is:extra`; `is:glossy` fires with 7 and zero. `is:stamped` does NOT fire with 696 extras out
+#    of 3,195 -- the largest extras share in the table.
+#  - NOT the layout family. `is:mdfc` fires, `is:transform` and `is:meld` do not, and `is:dfc` --
+#    which is exactly their union -- fires.
+#
+# So it is Scryfall's own per-value table, and the honest way to mirror it is to copy it down.
+# Re-derive it by re-running the probe, not by reasoning about the values.
+#
+# THE WHOLE MEASUREMENT IS KEPT, not the part this parser can reach today: `_DERIVED_EXPANSIONS`
+# defines nine of these twelve and has no `has:` alias at all, so `is:token`, `is:planar`,
+# `is:funny`, `is:artseries`, `is:augmentation`, `is:host`, `is:reversible`, `is:watermark`,
+# `has:watermark` and `has:glossy` are inert here. Pruning them to today's vocabulary would quietly
+# lose the measurement the day one of those values is added, and re-probing is 90 live requests.
+_EXTRAS_DERIVED_TRIGGERS = frozenset(
+    {
+        "has:glossy",  # == is:glossy, and it fires there too
+        "has:watermark",  # == is:watermark; `wm:` is an unconditional trigger and this agrees
+        "is:artseries",
+        "is:augmentation",
+        "is:dfc",
+        "is:funny",
+        "is:host",
+        "is:mdfc",
+        "is:planar",
+        "is:reversible",
+        "is:token",
+        "is:watermark",
+    }
+)
 
 # The set-code attribute every spelling of the set operator (`e:`, `s:`, `set:`) rewrites to.
 _SET_CODE_ATTRIBUTE = "card_set_code"
@@ -276,6 +326,11 @@ def _extras_triggers(node: object) -> _ExtrasTriggers:
     set" rule -- which is wrong on every ordinary modern set. Across the non-set probes that rule
     also missed `name:/…/`, `layout:`, `t:token` and `is:extra`.
 
+    A DERIVED `is:` FIRES ON THE TERM, NOT ON WHAT IT EXPANDED INTO. `expand_derived_predicates`
+    replaces `is:split` with `layout:split` before this walk runs and `layout:` is an unconditional
+    trigger, so without `derived_from` every layout-derived `is:` would fire and Scryfall fires for
+    none of them. `_EXTRAS_DERIVED_TRIGGERS` is the measured list of the twelve that do.
+
     KNOWN RESIDUAL, in both directions and from one cause: the rewrite lowers a regex with no
     metacharacters to a literal before this walk sees it. So `name:/zzzqq/` reads here as
     `name:"zzzqq"` and does NOT trigger where Scryfall does, and `t:/token/` reads as `t:token`
@@ -305,6 +360,16 @@ def _extras_triggers(node: object) -> _ExtrasTriggers:
 
 def _extras_triggers_of_term(node: BinaryOperatorNode) -> _ExtrasTriggers:
     """The trigger verdict for a single comparison term. See `_extras_triggers`."""
+    # A LEAF A REWRITE INVENTED ANSWERS FOR THE TERM THE CALLER WROTE, not for itself. This is the
+    # `regex_derived` problem one rewrite further along: `expand_derived_predicates` turns
+    # `is:split` into `layout:split` before this walk runs, `layout:` is an unconditional trigger,
+    # and `is:split` is not one -- 327 there against the 347 `layout:split` answers. Reading the
+    # ORIGIN term settles both directions at once, and exactly: nothing this expansion produced can
+    # trigger on its own account, and `has:glossy` still fires although the `is:glossy` leaf it
+    # leaves behind must not fire as a leaf.
+    derived_from = getattr(node, "derived_from", None)
+    if derived_from is not None:
+        return _ExtrasTriggers(forced=derived_from in _EXTRAS_DERIVED_TRIGGERS, sets=())
     lhs = node.lhs
     if not isinstance(lhs, AttributeNode):
         return _NO_EXTRAS_TRIGGERS

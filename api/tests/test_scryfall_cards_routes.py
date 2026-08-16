@@ -797,14 +797,18 @@ class TestExtrasTriggers:
         assert routes_module._extras_triggers(parse_scryfall_query("border:/silver/")).forced is False
 
     def test_the_is_and_border_triggers_are_value_specific(self):
-        """Four `is:` values and one `border:` value force extras on; their neighbours do not.
+        """Five `is:` values and one `border:` value force extras on; their neighbours do not.
 
-        All 32 supported `is:` values were probed for the `include_extras` echo on 2026-08-16, and
-        `border:gold` is the control that makes `border:silver` a trigger rather than a
-        coincidence: every gold border is a World Championship card, so the whole population is
-        memorabilia, and it still answers 0 bare against 1,373 with the flag.
+        All 32 supported STORED `is:` values were probed for the `include_extras` echo on
+        2026-08-16, and `border:gold` is the control that makes `border:silver` a trigger rather
+        than a coincidence: every gold border is a World Championship card, so the whole population
+        is memorabilia, and it still answers 0 bare against 1,373 with the flag.
+
+        `glossy` is the same point from the other side. It holds NO extras, so the flag cannot move
+        its count and a count-based probe calls it unfalsifiable -- and the echo says true anyway,
+        because the rule is syntactic.
         """
-        for value in ("extra", "oversized", "reserved", "rebalanced"):
+        for value in ("extra", "oversized", "reserved", "rebalanced", "glossy"):
             assert routes_module._extras_triggers(parse_scryfall_query(f"is:{value}")).forced is True, value
         for value in ("variation", "convention", "judge", "league", "promo", "foil"):
             assert routes_module._extras_triggers(parse_scryfall_query(f"is:{value}")).forced is False, value
@@ -813,6 +817,38 @@ class TestExtrasTriggers:
             assert routes_module._extras_triggers(parse_scryfall_query(f"border:{value}")).forced is False, value
         for value in ("1993", "2015", "future"):
             assert routes_module._extras_triggers(parse_scryfall_query(f"frame:{value}")).forced is False, value
+
+    def test_a_derived_is_fires_on_the_term_written_not_on_its_expansion(self):
+        """`is:split` is not `layout:split` for this rule, though the rewrite makes them one tree.
+
+        Measured on api.scryfall.com 2026-08-16: `is:split` echoes `include_extras=false` and
+        answers 327 where `layout:split` echoes true and answers 347. All 90 derived values were
+        probed one at a time; twelve fire and 78 do not, and the split follows no structural rule --
+        `is:mdfc` fires with zero extras in its population, `is:stamped` does not fire with 696.
+        """
+        # Derived, expands to something that DOES trigger, and does not trigger there. The first
+        # six expand to `layout:`, an unconditional trigger; `is:commander` expands to a subtree
+        # ending in `-banned:commander`, which is one too.
+        for query in (
+            "is:split",
+            "is:flip",
+            "is:transform",
+            "is:meld",
+            "is:leveler",
+            "is:adventure",
+            "is:commander",
+        ):
+            assert routes_module._extras_triggers(parse_scryfall_query(query)).forced is False, query
+        # Derived AND measured triggers. `is:dfc` is the one that makes this a list rather than a
+        # rule: it is exactly the union of transform / modal_dfc / meld, and it fires where two of
+        # its three parts do not.
+        for query in ("is:mdfc", "is:dfc"):
+            assert routes_module._extras_triggers(parse_scryfall_query(query)).forced is True, query
+        # The spelling the caller DID write still fires beside the one they did not.
+        assert routes_module._extras_triggers(parse_scryfall_query("is:split layout:normal")).forced is True
+        # And a set term inside an expansion is not a set the caller named: nothing widens by
+        # accident through the conditional arm either.
+        assert routes_module._extras_triggers(parse_scryfall_query("is:split")).sets == ()
 
     def test_banned_triggers_wholesale_and_f_only_at_premodern(self):
         """Every legality alias binds to `card_legalities`, so the alias separates them.

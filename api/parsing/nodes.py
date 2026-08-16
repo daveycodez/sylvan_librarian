@@ -201,7 +201,17 @@ class AttributeNode(LeafNode):
 
 
 class BinaryOperatorNode(QueryNode):
-    """Represents a binary operator node (e.g., '=', '!=', '<', '>', etc.)."""
+    """Represents a binary operator node (e.g., '=', '!=', '<', '>', etc.).
+
+    `derived_from` is the same kind of fact `StringValueNode.regex_derived` is, and it is not
+    serialized either: it names the `is:`/`has:`/`frame:` term whose expansion PUT this leaf here,
+    or None when the caller wrote the leaf themselves. `expand_derived_predicates` replaces
+    `is:split` with `layout:split`, and the two are then the same node -- while Scryfall's
+    `include_extras` auto-enable separates them (`is:split` echoes false and answers 327,
+    `layout:split` echoes true and answers 347). One consumer above the parser has to be able to
+    tell an invented term from a written one; `_expand` sets this, and `_extras_triggers_of_term`
+    is what reads it.
+    """
 
     def __init__(self: BinaryOperatorNode, lhs: QueryNode, operator: str, rhs: QueryNode) -> None:
         """Initialize a BinaryOperatorNode with left/right operands and an operator.
@@ -214,6 +224,7 @@ class BinaryOperatorNode(QueryNode):
         self.lhs = lhs
         self.operator = operator
         self.rhs = rhs
+        self.derived_from: str | None = None
         bin_ops = {
             "-",
             "!=",

@@ -196,8 +196,34 @@ def _expand(node: QueryNode, in_progress: frozenset[tuple[str, str]]) -> tuple[Q
         # Recurse into the expansion so a definition may itself reference another derived
         # predicate; `in_progress` breaks any (mis)configured cycle (a -> ... -> a).
         subtree, _ = _expand(_parse_expansion(_DERIVED_EXPANSIONS[key]), in_progress | {key})
+        # Every leaf in the subtree remembers the term it came from. The OUTERMOST expansion wins,
+        # because it is marked last: `is:watermark` expands to `has:watermark`, which expands again
+        # to `watermark:/./`, and the term the caller wrote is the first of the three.
+        _mark_derived(subtree, f"{key[0]}:{key[1]}")
         return subtree, True
     return node, False
+
+
+def _mark_derived(node: QueryNode, term: str) -> None:
+    """Record on every comparison leaf under `node` that `term`'s expansion is what put it there.
+
+    NOT bookkeeping. The rewrite makes `is:split` and `layout:split` the same tree, and Scryfall's
+    `include_extras` auto-enable fires for one and not the other -- so the fact has to survive to
+    the one consumer that applies that rule. It rides on the node rather than beside the query for
+    the same reason `regex_derived` does: nothing serializes it, so the wire tree the engine reads
+    is unchanged byte for byte.
+
+    Args:
+        node: The root of an expansion's subtree.
+        term: The `alias:value` the caller actually wrote, e.g. `is:split`.
+    """
+    if isinstance(node, (AndNode, OrNode)):
+        for operand in node.operands:
+            _mark_derived(operand, term)
+    elif isinstance(node, NotNode):
+        _mark_derived(node.operand, term)
+    elif isinstance(node, BinaryOperatorNode):
+        node.derived_from = term
 
 
 def _regex_plain_literal(pattern: str) -> str | None:
