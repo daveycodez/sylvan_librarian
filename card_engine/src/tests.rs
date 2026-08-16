@@ -12057,7 +12057,9 @@ fn bilingual_store() -> (CardData, u16, u16) {
     let en = vocab.intern("en".to_string()).expect("intern en");
     let fr = vocab.intern("fr".to_string()).expect("intern fr");
     let mut card = stub_card(1, 0, &[], &mut vocab);
-    card.card_name_folded = InlineStr::from_str("lightning bolt");
+    // `card_name_folded_id` stays NONE_STR: the name carries no diacritic, so folded == lower and
+    // `folded_name` reads `card_name_lower` — which also keeps the interned id from colliding with
+    // the strings table this fixture replaces below.
     card.card_name_lower = InlineStr::from_str("lightning bolt");
     let mut data = store_of(vec![card], &[1], vocab);
     data.printings[0].compat.lang_id = en;
