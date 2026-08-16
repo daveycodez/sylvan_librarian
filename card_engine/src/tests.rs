@@ -19,7 +19,7 @@ use super::{
     CollField, CmpOp, FilterExpr, InlineStr, Interner, ManaCost, CompatFields, OracleCard, OracleFace, Printing, PrintingFace, RelatedCard, TagIndex,
     build_printing_by_scryfall_id, build_oracle_by_oracle_id, find_printing_by_scryfall_id, find_oracle_by_oracle_id,
     build_external_id_index, find_printing_by_external_id, EXT_MULTIVERSE, EXT_MTGO, EXT_ARENA, EXT_TCGPLAYER,
-    fuzzy_similarity, fuzzy_name_match, autocomplete_names, FuzzyOutcome,
+    fuzzy_similarity, fuzzy_name_match, autocomplete_names, iso8601_utc_to_epoch_secs, FuzzyOutcome,
     VOCAB_NONE, COMPAT_PROMO, COMPAT_REPRINT, COMPAT_TEXTLESS, GAME_PAPER, GAME_ARENA, FINISH_FOIL, FINISH_NONFOIL,
     TextField, TextSearchField, Tri, SortedTrigramIndex, VocabInterner, ARTIST_NONE, NONE_STR, TYPE_ARTIFACT, TYPE_CREATURE,
     TYPE_ENCHANTMENT, TYPE_INSTANT, TYPE_LAND, TYPE_LEGENDARY, TYPE_PLANESWALKER, TYPE_SNOW, TYPE_SORCERY,
@@ -11868,6 +11868,29 @@ fn compat_fields_survive_the_archive_round_trip() {
     assert_ne!(u16::from(a.flags) & COMPAT_PROMO, 0);
     assert_ne!(u16::from(a.flags) & COMPAT_REPRINT, 0);
     assert_eq!(u16::from(a.flags) & COMPAT_TEXTLESS, 0, "textless was not set");
+}
+
+/// `image_updated_at` reaches the residue as an ISO-8601 string and leaves it as the epoch seconds
+/// Scryfall hangs off an image URL, so the conversion is the whole of that field's correctness.
+#[test]
+fn an_iso_timestamp_converts_to_the_epoch_behind_the_image_cache_buster() {
+    // The exact pair the corpus serves: Lightning Bolt lea/161's `image_updated_at` against the
+    // `?1783903008` on its own `image_uris`.
+    assert_eq!(iso8601_utc_to_epoch_secs("2026-07-13T00:36:48Z"), Some(1_783_903_008));
+    // Leap day and the year boundaries on either side of it, where a hand-rolled civil calendar
+    // goes wrong if it goes wrong at all.
+    assert_eq!(iso8601_utc_to_epoch_secs("2024-02-29T00:00:00Z"), Some(1_709_164_800));
+    assert_eq!(iso8601_utc_to_epoch_secs("2024-03-01T00:00:00Z"), Some(1_709_251_200));
+    assert_eq!(iso8601_utc_to_epoch_secs("2000-02-29T00:00:00Z"), Some(951_782_400));
+    assert_eq!(iso8601_utc_to_epoch_secs("1970-01-01T00:00:00Z"), Some(0));
+    // The Z is optional; every other departure from the shape reads as absent rather than as a
+    // guess, including a pre-epoch date that would otherwise wrap through the u32.
+    assert_eq!(iso8601_utc_to_epoch_secs("2026-07-13T00:36:48"), Some(1_783_903_008));
+    assert_eq!(iso8601_utc_to_epoch_secs("1969-12-31T23:59:59Z"), None);
+    assert_eq!(iso8601_utc_to_epoch_secs("2026-07-13"), None);
+    assert_eq!(iso8601_utc_to_epoch_secs("2026-13-01T00:00:00Z"), None);
+    assert_eq!(iso8601_utc_to_epoch_secs("2026-07-13T00:36:48.123Z"), None);
+    assert_eq!(iso8601_utc_to_epoch_secs(""), None);
 }
 
 #[test]

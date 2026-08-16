@@ -1015,9 +1015,19 @@ fn opt_date_str(d: &Bound<PyDict>, key: &str) -> Option<String> {
 /// the source value is a decimal price (from Scryfall's JSON via Python's json/psycopg, both
 /// already correctly-rounded f64), so rounding to the nearest cent recovers the exact intended
 /// value even if the f64 isn't bit-exact for the decimal (see Printing's price_usd doc comment).
+///
+/// The string arm is not defensive -- it is the ONLY arm the corpus exercises. Scryfall sends the
+/// members of `prices` as decimal STRINGS ("60.00", "0.10"), and this reader is applied to that
+/// object verbatim out of `card_compat_blob`, so with the numeric arms alone `usd_foil`,
+/// `usd_etched` and `eur_foil` read as absent on EVERY printing (measured 2026-08-16: 0 of 175
+/// `t:goblin` rows carried one, against api.scryfall.com's `"60.00"` on APC Fire // Ice). The
+/// sibling columns `price_usd`/`price_eur`/`price_tix` escaped because they come through
+/// `maybe_float` in card_processing.py, which has had this arm all along -- this is that arm.
 fn opt_price_cents(d: &Bound<PyDict>, key: &str) -> Option<u32> {
     d.get_item(key).ok().flatten().and_then(|v| {
-        v.extract::<f64>().ok().or_else(|| v.extract::<i64>().ok().map(|n| n as f64))
+        v.extract::<f64>().ok()
+            .or_else(|| v.extract::<i64>().ok().map(|n| n as f64))
+            .or_else(|| v.extract::<String>().ok().and_then(|s| s.trim().parse::<f64>().ok()))
     }).map(|dollars| (dollars * 100.0).round() as u32)
 }
 
@@ -1161,6 +1171,63 @@ fn opt_nonzero_u32(d: &Bound<PyDict>, key: &str) -> Option<NonZeroU32> {
     opt_u32(d, key).and_then(NonZeroU32::new)
 }
 
+/// `"2026-07-13T00:36:48Z"` -> `1_783_903_008`, the epoch seconds Scryfall hangs off an image URL
+/// as its cache-buster (`.../7673784e-....jpg?1783903008`).
+///
+/// Deliberately narrow: `YYYY-MM-DDTHH:MM:SS` with an optional trailing `Z`, which is the only
+/// shape the corpus contains (116,712 of 116,712 printings measured against the 2026-08-16 bulk
+/// file). Anything else reads as absent rather than as a guessed epoch -- the same all-or-nothing
+/// stance every other reader here takes toward a value it does not recognise.
+///
+/// Days-from-civil is Howard Hinnant's `days_from_civil`, shifted so year 0 March 1 is the era
+/// origin; no calendar crate, because this is the only date arithmetic in the engine and the
+/// input range (2015 onward) is trivially inside u32.
+fn iso8601_utc_to_epoch_secs(text: &str) -> Option<u32> {
+    let (date, time) = text.strip_suffix('Z').unwrap_or(text).split_once('T')?;
+    let mut parts = date.split('-');
+    let year = parts.next()?.parse::<i64>().ok()?;
+    let month = parts.next()?.parse::<u32>().ok()?;
+    let day = parts.next()?.parse::<u32>().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let mut parts = time.split(':');
+    let hour = parts.next()?.parse::<u32>().ok()?;
+    let minute = parts.next()?.parse::<u32>().ok()?;
+    let second = parts.next()?.parse::<u32>().ok()?;
+    if parts.next().is_some() || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+
+    let shifted = year - i64::from(month <= 2);
+    let era = shifted.div_euclid(400);
+    let year_of_era = shifted - era * 400;
+    let month_of_year = i64::from((month + 9) % 12);
+    let day_of_year = (153 * month_of_year + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    let secs = days * 86_400 + i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second);
+    u32::try_from(secs).ok()
+}
+
+/// `image_updated_at` out of the compat residue, as epoch seconds.
+///
+/// Scryfall sends this one as an ISO-8601 UTC STRING, not a number, so `opt_nonzero_u32` -- which
+/// this field was read with -- saw a string and produced None on every printing in the corpus.
+/// The consequence was silent and total: `image_uris` is derived, and its cache-buster query is
+/// written only when this value is present, so every image URL the API served came out bare
+/// (`....jpg`) where Scryfall's carries `....jpg?1783903008`. Measured 2026-08-16: 0 of 175
+/// `t:goblin` rows had a `?` in `image_uris.large`.
+fn opt_image_updated_at(d: &Bound<PyDict>, key: &str) -> Option<NonZeroU32> {
+    let value = d.get_item(key).ok().flatten()?;
+    let secs = match value.extract::<String>() {
+        Ok(text) => iso8601_utc_to_epoch_secs(&text)?,
+        // Already-numeric input (a re-ingested row) keeps the old reading rather than vanishing.
+        Err(_) => value.extract::<u32>().ok()?,
+    };
+    NonZeroU32::new(secs)
+}
+
 fn compat_from_pydict(d: &Bound<PyDict>, vocab: &mut VocabInterner) -> PyResult<CompatFields> {
     let Some(blob) = d.get_item("card_compat_blob").ok().flatten().and_then(|v| v.cast_into::<PyDict>().ok()) else {
         return Ok(CompatFields::default());
@@ -1203,7 +1270,7 @@ fn compat_from_pydict(d: &Bound<PyDict>, vocab: &mut VocabInterner) -> PyResult<
         tcgplayer_etched_id: opt_nonzero_u32(&blob, "tcgplayer_etched_id"),
         cardmarket_id: opt_nonzero_u32(&blob, "cardmarket_id"),
         penny_rank: opt_nonzero_u32(&blob, "penny_rank"),
-        image_updated_at: opt_nonzero_u32(&blob, "image_updated_at"),
+        image_updated_at: opt_image_updated_at(&blob, "image_updated_at"),
         price_usd_foil: price("usd_foil").and_then(NonZeroU32::new),
         price_usd_etched: price("usd_etched").and_then(NonZeroU32::new),
         price_eur_foil: price("eur_foil").and_then(NonZeroU32::new),
