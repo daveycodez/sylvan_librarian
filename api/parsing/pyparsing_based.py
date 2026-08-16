@@ -23,7 +23,7 @@ from pyparsing import (
 )
 
 from api.parsing.card_query_nodes import CardAttributeNode, ExactNameNode, to_card_query_ast
-from api.parsing.colors import COLOR_ALIAS_TO_CODES
+from api.parsing.colors import COLOR_ALIAS_TO_CODES, COLOR_COUNT_NAMES
 from api.parsing.db_info import (
     NUMERIC_CARD_ATTRIBUTES,
     PARSER_CLASS_TO_FIELD_INFOS,
@@ -318,7 +318,7 @@ def create_color_parsers() -> dict[str, ParserElement]:
     # The same vocabulary the hand parser's _VALID_COLOR_NAMES draws from — one table, so a name
     # added for one parser cannot be missing from the other (test_parser_parity asserts they agree
     # on validity, and a colour name accepted by only one of them is exactly that failure).
-    color_word = make_regex_pattern(COLOR_ALIAS_TO_CODES)
+    color_word = make_regex_pattern({*COLOR_ALIAS_TO_CODES, *COLOR_COUNT_NAMES})
     color_letter_pattern = Regex(r"[wubrgcWUBRGC]+")
     # Scryfall numeric color syntax: id>=3 / c=2 compare the NUMBER of colors in
     # the field. A bare integer is a valid color value; the negative lookahead
