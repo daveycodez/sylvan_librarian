@@ -209,8 +209,34 @@ class TestCatalog:
         assert body["object"] == "catalog"
         assert body["total_values"] == 0
 
-    def test_the_name_is_case_insensitive(self, reference_corpus: APIResource) -> None:
-        assert payload(dispatch(reference_corpus, "/catalog/Creature-Types"))["data"] == CREATURE_TYPES
+    def test_the_name_is_CASE_SENSITIVE(self, reference_corpus: APIResource) -> None:  # noqa: N802
+        """`/catalog/Creature-Types` is a 404 on api.scryfall.com (measured 2026-08-16).
+
+        This asserted the opposite. Folding the case made the route answer a URL Scryfall does not
+        serve, which is the same class of mistake as failing to answer one it does -- and it is the
+        worse direction of the two, because a client cannot discover it from a 200.
+        """
+        resp = dispatch(reference_corpus, "/catalog/Creature-Types")
+        assert resp.status == falcon.HTTP_404
+        assert payload(resp)["object"] == "error"
+        assert payload(dispatch(reference_corpus, "/catalog/creature-types"))["data"] == CREATURE_TYPES
+
+    def test_a_path_miss_is_no_cache_where_a_data_miss_keeps_the_data_tier(self, reference_corpus: APIResource) -> None:
+        """The tier splits by what the 404 is a statement ABOUT, and Scryfall really sends both.
+
+        `/sets/zzzz` -- a well-formed set lookup that found nothing -- is `public`, the same tier the
+        answer would have had. `/catalog/not-a-catalog` and `/sets/khm/extra` are `no-cache`. All
+        three were `public` here, so a mistyped catalog name was held at every edge.
+        """
+        assert dispatch(reference_corpus, "/catalog/not-a-catalog").headers["cache-control"] == "no-cache"
+        assert dispatch(reference_corpus, "/sets/zzzz").headers["cache-control"] == "public"
+
+    def test_an_over_long_path_is_a_route_miss_not_a_set_miss(self, reference_corpus: APIResource) -> None:
+        """`/sets/khm/extra` said "No Magic set found ..." -- about a set that was fine."""
+        resp = dispatch(reference_corpus, "/sets/zzt/extra")
+        assert resp.status == falcon.HTTP_404
+        assert payload(resp)["details"] == "The requested object or REST method was not found."
+        assert resp.headers["cache-control"] == "no-cache"
 
 
 class TestSymbology:
@@ -234,10 +260,24 @@ class TestParseMana:
         assert body["cost"] == "{U}{R}{W}"
         assert body["cmc"] == 3.0
 
-    def test_a_missing_cost_is_a_400(self, reference_corpus: APIResource) -> None:
+    def test_a_missing_cost_is_the_same_200_an_empty_cost_is(self, reference_corpus: APIResource) -> None:
+        """api.scryfall.com does not reject this (measured 2026-08-16).
+
+        A missing `cost` is the same request as an empty one and both answer
+        `200 {"object": "mana_cost", "cost": null, ...}`. This asserted the 400 the route used to
+        send, whose sentence -- "You must provide a cost parameter to parse." -- Scryfall does not own.
+        """
         resp = dispatch(reference_corpus, "/symbology/parse-mana")
-        assert resp.status == falcon.HTTP_400
-        assert payload(resp)["object"] == "error"
+        assert resp.status == falcon.HTTP_200
+        body = payload(resp)
+        assert body["object"] == "mana_cost"
+        assert body["cost"] is None
+        assert payload(dispatch(reference_corpus, "/symbology/parse-mana", "cost=")) == body
+
+    def test_an_unreadable_cost_is_no_cache(self, reference_corpus: APIResource) -> None:
+        """An unreadable cost is a fact about the REQUEST, and Scryfall declines to cache those."""
+        resp = dispatch(reference_corpus, "/symbology/parse-mana", "cost=%7BQ%7D")
+        assert resp.headers["cache-control"] == "no-cache"
 
     def test_an_unparseable_cost_is_a_422(self, reference_corpus: APIResource) -> None:
         """Scryfall answers 422 here, not 400."""
