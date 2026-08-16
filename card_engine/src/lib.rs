@@ -3247,78 +3247,150 @@ fn build_printed_name_index(printings: &[Printing], foreign: &[Printing], string
 }
 
 // ─── Fuzzy name matching ─────────────────────────────────────────────────────
-// A reimplementation of pg_trgm's similarity(), because the SQL path is a FALLBACK and the engine
-// has to answer `?fuzzy=` itself. Matching pg_trgm exactly matters: if the two paths scored
-// differently, the same query would resolve to different cards depending on which one served it.
+// SCRYFALL'S `?fuzzy=` METRIC, DERIVED FROM 86 PROBED NEEDLES (api.scryfall.com, 2026-08-16) —
+// NOT pg_trgm's similarity(), which is what this scan used to compute.
 //
-// pg_trgm's algorithm: split on non-alphanumerics, pad each word with two leading spaces and one
-// trailing, take every 3-byte window, deduplicate, and score |intersection| / |union|.
+// The old code reimplemented pg_trgm exactly so the engine and upstream's Postgres FALLBACK would
+// resolve a needle the same way. It does not: pg_trgm splits on non-alphanumerics and pads each
+// WORD with "  x ", which makes its trigram set a set of WORDS and therefore blind to word order.
+// The clean proof is one needle:
+//
+//     /cards/named?fuzzy=bolt+lightning  ->  Blightning
+//
+// pg_trgm scores `bolt lightning` against `Lightning Bolt` at 1.0 — the two have identical word
+// sets — so no threshold and no tiebreak can ever let Blightning win. Scryfall answers Blightning,
+// so Scryfall is not scoring word sets.
+//
+// WHAT IT IS SCORING, fitted over the whole 86-needle set (the fit lives in this repo's history
+// as scratchpad/fit3.ts; the probe corpus is the cached Scryfall responses it reads):
+//
+//     fold  = accents folded, lowercased, EVERY non-alphanumeric removed  ("Ego à Deriva" ->
+//             "egoaderiva", "bolt lightning" -> "boltlightning")
+//     J     = Jaccard over the distinct raw 3-byte windows of the WHOLE folded string
+//             (no word split, no padding — this is where word order survives)
+//     L     = 1 - levenshtein(a, b) / max(|a|, |b|)
+//     score = (J + L) / 2                    FLOOR 0.625   LEAD 0.01
+//
+// Neither half alone reproduces the set: J alone puts `Lightning Bolt` (0.692) above `Blightning`
+// (0.583) for `bolt lightning`; L alone puts `Ball Lightning` (0.846) above it. Their mean puts
+// Blightning first (0.676 vs 0.664), and does so for 85 of the 86 needles. The one it does not
+// reproduce is `fuzzy=austere` — see `cards_containing_all_words`, which is the stage that
+// actually answers it.
+//
+// THE STAGE ORDER CHANGED WITH THE METRIC, and had to: `/cards/named?fuzzy=` is exact ->
+// TYPO -> containment, not exact -> containment -> typo. `fuzzy=primeval titanoth` is the proof
+// in one needle — containment answers `Titanoth Rex` (its flavor name carries "primeval", its
+// oracle name carries "titanoth") and Scryfall answers `Primeval Titan`, which only the typo
+// stage can produce. Reordering without the metric change is not an option either: it turns
+// `bolt` and `jac bel`, which Scryfall calls ambiguous, into hits.
+//
+// THE TYPO STAGE IS ENGLISH-ONLY. Scryfall gives foreign printed names no typo tolerance at all:
+// `fuzzy=blitzschlag` resolves the German printing of Lightning Bolt, `fuzzy=blitzschlagg`
+// answers 404, and `fuzzy=ego a derva` (one letter off the Portuguese name) answers 404 while
+// `fuzzy=ego a deriva` resolves it. So printed names reach `?fuzzy=` through the EXACT and
+// CONTAINMENT stages only, and this scan reads oracle names — which also takes ~247k records off
+// the hot path it used to walk.
+//
+// UPSTREAM CONSEQUENCE, deliberate and owner-approved (PR #927): upstream's SQL fallback still
+// scores with pg_trgm, so the two paths now disagree on needles like `bolt lightning`. The engine
+// is what this port serves and Scryfall is what it has to match, so the engine matches Scryfall.
 //
 // Nothing is stored for this. The name vocabulary is ~31,700 oracle names, so scoring the whole
 // corpus per request is a few milliseconds -- cheaper than carrying a trigram index for a route
-// that is a small fraction of traffic.
+// that is a small fraction of traffic. It runs in the Durable Object (30 s), never the isolate.
 
-/// Every distinct trigram of `s`, pg_trgm's way.
-fn trigrams(s: &str) -> std::collections::BTreeSet<[u8; 3]> {
-    let mut out = std::collections::BTreeSet::new();
-    for word in s.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()) {
-        // pg_trgm pads "  word " and windows over the bytes.
-        let mut padded = Vec::with_capacity(word.len() + 3);
-        padded.extend_from_slice(b"  ");
-        padded.extend_from_slice(word.as_bytes());
-        padded.push(b' ');
-        for w in padded.windows(3) {
-            out.insert([w[0], w[1], w[2]]);
-        }
-    }
-    out
+/// The score at or above which a candidate is eligible at all, and the margin the winner must
+/// hold over the best DIFFERENT answer. Fitted, not chosen: 0.625 sits in the middle of the
+/// 0.60–0.65 plateau over which the 86-needle set scores identically.
+pub(crate) const FUZZY_SCORE_FLOOR: f32 = 0.625;
+pub(crate) const FUZZY_SCORE_LEAD: f32 = 0.01;
+
+/// `s` with every non-alphanumeric ASCII byte removed, written into a caller-owned buffer.
+///
+/// Multi-byte UTF-8 is kept whole (a continuation byte is never ASCII), so a CJK printed name
+/// survives this unchanged while `"ego à deriva"` — already accent-folded by the caller — becomes
+/// `"egoaderiva"`. This is the same separator fold `core_api::strip_separators` applies to the
+/// containment stage's words, spelled for bytes because the windows below are byte windows.
+fn fold_separators_into(s: &str, out: &mut Vec<u8>) {
+    out.clear();
+    out.extend(s.bytes().filter(|b| !b.is_ascii() || b.is_ascii_alphanumeric()));
 }
 
-/// pg_trgm's `similarity(a, b)`: Jaccard over trigram sets. 0.0 when both are empty.
-/// `trigrams`, written into a caller-owned buffer as a sorted, deduped run.
+/// The distinct 3-byte windows of an already-separator-folded string, as a sorted, deduped run so
+/// a merge can stand in for a set intersection.
 ///
-/// Same trigram definition as `trigrams` (pg_trgm's `"  word "` padding, windowed over bytes), and
-/// `fuzzy_name_match` reuses one buffer across every card so its scan allocates once instead of
-/// 31,724 times. Sorted+deduped so a merge can stand in for a set intersection.
-fn trigrams_into(s: &str, out: &mut Vec<[u8; 3]>) {
+/// A string under three bytes has no windows, so it is right-padded with NUL — a byte no folded
+/// name contains — which gives it exactly one gram that only an identical short string shares.
+fn name_trigrams_into(folded: &[u8], out: &mut Vec<[u8; 3]>) {
     out.clear();
-    for word in s.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()) {
-        let bytes = word.as_bytes();
-        // The padded form is "  word ", so the windows are: two leading pairs that need no buffer,
-        // then the word's own windows, then the trailing one. Materialising the padded Vec was the
-        // other per-name allocation.
-        out.push([b' ', b' ', bytes[0]]);
-        if bytes.len() >= 2 {
-            out.push([b' ', bytes[0], bytes[1]]);
-        } else {
-            out.push([b' ', bytes[0], b' ']);
-        }
-        for w in bytes.windows(3) {
-            out.push([w[0], w[1], w[2]]);
-        }
-        if bytes.len() >= 2 {
-            let n = bytes.len();
-            out.push([bytes[n - 2], bytes[n - 1], b' ']);
-        }
+    if folded.is_empty() {
+        return;
+    }
+    if folded.len() < 3 {
+        out.push([folded[0], *folded.get(1).unwrap_or(&0), 0]);
+        return;
+    }
+    for w in folded.windows(3) {
+        out.push([w[0], w[1], w[2]]);
     }
     out.sort_unstable();
     out.dedup();
 }
 
-/// TEST-ONLY since the fuzzy scan stopped calling it: this is the REFERENCE statement of
-/// pg_trgm's similarity, pinned by `trigram_similarity_matches_pg_trgm` and used by
-/// `trigrams_into_matches_the_padded_definition` to hold the scan's faster route to it. Kept
-/// rather than deleted because a definition the tests check against is worth more than the call
-/// site it lost.
+/// Levenshtein distance over bytes, two rolling rows in a caller-owned buffer so the scan
+/// allocates once rather than once per name. Bytes rather than chars for the same reason the
+/// trigram windows are byte windows: the strings this compares are accent-folded oracle names,
+/// which are ASCII but for a handful of names whose non-ASCII bytes then simply compare as bytes.
+fn levenshtein_bytes(a: &[u8], b: &[u8], buf: &mut Vec<u32>) -> u32 {
+    if a.is_empty() {
+        return b.len() as u32;
+    }
+    if b.is_empty() {
+        return a.len() as u32;
+    }
+    let m = b.len();
+    buf.clear();
+    buf.extend(0..=m as u32);
+    for (i, &ca) in a.iter().enumerate() {
+        let mut diag = buf[0];
+        buf[0] = i as u32 + 1;
+        for j in 1..=m {
+            let up = buf[j];
+            let cost = u32::from(ca != b[j - 1]);
+            buf[j] = (buf[j] + 1).min(buf[j - 1] + 1).min(diag + cost);
+            diag = up;
+        }
+    }
+    buf[m]
+}
+
+/// TEST-ONLY: the REFERENCE statement of the metric above, written the obvious way (sets and a
+/// full DP) so the scan's faster route to it — sorted-run merge, rolling rows, the Jaccard
+/// prefilter — has something to be pinned against. See `fuzzy_score_matches_the_reference`.
 #[cfg(test)]
-pub(crate) fn trigram_similarity(a: &str, b: &str) -> f32 {
-    let (ta, tb) = (trigrams(a), trigrams(b));
-    if ta.is_empty() || tb.is_empty() {
+pub(crate) fn fuzzy_similarity(a: &str, b: &str) -> f32 {
+    let fold = |s: &str| -> Vec<u8> {
+        let mut v = Vec::new();
+        fold_separators_into(s, &mut v);
+        v
+    };
+    let (fa, fb) = (fold(a), fold(b));
+    if fa.is_empty() || fb.is_empty() {
         return 0.0;
     }
-    let shared = ta.intersection(&tb).count();
-    let union = ta.len() + tb.len() - shared;
-    if union == 0 { 0.0 } else { shared as f32 / union as f32 }
+    let grams = |v: &[u8]| -> std::collections::BTreeSet<[u8; 3]> {
+        let mut g = Vec::new();
+        name_trigrams_into(v, &mut g);
+        g.into_iter().collect()
+    };
+    let (ga, gb) = (grams(&fa), grams(&fb));
+    let shared = ga.intersection(&gb).count();
+    let union = ga.len() + gb.len() - shared;
+    let jaccard = if union == 0 { 0.0 } else { shared as f32 / union as f32 };
+    let mut buf = Vec::new();
+    let dist = levenshtein_bytes(&fa, &fb, &mut buf) as f32;
+    let lev = 1.0 - dist / fa.len().max(fb.len()) as f32;
+    (jaccard + lev) / 2.0
 }
 
 /// What a `?fuzzy=` lookup resolved to.
@@ -3380,12 +3452,30 @@ pub(crate) fn card_of_vpid(data: &Archived<CardData>, vpid: u32) -> u32 {
     }
 }
 
-/// pg_trgm's Jaccard over two sorted, deduped trigram runs, or None when it cannot clear
-/// `floor`. The size-ratio ceiling (`shared <= min(|a|,|b|)`, `union >= max`) makes the skip
-/// exact rather than approximate — no candidate that could clear the floor is dropped.
-fn jaccard_cleared(name_tg: &[[u8; 3]], needle_tg: &[[u8; 3]], floor: f32) -> Option<f32> {
+/// `(J + L) / 2` for one candidate, or None when it cannot clear `floor`.
+///
+/// Two exact skips, in the order that makes the cheap one pay for the dear one:
+///
+///   1. THE JACCARD PREFILTER. `L` is at most 1, so a candidate cannot reach `floor` unless
+///      `J >= 2 * floor - 1` — 0.25 at the fitted floor. The Jaccard is a merge of two sorted
+///      runs; the Levenshtein is a `|a| x |b|` DP, so paying the merge to skip the DP is the
+///      whole reason the scan stays in the low milliseconds over ~31,700 names.
+///   2. THE SIZE-RATIO CEILING inside it (`shared <= min(|a|,|b|)`, `union >= max`), which drops
+///      wildly mismatched lengths without touching either run.
+///
+/// Both are ceilings on the true score, never approximations of it: nothing that could clear the
+/// floor is skipped.
+fn fuzzy_score_cleared(
+    name_tg: &[[u8; 3]],
+    needle_tg: &[[u8; 3]],
+    name: &[u8],
+    needle: &[u8],
+    floor: f32,
+    dp: &mut Vec<u32>,
+) -> Option<f32> {
     let (la, lb) = (name_tg.len(), needle_tg.len());
-    if la == 0 || (la.min(lb) as f32) < floor * la.max(lb) as f32 {
+    let jaccard_floor = (2.0 * floor - 1.0).max(0.0);
+    if la == 0 || lb == 0 || (la.min(lb) as f32) < jaccard_floor * la.max(lb) as f32 {
         return None;
     }
     // Two sorted runs merged: no set, no allocation, no hashing.
@@ -3402,101 +3492,62 @@ fn jaccard_cleared(name_tg: &[[u8; 3]], needle_tg: &[[u8; 3]], floor: f32) -> Op
         }
     }
     let union = la + lb - shared;
-    let score = if union == 0 { 0.0 } else { shared as f32 / union as f32 };
+    let jaccard = if union == 0 { 0.0 } else { shared as f32 / union as f32 };
+    if jaccard < jaccard_floor {
+        return None;
+    }
+    let longest = name.len().max(needle.len());
+    if longest == 0 {
+        return None;
+    }
+    let lev = 1.0 - levenshtein_bytes(name, needle, dp) as f32 / longest as f32;
+    let score = (jaccard + lev) / 2.0;
     (score >= floor).then_some(score)
 }
 
-/// Printed-name records worth scoring against `needle`: the union of the trigram index's
-/// postings over the needle's raw 3-byte windows — any record sharing NO window with the
-/// needle is skipped without being resolved or scored, which is what keeps the foreign pass
-/// at candidate scale (~a few posting lists) instead of ~247k Jaccard evaluations.
-///
-/// Union, not intersection: fuzzy tolerates typos, so requiring EVERY window (the containment
-/// rule `trigram_candidates` enforces) would drop real matches. A needle under 3 bytes has no
-/// windows and falls back to every record, like the English scan's own short-needle behavior.
-/// KNOWN EDGE: a record whose folded name is under 3 bytes contributes no windows at build and
-/// is unreachable here — printed names that short do not occur in the real corpus, and the
-/// English pass (which scans) is unaffected.
-fn printed_record_candidates(pn: &Archived<PrintedNameIndex>, needle: &str) -> Vec<u32> {
-    let n_records = pn.name_ids.len();
-    // Applicability check, same shape as name_scan_candidates: an index built for a different
-    // record count (a hand-built fixture) must widen to a scan, never silently drop candidates.
-    if u32::from(pn.trigrams.domain) as usize != n_records || needle.len() < 3 {
-        return (0..n_records as u32).collect();
-    }
-    let mut bits = vec![0u64; n_records.div_ceil(64)];
-    let mut seen: Vec<[u8; 3]> = needle.as_bytes().windows(3).map(|w| [w[0], w[1], w[2]]).collect();
-    seen.sort_unstable();
-    seen.dedup();
-    for tri in seen {
-        match lookup_trigram(&pn.trigrams, tri) {
-            Some(TriOperand::Posting(ids)) => {
-                for id in ids {
-                    bits[(id >> 6) as usize] |= 1u64 << (id & 63);
-                }
-            }
-            Some(TriOperand::Plane(words)) => or_bits_into(&mut bits, &words),
-            None => {}
-        }
-    }
-    let mut out = Vec::new();
-    for (wi, word) in bits.iter().enumerate() {
-        let mut w = *word;
-        while w != 0 {
-            out.push((wi as u32) << 6 | w.trailing_zeros());
-            w &= w - 1;
-        }
-    }
-    out
+/// The needle, in the form both scans below compare against: lowercased, separator-folded bytes
+/// plus their sorted trigram run. Empty when nothing alphanumeric survives.
+fn fuzzy_needle(needle: &str) -> Option<(Vec<u8>, Vec<[u8; 3]>)> {
+    let lowered = needle.to_lowercase();
+    let mut bytes = Vec::with_capacity(lowered.len());
+    fold_separators_into(&lowered, &mut bytes);
+    let mut tg = Vec::with_capacity(32);
+    name_trigrams_into(&bytes, &mut tg);
+    (!tg.is_empty()).then_some((bytes, tg))
 }
 
-/// The typo-tolerant name match, with Scryfall's thresholds, over BOTH name spaces: every
-/// card's folded English name (a scan, as ever) plus every distinct (folded printed name, lang)
-/// record, trigram-narrowed to the records sharing a window with the needle.
+/// The typo-tolerant name match, with Scryfall's thresholds, over every card's folded ENGLISH
+/// name — and only those. Printed names get no typo tolerance on Scryfall (`fuzzy=blitzschlagg`
+/// and `fuzzy=ego a derva` both answer 404 while the exact foreign spellings resolve), so they
+/// reach `?fuzzy=` through the exact and containment stages instead; see the module comment.
 ///
 /// A candidate must clear `floor`, and the best must lead the runner-up by `lead`. The
 /// runner-up rule is FuzzyRace's: only a different name on a different CARD competes — several
 /// printings of one card are the same answer, a card's own foreign and English names are too,
 /// and two cards sharing a name stay one answer.
-pub(crate) fn fuzzy_name_match(data: &Archived<CardData>, needle: &str, floor: f32, lead: f32) -> FuzzyOutcome {
-    let needle = needle.to_lowercase();
-    let needle = needle.to_lowercase();
-    // The needle's trigrams are LOOP-INVARIANT, and a sorted Vec is the shape this scan wants
-    // rather than the BTreeSet `trigram_similarity` returns. Calling that helper per card rebuilt
-    // this set 31,724 times and heap-allocated a fresh BTreeSet (plus a padded Vec per word) for
-    // every name besides — on a path that is one linear pass over every card in the corpus.
-    // Measured on the real corpus: 25,350 us for one `?fuzzy=` lookup before this.
-    //
-    // `trigram_similarity` itself is deliberately untouched: it is pinned to pg_trgm's definition
-    // by `trigram_similarity_matches_pg_trgm`, and jaccard_cleared computes the identical ratio
-    // by a different route (two sorted runs merged, instead of two sets intersected).
-    let mut needle_tg: Vec<[u8; 3]> = trigrams(&needle).into_iter().collect();
-    needle_tg.sort_unstable();
-    needle_tg.dedup();
-    if needle_tg.is_empty() {
-        return FuzzyOutcome::Miss;
-    }
+pub(crate) fn fuzzy_name_match(
+    data: &Archived<CardData>,
+    needle: &str,
+    floor: f32,
+    lead: f32,
+) -> FuzzyOutcome {
+    // The needle's folded bytes and trigrams are LOOP-INVARIANT. Rebuilding them per card is what
+    // made one `?fuzzy=` lookup cost 25,350 us on the real corpus before this scan was written.
+    let Some((needle_bytes, needle_tg)) = fuzzy_needle(needle) else { return FuzzyOutcome::Miss };
     // Reused across every candidate, so the scan allocates once rather than per name.
+    let mut name_bytes: Vec<u8> = Vec::with_capacity(64);
     let mut name_tg: Vec<[u8; 3]> = Vec::with_capacity(64);
+    let mut dp: Vec<u32> = Vec::with_capacity(64);
     let mut race = FuzzyRace { best: None, runner_up: None };
     for (cid, card) in data.cards.iter().enumerate() {
         let name = card.card_name_folded.as_str();
-        trigrams_into(name, &mut name_tg);
-        if let Some(score) = jaccard_cleared(&name_tg, &needle_tg, floor) {
+        fold_separators_into(name, &mut name_bytes);
+        name_trigrams_into(&name_bytes, &mut name_tg);
+        if let Some(score) =
+            fuzzy_score_cleared(&name_tg, &needle_tg, &name_bytes, &needle_bytes, floor, &mut dp)
+        {
             // An English-name hit materializes what it always has: the card's preferred printing.
             race.offer(score, cid as u32, u32::from(data.offsets[cid]), name);
-        }
-    }
-    let pn = &data.indexes.printed_names;
-    for rec in printed_record_candidates(pn, &needle) {
-        let rec = rec as usize;
-        let Some(name) = str_at(&data.strings, u32::from(pn.name_ids[rec])) else { continue };
-        trigrams_into(name, &mut name_tg);
-        if let Some(score) = jaccard_cleared(&name_tg, &needle_tg, floor) {
-            // The record's first vpid is its best-prefer printing — the object a foreign hit
-            // materializes.
-            let vpid = u32::from(pn.vpids[u32::from(pn.offsets[rec]) as usize]);
-            race.offer(score, card_of_vpid(data, vpid), vpid, name);
         }
     }
     race.outcome(lead)

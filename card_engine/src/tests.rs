@@ -19,7 +19,7 @@ use super::{
     CollField, CmpOp, FilterExpr, InlineStr, Interner, ManaCost, CompatFields, OracleCard, OracleFace, Printing, PrintingFace, RelatedCard, TagIndex,
     build_printing_by_scryfall_id, build_oracle_by_oracle_id, find_printing_by_scryfall_id, find_oracle_by_oracle_id,
     build_external_id_index, find_printing_by_external_id, EXT_MULTIVERSE, EXT_MTGO, EXT_ARENA, EXT_TCGPLAYER,
-    trigram_similarity, fuzzy_name_match, autocomplete_names, FuzzyOutcome,
+    fuzzy_similarity, fuzzy_name_match, autocomplete_names, FuzzyOutcome,
     VOCAB_NONE, COMPAT_PROMO, COMPAT_REPRINT, COMPAT_TEXTLESS, GAME_PAPER, GAME_ARENA, FINISH_FOIL, FINISH_NONFOIL,
     TextField, TextSearchField, Tri, SortedTrigramIndex, VocabInterner, ARTIST_NONE, NONE_STR, TYPE_ARTIFACT, TYPE_CREATURE,
     TYPE_ENCHANTMENT, TYPE_INSTANT, TYPE_LAND, TYPE_LEGENDARY, TYPE_PLANESWALKER, TYPE_SNOW, TYPE_SORCERY,
@@ -11913,17 +11913,17 @@ fn printings_without_relations_carry_none() {
 
 // ─── Fuzzy name matching ──────────────────────────────────────────────────────
 
-/// `trigrams_into` is a hand-rolled restatement of `trigrams`'s padded-window definition that
-/// avoids materialising the `"  word "` buffer, so the two must agree EXACTLY — a single dropped
-/// or extra window would shift every fuzzy score without failing anything else.
+/// `fuzzy_score_cleared` is a hand-rolled restatement of the metric that skips work two ways (the
+/// Jaccard prefilter, the size-ratio ceiling) and merges sorted runs instead of intersecting
+/// sets. It must agree EXACTLY with `fuzzy_similarity`, the reference statement — a single
+/// dropped window or an over-eager skip would shift every fuzzy score without failing anything
+/// else.
 ///
-/// The word lengths are the interesting axis: 1 and 2 bytes are the cases where the padded form is
-/// shorter than a full 3-window and the leading/trailing windows overlap, which is precisely where
-/// an off-by-one would hide.
+/// Lengths 1 and 2 are the interesting axis: they are the cases with no full 3-window, where the
+/// NUL padding is the only thing keeping two short strings from colliding.
 #[test]
-fn trigrams_into_matches_the_padded_definition() {
-    let mut buf = Vec::new();
-    for s in [
+fn fuzzy_score_matches_the_reference() {
+    let cases = [
         "",
         "a",
         "ab",
@@ -11936,38 +11936,68 @@ fn trigrams_into_matches_the_padded_definition() {
         "  leading and trailing  ",
         "!!! ??? ---",
         "eowyn",
-        "\u{e9}owyn",
         "fire // ice",
         "x",
         "aaaa aaaa",
-        "\u{c6}therling",
-    ] {
-        crate::trigrams_into(s, &mut buf);
-        let want: Vec<[u8; 3]> = crate::trigrams(s).into_iter().collect();
-        assert_eq!(buf, want, "trigrams_into disagrees with trigrams for {s:?}");
+        "lightning bolt",
+        "bolt lightning",
+        "blightning",
+        "counterspell",
+        "counters",
+    ];
+    let mut dp = Vec::new();
+    let (mut ab, mut bb) = (Vec::new(), Vec::new());
+    let (mut at, mut bt) = (Vec::new(), Vec::new());
+    for a in cases {
+        for b in cases {
+            crate::fold_separators_into(a, &mut ab);
+            crate::fold_separators_into(b, &mut bb);
+            crate::name_trigrams_into(&ab, &mut at);
+            crate::name_trigrams_into(&bb, &mut bt);
+            let want = crate::fuzzy_similarity(a, b);
+            // Floor 0.0 asks for the score whenever one exists, so the skips are exercised
+            // against the reference rather than hidden behind them.
+            let got = crate::fuzzy_score_cleared(&at, &bt, &ab, &bb, 0.0, &mut dp);
+            match got {
+                Some(score) => assert!((score - want).abs() < 1e-6, "{a:?} vs {b:?}: {score} != {want}"),
+                None => assert_eq!(want, 0.0, "{a:?} vs {b:?}: skipped a nonzero score {want}"),
+            }
+        }
     }
 }
 
+/// The metric itself, on the needles that fixed it. Hand-computed from the definition in lib.rs's
+/// module comment: J over the whole folded string's 3-byte windows, averaged with normalized
+/// Levenshtein.
 #[test]
-fn trigram_similarity_matches_pg_trgm() {
-    // pg_trgm pads each word "  word " and windows over it, so "abc" yields exactly
-    // {"  a", " ab", "abc", "bc "}. Identical strings therefore score 1.0.
-    assert!((trigram_similarity("abc", "abc") - 1.0).abs() < 1e-6);
+fn fuzzy_similarity_is_the_derived_metric() {
+    // Identical strings score 1.0, and separators are not characters.
+    assert!((fuzzy_similarity("abc", "abc") - 1.0).abs() < 1e-6);
+    assert!((fuzzy_similarity("urza's bauble", "urza s bauble") - 1.0).abs() < 1e-6);
 
-    // "abc" vs "abd": {"  a"," ab","abc","bc "} vs {"  a"," ab","abd","bd "}.
-    // shared 2, union 4 + 4 - 2 = 6, so 1/3. Hand-computed against pg_trgm's definition.
-    assert!((trigram_similarity("abc", "abd") - 1.0 / 3.0).abs() < 1e-6);
-
-    // Non-alphanumerics are separators, not characters: punctuation between words changes nothing.
-    assert!((trigram_similarity("urza's bauble", "urza s bauble") - 1.0).abs() < 1e-6);
+    // THE NEEDLE THAT DISPROVED pg_trgm. Word-set similarity scores `bolt lightning` against
+    // `Lightning Bolt` at 1.0, so Blightning could never win; Scryfall answers Blightning, and so
+    // does this metric. Measured on api.scryfall.com 2026-08-16.
+    let blightning = fuzzy_similarity("bolt lightning", "blightning");
+    let bolt = fuzzy_similarity("bolt lightning", "lightning bolt");
+    assert!(blightning > bolt, "bolt lightning: Blightning {blightning} must beat Lightning Bolt {bolt}");
 
     // Nothing in common scores 0, and an empty side scores 0 rather than dividing by zero.
-    assert_eq!(trigram_similarity("abc", "xyz"), 0.0);
-    assert_eq!(trigram_similarity("", "abc"), 0.0);
-    assert_eq!(trigram_similarity("", ""), 0.0);
+    assert_eq!(fuzzy_similarity("abc", "xyz"), 0.0);
+    assert_eq!(fuzzy_similarity("", "abc"), 0.0);
+    assert_eq!(fuzzy_similarity("", ""), 0.0);
 
-    // Symmetric, as Jaccard is.
-    assert_eq!(trigram_similarity("lightning", "lightnin"), trigram_similarity("lightnin", "lightning"));
+    // Symmetric, as both halves are.
+    assert_eq!(fuzzy_similarity("lightning", "lightnin"), fuzzy_similarity("lightnin", "lightning"));
+
+    // The fitted floor admits the needles Scryfall resolves and rejects the ones it calls
+    // ambiguous or not_found — the plateau's two edges, on real names.
+    assert!(fuzzy_similarity("counterspellxxxxxxxxxx", "counterspell") >= crate::FUZZY_SCORE_FLOOR);
+    assert!(fuzzy_similarity("lihgtning bolt", "lightning bolt") >= crate::FUZZY_SCORE_FLOOR);
+    assert!(fuzzy_similarity("sol rin", "sol ring") >= crate::FUZZY_SCORE_FLOOR);
+    assert!(fuzzy_similarity("ring sol", "sol ring") < crate::FUZZY_SCORE_FLOOR);
+    assert!(fuzzy_similarity("red ego", "altered ego") < crate::FUZZY_SCORE_FLOOR);
+    assert!(fuzzy_similarity("bolt", "boltwave") < crate::FUZZY_SCORE_FLOOR);
 }
 
 /// A CardData whose cards carry the given names, one printing each — the fuzzy scan's minimal
@@ -11991,7 +12021,7 @@ fn a_typo_resolves_to_the_intended_card() {
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
-    match fuzzy_name_match(a, "lightnig bolt", 0.4, 0.05) {
+    match fuzzy_name_match(a, "lightnig bolt", crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD) {
         FuzzyOutcome::Hit { cid, vpid } => {
             assert_eq!(cid, 0, "a one-letter typo still finds Lightning Bolt");
             assert_eq!(vpid, 0, "an English hit carries the card's preferred printing");
@@ -11999,17 +12029,23 @@ fn a_typo_resolves_to_the_intended_card() {
         _ => panic!("expected a hit"),
     }
     // Nothing close enough clears the floor.
-    assert!(matches!(fuzzy_name_match(a, "zzzzzzzz", 0.4, 0.05), FuzzyOutcome::Miss));
+    assert!(matches!(fuzzy_name_match(a, "zzzzzzzz", crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD), FuzzyOutcome::Miss));
 }
 
 #[test]
 fn two_close_names_are_ambiguous_not_a_guess() {
     // Scryfall reports `ambiguous` rather than picking, and collapsing that to "not found" would
     // tell the client the card does not exist.
-    let data = named_cards_store(&["fire dragon", "fire dragoon"]);
+    //
+    // The pair is SYMMETRIC around the needle — "fire dragen" is one substitution from each, and
+    // each differs from it in the same three trigrams — so the two score identically and neither
+    // can lead. An asymmetric near-miss like "fire dragoon" (two edits, one more trigram) is NOT
+    // ambiguous under the derived metric and must not be used here: it loses by 0.068, which is
+    // the metric working rather than a tie.
+    let data = named_cards_store(&["fire dragon", "fire dragan"]);
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
-    assert!(matches!(fuzzy_name_match(a, "fire dragen", 0.4, 0.05), FuzzyOutcome::Ambiguous));
+    assert!(matches!(fuzzy_name_match(a, "fire dragen", crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD), FuzzyOutcome::Ambiguous));
 }
 
 #[test]
@@ -12019,7 +12055,7 @@ fn printings_of_one_card_do_not_look_ambiguous() {
     let data = named_cards_store(&["lightning bolt", "lightning bolt", "lightning bolt"]);
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
-    assert!(matches!(fuzzy_name_match(a, "lightning bolt", 0.4, 0.05), FuzzyOutcome::Hit { .. }));
+    assert!(matches!(fuzzy_name_match(a, "lightning bolt", crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD), FuzzyOutcome::Hit { .. }));
 }
 
 #[test]
@@ -12343,21 +12379,24 @@ fn a_language_pick_follows_the_english_row_in_the_querys_own_set() {
     assert_eq!(u128::from(page[0].1.scryfall_id), 1, "clb 865 is still the card's own pick");
 }
 
+/// A foreign printed name gets NO TYPO TOLERANCE from this scan, and that is Scryfall's rule
+/// rather than a simplification. Measured on api.scryfall.com 2026-08-16: `fuzzy=blitzschlag`
+/// resolves the German printing of Lightning Bolt and `fuzzy=blitzschlagg` answers 404;
+/// `fuzzy=ego a deriva` resolves the Portuguese printing of Unmoored Ego and `fuzzy=ego a derva`
+/// answers 404. Printed names reach `?fuzzy=` through the EXACT and CONTAINMENT stages, which
+/// index them; this scan reads oracle names, which also takes ~247k records off its hot path.
 #[test]
-fn a_foreign_printed_name_fuzzy_matches_to_its_printing() {
+fn a_foreign_printed_name_gets_no_typo_tolerance() {
     let (data, _, _) = bilingual_store();
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
-    match fuzzy_name_match(a, "eclair de fouder", 0.4, 0.05) {
-        FuzzyOutcome::Hit { cid, vpid } => {
-            assert_eq!(cid, 0);
-            assert_eq!(vpid, 1, "the annex printing (vpid = n_printings + 0), not the English row");
-        }
-        _ => panic!("expected a foreign-name hit"),
-    }
+    assert!(matches!(
+        fuzzy_name_match(a, "eclair de fouder", crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD),
+        FuzzyOutcome::Miss
+    ));
     // The card's own English and foreign names are ONE answer, never ambiguous with each other.
-    assert!(matches!(fuzzy_name_match(a, "lightning bolt", 0.4, 0.05), FuzzyOutcome::Hit { .. }));
+    assert!(matches!(fuzzy_name_match(a, "lightning bolt", crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD), FuzzyOutcome::Hit { .. }));
 }
 
 #[test]
