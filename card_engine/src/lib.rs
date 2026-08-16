@@ -2362,6 +2362,25 @@ impl ArchivedHybridTagIndex {
         }
         self.sparse.get(value).map(|v| v.len())
     }
+
+    /// The value's ids as a materialized posting list, whichever tier stores it. `None` only when
+    /// the value is absent from the store entirely (same proof as `bits`). The widened driver's
+    /// card-space narrowing wants ids to project through `printing_to_card`/`foreign_to_card`,
+    /// not a bitmap over a space it is about to leave.
+    fn ids_of(&self, value: &str) -> Option<Vec<u32>> {
+        if let Some(b) = self.dense.get(value) {
+            let mut out = Vec::new();
+            for (wi, word) in b.iter().enumerate() {
+                let mut w = u64::from(*word);
+                while w != 0 {
+                    out.push((wi * 64) as u32 + w.trailing_zeros());
+                    w &= w - 1;
+                }
+            }
+            return Some(out);
+        }
+        self.sparse.get(value).map(|v| v.iter().map(|x| u32::from(*x)).collect())
+    }
 }
 
 fn build_artist_index(printings: &[Printing], n_artists: usize) -> ArtistIndex {
@@ -11591,6 +11610,152 @@ fn acquire_plan_features(
 /// estimate, so if a *materializing* plan wins there — or `PrintingRangeScan` wins
 /// but its fastpath declines — dispatch materializes lazily and re-chooses on exact
 /// features. That deferral is the "don't pay to materialize a plan you won't run".
+/// Resolve a VIRTUAL printing id: `vpid < printings.len()` is a canonical index, anything
+/// else addresses the foreign annex at `vpid - printings.len()`. The single addressing rule
+/// for both spaces — every widened-path emitter and every by-printed-name path goes through
+/// here, so the split can never be interpreted two ways.
+pub(crate) fn printing_at(data: &Archived<CardData>, vpid: u32) -> &APrinting {
+    let n = data.printings.len() as u32;
+    if vpid < n { &data.printings[vpid as usize] } else { &data.foreign[(vpid - n) as usize] }
+}
+
+/// One card's rows across BOTH printing spaces as `(vpid, row)`: the canonical range first,
+/// then the annex range, each already in prefer-desc store order. That order is load-bearing
+/// twice over — ties in every "best row" selection resolve to the earlier row, and
+/// `select_page`'s vpid tiebreak keeps canonical rows ahead of annex rows of the same card.
+fn widened_rows(data: &Archived<CardData>, cid: usize) -> impl Iterator<Item = (u32, &APrinting)> {
+    let n = data.printings.len() as u32;
+    let (cs, ce) = (u32::from(data.offsets[cid]) as usize, u32::from(data.offsets[cid + 1]) as usize);
+    let (fs, fe) =
+        (u32::from(data.foreign_offsets[cid]) as usize, u32::from(data.foreign_offsets[cid + 1]) as usize);
+    data.printings[cs..ce]
+        .iter()
+        .enumerate()
+        .map(move |(i, p)| ((cs + i) as u32, p))
+        .chain(data.foreign[fs..fe].iter().enumerate().map(move |(i, p)| (n + (fs + i) as u32, p)))
+}
+
+/// The multilingual (widened) query driver: both printing spaces, full-filter verify, no plans.
+///
+/// Runs instead of `run_query_routed` when `include_multilingual` is set or the bound filter
+/// carries a `LangMatch` leaf; with neither trigger the routed driver runs bit-for-bit as before
+/// and never reads the annex — that separation is the annex's whole design (see CardData.foreign),
+/// and it is why this driver affords to be simple. The six physical plans, the narrowing
+/// machinery, and the estimator are all built over canonical-space indexes; rather than teach
+/// each of them a second space, this verifies the FULL bound filter per row over both ranges of
+/// each candidate card and feeds the same `sort_key_bits`/`GatherSelect`/`select_page` selection
+/// the gathered plan uses. `set_rank`/`artist_rank` are assigned over the canonical+annex union
+/// at build time, so every sort key is comparable across the two spaces.
+///
+/// Candidate cards: a language pinned as a top-level conjunct (`lang:ja …`) narrows to the cards
+/// owning a printing in that language — both lang indexes projected to card space, ~62k rows'
+/// cards for `lang:ja` at corpus scale instead of the corpus. Anything else (bare
+/// `include_multilingual`, `lang:` under Or/Not, `lang:any`) verifies every card, which is the
+/// full-scan cost class the routed path's GatheredScan already accepts as its floor.
+///
+/// Mode semantics (verified against the live Scryfall API):
+/// - `unique=cards`: one row per card — the best MATCHING row by the request's prefer across
+///   both spaces. `lang:ja` therefore answers with the Japanese printing itself, while
+///   `include_multilingual` rolls up to the English row (every row matches, and foreign rows
+///   lack the English prefer bonus — no prefer change needed).
+/// - `unique=prints`: every matching row, canonical before annex within a card.
+/// - `unique=art`: one row per distinct artwork group with a matching row; annex rows share
+///   canonical group ids where they share the illustration (assign_foreign_artwork_groups).
+fn run_query_widened<'a>(
+    data: &'a Archived<CardData>,
+    params: &QueryParams,
+    filter: &FilterExpr,
+) -> (usize, Vec<(&'a AOracleCard, &'a APrinting)>) {
+    let candidates: Vec<u32> = match filter.required_lang_value() {
+        Some(value) => {
+            let mut cards: Vec<u32> = Vec::new();
+            if let Some(pids) = data.indexes.langs.ids_of(value) {
+                cards.extend(pids.iter().map(|&p| u32::from(data.indexes.printing_to_card[p as usize])));
+            }
+            if let Some(fids) = data.indexes.foreign_langs.ids_of(value) {
+                cards.extend(fids.iter().map(|&f| u32::from(data.indexes.foreign_to_card[f as usize])));
+            }
+            cards.sort_unstable();
+            cards.dedup();
+            cards
+        }
+        None => (0..data.cards.len() as u32).collect(),
+    };
+
+    let residual: [&FilterExpr; 1] = [filter];
+    let matches = |card: &AOracleCard, p: &APrinting| {
+        FilterExpr::residual_matches(card, p, &data.strings, &residual, false)
+    };
+    let mut sel = GatherSelect::new(params.page_offset, params.limit);
+    // Artwork scratch, reused across cards: group ids are bounded by the same
+    // ARTWORK_GROUP_WORDS invariant the canonical walk relies on — asserted over the
+    // canonical+annex UNION at build time (assign_foreign_artwork_groups).
+    let mut group_best: Vec<Option<(u32, f64)>> = vec![None; ARTWORK_GROUP_WORDS * 64];
+    let mut touched: Vec<usize> = Vec::new();
+    for &cid in &candidates {
+        let card = &data.cards[cid as usize];
+        let before = sel.buf().len();
+        match params.mode {
+            Mode::Card => {
+                // Strict > keeps the earlier row on ties, so with the default prefer this picks
+                // exactly what the stored order encodes: the best canonical row, then the best
+                // annex row only when no canonical row matched (or genuinely outscores).
+                let mut best: Option<(u32, f64)> = None;
+                for (vpid, p) in widened_rows(data, cid as usize) {
+                    if !matches(card, p) {
+                        continue;
+                    }
+                    let score = prefer_score(card, p, params.prefer);
+                    if best.is_none_or(|(_, s)| score > s) {
+                        best = Some((vpid, score));
+                    }
+                }
+                if let Some((vpid, _)) = best {
+                    let p = printing_at(data, vpid);
+                    sel.buf().push((sort_key_bits(card, p, params.sort_col, params.descending), cid, vpid));
+                }
+            }
+            Mode::Printing => {
+                for (vpid, p) in widened_rows(data, cid as usize) {
+                    if matches(card, p) {
+                        sel.buf().push((sort_key_bits(card, p, params.sort_col, params.descending), cid, vpid));
+                    }
+                }
+            }
+            Mode::Artwork => {
+                touched.clear();
+                for (vpid, p) in widened_rows(data, cid as usize) {
+                    if !matches(card, p) {
+                        continue;
+                    }
+                    let gid = u16::from(p.artwork_group_id) as usize;
+                    let score = prefer_score(card, p, params.prefer);
+                    match group_best[gid] {
+                        None => {
+                            group_best[gid] = Some((vpid, score));
+                            touched.push(gid);
+                        }
+                        Some((_, s)) if score > s => group_best[gid] = Some((vpid, score)),
+                        Some(_) => {}
+                    }
+                }
+                for &gid in &touched {
+                    if let Some((vpid, _)) = group_best[gid].take() {
+                        let p = printing_at(data, vpid);
+                        sel.buf().push((sort_key_bits(card, p, params.sort_col, params.descending), cid, vpid));
+                    }
+                }
+            }
+        }
+        sel.absorb(before);
+    }
+    let (total, page) = sel.finish(params.page_offset, params.limit);
+    (
+        total,
+        page.into_iter().map(|(cid, vpid)| (&data.cards[cid as usize], printing_at(data, vpid))).collect(),
+    )
+}
+
 fn run_query_routed<'a>(
     ctx: &QueryCtx<'a>,
     params: &QueryParams,
@@ -13802,7 +13967,7 @@ impl QueryEngine {
     }
 
     #[allow(clippy::too_many_arguments)] // the PyO3 keyword surface; `run_query` behind it takes 9
-    #[pyo3(signature = (*, filters, unique="card", prefer="default", orderby="edhrec", direction="asc", limit=100, offset=0, fields=None))]
+    #[pyo3(signature = (*, filters, unique="card", prefer="default", orderby="edhrec", direction="asc", limit=100, offset=0, fields=None, include_multilingual=false))]
     fn query<'py>(
         &self,
         py: Python<'py>,
@@ -13814,6 +13979,7 @@ impl QueryEngine {
         limit: usize,
         offset: usize,
         fields: Option<Vec<String>>,
+        include_multilingual: bool,
     ) -> PyResult<Bound<'py, PyTuple>> {
         let resolved_fields = resolve_fields(fields)?;
         // get_mmap() remaps automatically if the on-disk inode has changed since
@@ -13856,8 +14022,16 @@ impl QueryEngine {
         let ctx = QueryCtx::from(data);
         // `run_query`'s string→enum adaptation, done here so the filter's sort-column bound can ride on
         // the params: `from_strs` is still the single interpretation of the four strings.
-        let (total, page) =
-            run_query_routed(&ctx, &params.with_sort_bound(sort_bound), &mut filter_expr, Some(&unsplit), plane_expr.as_ref());
+        //
+        // Scryfall's `include_multilingual`, or a `lang:` leaf anywhere in the bound filter
+        // (detected on the compiled tree, so the flag and the operator cannot widen differently),
+        // sends the query to the widened multilingual driver over both printing spaces. With
+        // neither trigger the routed driver runs bit-for-bit as before and never reads the annex.
+        let (total, page) = if include_multilingual || unsplit.mentions_lang() {
+            run_query_widened(data, &params.with_sort_bound(sort_bound), &unsplit)
+        } else {
+            run_query_routed(&ctx, &params.with_sort_bound(sort_bound), &mut filter_expr, Some(&unsplit), plane_expr.as_ref())
+        };
 
         let matches: Vec<Bound<PyDict>> = page
             .iter()
