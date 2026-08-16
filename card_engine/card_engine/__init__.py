@@ -83,4 +83,13 @@ ENGINE_COLUMNS: list[str] = [
     "type_line",
     "prefer_score",
     "cubecobra_score",
+    # The multilingual store's columns: the printed-language triple and its folded search key
+    # (per-face halves ride card_faces), and the canonical flag that routes a row into
+    # CardData.printings or the foreign annex. card_lang is deliberately absent — the engine
+    # reads lang from card_compat_blob, where it always has.
+    "printed_name",
+    "printed_type_line",
+    "printed_text",
+    "printed_name_folded",
+    "is_canonical",
 ]

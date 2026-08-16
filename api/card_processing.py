@@ -129,9 +129,17 @@ _FACE_TEXT_SEPARATOR = "\n//\n"
 # face's position, so neither is stored; both are re-emitted on read.
 _FACE_OBJECT_FIELDS = (
     "name",
+    # The face's printed-language text, in Scryfall's own key positions (printed_name after name,
+    # printed_type_line after type_line, printed_text after oracle_text). Presence varies per face
+    # per printing — a prepare-layout Spanish printing localizes the front face's name and type
+    # line and NOTHING else — and _face_records keeps absent keys absent, so the absence
+    # round-trips exactly instead of becoming null or borrowed English.
+    "printed_name",
     "mana_cost",
     "type_line",
+    "printed_type_line",
     "oracle_text",
+    "printed_text",
     "power",
     "toughness",
     "loyalty",
@@ -161,6 +169,31 @@ def _face_records(card_faces: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{field: face[field] for field in _FACE_OBJECT_FIELDS if field in face} for face in card_faces]
 
 
+def _printed_name_folded(card: dict[str, Any], face_records: list[dict[str, Any]]) -> str | None:
+    """The printed FULL name, folded exactly like card_name_folded, for the engine's printed-name index.
+
+    Per-face printed_names joined " // " — each face falling back to its English name when Scryfall
+    omitted printed_name there, so a prepare-layout printing whose second face has no printed name
+    still forms the full "Front // Back" key. The card's own top-level printed_name when it has no
+    faces. None when no printed name exists anywhere: an English printing contributes nothing to
+    the printed-name index.
+
+    Args:
+        card: The card-level object (top-level printed_name lives here for single-faced cards).
+        face_records: The `_face_records` snapshot, front first (empty for single-faced cards).
+
+    Returns:
+        The lowercased, accent-folded full printed name, or None.
+    """
+    if any("printed_name" in face for face in face_records):
+        full = " // ".join(face.get("printed_name") or face.get("name") or "" for face in face_records)
+    else:
+        full = card.get("printed_name")
+        if not full:
+            return None
+    return fold_accents(full.lower())
+
+
 # Keys that do NOT go in card_compat_blob, because a column already holds them or they are a pure
 # function of one. Kept subtractive, and mirrored in 2026-08-10-01-engine-card-objects.sql: the
 # residue is "whatever is left", so a Scryfall key nobody has seen yet lands in the blob by default
@@ -177,6 +210,7 @@ _COMPAT_BLOB_EXCLUDED = frozenset(
         "set", "set_name", "collector_number", "rarity", "flavor_text", "artist",
         "illustration_id", "border_color", "edhrec_rank", "legalities", "produced_mana",
         "watermark", "reserved", "game_changer", "frame",
+        "printed_name", "printed_type_line", "printed_text",
         # pure functions of id / set / collector_number / oracle_id, re-emitted on read
         "object", "uri", "scryfall_uri", "image_uris", "rulings_uri", "prints_search_uri",
         "set_uri", "set_search_uri", "scryfall_set_uri", "card_back_id", "related_uris",
@@ -309,6 +343,13 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
         # is a fallback, so anything only the blob carries is unanswerable on the engine path.
         merged_row["card_faces"] = _face_records(card_faces)
         merged_row["card_compat_blob"] = _compat_blob(card)
+        # The printed-language COLUMNS are the card-level triple. The per-face recursion above
+        # merged each face's own printed keys into its row, so without this the front face's
+        # printed_name would masquerade as the card's — the per-face halves ride card_faces.
+        merged_row["printed_name"] = card.get("printed_name")
+        merged_row["printed_type_line"] = card.get("printed_type_line")
+        merged_row["printed_text"] = card.get("printed_text")
+        merged_row["printed_name_folded"] = _printed_name_folded(card, merged_row["card_faces"])
         return [merged_row]
 
     # Single face case - set defaults
@@ -389,6 +430,18 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
         card["card_border"] = card["border_color"].lower()
     if "watermark" in card:
         card["card_watermark"] = card["watermark"].lower()
+    # The printing's language ("en", "ja", ...; Scryfall sends it lowercase already, lowered here
+    # to make the invariant explicit like the columns above). `lang` itself deliberately stays in
+    # card_compat_blob — the card object reads it from there — while card_lang is the search column.
+    if "lang" in card:
+        card["card_lang"] = card["lang"].lower()
+    # The printed-language triple, verbatim. Explicit None (not absent) when Scryfall omitted the
+    # key, so an upsert overrides any stale value instead of keeping it, same reasoning as the
+    # creature stat columns above.
+    card["printed_name"] = card.get("printed_name")
+    card["printed_type_line"] = card.get("printed_type_line")
+    card["printed_text"] = card.get("printed_text")
+    card["printed_name_folded"] = _printed_name_folded(card, [])
 
     mana_cost_text = card.get("mana_cost", "")
     card["mana_cost_jsonb"] = mana_cost_str_to_dict(mana_cost_text)

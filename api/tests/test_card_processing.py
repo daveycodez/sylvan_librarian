@@ -849,3 +849,93 @@ class TestEngineCardObjects:
     def test_single_faced_cards_still_get_a_compat_blob(self) -> None:
         """The residue is card-level, so it is not a multi-face concern."""
         assert "card_compat_blob" in preprocess_card(create_test_card(name="Solo Test"))[0]
+
+
+class TestMultilingualIngest:
+    """The printed-language columns, the language column, and their DFC discipline."""
+
+    def test_a_japanese_printing_carries_its_printed_triple(self) -> None:
+        card = create_test_card(
+            name="Shock",
+            lang="ja",
+            printed_name="ショック",
+            printed_type_line="インスタント",
+            printed_text="ショックはクリーチャー1体かプレインズウォーカー1体かプレイヤー1人を対象とする。",
+        )
+        (row,) = preprocess_card(card)
+        assert row["card_lang"] == "ja"
+        assert row["printed_name"] == "ショック"
+        assert row["printed_type_line"] == "インスタント"
+        assert row["printed_text"].startswith("ショック")
+        assert row["printed_name_folded"] == "ショック"
+        # The triple has columns of its own now, so the compat residue must not double-store it.
+        assert "printed_name" not in row["card_compat_blob"]
+        # lang deliberately STAYS in the blob: the card object reads it from there.
+        assert row["card_compat_blob"]["lang"] == "ja"
+
+    def test_an_english_printing_has_no_printed_columns(self) -> None:
+        (row,) = preprocess_card(create_test_card(lang="en"))
+        assert row["card_lang"] == "en"
+        # Explicit None (not absent) so an upsert overrides stale values.
+        assert row["printed_name"] is None
+        assert row["printed_type_line"] is None
+        assert row["printed_text"] is None
+        assert row["printed_name_folded"] is None
+
+    def test_dfc_printed_columns_are_the_cards_not_a_faces(self) -> None:
+        # A Spanish prepare-layout printing: the FRONT face localizes name and type line and
+        # nothing else, the back face nothing at all, and the card has no top-level triple.
+        card = create_test_card(
+            name="Prepare // Fight",
+            lang="es",
+            card_faces=[
+                {
+                    "name": "Prepare",
+                    "printed_name": "Preparación",
+                    "type_line": "Instant",
+                    "printed_type_line": "Instantáneo",
+                    "oracle_text": "Untap target creature.",
+                },
+                {
+                    "name": "Fight",
+                    "type_line": "Sorcery",
+                    "oracle_text": "Target creature you control fights target creature you don't control.",
+                },
+            ],
+        )
+        (row,) = preprocess_card(card)
+        # The columns are the card-level triple — absent here — not the front face's overlay.
+        assert row["printed_name"] is None
+        assert row["printed_type_line"] is None
+        # The per-face halves ride the face records, absence exact per face.
+        front, back = row["card_faces"]
+        assert front["printed_name"] == "Preparación"
+        assert front["printed_type_line"] == "Instantáneo"
+        assert "printed_text" not in front
+        assert "printed_name" not in back
+        # The folded FULL name joins printed where present and falls back to English where not.
+        assert row["printed_name_folded"] == "preparacion // fight"
+
+    def test_face_records_keep_scryfall_key_order(self) -> None:
+        card = create_test_card(
+            name="A // B",
+            lang="es",
+            card_faces=[
+                {
+                    "name": "A",
+                    "printed_name": "A-es",
+                    "mana_cost": "{R}",
+                    "type_line": "Instant",
+                    "printed_type_line": "Instantáneo",
+                    "oracle_text": "x",
+                    "printed_text": "x-es",
+                },
+                {"name": "B", "type_line": "Sorcery", "oracle_text": "y"},
+            ],
+        )
+        (row,) = preprocess_card(card)
+        front = row["card_faces"][0]
+        keys = list(front)
+        assert keys.index("printed_name") == keys.index("name") + 1
+        assert keys.index("printed_type_line") == keys.index("type_line") + 1
+        assert keys.index("printed_text") == keys.index("oracle_text") + 1
