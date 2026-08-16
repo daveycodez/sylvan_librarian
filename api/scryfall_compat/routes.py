@@ -216,6 +216,26 @@ _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F
 FUZZY_SIMILARITY_FLOOR = 0.4
 FUZZY_SIMILARITY_LEAD = 0.05
 
+# A name column with every non-alphanumeric character removed, which is what the containment stage
+# matches against (see `_fuzzy_containment_candidates`). NULL folds to '' so a row with no printed
+# name simply carries nothing, rather than making the whole predicate NULL. Spelled once, because
+# `api/db/2026-08-16-01-unseparated-name-search.sql` indexes this EXACT expression -- an expression
+# index only serves a query that repeats it character for character.
+_UNSEPARATED = "regexp_replace(lower(coalesce({column}, '')), '[^[:alnum:]]', '', 'g')"
+
+
+def _unseparated(word: str) -> str:
+    """Return `word` with every non-alphanumeric character removed -- `_UNSEPARATED`'s query side.
+
+    Args:
+        word: One word of the folded query.
+
+    Returns:
+        The word's alphanumeric characters, in order.
+    """
+    return "".join(char for char in word if char.isalnum())
+
+
 # Returned by the similarity stage when two names are too close to choose between. A distinct
 # object rather than a flag so the caller compares with `is` and cannot confuse it with a row.
 _AMBIGUOUS: dict[str, Any] = {"ambiguous": True}
@@ -923,7 +943,10 @@ class ScryfallCardsRoutes:
             A card object, or a Scryfall error object.
         """
         needle = fold_accents(fuzzy.strip().lower())
-        words = [word for word in re.split(r"[^\w']+", needle) if word]
+        # Separators come off the QUERY side too, so the containment stage compares like with like:
+        # "yawgmoth's" is matched as "yawgmoths", which is what "Yawgmoth's Will" reads as with ITS
+        # separators gone. A word that was nothing but punctuation drops out entirely.
+        words = [stripped for word in re.split(r"[^\w']+", needle) if (stripped := _unseparated(word))]
         if not words:
             return self._scryfall_respond(
                 falcon_response,
@@ -968,7 +991,16 @@ class ScryfallCardsRoutes:
         )
 
     def _ambiguous(self, falcon_response: falcon.Response | None, name: str, *, pretty: bool) -> dict[str, Any] | None:
-        """Emit Scryfall's `ambiguous` error.
+        """Emit Scryfall's `ambiguous` error, which is a `not_found` CARRYING a type.
+
+        Measured on api.scryfall.com 2026-08-16, `/cards/named?fuzzy=aust com`:
+
+            {"object":"error","code":"not_found","type":"ambiguous","status":404,
+             "details":"Too many cards match ambiguous name “aust com”. Add more words..."}
+
+        This sent `"code":"ambiguous"` with no `type` -- the same 404 with a different body. `code`
+        is the coarse class ("this resolved to no one card") and `type` carries the refinement,
+        which is Scryfall's split rather than ours.
 
         Args:
             falcon_response: The Falcon response to write to.
@@ -981,7 +1013,8 @@ class ScryfallCardsRoutes:
         return self._scryfall_respond(
             falcon_response,
             error_object(
-                code="ambiguous",
+                code="not_found",
+                error_type="ambiguous",
                 status=404,
                 details=f"Too many cards match ambiguous name “{name}”. Add more words to refine your search.",
             ),
@@ -1034,7 +1067,28 @@ class ScryfallCardsRoutes:
         base_clauses: list[str],
         base_params: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        """Return one printing per distinct card name containing every query word.
+        """Return one printing per distinct card name whose NAMES carry every query word.
+
+        Scryfall's containment stage is slacker than a LIKE per word against one column, in two
+        ways this reproduces -- both measured against api.scryfall.com on 2026-08-16:
+
+        1. SEPARATORS DO NOT COUNT. A word is matched against the name with every non-alphanumeric
+           character removed, so it may span the name's own word boundaries: `fuzzy=goad` is inside
+           "Ego à Deriva" ("eg|o a d|eriva"), and `fuzzy=aust com` matches "Manicomio Infausto".
+           `_UNSEPARATED` is the SQL side of that fold, and `api/db/2026-08-16-01-unseparated-name
+           -search.sql` indexes the identical expression so this stays index-assisted.
+        2. THE POOL IS THE PRINTING'S NAMES, NOT ONE NAME. Each word may land in EITHER the oracle
+           name or that printing's printed name, independently and in any order -- `fuzzy=red goad`
+           takes `red` from "Unmoo|red| Ego" and `goad` from the Portuguese printing's name, and
+           `fuzzy=goad red` resolves to the same printing. `magic.cards` is a row per PRINTING, so
+           the pool is exactly this row's two name columns.
+
+        The row that answers is the shortest completing printed name (English rows, whose
+        `printed_name_folded` is NULL, sort first at length 0), then prefer score. Length rather
+        than score alone because a name that spells the query and nothing else is the match the
+        query meant: `fuzzy=ego à deriva` is carried by the Portuguese "Ego à Deriva", the Spanish
+        "Ego a la deriva" and the Italian "Ego alla Deriva" alike, and Scryfall answers the
+        Portuguese one.
 
         Args:
             words: The folded query, split into words.
@@ -1048,12 +1102,16 @@ class ScryfallCardsRoutes:
         clauses = list(base_clauses)
         for index, word in enumerate(words):
             params[f"word_{index}"] = f"%{word}%"
-            clauses.append(f"lower(card_name_folded) LIKE %(word_{index})s")
+            clauses.append(
+                f"({_UNSEPARATED.format(column='card_name_folded')} LIKE %(word_{index})s "
+                f"OR {_UNSEPARATED.format(column='printed_name_folded')} LIKE %(word_{index})s)",
+            )
         return self._run_query(
             query=(
                 "SELECT DISTINCT ON (card_name) card_name, scryfall_id "
                 f"FROM magic.cards AS card WHERE {' AND '.join(clauses)} "
-                "ORDER BY card_name, prefer_score DESC NULLS LAST LIMIT 2"
+                "ORDER BY card_name, length(coalesce(printed_name_folded, '')), "
+                "prefer_score DESC NULLS LAST LIMIT 2"
             ),
             params=params,
             explain=False,
