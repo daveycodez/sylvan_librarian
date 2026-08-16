@@ -230,6 +230,40 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     # falls out of the complement without a rule of its own. Scryfall accepts both spellings.
     ("is", "firstprinting"): "-is:reprint",
     ("is", "firstprint"): "-is:reprint",
+    # -- Mana-symbol classes -------------------------------------------------
+    # Both are SYMBOL SET membership, and the sets come from Scryfall's own /symbology (fetched
+    # 2026-08-16, filtered to `represents_mana`), not from a shape guess: a symbol is HYBRID when it
+    # has two or more non-Phyrexian components, and PHYREXIAN when one of its components is P. The
+    # two overlap on the ten two-colour Phyrexian symbols ({G/W/P} ...), which are both, and they
+    # part company on {B/P} (Phyrexian, not hybrid -- one colour) and {C/P} (the same).
+    #
+    # Verified against api.scryfall.com card for card -- all 603 `is:hybrid` and all 73
+    # `is:phyrexian` fetched and diffed against the 2026-08-16 bulk: ZERO cards Scryfall names are
+    # missed by either rule, and every extra this corpus would add comes from a set the import does
+    # not carry (Unknown Event, Mystery Booster playtest, Heroes of the Realm).
+    #
+    # `m:` and not a regex over the printed cost: the cost is stored as counted SYMBOLS, so each
+    # leaf is an integer compare against the mana vocab, where a regex over the cost string
+    # mismatches in both directions (measured: 5 under, 35 over).
+    #
+    # The `o:` half of `is:phyrexian` is not decoration. Scryfall's rule is the symbol ANYWHERE on
+    # the card, not only in the cost -- 36 of its 73 cards carry no Phyrexian symbol in any cost at
+    # all (Spellskite, the Souleaters, every `{2}{B/P}: transform` back face) -- and dropping it
+    # leaves half the answer behind. `is:hybrid` is cost-only by the same measurement: 216 cards
+    # carry a hybrid symbol in their rules text and Scryfall calls none of them hybrid.
+    ("is", "hybrid"): (
+        "m:{W/U} or m:{W/B} or m:{U/B} or m:{U/R} or m:{B/R} or m:{B/G} or m:{R/G} or m:{R/W} or "
+        "m:{G/W} or m:{G/U} or m:{W/U/P} or m:{W/B/P} or m:{U/B/P} or m:{U/R/P} or m:{B/R/P} or "
+        "m:{B/G/P} or m:{R/G/P} or m:{R/W/P} or m:{G/W/P} or m:{G/U/P} or m:{2/W} or m:{2/U} or "
+        "m:{2/B} or m:{2/R} or m:{2/G} or m:{C/W} or m:{C/U} or m:{C/B} or m:{C/R} or m:{C/G}"
+    ),
+    ("is", "phyrexian"): (
+        "m:{W/P} or m:{U/P} or m:{B/P} or m:{R/P} or m:{G/P} or m:{C/P} or m:{W/U/P} or m:{W/B/P} or "
+        "m:{U/B/P} or m:{U/R/P} or m:{B/R/P} or m:{B/G/P} or m:{R/G/P} or m:{R/W/P} or m:{G/W/P} or "
+        'm:{G/U/P} or o:"{w/p}" or o:"{u/p}" or o:"{b/p}" or o:"{r/p}" or o:"{g/p}" or o:"{c/p}" or '
+        'o:"{w/u/p}" or o:"{w/b/p}" or o:"{u/b/p}" or o:"{u/r/p}" or o:"{b/r/p}" or o:"{b/g/p}" or '
+        'o:"{r/g/p}" or o:"{r/w/p}" or o:"{g/w/p}" or o:"{g/u/p}"'
+    ),
     # Spelling aliases of tags the importer stores (db_info.BOOLEAN_IS_TAGS / ARRAY_IS_TAGS).
     # Aliased rather than stored twice: a second copy of a 3,228-card tag is bytes for nothing.
     ("is", "full"): "is:fullart",
@@ -246,10 +280,9 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
 # one-character regex over a column matches exactly the rows that have one.
 #
 # NOT here, and warning for a stated reason: `has:illustration` / `has:stamp` / `has:multiverse` /
-# `has:tcgplayer` / `has:cardmarket` / `has:image` / `has:printedname` / `has:indicator` are
-# presence tests on columns with no regex path (ids, interned compat scalars, the annex), and
-# `has:attraction_lights` / `has:partner` have no stored column at all. Each needs a presence
-# predicate in the engine, not a rewrite.
+# `has:tcgplayer` / `has:cardmarket` / `has:image` / `has:indicator` are presence tests on columns
+# with no regex path (ids, interned compat scalars), and `has:attraction_lights` / `has:partner`
+# have no stored column at all. Each needs a presence predicate in the engine, not a rewrite.
 _HAS_EXPANSIONS: dict[str, str] = {
     # Presence on a regex-capable text column.
     "artist": "artist:/./",
@@ -264,6 +297,10 @@ _HAS_EXPANSIONS: dict[str, str] = {
     "nonfoil": "is:nonfoil",
     "spotlight": "is:spotlight",
     "story": "is:spotlight",
+    # The presence half again, for the one column that grew a predicate instead of a regex path:
+    # `has:printedname` is the same question `is:localizedname` asks, and both counts on
+    # api.scryfall.com are 31,294.
+    "printedname": "is:localizedname",
 }
 _DERIVED_EXPANSIONS.update({("has", value): dsl for value, dsl in _HAS_EXPANSIONS.items()})
 
@@ -271,14 +308,38 @@ _DERIVED_EXPANSIONS.update({("has", value): dsl for value, dsl in _HAS_EXPANSION
 # consequence for anything outside it: a warning rather than a silent zero.
 SUPPORTED_HAS_VALUES: frozenset[str] = frozenset(_HAS_EXPANSIONS)
 
-# Every `is:` value this parser can answer at all: the derivable expansions above plus the booleans
-# the importer stores on the row. Anything else reaches the engine as a tag no row carries and comes
-# back as zero results with nothing to say why -- see `unsupported_is_warnings`. Reading
-# BOOLEAN_IS_TAGS rather than restating it is what keeps a tag added to the importer from being
-# reported unsupported by the parser.
+# The `is:` values no rewrite can express and no importer tag holds: the engine answers each from a
+# field it already stores. Listed here so `SUPPORTED_IS_VALUES` covers them -- the alternative is a
+# predicate that works and still warns that it does not.
+#
+# `localizedname` is `printed_name_folded_id != NONE_STR`, "this printing carries a printed name",
+# which is also what Scryfall means. Measured 2026-08-16: 182 of the printings it matches are
+# ENGLISH (om1/66 prints "Rhilex the Accursed" over Agent Venom), so it is not "non-English"; it is
+# per-FACE, matching every Japanese transform printing whose printed names live on the faces and not
+# at the top level; and `is:localizedname e:dsk` counts 1,917 printings there against the same 1,917
+# in the bulk. Like `lang:`, its presence WIDENS the query to the foreign annex -- that is how
+# api.scryfall.com answers 31,294 cards for it with no `lang:` term in sight.
+#
+# `unique` is "this card has been printed in exactly one SET" -- Scryfall's syntax page says so in
+# as many words ("cards that have only been in a single set") -- and it is NOT prints=1: 2,847 of
+# its own 16,318 have more than one printing. The set count spans every language, verified on the
+# 130 cards whose only second set is a foreign-only promo (Salvat, ps11, pmei): Scryfall calls none
+# of them unique.
+ENGINE_IS_VALUES: frozenset[str] = frozenset({"localizedname", "unique"})
+
+# Every `has:` value this parser can answer. Same contract as SUPPORTED_IS_VALUES, and the same
+# consequence for anything outside it: a warning rather than a silent zero.
+SUPPORTED_HAS_VALUES: frozenset[str] = frozenset(_HAS_EXPANSIONS)
+
+# Every `is:` value this parser can answer at all: the derivable expansions above, the booleans the
+# importer stores on the row, and the two the engine answers from a stored field. Anything else
+# reaches the engine as a tag no row carries and comes back as zero results with nothing to say why
+# -- see `unsupported_is_warnings`. Reading BOOLEAN_IS_TAGS rather than restating it is what keeps a
+# tag added to the importer from being reported unsupported by the parser.
 SUPPORTED_IS_VALUES: frozenset[str] = (
     frozenset(BOOLEAN_IS_TAGS)
     | frozenset(ARRAY_IS_TAGS)
+    | ENGINE_IS_VALUES
     | frozenset(value for alias, value in _DERIVED_EXPANSIONS if alias == "is")
 )
 

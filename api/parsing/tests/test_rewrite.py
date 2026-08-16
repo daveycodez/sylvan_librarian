@@ -13,7 +13,7 @@ import pytest
 from api.parsing import generate_sql_query, parse_scryfall_query
 from api.parsing.db_info import ARRAY_IS_TAGS, BOOLEAN_IS_TAGS
 from api.parsing.nodes import RegexValueNode
-from api.parsing.rewrite import SUPPORTED_IS_VALUES, _regex_plain_literal
+from api.parsing.rewrite import _DERIVED_EXPANSIONS, ENGINE_IS_VALUES, SUPPORTED_IS_VALUES, _regex_plain_literal
 
 # (synonym query, canonical expansion) — the two must produce identical ASTs.
 EQUIVALENCES = [
@@ -60,6 +60,27 @@ EQUIVALENCES = [
     ("is:triome", "otag:cycle-iko-triome or otag:cycle-snc-triland"),
     ("is:companion", "kw:companion"),
     ("is:class", "t:class"),
+    # Mana-symbol classes. Long, and spelled out rather than trimmed to a sample: the whole point of
+    # the entry is that the SET is right, and a truncated expectation would pass while the
+    # vocabulary drifted.
+    (
+        "is:hybrid",
+        "m:{W/U} or m:{W/B} or m:{U/B} or m:{U/R} or m:{B/R} or m:{B/G} or m:{R/G} or m:{R/W} or "
+        "m:{G/W} or m:{G/U} or m:{W/U/P} or m:{W/B/P} or m:{U/B/P} or m:{U/R/P} or m:{B/R/P} or "
+        "m:{B/G/P} or m:{R/G/P} or m:{R/W/P} or m:{G/W/P} or m:{G/U/P} or m:{2/W} or m:{2/U} or "
+        "m:{2/B} or m:{2/R} or m:{2/G} or m:{C/W} or m:{C/U} or m:{C/B} or m:{C/R} or m:{C/G}",
+    ),
+    (
+        "is:phyrexian",
+        "m:{W/P} or m:{U/P} or m:{B/P} or m:{R/P} or m:{G/P} or m:{C/P} or m:{W/U/P} or m:{W/B/P} or "
+        "m:{U/B/P} or m:{U/R/P} or m:{B/R/P} or m:{B/G/P} or m:{R/G/P} or m:{R/W/P} or m:{G/W/P} or "
+        'm:{G/U/P} or o:"{w/p}" or o:"{u/p}" or o:"{b/p}" or o:"{r/p}" or o:"{g/p}" or o:"{c/p}" or '
+        'o:"{w/u/p}" or o:"{w/b/p}" or o:"{u/b/p}" or o:"{u/r/p}" or o:"{b/r/p}" or o:"{b/g/p}" or '
+        'o:"{r/g/p}" or o:"{r/w/p}" or o:"{g/w/p}" or o:"{g/u/p}"',
+    ),
+    # `has:printedname` is `is:localizedname` under its other spelling; the engine answers the
+    # right-hand side from a field, which is why this one does not expand any further.
+    ("has:printedname", "is:localizedname"),
     ("is:adventure", "layout:adventure"),
     ("is:bounceland", "otag:bounceland"),
     ("is:filterland", "otag:cycle-hybrid-filterland or otag:cycle-ody-filterland"),
@@ -375,6 +396,21 @@ def test_every_stored_is_tag_is_a_supported_value() -> None:
     assert frozenset(ARRAY_IS_TAGS) <= SUPPORTED_IS_VALUES
 
 
+def test_engine_answered_is_values_are_supported_and_stored_nowhere() -> None:
+    """The `is:` values the ENGINE answers from a field are supported, and only from there.
+
+    Two directions, and the second is the one that bites. Supported: a predicate that works and
+    still warns is worse than one that does neither. Stored nowhere: if `localizedname` or `unique`
+    ever became an importer tag as well, the engine would keep intercepting the leaf and the stored
+    tag would be dead weight nobody could observe.
+    """
+    assert ENGINE_IS_VALUES <= SUPPORTED_IS_VALUES
+    assert not (ENGINE_IS_VALUES & frozenset(BOOLEAN_IS_TAGS))
+    assert not (ENGINE_IS_VALUES & frozenset(ARRAY_IS_TAGS))
+    # ...and no rewrite claims them either: an expansion would silently win over the engine leaf.
+    assert not (ENGINE_IS_VALUES & {value for alias, value in _DERIVED_EXPANSIONS if alias == "is"})
+
+
 @pytest.mark.parametrize(
     argnames="query",
     argvalues=[
@@ -394,6 +430,12 @@ def test_every_stored_is_tag_is_a_supported_value() -> None:
         "is:etched",
         "is:showcase",
         "is:tdfc",
+        "is:hybrid",
+        "is:phyrexian",
+        # Neither expands nor names a stored tag: the engine reads a field for each. Warning about
+        # them would be the exact defect SUPPORTED_IS_VALUES exists to remove, in reverse.
+        "is:localizedname",
+        "is:unique",
     ],
 )
 def test_supported_is_values_do_not_warn(query: str) -> None:
