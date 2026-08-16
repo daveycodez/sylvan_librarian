@@ -1822,6 +1822,34 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
         return Ok(FilterExpr::Legality { shift: format_shift(format), expected });
     }
 
+    // A MULTI-WORD type value is a substring of the printed type line, not a member of the
+    // type/subtype vocabulary. `t:"artifact creature"` reaches here as the single title-cased token
+    // "Artifact Creature", which is not a type and not a subtype, so both branches below resolve it
+    // to a membership test nothing satisfies -- 404 where Scryfall answers 360 (`cmc<=2`, 2026-08-16).
+    //
+    // Scryfall's rule, measured that day and not guessed: the quoted string is matched against the
+    // whole type line as a case-insensitive substring, with runs of whitespace collapsed. Order
+    // matters (`t:"creature artifact"` is empty), it is not word-anchored on either side
+    // (`t:"tifact creat"` and `t:"ifact creature"` both return the same 360), a doubled space is the
+    // same query, and the em dash is ordinary text (`t:"creature — human"` matches, `t:"creature -
+    // human"` does not). Subtype pairs behave identically -- `t:"human wizard"` 6, reversed 0.
+    //
+    // Compiled as a regex over the escaped literal so the existing TypeLine path carries it: that
+    // gives the case folding for free (`CompiledRegex::new` prepends the query flags) and keeps the
+    // #734 literal-factor trigram narrowing, which a bare substring comparison here would not have.
+    // Containment operators only: `=`/`<`/`>` are set comparisons on the type arrays, and a
+    // substring is not a set.
+    if matches!(attr, "card_types" | "card_subtypes") && matches!(op, ":" | ">=") {
+        let raw = rhs.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()).unwrap_or("");
+        let mut words = raw.split_whitespace();
+        let (first, second) = (words.next(), words.next());
+        if let (Some(first), Some(second)) = (first, second) {
+            let needle = std::iter::once(first).chain(std::iter::once(second)).chain(words).collect::<Vec<_>>().join(" ");
+            let re = CompiledRegex::new(&regex::escape(&needle))?;
+            return Ok(FilterExpr::TextRegex { field: TextField::TypeLine, regex: re });
+        }
+    }
+
     if attr == "card_types" {
         let mask: u16 = rhs
             .as_array()

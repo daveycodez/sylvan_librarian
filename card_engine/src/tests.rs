@@ -11532,6 +11532,57 @@ fn backtracking_regex_outranks_every_linear_verify_tier() {
 }
 
 #[test]
+fn a_quoted_multi_word_type_matches_the_type_line() {
+    // `t:"artifact creature"` reaches build_filter as ONE title-cased token, "Artifact Creature".
+    // That is not a type and not a subtype, so both membership branches used to answer false for
+    // every card: 404 here against 360 on api.scryfall.com (with `cmc<=2`, 2026-08-16). Scryfall
+    // matches the quoted string against the whole type line as a case-insensitive substring, so
+    // that is what this compiles to.
+    let type_leaf = |attr: &str, op: &str, value: &str| {
+        serde_json::json!({
+            "node_type": "CardBinaryOperatorNode",
+            "kwargs": {
+                "op": op,
+                "lhs": {"node_type": "CardAttributeNode", "kwargs": {"attribute_name": attr, "original_attribute": "type"}},
+                "rhs": [value],
+            }
+        })
+    };
+    let regex_of = |v: serde_json::Value| match super::build_filter(&v).unwrap() {
+        FilterExpr::TextRegex { field: TextField::TypeLine, regex } => regex,
+        other => panic!("expected a type-line regex, got {:?}", std::mem::discriminant(&other)),
+    };
+
+    let re = regex_of(type_leaf("card_types", ":", "Artifact Creature"));
+    assert!(re.is_match("Artifact Creature — Golem"));
+    assert!(re.is_match("Legendary Artifact Creature — Golem"));
+    // Order matters, exactly as it does on Scryfall (`t:"creature artifact"` is empty there).
+    assert!(!re.is_match("Creature — Artifact Golem"));
+    // Not word-anchored on either side: `t:"tifact creat"` returns the same 360 rows.
+    assert!(regex_of(type_leaf("card_types", ":", "Tifact Creat")).is_match("Artifact Creature — Golem"));
+    // Whitespace runs collapse — a doubled space is the same query on Scryfall.
+    assert!(regex_of(type_leaf("card_types", ":", "Artifact  Creature")).is_match("Artifact Creature — Golem"));
+    // The em dash is ordinary text, so a query that spells it matches and one that spells a
+    // hyphen does not (both measured).
+    assert!(regex_of(type_leaf("card_subtypes", ":", "Creature — Human")).is_match("Creature — Human Wizard"));
+    assert!(!regex_of(type_leaf("card_subtypes", ":", "Creature - Human")).is_match("Creature — Human Wizard"));
+    // A subtype pair resolves to card_subtypes upstream and takes the same path.
+    let pair = regex_of(type_leaf("card_subtypes", ":", "Human Wizard"));
+    assert!(pair.is_match("Creature — Human Wizard"));
+    assert!(!pair.is_match("Creature — Wizard Human"));
+
+    // A single-word value keeps the membership path and its indexes — the whole point of gating
+    // on whitespace rather than routing every `t:` through the type line.
+    assert!(matches!(super::build_filter(&type_leaf("card_types", ":", "Creature")).unwrap(), FilterExpr::TypeCmp { .. }));
+    assert!(matches!(
+        super::build_filter(&type_leaf("card_subtypes", ":", "Goblin")).unwrap(),
+        FilterExpr::CollectionCmp { field: CollField::Subtypes, .. }
+    ));
+    // ...and so do the set-comparison operators, where a substring has no meaning.
+    assert!(matches!(super::build_filter(&type_leaf("card_types", "=", "Artifact Creature")).unwrap(), FilterExpr::TypeCmp { .. }));
+}
+
+#[test]
 fn type_regex_no_longer_builds_a_vacuous_mask() {
     // Regression for the silent-empty-result bug this fix closes: `t:/…/` used
     // to reach the card_types branch, whose `rhs.as_array()` is None for a
