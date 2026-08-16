@@ -2,7 +2,7 @@ use super::{
     and_child_rank, assign_name_ranks,
     build_numeric_index, build_oracle_text_index, build_tag_index, build_trigram_index,
     build_rarity_index, build_flavor_index, build_hybrid_tag_index, bitmap_beats_postings, HybridTagIndex, build_sort_permutations,
-    assign_artist_ranks, assign_artwork_groups, assign_collector_ranks, assign_set_ranks, order_annex_by_language, assign_foreign_artwork_groups, build_artwork_base_from, build_lang_index, build_printed_name_index, drop_group_if_annex_only, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
+    assign_artist_ranks, assign_artwork_groups, assign_collector_ranks, assign_set_ranks, assign_single_set_flags, order_annex_by_language, assign_foreign_artwork_groups, build_artwork_base_from, build_lang_index, build_printed_name_index, drop_group_if_annex_only, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
     cards_of_printings, count_common_keywords, count_common_types,
     build_artist_index, build_printing_value_index, build_arith_tuple_index, is_arith_tuple_route, range_candidates, narrow_candidates, narrow_candidates_exact, rarity_candidates,
     range_too_broad_to_narrow, run_query, run_query_routed, run_query_widened, run_query_with_plan, explain, explain_analyze, AcquireFacts, PlanEstimate, PlanTrial,
@@ -201,6 +201,7 @@ fn stub_card(oracle_id: u128, card_types: u16, subtypes: &[&str], vocab: &mut Vo
         produced_mana: 0,
         color_indicator: 0,
         card_types,
+        single_set: false,
         legality_divergent: false,
         oracle_id,
         card_name_id: NONE_STR,
@@ -12453,4 +12454,44 @@ fn an_annex_only_oracle_is_dropped_not_panicked() {
     assert_eq!((dropped, rows_dropped), (2, 3));
     // The accounting invariant reload_commit asserts: canonical + annex + dropped == staged.
     assert_eq!(printings.len() + foreign.len() + rows_dropped, 5);
+}
+
+/// `assign_single_set_flags` counts SETS, over the canonical rows AND the annex.
+///
+/// Three cards, each breaking a different wrong rule. A: two printings, one set — unique, so
+/// "prints == 1" is not it (`!"Forest"` is the real-corpus shape: two lea printings, one set).
+/// B: one English set plus an annex row in a set of its own — NOT unique, the case a
+/// canonical-only walk gets wrong on 130 real cards (the Salvat inserts, ps11, pmei, none of
+/// which api.scryfall.com calls unique). C: a canonical row and an annex row in the SAME set —
+/// unique, so the annex cannot simply be counted either.
+#[test]
+fn single_set_counts_sets_across_the_annex() {
+    let mut vocab = VocabInterner::new();
+    let mut cards = vec![
+        stub_card(1, 0, &[], &mut vocab),
+        stub_card(2, 0, &[], &mut vocab),
+        stub_card(3, 0, &[], &mut vocab),
+    ];
+    let set = |p: &mut Printing, code: &str| p.card_set_code = InlineStr::from_str(code);
+    let mut canonical = vec![
+        stub_printing(1, 1, None),
+        stub_printing(2, 2, None),
+        stub_printing(3, 3, None),
+        stub_printing(4, 4, None),
+    ];
+    set(&mut canonical[0], "aaa");
+    set(&mut canonical[1], "aaa");
+    set(&mut canonical[2], "aaa");
+    set(&mut canonical[3], "aaa");
+    let offsets = vec![0u32, 2, 3, 4];
+    let mut foreign = vec![stub_printing(5, 5, None), stub_printing(6, 6, None)];
+    set(&mut foreign[0], "bbb"); // B's annex row, in a set of its own
+    set(&mut foreign[1], "aaa"); // C's annex row, in the set C already has
+    let foreign_offsets = vec![0u32, 0, 1, 2];
+
+    assign_single_set_flags(&mut cards, &canonical, &offsets, &foreign, &foreign_offsets);
+
+    assert!(cards[0].single_set, "two printings of one set is still one set");
+    assert!(!cards[1].single_set, "an annex-only second set disqualifies it");
+    assert!(cards[2].single_set, "an annex row in the same set changes nothing");
 }

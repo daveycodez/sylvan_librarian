@@ -455,6 +455,15 @@ struct OracleCard {
     // the two colour masks above it; the per-FACE indicator lives on OracleFace.
     color_indicator: u8,
     card_types: u16,
+    /// True when every printing of this card -- canonical AND annex -- shares ONE set code: the
+    /// whole of `is:unique`, decided at build by `assign_single_set_flags` because no query-time
+    /// walk can see the annex from `tri()`, which holds one card and one printing and nothing else.
+    ///
+    /// A bool and not a count: the predicate asks `== 1` and nothing else asks at all, so a u16
+    /// would be 2 bytes a card for a question no operator poses. `sets=`/`prints=` would want the
+    /// count, and neither exists here yet; when one does, this is the field that widens.
+    single_set: bool,
+
     // True for the ~556 oracle ids whose printings carry different legality
     // words (non-tournament printings: 30A, Collectors' Edition, gold border).
     // When set, legality filters defer to each Printing's card_legalities; when
@@ -2829,6 +2838,49 @@ fn assign_printing_ranks<K: Ord>(
 /// Rank printings by set code, the sort key for `order=set`.
 fn assign_set_ranks(printings: &mut [Printing], foreign: &mut [Printing]) {
     assign_printing_ranks(printings, foreign, |p| p.card_set_code.as_str().to_owned(), |p, r| p.set_rank = r);
+}
+
+/// Decide `OracleCard.single_set` — the whole of `is:unique` — for every card.
+///
+/// One set code across the card's canonical printings AND its annex rows. The annex half is the
+/// half that makes it correct rather than nearly correct: 130 cards in the 2026-08-16 bulk have
+/// exactly one ENGLISH set and a second set that exists only in another language (the Salvat
+/// magazine inserts, ps11, pmei), and api.scryfall.com calls none of those 130 unique. Counting
+/// canonical rows alone would have answered "unique" for all 130.
+///
+/// A set COUNT and not a printing count, which is Scryfall's own definition ("cards that have only
+/// been in a single set" — syntax page, read 2026-08-16) and not a paraphrase of it: the two differ
+/// on 2,847 of Scryfall's 16,318 matches, `!"Forest"` being the shape (two lea printings, one set).
+///
+/// Two codes end the walk, so a heavily reprinted card costs two comparisons, not a HashSet.
+fn assign_single_set_flags(
+    cards: &mut [OracleCard],
+    printings: &[Printing],
+    offsets: &[u32],
+    foreign: &[Printing],
+    foreign_offsets: &[u32],
+) {
+    for (cid, card) in cards.iter_mut().enumerate() {
+        let mut first: Option<&str> = None;
+        let mut one = true;
+        let mut rows = printings[offsets[cid] as usize..offsets[cid + 1] as usize]
+            .iter()
+            .chain(foreign[foreign_offsets[cid] as usize..foreign_offsets[cid + 1] as usize].iter());
+        for p in &mut rows {
+            let code = p.card_set_code.as_str();
+            match first {
+                None => first = Some(code),
+                Some(f) if f != code => {
+                    one = false;
+                    break;
+                }
+                Some(_) => {}
+            }
+        }
+        // A card with no rows at all cannot have been printed in one set; `drop_group_if_annex_only`
+        // means it should not exist, and answering False keeps it out of `is:unique` if it does.
+        card.single_set = one && first.is_some();
+    }
 }
 
 /// Order each card's ANNEX rows by language, which is the order Scryfall serves them in.
@@ -13740,7 +13792,23 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 //
 //                The deployment's vendored copy carries this as 2026081607; the two trees'
 //                in-flight stacks differ, so the numbers are no longer in step.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026081605;
+//   2026081606 — `is:unique` gets the field it needs. `OracleCard` gains `single_set`, true when
+//                every printing of the card — canonical AND annex — shares one set code, decided
+//                at build by `assign_single_set_flags`. Stored rather than walked at query time
+//                because `tri()` is handed one card and one printing and can reach neither the
+//                card's other rows nor the annex. It costs ZERO bytes: the bool lands in the
+//                padding `legality_divergent` already left, so no archived row grows.
+//                Scryfall's own definition is a SET count ("cards that have only been in a single
+//                set"), which is not a printing count — the two differ on 2,847 of its 16,318 —
+//                and it spans languages: 130 cards have one English set plus a foreign-only second
+//                one (Salvat, ps11, pmei) and api.scryfall.com calls none of them unique.
+//                AND SO THE HEADER CANNOT CATCH IT: no struct size moves, so a reader pairing this
+//                code with a pre-`single_set` archive would read whatever the padding held and
+//                answer `is:unique` from noise. This constant is the only thing that stops it.
+//
+//                (`is:localizedname` landed in the same unit of work and needed NO archive change:
+//                it reads `Printing.printed_name_folded_id`, which the annex already carries.)
+const ARCHIVE_FORMAT_VERSION: u32 = 2026081606;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -14258,6 +14326,7 @@ impl QueryEngine {
                     produced_mana: row.produced_mana,
                 color_indicator: row.color_indicator,
                     card_types: row.card_types,
+                    single_set: false, // decided after grouping by assign_single_set_flags
                     legality_divergent: false,
                     oracle_id: row.oracle_id,
                     card_name_id: row.card_name_id,
@@ -14436,6 +14505,10 @@ impl QueryEngine {
         // union — see assign_printing_ranks for why that is safe for the canonical sort order and
         // necessary for the widened one.
         assign_set_ranks(&mut printings, &mut foreign);
+    // Needs both offset arrays complete and nothing else; placed with the other post-grouping
+    // passes because it is one, and stored on the card because `tri()` sees one card and one
+    // printing -- never the card's other rows, and never the annex.
+    assign_single_set_flags(&mut cards, &printings, &offsets, &foreign, &foreign_offsets);
         assign_artist_ranks(&mut printings, &mut foreign, &artist_vocab_folded);
         assign_collector_ranks(&mut printings, &mut foreign, &strings);
         order_annex_by_language(&mut foreign, &foreign_offsets, &coll_vocab);
@@ -14725,7 +14798,7 @@ impl QueryEngine {
         // (detected on the compiled tree, so the flag and the operator cannot widen differently),
         // sends the query to the widened multilingual driver over both printing spaces. With
         // neither trigger the routed driver runs bit-for-bit as before and never reads the annex.
-        let (total, page) = if include_multilingual || unsplit.mentions_lang() {
+        let (total, page) = if include_multilingual || unsplit.widens_to_annex() {
             run_query_widened(data, &params.with_sort_bound(sort_bound), &unsplit)
         } else {
             run_query_routed(&ctx, &params.with_sort_bound(sort_bound), &mut filter_expr, Some(&unsplit), plane_expr.as_ref())

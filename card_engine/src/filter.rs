@@ -533,6 +533,33 @@ pub(crate) enum FilterExpr {
         vid: Option<u16>,
     },
 
+    /// `is:localizedname`, and `has:printedname`, its other spelling — this printing carries a
+    /// PRINTED name. One field compare (`printed_name_folded_id != NONE_STR`), because the importer
+    /// already folds the printed FULL name of every face into that id and leaves it NONE_STR when
+    /// no face has one; nothing is stored for this predicate and nothing is bound for it.
+    ///
+    /// Presence, not difference, and not "non-English" — measured against api.scryfall.com on
+    /// 2026-08-16 over the whole 540,484-row bulk. 182 of the printings it matches are ENGLISH
+    /// (om1/66 prints "Rhilex the Accursed" over Agent Venom); 4,468 of the foreign ones print a
+    /// name IDENTICAL to the English one and still count; and it reads per-FACE, so every Japanese
+    /// transform printing matches on face names with no top-level `printed_name` at all.
+    /// `is:localizedname e:dsk` is 1,917 printings there against the same 1,917 in the bulk.
+    ///
+    /// Its presence WIDENS the query — see `widens_to_annex`, and the count that proves it.
+    PrintedNamePresent,
+
+    /// `is:unique` — the owning CARD has been printed in exactly one SET. Card-level and total, off
+    /// `OracleCard.single_set`, which the build computes over the canonical printings AND the annex
+    /// (`assign_single_set_flags`); nothing here to bind and nothing per printing to consult.
+    ///
+    /// A SET count, not a printing count: Scryfall's syntax page defines it as "cards that have
+    /// only been in a single set", and the two differ on 2,847 of its own 16,318 — `!"Forest"`
+    /// alone is two printings of one set. Spanning the annex is not optional either: 130 cards have
+    /// exactly one English set and a second set that exists only in another language (Salvat,
+    /// ps11, pmei), and api.scryfall.com calls none of the 130 unique. Reading canonical printings
+    /// alone would have called all 130 unique and been wrong 130 times.
+    SingleSet,
+
     /// `oracleid:<uuid>` — the oracle card whose `oracle_id` equals `id` (`parse_uuid_or_hash`'s
     /// u128, 0 for an unparseable value, which no stored id ever equals). Card-level and total,
     /// with nothing for `bind()` to resolve — bind() sees the vocab tables, not `CardIndexes` —
@@ -674,6 +701,10 @@ pub(crate) fn verify_cost_tier(f: &FilterExpr) -> u32 {
         | FilterExpr::LangMatch { .. }
         // ...and a SetTypeMatch is the same equality against a different id in the same vocab.
         | FilterExpr::SetTypeMatch { .. }
+        // A PrintedNamePresent is one u32 compare against a field already on the printing, and a
+        // SingleSet one bool read off a field already on the card.
+        | FilterExpr::PrintedNamePresent
+        | FilterExpr::SingleSet
         // An OracleIdMatch is one 128-bit integer equality against a field already in the card.
         | FilterExpr::OracleIdMatch { .. }
         | FilterExpr::DateCmp { .. }
@@ -810,6 +841,9 @@ fn leaf_compares_printing_field(f: &FilterExpr) -> bool {
         FilterExpr::LangMatch { .. } => true,
         // The set type is the PRINTING's set, so it can only settle once one is in hand.
         FilterExpr::SetTypeMatch { .. } => true,
+        // The printed name is a per-printing fact (Printing.printed_name_folded_id) — an English
+        // row and its Japanese sibling answer differently.
+        FilterExpr::PrintedNamePresent => true,
         // Composites are composed by the two callers, which differ on `all` vs `any`; reaching here with
         // one is a bug in whichever caller forgot to handle it, not a case to answer silently.
         FilterExpr::And(_) | FilterExpr::Or(_) | FilterExpr::Not(_) => {
@@ -823,6 +857,9 @@ fn leaf_compares_printing_field(f: &FilterExpr) -> bool {
         | FilterExpr::OracleMatch { .. }
         // The oracle id is the card's own identity — every printing of it shares one.
         | FilterExpr::OracleIdMatch { .. }
+        // How many SETS the card has been printed in is the card's fact too, decided at build over
+        // every printing of it; no printing can change the answer.
+        | FilterExpr::SingleSet
         | FilterExpr::ColorCmp { .. }
         | FilterExpr::TypeCmp { .. }
         | FilterExpr::ManaCostCmp { .. }
@@ -1351,15 +1388,21 @@ impl FilterExpr {
         }
     }
 
-    /// True iff any leaf of this (bound) filter is a `LangMatch` — one of the two triggers that
-    /// send a query to the widened (multilingual) driver instead of `run_query_routed`. Detected
-    /// here, on the compiled tree, so the `lang:` operator and the `include_multilingual` flag
-    /// cannot widen differently.
-    pub(crate) fn mentions_lang(&self) -> bool {
+    /// True iff any leaf of this (bound) filter can only be answered over the ANNEX — one of the
+    /// two triggers that send a query to the widened (multilingual) driver instead of
+    /// `run_query_routed`. Detected here, on the compiled tree, so the operators and the
+    /// `include_multilingual` flag cannot widen differently.
+    ///
+    /// Two leaves qualify. `LangMatch` is the obvious one. `PrintedNamePresent` is the other, and
+    /// it is not a design choice — it is Scryfall's measured behaviour: `is:localizedname` with no
+    /// `lang:` term in sight answers 31,294 cards there, and `&unique=prints` shows the rows it
+    /// returns are German, French, Japanese… A canonical-only reading would answer 182 (the
+    /// English printings that carry a printed name) and call it the whole set.
+    pub(crate) fn widens_to_annex(&self) -> bool {
         match self {
-            FilterExpr::LangMatch { .. } => true,
-            FilterExpr::And(children) | FilterExpr::Or(children) => children.iter().any(Self::mentions_lang),
-            FilterExpr::Not(inner) => inner.mentions_lang(),
+            FilterExpr::LangMatch { .. } | FilterExpr::PrintedNamePresent => true,
+            FilterExpr::And(children) | FilterExpr::Or(children) => children.iter().any(Self::widens_to_annex),
+            FilterExpr::Not(inner) => inner.widens_to_annex(),
             _ => false,
         }
     }
@@ -1476,6 +1519,16 @@ impl FilterExpr {
                     tri_bool(ids.binary_search(&vid).is_ok())
                 }
             }
+
+            // NONE_STR is Scryfall having omitted `printed_name` on every face, which is a real
+            // False (this printing has no printed name) and not an SQL NULL — unlike the interned
+            // scalars above, absence here IS the answer the predicate asks about.
+            FilterExpr::PrintedNamePresent => {
+                let Some(p) = printing else { return Tri::PrintingDep };
+                tri_bool(p.printed_name_folded_id != super::NONE_STR)
+            }
+
+            FilterExpr::SingleSet => tri_bool(card.single_set),
 
             FilterExpr::SetTypeMatch { vid, .. } => {
                 let Some(p) = printing else { return Tri::PrintingDep };
@@ -2006,6 +2059,18 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
             _                  => CollField::FrameData,
         };
         let value  = rhs.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        // Two `is:` values the importer stores no tag for, because a field already on the row
+        // answers them (see `rewrite.ENGINE_IS_VALUES`, which is what keeps the parser from
+        // reporting them unsupported). They arrive as `card_is_tags` membership like every other
+        // `is:` value and turn into their own leaf HERE rather than in the parser, so the tag
+        // vocabulary stays what the importer writes and nothing has to be stored twice.
+        if matches!(coll_field, CollField::IsTags) {
+            match value.as_str() {
+                "localizedname" => return Ok(FilterExpr::PrintedNamePresent),
+                "unique" => return Ok(FilterExpr::SingleSet),
+                _ => {}
+            }
+        }
         let cmp_op = op_to_collection_cmp(op);
         return Ok(FilterExpr::CollectionCmp { field: coll_field, op: cmp_op, value, value_id: None });
     }

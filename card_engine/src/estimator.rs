@@ -107,6 +107,8 @@ pub(crate) fn has_printing_varying_leaf(f: &FilterExpr) -> bool {
         FilterExpr::Legality { .. } => true,
         // The language is a per-printing fact (CompatFields.lang_id).
         FilterExpr::LangMatch { .. } | FilterExpr::SetTypeMatch { .. } => true,
+        // ...and so is the printed name (Printing.printed_name_folded_id).
+        FilterExpr::PrintedNamePresent => true,
         FilterExpr::And(children) | FilterExpr::Or(children) => children.iter().any(has_printing_varying_leaf),
         FilterExpr::Not(inner) => has_printing_varying_leaf(inner),
         // Exhaustive, not `_ => false`: a new variant must get a considered
@@ -117,6 +119,8 @@ pub(crate) fn has_printing_varying_leaf(f: &FilterExpr) -> bool {
         | FilterExpr::OracleMatch { .. }
         // The oracle id is the card's own identity — every printing of it shares one.
         | FilterExpr::OracleIdMatch { .. }
+        // ...and so is its set count: `single_set` is decided once, at build, over every printing.
+        | FilterExpr::SingleSet
         | FilterExpr::ColorCmp { .. }
         | FilterExpr::TypeCmp { .. }
         | FilterExpr::ManaCostCmp { .. }
@@ -465,6 +469,11 @@ fn estimate_leaf(f: &FilterExpr, indexes: &Archived<CardIndexes>, n_cards: u32, 
         // query to the widened (multilingual) driver, which does not consult the estimator.
         // "Unknown" is the sound answer if that ever changes.
         FilterExpr::LangMatch { .. } | FilterExpr::SetTypeMatch { .. } => unknown(n),
+
+        // Neither has an index to count through: `is:localizedname` reads a field on the printing
+        // (and widens, so it is unreachable here for the same reason LangMatch is), and `is:unique`
+        // a bool on the card. Both are a full-scan verify, and "unknown" says exactly that.
+        FilterExpr::PrintedNamePresent | FilterExpr::SingleSet => unknown(n),
 
         // Printing-space CSR width sums → project (varying).
         FilterExpr::ArtistMatch { ids } => {
