@@ -244,6 +244,7 @@ def _set_cards_cache(falcon_response: falcon.Response | None) -> None:
     if falcon_response is not None:
         falcon_response.set_header("Cache-Control", _CARDS_CACHE_CONTROL)
 
+
 # Hosts an absolute self-URL should address over plain HTTP. Everything else is assumed to be
 # reached over TLS, which is what `next_page` has to say for a client to follow it.
 _PLAINTEXT_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "[::1]")  # noqa: S104
@@ -741,9 +742,11 @@ class ScryfallCardsRoutes:
     ) -> dict[str, Any] | None:
         """Search for cards, paginated 175 at a time.
 
-        `include_extras`, `include_multilingual` and `include_variations` are accepted and have no
-        effect: the corpus holds no tokens, emblems or funny-set cards for `include_extras` to add,
-        and it holds every printing and language it has imported unconditionally.
+        `include_multilingual` is honored: the default is Scryfall's -- English (canonical)
+        printings only -- and `include_multilingual=true` widens the search to foreign printings,
+        as does a `lang:` term in the query itself. `include_extras` and `include_variations` are
+        accepted and have no effect: the corpus holds no tokens, emblems or funny-set cards for
+        `include_extras` to add, and it holds every variation it has imported unconditionally.
 
         Args:
             falcon_response: The Falcon response to write to.
@@ -757,7 +760,7 @@ class ScryfallCardsRoutes:
             format: Response format -- json or csv.
             pretty: Whether to indent JSON output.
             include_extras: Accepted, ignored.
-            include_multilingual: Accepted, ignored.
+            include_multilingual: Whether to widen the search to foreign printings.
             include_variations: Accepted, ignored.
 
         Returns:
@@ -809,6 +812,10 @@ class ScryfallCardsRoutes:
                 offset=(page_number - 1) * PAGE_SIZE,
                 unique=unique_on,
                 prefer=PreferOrder.DEFAULT,
+                # Always resolved, never left to a default downstream: false IS Scryfall's default
+                # (English/canonical printings only), and fixing it here keeps "absent" from
+                # meaning anything.
+                include_multilingual=_as_bool(include_multilingual),
             )
         except falcon.HTTPBadRequest as err:
             return self._scryfall_respond(
@@ -1014,7 +1021,10 @@ class ScryfallCardsRoutes:
                 pretty=pretty,
             )
 
-        cards = self._cards_by_ids([str(chosen["scryfall_id"])])
+        # A candidate that already carries its rendered card is used as-is: the similarity stage's
+        # engine lane resolved a specific printing -- possibly a foreign one, which the by-id
+        # lookups only know canonical printings and could not find again.
+        cards = [chosen["card"]] if "card" in chosen else self._cards_by_ids([str(chosen["scryfall_id"])])
         if not cards:
             return self._scryfall_respond(
                 falcon_response,
@@ -1199,7 +1209,11 @@ class ScryfallCardsRoutes:
                     if status == "miss":
                         return None
                     if row:
-                        return {"scryfall_id": row["scryfall_id"], "card_name": row["name"]}
+                        # The whole rendered card rides along, not just its id: a foreign-name hit
+                        # resolves to the FOREIGN printing ("ego à deriva" materializes the
+                        # Portuguese object), and re-fetching by scryfall_id would re-resolve
+                        # through the canonical lookups and lose the printing the engine chose.
+                        return {"scryfall_id": row["scryfall_id"], "card_name": row["name"], "card": to_scryfall_card(row)}
 
         params = {**base_params, "needle": needle, "floor": FUZZY_SIMILARITY_FLOOR}
         # `%%` escapes psycopg's placeholder marker: the bare `%` operator would be read as the
@@ -1450,9 +1464,13 @@ class ScryfallCardsRoutes:
         if "multiverse_id" in identifier:
             return self._card_by_multiverse_id(_as_int(str(identifier["multiverse_id"])))
         if "set" in identifier and "collector_number" in identifier:
+            # English EXPLICITLY, the same default `/cards/:code/:number` applies to its absent
+            # language segment: foreign printings share a set code and collector number with their
+            # English row, so without the constraint this would resolve whichever row scored
+            # higher. Scryfall's `{set, collector_number}` identifier means the English printing.
             return self._fetch_one_card(
-                "lower(card_set_code) = lower(%(set_code)s) AND collector_number = %(number)s",
-                {"set_code": str(identifier["set"]), "number": str(identifier["collector_number"])},
+                "lower(card_set_code) = lower(%(set_code)s) AND collector_number = %(number)s AND card_lang = %(lang)s",
+                {"set_code": str(identifier["set"]), "number": str(identifier["collector_number"]), "lang": "en"},
             )
         if "name" in identifier:
             clauses = ["lower(card_name) = lower(%(name)s) OR lower(split_part(card_name, ' // ', 1)) = lower(%(name)s)"]
@@ -1572,9 +1590,11 @@ class ScryfallCardsRoutes:
 
         clauses = ["lower(card_set_code) = lower(%(set_code)s)", "collector_number = %(number)s"]
         params: dict[str, Any] = {"set_code": identifier, "number": number}
-        # Scryfall defaults the language segment to English rather than to "any language".
-        clauses.append("raw_card_blob ->> 'lang' = %(lang)s")
-        params["lang"] = suffix or "en"
+        # Scryfall defaults the language segment to English rather than to "any language". The
+        # filter is the card_lang COLUMN — the same column the lang: operator compares, backfilled
+        # for pre-multilingual rows — not a blob lookup.
+        clauses.append("card_lang = %(lang)s")
+        params["lang"] = (suffix or "en").lower()
         return self._fetch_one_card(" AND ".join(clauses), params)
 
     def _card_by_multiverse_id(self, multiverse_id: int | None) -> dict[str, Any] | None:

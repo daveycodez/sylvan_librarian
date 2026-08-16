@@ -86,6 +86,10 @@ def _delver() -> dict:
         "set_name": "Scryfall Compat",
         "collector_number": "3",
         "layout": "transform",
+        # Present like every real bulk row's: the collection route's {set, collector_number}
+        # identifier now resolves to the ENGLISH printing explicitly, and a lang-less row is
+        # invisible to it the same way it always was to /cards/:code/:number.
+        "lang": "en",
         "type_line": "Creature — Human Wizard // Creature — Human Insect",
         "colors": ["U"],
         "color_identity": ["U"],

@@ -1365,6 +1365,7 @@ class APIResource(ScryfallCardsRoutes):
         *,
         direction: SortDirection = SortDirection.ASC,
         fields: Sequence[str] | None = None,
+        include_multilingual: bool = False,
         limit: int = 100,
         offset: int = DEFAULT_OFFSET,
         orderby: CardOrdering = CardOrdering.EDHREC,
@@ -1381,7 +1382,10 @@ class APIResource(ScryfallCardsRoutes):
         resolved_fields = self._resolve_result_fields(fields)
 
         if settings.enable_cache:
-            cache_key = (direction, limit, offset, orderby, prefer, query, unique, tuple(resolved_fields))
+            # `include_multilingual` is part of the key: the same query widened to the foreign
+            # annex is a different result set, and serving one for the other from cache would be
+            # exactly the kind of wrong answer the flag exists to prevent.
+            cache_key = (direction, include_multilingual, limit, offset, orderby, prefer, query, unique, tuple(resolved_fields))
             gen = self._cache_generation.value
             try:
                 search_cache = self._search_gen_cache[gen]
@@ -1423,6 +1427,7 @@ class APIResource(ScryfallCardsRoutes):
                     offset=offset,
                     timer=timer,
                     fields=resolved_fields,
+                    include_multilingual=include_multilingual,
                 )
             except BaseException as e:
                 # BaseException, not Exception: a Rust panic anywhere under `self._engine.query`
@@ -1460,6 +1465,7 @@ class APIResource(ScryfallCardsRoutes):
             offset=offset,
             timer=timer,
             fields=resolved_fields,
+            include_multilingual=include_multilingual,
         )
         if settings.enable_cache:
             search_cache[cache_key] = result
@@ -1478,6 +1484,7 @@ class APIResource(ScryfallCardsRoutes):
         timer: Timer,
         offset: int = DEFAULT_OFFSET,
         fields: Sequence[str] | None = None,
+        include_multilingual: bool = False,
     ) -> dict[str, Any]:
         # AUTO is a request-level spelling neither search path knows, resolved on the way in so
         # nothing downstream can see it. Resolved in each path rather than once in `_search`
@@ -1500,6 +1507,7 @@ class APIResource(ScryfallCardsRoutes):
                     limit=limit if limit is not None else 1_000_000,
                     offset=offset,
                     fields=fields,
+                    include_multilingual=include_multilingual,
                 )
         except _QueryError as err:
             logger.info("QueryError caught for query '%s', raising BadRequest", query)
@@ -1533,6 +1541,7 @@ class APIResource(ScryfallCardsRoutes):
         timer: Timer,
         offset: int = DEFAULT_OFFSET,
         fields: Sequence[str] | None = None,
+        include_multilingual: bool = False,
     ) -> dict[str, Any]:
         # AUTO is a request-level spelling neither search path knows, resolved on the way in so
         # nothing downstream can see it. Resolved in each path rather than once in `_search`
@@ -1548,8 +1557,10 @@ class APIResource(ScryfallCardsRoutes):
             with timer("get_where_clause"):
                 where_clause, params = generate_sql_query(parsed_query)
                 # Same default-canonical rule as get_where_clause: foreign rows join the result
-                # space only when the query names a language.
-                where_clause = _canonical_guard(where_clause)
+                # space only when the query names a language — or when the caller widened with
+                # include_multilingual, the SQL twin of the engine driver's second trigger.
+                if not include_multilingual:
+                    where_clause = _canonical_guard(where_clause)
         except ValueError as err:
             logger.info("ValueError caught for query '%s', raising BadRequest", query)
             raise falcon.HTTPBadRequest(
