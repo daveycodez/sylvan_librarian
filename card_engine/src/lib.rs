@@ -283,8 +283,14 @@ struct PrintingFace {
     card_artist_vid: u16,
     flavor_text_id: u32,
     // Scryfall's FACE-level `flavor_name`, interned (NONE_STR = absent). The card-level twin is
-    // `Printing.flavor_name_id`, and a printing carries one or the other, never both;
-    // `printing_has_flavor_name` reads both for `prefer:borderless`.
+    // `Printing.flavor_name_id`, and a printing carries one or the other, never both: 28 face
+    // occurrences on 15 printings in the 2026-08-16 all_cards bulk, all `transform` or
+    // `reversible_card` (vow/338 "Dracula, Lord of Blood" // "Dracula, Lord of Bats").
+    //
+    // NOT INDEXED, and that is Scryfall's own split rather than a shortcut:
+    // `exact=Dracula, Lord of Blood` answers 404 there while `exact=Godzilla, Primeval Champion`
+    // (a card-level flavor name) answers prm/80925. Only the card-level one reaches the name
+    // routes; this one is emission-only, like `flavor_text` beside it.
     flavor_name_id: u32,
 }
 
@@ -14890,6 +14896,9 @@ fn faces_to_pylist<'py>(
             d.set_item("artist", coll_str_opt(vocab, u16::from(art.card_artist_vid)))?;
             d.set_item("illustration_id", uuid_from_u128(u128::from(art.illustration_id)))?;
             d.set_item("flavor_text", str_at(strings, u32::from(art.flavor_text_id)))?;
+            if let Some(v) = str_at(strings, u32::from(art.flavor_name_id)) {
+                d.set_item("flavor_name", v)?;
+            }
         }
         out.push(d);
     }
