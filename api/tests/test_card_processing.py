@@ -664,7 +664,10 @@ class TestFaceMerging:
             ],
         )
         merged = preprocess_card(card)[0]
-        assert merged["creature_power"] is None  # "*" is non-numeric
+        # `*` is ZERO, and `1+*` is 1 -- see maybe_stat_int. The point of this test is that the
+        # numeric and _text columns come from the SAME face, which they still do.
+        assert merged["creature_power"] == 0
+        assert merged["creature_toughness"] == 1
         assert merged["creature_power_text"] == "*"
         assert merged["creature_toughness_text"] == "1+*"
 

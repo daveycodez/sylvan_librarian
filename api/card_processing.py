@@ -96,11 +96,11 @@ def maybe_stat_int(val: str | int | float | None) -> int | None:
         raise ValueError(text)
     total = 0.0
     sign = 1
-    for index, term in enumerate(re.split(r"(?<=.)([+-])", text)):
+    for index, piece in enumerate(re.split(r"(?<=.)([+-])", text)):
         if index % 2:
-            sign = -1 if term == "-" else 1
+            sign = -1 if piece == "-" else 1
             continue
-        term = term.strip()
+        term = piece.strip()
         if term in {"*", "*\u00b2"}:
             continue  # `*` and `*` squared are both zero
         total += sign * float(term)
