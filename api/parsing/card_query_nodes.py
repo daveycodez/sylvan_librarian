@@ -634,13 +634,19 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
             # matched literally instead, so it keeps neither fold; see StringValueNode. Measured on
             # api.scryfall.com 2026-08-16: `name:ft` 1,628 against `name:"ft"` 362, `name:ofthe`
             # 1,109 against `name:"ofthe"` 0, `name:limdul` 8 against `name:"limdul"` 0.
-            # Comparison ops (name=, name!=) keep the literal value on both sides,
-            # accent-sensitive, exactly as before.
+            #
+            # `=` IS `:` HERE -- it is not a comparison on a string column, it carries no
+            # information of its own, and the bare/quoted split survives it INTACT. Measured on
+            # api.scryfall.com 2026-08-16: `name=ft` answers `name:ft`'s 1,628 (not `name:"ft"`'s
+            # 362), `name="ft"` answers `name:"ft"`'s 362, and `name=limdul` answers
+            # `name:limdul`'s 8. Gating on `:` alone sent `name=ft` down the literal path, where a
+            # whole-string equality then answered nothing at all. `!=` is NOT in this class -- it
+            # is the empty set on every string column.
             # `a:` gets the SAME split, on the same kind of evidence (api.scryfall.com, 2026-08-16):
             # `a:gawel` answers 10 exactly as `a:gaweł` does, `a:rebecca-guay` answers
             # `a:"rebecca guay"`'s 166, and `a:gu*ay` answers `a:guay`'s 197. An artist could only be
             # found under their own diacritics and punctuation before this.
-            if attr in ("card_name", "card_artist") and self.operator == ":" and not self.rhs.literal:
+            if attr in ("card_name", "card_artist") and self.operator in (":", "=") and not self.rhs.literal:
                 return {"node_type": "CollatedNameValueNode", "kwargs": {"value": collate_name(fold_accents(value))}}
             return {"node_type": "StringValueNode", "kwargs": {"value": value}}
 
@@ -792,7 +798,18 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         if field_type == FieldType.JSONB_ARRAY:
             return self._handle_jsonb_array(context)
 
-        if self.operator == ":":
+        # `=` IS `:` ON A TEXT COLUMN -- a substring test, not an equality. It is the one operator
+        # on these columns that carries no information of its own. Measured on api.scryfall.com
+        # 2026-08-16 over the whole default corpus, `X=v` against `X:v`: `o=flying` 4,574 =
+        # `o:flying` 4,574 (this answered the cards whose oracle text IS the word), `ft=aether` 80
+        # = `ft:aether` 80, `name=ft` 1,628 = `name:ft` 1,628, `fo=lifelink` 713 = `fo:lifelink`
+        # 713. The columns stored exact rather than searched -- set code, layout, border,
+        # watermark, collector number -- are claimed inside `_handle_colon_operator` and keep a
+        # genuine equality, because equality IS the meaning there; routing `=` through the same
+        # door reaches them by the path that also lowercases the value, which `e=KHM` needed.
+        #
+        # `!=` and the ordered comparisons are NOT in this class and still fall through below.
+        if self.operator in (":", "="):
             return self._handle_colon_operator(context, field_type, lhs_sql, attr)
 
         if field_type == FieldType.TEXT:
@@ -831,7 +848,7 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         return super().to_sql(context)
 
     def _handle_colon_operator(self, context: QueryContext, field_type: str, lhs_sql: str, attr: str) -> str:
-        """Handle colon operator for different field types."""
+        """Handle the containment operators -- `:` and its synonym `=` -- for different field types."""
         if field_type == FieldType.TEXT:
             # Handle fields that need exact matching instead of pattern matching
             if attr in ("card_set_code", "card_layout", "card_border", "card_watermark", "collector_number"):
@@ -1017,7 +1034,12 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         # A QUOTED value is compared against the name AS WRITTEN: `name:"eowyn"` answers 0 on
         # api.scryfall.com while `name:"eowyn"` with the accent answers 3.
         #
-        # Exact-match paths (name=, name!=) are unchanged and keep using card_name/card_name_lower.
+        # `name=` REACHES THIS, and the bare/quoted split survives it intact rather than being
+        # flattened to one side: `name=ft` is 1,628 on api.scryfall.com (exactly `name:ft`, NOT
+        # `name:"ft"`'s 362) and `name="ft"` is 362 (exactly `name:"ft"`), measured 2026-08-16. The
+        # split is carried by `self.rhs.literal`, which the quotes set and the operator does not
+        # touch, so routing `=` here preserves it for free. `name!=` is not in this class and
+        # still takes the exact-match path on card_name.
         if attr == "card_name" and isinstance(self.rhs, StringValueNode) and self.rhs.literal:
             lhs_sql = "card.card_name"
         elif attr == "card_name":
@@ -1054,6 +1076,22 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         # Produce the query as a jsonb object
         lhs_sql = self.lhs.to_sql(context)
         attr = self.lhs.attribute_name
+        # `=` IS `:` ON A COLLECTION COLUMN -- set EQUALITY is not a meaning Scryfall gives it, and
+        # a card whose keyword list is exactly ["Flying"] is not what anyone asking `kw=flying`
+        # wants. Measured on api.scryfall.com 2026-08-16, `X=v` against `X:v` on the same corpus,
+        # identical on every row::
+        #
+        #     kw=flying e:khm             28 = kw:flying 28
+        #     otag=ramp e:khm             35 = otag:ramp 35
+        #     is=foil e:khm t:creature   129 = is:foil 129
+        #     f=modern e:khm             304 = f:modern 304
+        #
+        # The boundary is real and lies elsewhere: the COLOR columns in this same handler keep a
+        # genuine equality, because equality is the meaning there -- `c=rg e:khm t:creature` is 1
+        # against `c:rg`'s 2, and `id=rg` is 1 against `id:rg`'s 52. So does `devotion`, whose `=`
+        # is a count comparison rather than a set one (`devotion={r} e:khm t:creature` is 20
+        # against `devotion:{r}`'s 27). Probed in both directions before this changed.
+        is_containment_collection = attr not in ("card_colors", "card_color_identity", "produced_mana", "devotion")
         is_color_identity = False
         if attr in ("card_colors", "card_color_identity", "produced_mana"):
             rhs = get_colors_comparison_object(self.rhs.value.strip().lower(), attr)
@@ -1105,9 +1143,9 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
             msg = f"Unknown attribute: {attr}"
             raise ValueError(msg)
 
-        if self.operator == "=":
+        if self.operator == "=" and not is_containment_collection:
             return f"({lhs_sql} = {placeholder})"
-        if self.operator in (">=", ":"):
+        if self.operator in (">=", ":", "="):
             return f"({lhs_sql} @> {placeholder})"
         if self.operator == "<=":
             return f"({lhs_sql} <@ {placeholder})"
@@ -1131,17 +1169,19 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         col = self.lhs.to_sql(context)
 
         query = context.add([rhs_val])
-        if self.operator == "=":
-            return f"({col} <@ {query}) AND ({query} <@ {col})"
-        if self.operator in (">=", ":"):
+        # `=` IS `:` HERE TOO, for the same reason and on the same evidence: `t=creature e:khm` is
+        # 151 and `t:creature e:khm` is 151, `t=legendary e:khm` is 42 and `t:legendary e:khm` is
+        # 42 (api.scryfall.com, 2026-08-16). A set equality answered only the cards whose whole
+        # type list is the one word, which is never what a type query means.
+        if self.operator in (">=", ":", "="):
             return f"({query} <@ {col})"
         if self.operator == "<=":
             return f"({col} <@ {query})"
         if self.operator == ">":
             return f"({query} <@ {col}) AND NOT({col} <@ {query})"
-        # < and != use the same order-insensitive set semantics as = above
-        # (containment both ways), not jsonb literal equality, which is
-        # order-sensitive for arrays.
+        # < and != express set equality as containment BOTH WAYS, not as jsonb literal equality,
+        # which is order-sensitive for arrays. `=` used to be spelled this way as well and is now
+        # the containment above; these two are the only readers of the two-way form left.
         if self.operator == "<":
             return f"({col} <@ {query}) AND NOT({query} <@ {col})"
         if self.operator in ("!=", "<>"):
