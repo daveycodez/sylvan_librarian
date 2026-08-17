@@ -1,7 +1,8 @@
 use memchr::memmem;
+use rkyv::Archived;
 use regex::Regex;
 use serde_json::Value;
-use super::{AOracleCard, APrinting, AStrings, str_at, mana_lane, lane_add, lanes_ge, LANES6_HI, LANES8_HI, mana_pip_counts, mana_cmc, color_list_to_mask, card_type_str_to_bit, trigram_candidates, trigram_min_posting, ARTIST_NONE, NONE_STR, FlavorIndex, NameBigramIndex, PrintedNameIndex, OracleTextIndex, SortedTrigramIndex, flavor_fingerprint, flavor_match_sets};
+use super::{AOracleCard, APrinting, AStrings, ManaCost, str_at, mana_lane, lane_add, lanes_ge, LANES6_HI, LANES8_HI, mana_pip_counts, mana_cmc, color_list_to_mask, card_type_str_to_bit, trigram_candidates, trigram_min_posting, ARTIST_NONE, NONE_STR, FlavorIndex, NameBigramIndex, PrintedNameIndex, OracleTextIndex, SortedTrigramIndex, flavor_fingerprint, flavor_match_sets};
 use super::legality::{LEGALITY_LEGAL, LEGALITY_BANNED, LEGALITY_RESTRICTED, format_shift};
 
 // ─── Comparison / arithmetic operators ───────────────────────────────────────
@@ -189,6 +190,170 @@ pub(crate) fn numeric_cmp_tri<F: Fn(NumField) -> NumVal>(lhs: &NumExpr, op: CmpO
         (NumVal::PDep, _) | (_, NumVal::PDep) => Tri::PrintingDep,
         (NumVal::Known(a), NumVal::Known(b)) => tri_bool(num_cmp(op, a, b)),
     }
+}
+
+// ─── per-face numeric values ────────────────────────────────────────
+//
+// Scryfall matches a `//` card if ANY FACE satisfies the predicate, and the three stat columns
+// are INDEPENDENT of one another when it does. Both halves are measured against
+// api.scryfall.com, 2026-08-16, with `!"Full // Name"` scoping so the answer is 1 or 404:
+//
+//   pow>=3                on Delver of Secrets (1/1 // 3/2)          -> 1   (back only)
+//   pow=1 tou=2           on Delver                                   -> 1   (no face is 1/2)
+//   pow>=3 pow<=1         on Delver                                   -> 1   (one column, two faces)
+//   pow>tou               on Huntmaster of the Fells (2/2 // 4/4)     -> 1   (no face has p>t)
+//   pow=tou               on Thing in the Ice (0/4 // 7/8)            -> 404 (no pair is equal)
+//
+// The last two are the pair that settles the shape: a per-face ROW model answers 404 to
+// `pow>tou` on Huntmaster, and a "max power vs max toughness" model answers 1 to `pow=tou` on
+// Thing in the Ice. A card carrying a SET of values per column, with the comparison existential
+// over the cross product, is the only one of the three that answers both as measured — so that
+// is what `face_num_values` builds and what `build_arith_tuple_index` interns.
+//
+// NEGATION is deliberately not part of this: Scryfall IGNORES a negated numeric term outright
+// (`-pow=1` answers with `Invalid expression "-pow=1" was ignored`, and `is:dfc -pow>=3` is 2,895
+// = the unfiltered `is:dfc`), so it offers no oracle for what NOT should mean over a value set.
+// This port keeps its existing NOT-of-the-existential, which is the deviation already ledgered.
+
+/// How many distinct values one card can hold for one face-scoped column. Two faces is the whole
+/// corpus (`reversible_card` and `meld` are single-faced rows), and the front's own value is one
+/// of them; 4 leaves room for a future three-face layout without a heap allocation in `tri`.
+const MAX_FACE_VALUES: usize = 4;
+
+/// A fixed-capacity, allocation-free value set. Local rather than a new crate dependency: the
+/// whole need is "up to four f64s on the stack, deduped", and the wasm engine pays for every
+/// dependency it links.
+#[derive(Default)]
+struct FaceValues {
+    vals: [f64; MAX_FACE_VALUES],
+    len: usize,
+}
+
+impl FaceValues {
+    fn push(&mut self, v: f64) {
+        if self.vals[..self.len].contains(&v) || self.len == MAX_FACE_VALUES {
+            return;
+        }
+        self.vals[self.len] = v;
+        self.len += 1;
+    }
+    fn get(&self, i: usize) -> Option<f64> {
+        if i < self.len { Some(self.vals[i]) } else { None }
+    }
+    /// One "don't care" slot when the card has 0 or 1 value, so a column the card has nothing
+    /// for still evaluates once and reaches `field_num`'s NULL exactly as before.
+    fn slots(&self) -> usize {
+        self.len.max(1)
+    }
+}
+
+/// True for the columns whose values a face can differ on. `Cmc` is deliberately NOT here:
+/// measured, mana value stays card-level on every layout — `mv=0` on Delver (back has no cost),
+/// `mv=2` on Fire // Ice (each half) and `mv=2` on Bonecrusher Giant // Stomp (the adventure's
+/// cost) are all 404, while the front's 1 / the joined 4 / the creature's 3 all answer 1.
+fn num_field_is_face_scoped(f: NumField) -> bool {
+    matches!(f, NumField::Power | NumField::Toughness | NumField::Loyalty)
+}
+
+fn num_expr_touches_face_field(e: &NumExpr) -> bool {
+    match e {
+        NumExpr::Const(_) => false,
+        NumExpr::Field(f) => num_field_is_face_scoped(*f),
+        NumExpr::Arith(l, _, r) => num_expr_touches_face_field(l) || num_expr_touches_face_field(r),
+    }
+}
+
+/// The distinct values this card holds for one face-scoped column, card value first.
+///
+/// The card value is always one of the faces' (the merge copies a whole `_FACE_STAT_GROUPS`
+/// group from one face), so listing it first costs nothing and makes the single-face path —
+/// `faces` empty, one value, identical to the pre-gen-28 behaviour — fall out rather than be
+/// special-cased. A face with no value for the column contributes nothing, which is why
+/// `pow=4` matches Bonecrusher Giant // Stomp and the costless adventure half adds no NULL.
+fn face_num_values(card: &AOracleCard, f: NumField) -> FaceValues {
+    let mut out = FaceValues::default();
+    let mut push = |v: f64| out.push(v);
+    match f {
+        NumField::Power => {
+            if let Some(v) = card.creature_power.as_ref() {
+                push(f64::from(*v));
+            }
+            for face in card.faces.iter() {
+                if let Some(v) = face.creature_power.as_ref() {
+                    push(f64::from(*v));
+                }
+            }
+        }
+        NumField::Toughness => {
+            if let Some(v) = card.creature_toughness.as_ref() {
+                push(f64::from(*v));
+            }
+            for face in card.faces.iter() {
+                if let Some(v) = face.creature_toughness.as_ref() {
+                    push(f64::from(*v));
+                }
+            }
+        }
+        NumField::Loyalty => {
+            if let Some(v) = card.planeswalker_loyalty.as_ref() {
+                push(f64::from(*v));
+            }
+            for face in card.faces.iter() {
+                if let Some(v) = face.planeswalker_loyalty.as_ref() {
+                    push(f64::from(*v));
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Existential re-evaluation of a `NumericCmp` over a multi-face card's value sets.
+///
+/// Only reached from `tri` when the card HAS faces and the card-level answer was not already
+/// `True`, so the 82% single-face majority and every already-matching row pay one branch. The
+/// three columns are enumerated independently (the cross product, per the measurements above);
+/// `Cmc` and every printing-level field keep coming from `field_num`, unchanged.
+///
+/// Three-valued aggregation matches `tri`'s own: any `True` wins, else any `False`, else `Null`.
+fn face_numeric_cmp_tri(
+    card: &AOracleCard,
+    printing: Option<&APrinting>,
+    lhs: &NumExpr,
+    op: CmpOp,
+    rhs: &NumExpr,
+    base: Tri,
+) -> Tri {
+    if !num_expr_touches_face_field(lhs) && !num_expr_touches_face_field(rhs) {
+        return base;
+    }
+    let powers = face_num_values(card, NumField::Power);
+    let toughnesses = face_num_values(card, NumField::Toughness);
+    let loyalties = face_num_values(card, NumField::Loyalty);
+    let mut acc = base;
+    for pi in 0..powers.slots() {
+        for ti in 0..toughnesses.slots() {
+            for li in 0..loyalties.slots() {
+                let fetch = |f: NumField| -> NumVal {
+                    let pick = |vs: &FaceValues, i: usize| vs.get(i).map_or(NumVal::Null, NumVal::Known);
+                    match f {
+                        NumField::Power => pick(&powers, pi),
+                        NumField::Toughness => pick(&toughnesses, ti),
+                        NumField::Loyalty => pick(&loyalties, li),
+                        other => field_num(card, printing, other),
+                    }
+                };
+                match numeric_cmp_tri(lhs, op, rhs, &fetch) {
+                    Tri::True => return Tri::True,
+                    Tri::PrintingDep => return Tri::PrintingDep,
+                    Tri::False => acc = Tri::False,
+                    Tri::Null => {}
+                }
+            }
+        }
+    }
+    acc
 }
 
 /// Card-level numeric fields the #743 joint-tuple index covers: all card-scoped (not
@@ -1696,7 +1861,15 @@ impl FilterExpr {
             FilterExpr::ExactName(lower) => tri_bool(exact_name_matches(card.card_name_folded.as_str(), lower)),
 
             FilterExpr::NumericCmp { lhs, op, rhs } => {
-                numeric_cmp_tri(lhs, *op, rhs, &|f| field_num(card, printing, f))
+                let base = numeric_cmp_tri(lhs, *op, rhs, &|f| field_num(card, printing, f));
+                // The merged row answers for 82% of cards (no faces) and for every row that
+                // already matched, so the per-face cross product is reached only by a multi-face
+                // card the card-level values did not satisfy — see face_numeric_cmp_tri.
+                if base == Tri::True || card.faces.is_empty() {
+                    base
+                } else {
+                    face_numeric_cmp_tri(card, printing, lhs, *op, rhs, base)
+                }
             }
 
             FilterExpr::TextContains { field, word } => {
@@ -1896,20 +2069,33 @@ impl FilterExpr {
                 // Containment/equality over the pip multiset = the same test
                 // per lane (SWAR, all eight at once) and per hybrid entry
                 // (sorted-slice walks; both sides empty on ~97% of cards).
-                let mc = &card.mana_cost;
-                let card_core = u64::from(mc.core);
-                let card_cmc = f32::from(mc.cmc);
-                let ge = || lanes_ge(card_core, *core, LANES8_HI) && hybrids_ge(&mc.hybrids, hybrid_ids) && card_cmc >= *cmc;
-                let le = || lanes_ge(*core, card_core, LANES8_HI) && hybrids_le(&mc.hybrids, hybrid_ids) && card_cmc <= *cmc;
-                let eq = || card_cmc == *cmc && card_core == *core && hybrids_eq(&mc.hybrids, hybrid_ids);
-                tri_bool(match op {
-                    CmpOp::Ge => ge(),
-                    CmpOp::Le => le(),
-                    CmpOp::Eq => eq(),
-                    CmpOp::Gt => ge() && !eq(),
-                    CmpOp::Lt => le() && !eq(),
-                    CmpOp::Ne => !eq(),
-                })
+                //
+                // Existential over the faces on top of that, for the same measured reason the
+                // numeric columns are : `m:{R}` matches Valki // Tibalt on the BACK's
+                // {5}{B}{R}, and `m={1}{R}` matches Fire // Ice on one half's cost rather than
+                // the card's joined "{1}{R} // {1}{U}" (whose cmc is 4, so `eq` could never
+                // hold). The card-level cost is tried first and is the whole answer for the 82%
+                // of cards with no faces; a face that printed NO cost has no `mana_cost` and is
+                // skipped, which is why `m=0` still does not match Delver's costless back.
+                let matches = |mc: &Archived<ManaCost>| {
+                    let card_core = u64::from(mc.core);
+                    let card_cmc = f32::from(mc.cmc);
+                    let ge = || lanes_ge(card_core, *core, LANES8_HI) && hybrids_ge(&mc.hybrids, hybrid_ids) && card_cmc >= *cmc;
+                    let le = || lanes_ge(*core, card_core, LANES8_HI) && hybrids_le(&mc.hybrids, hybrid_ids) && card_cmc <= *cmc;
+                    let eq = || card_cmc == *cmc && card_core == *core && hybrids_eq(&mc.hybrids, hybrid_ids);
+                    match op {
+                        CmpOp::Ge => ge(),
+                        CmpOp::Le => le(),
+                        CmpOp::Eq => eq(),
+                        CmpOp::Gt => ge() && !eq(),
+                        CmpOp::Lt => le() && !eq(),
+                        CmpOp::Ne => !eq(),
+                    }
+                };
+                tri_bool(
+                    matches(&card.mana_cost)
+                        || card.faces.iter().any(|f| f.mana_cost.as_ref().is_some_and(matches)),
+                )
             }
 
             FilterExpr::Devotion { op, pips } => {

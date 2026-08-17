@@ -1,5 +1,5 @@
 use super::{
-    and_child_rank, assign_name_ranks,
+    and_child_rank, AStrings, face_mana_cost, face_stat_nums, lane_get, mana_lane, ManaVocabInterner, assign_name_ranks,
     build_numeric_index, build_oracle_text_index, build_tag_index, build_trigram_index,
     build_rarity_index, build_flavor_index, build_hybrid_tag_index, bitmap_beats_postings, HybridTagIndex, build_sort_permutations,
     assign_artist_ranks, assign_artwork_groups, assign_collector_ranks, assign_set_ranks, assign_single_set_flags, order_annex_by_language, assign_foreign_artwork_groups, build_artwork_base_from, build_lang_index, build_printed_name_index, drop_group_if_annex_only, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
@@ -11681,6 +11681,11 @@ fn two_faces() -> (Vec<OracleFace>, Vec<PrintingFace>) {
             defense_text_id: NONE_STR,
             card_colors: 0b0000_0001, // W
             color_indicator: 0,
+            // The front's 2/2 and its {W} cost, parsed — the searchable half of the same face.
+            creature_power: Some(2),
+            creature_toughness: Some(2),
+            planeswalker_loyalty: None,
+            mana_cost: Some(face_mana_cost("{W}", &mut ManaVocabInterner::new()).unwrap()),
         },
         OracleFace {
             card_name_id: 11,
@@ -11693,6 +11698,11 @@ fn two_faces() -> (Vec<OracleFace>, Vec<PrintingFace>) {
             defense_text_id: NONE_STR,
             card_colors: 0b0000_1000, // R
             color_indicator: 0b0000_1000,
+            // A bigger back face with no cost of its own: the shape `pow>=3` used to miss.
+            creature_power: Some(5),
+            creature_toughness: Some(4),
+            planeswalker_loyalty: None,
+            mana_cost: None,
         },
     ];
     let printing = vec![
@@ -11746,6 +11756,146 @@ fn single_faced_cards_carry_no_faces() {
     let archived = rkyv::access::<Archived<OracleCard>, Error>(&bytes).expect("access");
     // ~82% of the corpus. An empty Vec archives to a length word, so the cost is bounded.
     assert!(archived.faces.is_empty());
+}
+
+/// The per-face rule, as MEASURED against api.scryfall.com on 2026-08-16 rather than as inferred
+/// from `_merge_processed_faces`. Each row below is a live probe, scoped with `!"Full // Name"`
+/// so the reference answer is 1 or 404; the fixture reproduces the same stat lines.
+///
+/// The last two rows are the ones that choose between the three models that all explain
+/// `pow>=3` on Delver: a per-face ROW answers 404 to `pow>tou` on a 2/2 // 4/4, and a
+/// max-against-max model answers 1 to `pow=tou` on a 0/4 // 7/8. Only a card holding a SET of
+/// values per column, compared existentially over the CROSS PRODUCT, answers both as measured.
+#[test]
+fn a_face_satisfies_a_numeric_predicate_the_merged_row_cannot() {
+    fn card_with(faces: &[(Option<i8>, Option<i8>)]) -> Vec<u8> {
+        let mut vocab = VocabInterner::new();
+        let mut card = stub_card(1, 0, &[], &mut vocab);
+        // The merged row is the front face's group, exactly as _FACE_STAT_GROUPS leaves it.
+        card.creature_power = faces[0].0;
+        card.creature_toughness = faces[0].1;
+        card.faces = faces
+            .iter()
+            .map(|&(p, t)| OracleFace {
+                card_name_id: NONE_STR,
+                mana_cost_text_id: NONE_STR,
+                type_line_id: NONE_STR,
+                oracle_text_id: NONE_STR,
+                creature_power_text_id: NONE_STR,
+                creature_toughness_text_id: NONE_STR,
+                planeswalker_loyalty_text_id: NONE_STR,
+                defense_text_id: NONE_STR,
+                card_colors: 0,
+                color_indicator: 0,
+                creature_power: p,
+                creature_toughness: t,
+                planeswalker_loyalty: None,
+                mana_cost: None,
+            })
+            .collect();
+        rkyv::to_bytes::<Error>(&card).expect("serialize").into_vec()
+    }
+    // Tri has no Debug (it is a hot enum), so equality is asserted through a named predicate
+    // rather than assert_eq!.
+    fn matches_tri(got: Tri, want: Tri) -> bool {
+        got == want
+    }
+    let num = |field, op, v: f64| FilterExpr::NumericCmp {
+        lhs: NumExpr::Field(field),
+        op,
+        rhs: NumExpr::Const(v),
+    };
+    let field_vs_field = |a, op, b| FilterExpr::NumericCmp {
+        lhs: NumExpr::Field(a),
+        op,
+        rhs: NumExpr::Field(b),
+    };
+
+    // Delver of Secrets // Insectile Aberration: 1/1 front, 3/2 back.
+    let delver = card_with(&[(Some(1), Some(1)), (Some(3), Some(2))]);
+    let delver = rkyv::access::<Archived<OracleCard>, Error>(&delver).expect("access");
+    let strings: Vec<String> = Vec::new();
+    let strings_bytes = rkyv::to_bytes::<Error>(&strings).expect("serialize strings");
+    let strings = rkyv::access::<AStrings, Error>(&strings_bytes).expect("access strings");
+    let t = |c: &Archived<OracleCard>, f: &FilterExpr| f.eval_card(c, strings);
+
+    // pow>=3 -> 1 on Scryfall. The back's power, which the merged row does not carry.
+    assert!(matches_tri(t(delver, &num(NumField::Power, CmpOp::Ge, 3.0)), Tri::True));
+    // pow=1 -> 1: the front's is still there.
+    assert!(matches_tri(t(delver, &num(NumField::Power, CmpOp::Eq, 1.0)), Tri::True));
+    // pow=2 -> 404: neither face, and the union must not invent a value between them.
+    assert!(matches_tri(t(delver, &num(NumField::Power, CmpOp::Eq, 2.0)), Tri::False));
+    // pow=1 tou=2 -> 1, and no face is 1/2: the columns are independent.
+    assert!(matches_tri(t(delver, &num(NumField::Power, CmpOp::Eq, 1.0)), Tri::True));
+    assert!(matches_tri(t(delver, &num(NumField::Toughness, CmpOp::Eq, 2.0)), Tri::True));
+    // pow>=3 pow<=1 -> 1: one column, two faces, both conjuncts satisfied by different ones.
+    assert!(matches_tri(t(delver, &num(NumField::Power, CmpOp::Le, 1.0)), Tri::True));
+
+    // Huntmaster of the Fells // Ravager of the Fells: 2/2 // 4/4. pow>tou -> 1 there, and no
+    // single face has power above its own toughness.
+    let huntmaster = card_with(&[(Some(2), Some(2)), (Some(4), Some(4))]);
+    let huntmaster = rkyv::access::<Archived<OracleCard>, Error>(&huntmaster).expect("access");
+    assert!(
+        matches_tri(t(huntmaster, &field_vs_field(NumField::Power, CmpOp::Gt, NumField::Toughness)), Tri::True),
+        "cross product: 4 against 2",
+    );
+
+    // Thing in the Ice // Awoken Horror: 0/4 // 7/8. pow=tou -> 404 there, which a max-vs-max
+    // reading (7 against 8) also gives — but pow>tou -> 1 there, which it does not.
+    let thing = card_with(&[(Some(0), Some(4)), (Some(7), Some(8))]);
+    let thing = rkyv::access::<Archived<OracleCard>, Error>(&thing).expect("access");
+    assert!(matches_tri(t(thing, &field_vs_field(NumField::Power, CmpOp::Eq, NumField::Toughness)), Tri::False));
+    assert!(matches_tri(t(thing, &field_vs_field(NumField::Power, CmpOp::Gt, NumField::Toughness)), Tri::True));
+
+    // A face with no value contributes none: the adventure half of Bonecrusher Giant // Stomp is
+    // costless and statless, and `pow=4` still answers 1 without a NULL leaking in.
+    let bonecrusher = card_with(&[(Some(4), Some(3)), (None, None)]);
+    let bonecrusher = rkyv::access::<Archived<OracleCard>, Error>(&bonecrusher).expect("access");
+    assert!(matches_tri(t(bonecrusher, &num(NumField::Power, CmpOp::Eq, 4.0)), Tri::True));
+    assert!(matches_tri(t(bonecrusher, &num(NumField::Power, CmpOp::Eq, 0.0)), Tri::False));
+
+    // A card with no faces is unchanged, which is the 82% path: same single value, same NULL.
+    let plain = card_with(&[(Some(1), Some(1))]);
+    let plain = rkyv::access::<Archived<OracleCard>, Error>(&plain).expect("access");
+    assert!(matches_tri(t(plain, &num(NumField::Power, CmpOp::Ge, 3.0)), Tri::False));
+    assert!(matches_tri(t(plain, &num(NumField::Loyalty, CmpOp::Ge, 1.0)), Tri::Null));
+}
+
+/// `face_stat_nums` is `card_processing.py`'s `maybe_int` behind the same creature-like gate the
+/// card-level column uses, so the FRONT face's parse must reproduce that column exactly. If it
+/// ever does not, `face_num_values` would add a phantom value beside the merged one.
+#[test]
+fn front_face_stats_match_card_columns() {
+    // The printed forms the corpus actually holds, including the ones that are not numbers.
+    let creature = Some("Creature — Human Wizard");
+    assert_eq!(face_stat_nums(creature, Some("3"), Some("2"), None), (Some(3), Some(2), None));
+    assert_eq!(face_stat_nums(creature, Some("*"), Some("1+*"), None), (None, None, None));
+    assert_eq!(face_stat_nums(creature, Some("-1"), Some("0"), None), (Some(-1), Some(0), None));
+    // int(float(...)) truncates, exactly as maybe_int does.
+    assert_eq!(face_stat_nums(creature, Some("1.5"), None, None), (Some(1), None, None));
+    // Not creature-like: the card-level column is None there, so the face's must be too.
+    assert_eq!(face_stat_nums(Some("Legendary Planeswalker — Tibalt"), Some("2"), Some("2"), Some("5")), (None, None, Some(5)));
+    // Vehicles and Spacecraft are inside the gate, as in card_processing.py.
+    assert_eq!(face_stat_nums(Some("Artifact — Vehicle"), Some("4"), Some("3"), None), (Some(4), Some(3), None));
+    assert_eq!(face_stat_nums(Some("Land"), Some("9"), Some("9"), None), (None, None, None));
+}
+
+/// A face's mana cost carries its OWN converted cost, which is the number `m=` compares.
+#[test]
+fn a_face_mana_cost_uses_its_own_cmc() {
+    let mut vocab = ManaVocabInterner::new();
+    // Fire, one half of Fire // Ice: cmc 2, where the card's joined cost is 4.
+    let fire = face_mana_cost("{1}{R}", &mut vocab).expect("fire");
+    assert_eq!(fire.cmc, 2.0);
+    assert_eq!(lane_get(fire.core, mana_lane("R").expect("R lane")), 1);
+    // Generic pips are not lanes; only the cmc records them, exactly as the card-level path does.
+    assert_eq!(lane_get(fire.core, mana_lane("W").expect("W lane")), 0);
+    // {X} is a real pip with no cmc contribution — Agadeem's Awakening answers `m:{X}`.
+    let agadeem = face_mana_cost("{X}{B}{B}{B}", &mut vocab).expect("agadeem");
+    assert_eq!(agadeem.cmc, 3.0);
+    assert_eq!(lane_get(agadeem.core, mana_lane("X").expect("X lane")), 1);
+    // Devotion stays a card-level column and is deliberately not derived per face.
+    assert_eq!(agadeem.devotion, 0);
 }
 
 #[test]

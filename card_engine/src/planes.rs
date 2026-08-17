@@ -442,20 +442,34 @@ pub(crate) fn build_bit_planes(cards: &[OracleCard], printings: &[Printing], off
         // low bucket. Power/toughness are Option<i8> and do (Char-Rumbler and
         // similar).
         set_numeric_plane(&mut set, card.cmc.map(i32::from), PLANE_CMC, None, (PLANE_CMC_HI, &mut cmc_hi));
-        set_numeric_plane(
-            &mut set,
-            card.creature_power.map(i32::from),
-            PLANE_POWER,
-            Some((PLANE_POWER_LO, &mut power_lo)),
-            (PLANE_POWER_HI, &mut power_hi),
-        );
-        set_numeric_plane(
-            &mut set,
-            card.creature_toughness.map(i32::from),
-            PLANE_TOUGHNESS,
-            Some((PLANE_TOUGHNESS_LO, &mut toughness_lo)),
-            (PLANE_TOUGHNESS_HI, &mut toughness_hi),
-        );
+        // EVERY face's value, not just the merged row's. The planes are one-hot per value and
+        // `compile_numeric_cmp` ORs the satisfying ones, so a card with a bit at 1 and another at 3
+        // is included by `pow>=3` and by `pow=1` alike — which IS the existential semantics `tri`
+        // answers, reproduced by setting two bits rather than by a second code path. Without this
+        // the planes are a THIRD narrowing structure disagreeing with the other two: measured,
+        // `!"Thing in the Ice // Awoken Horror" pow>=7` answered 404 with the numeric index and the
+        // arith-tuple postings both already face-aware, because the plane consumed the leaf first.
+        //
+        // Negation is unaffected: `contains_unnegatable_numeric` already declines every negated
+        // cmc/power/toughness leaf, so nothing here has to reason about NOT over a value set.
+        for v in crate::face_stat_values(card, |c| c.creature_power, |f| f.creature_power) {
+            set_numeric_plane(
+                &mut set,
+                Some(i32::from(v)),
+                PLANE_POWER,
+                Some((PLANE_POWER_LO, &mut power_lo)),
+                (PLANE_POWER_HI, &mut power_hi),
+            );
+        }
+        for v in crate::face_stat_values(card, |c| c.creature_toughness, |f| f.creature_toughness) {
+            set_numeric_plane(
+                &mut set,
+                Some(i32::from(v)),
+                PLANE_TOUGHNESS,
+                Some((PLANE_TOUGHNESS_LO, &mut toughness_lo)),
+                (PLANE_TOUGHNESS_HI, &mut toughness_hi),
+            );
+        }
     }
     BitPlanes {
         n_cards: cards.len() as u32,

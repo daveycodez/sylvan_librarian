@@ -207,6 +207,64 @@ pub(crate) fn mana_cmc(s: &str) -> f32 {
     cmc
 }
 
+/// `card_processing.py`'s `maybe_int` over a printed stat string: the value if it is a number,
+/// `None` for `*`, `1+*`, `X`, an absent key. Truncating, and via f64 so "1.5" reads as 1 exactly
+/// as `int(float(...))` does. The card-level columns are parsed by the BUILDER with this rule;
+/// this is that rule applied to a face's own printed string, and the two are asserted equal for
+/// the front face in `front_face_stats_match_card_columns`.
+fn stat_str_to_int(s: Option<&str>) -> Option<f64> {
+    let v: f64 = s?.trim().parse().ok()?;
+    if v.is_finite() { Some(v.trunc()) } else { None }
+}
+
+/// The parsed power/toughness/loyalty of one face, from the strings Scryfall printed on it.
+///
+/// The power/toughness gate is `card_processing.py`'s: creature-like TYPE LINES only, so a face
+/// that somehow printed a power without being a creature contributes nothing, exactly as the
+/// card-level column would. Loyalty is ungated there and ungated here.
+pub(crate) fn face_stat_nums(
+    type_line: Option<&str>,
+    power: Option<&str>,
+    toughness: Option<&str>,
+    loyalty: Option<&str>,
+) -> (Option<i8>, Option<i8>, Option<u8>) {
+    let t = type_line.unwrap_or("");
+    let creaturelike = t.contains("Creature") || t.contains("Vehicle") || t.contains("Spacecraft");
+    let (p, tough) = if creaturelike {
+        (
+            stat_str_to_int(power).map(|v| v as i8),
+            stat_str_to_int(toughness).map(|v| v as i8),
+        )
+    } else {
+        (None, None)
+    };
+    (p, tough, stat_str_to_int(loyalty).map(|v| v as u8))
+}
+
+/// One face's own mana cost, packed the way `ManaCostCmp` compares.
+///
+/// Built from the face's printed `mana_cost` STRING through the same `mana_pip_counts` /
+/// `mana_cmc` pair the query side uses, rather than from a `mana_cost_jsonb` column that does not
+/// exist per face. `cmc` is therefore the face's OWN converted cost (Fire's 2, not Fire // Ice's
+/// 4) — the number `m=` compares against. `devotion` stays 0: devotion is a card-level column and
+/// nothing measured says otherwise.
+///
+/// An absent cost (a transform back) gives an all-zero `ManaCost` with cmc 0, which no `m:` query
+/// containing a pip can match and which `m=0` would — so callers must skip faces with no
+/// `mana_cost` key rather than store this. See `jv_faces`.
+pub(crate) fn face_mana_cost(mana_cost: &str, mana_vocab: &mut ManaVocabInterner) -> PyResult<ManaCost> {
+    let mut core = 0u64;
+    let mut hybrids: Vec<(u8, u8)> = Vec::new();
+    for (sym, n) in mana_pip_counts(mana_cost) {
+        match mana_lane(&sym) {
+            Some(lane) => core = lane_add(core, lane, n),
+            None => hybrids.push((mana_vocab.intern(&sym)?, n)),
+        }
+    }
+    hybrids.sort_unstable();
+    Ok(ManaCost { core, hybrids, devotion: 0, cmc: mana_cmc(mana_cost) })
+}
+
 // ─── Card / printing structs ─────────────────────────────────────────────────
 // The store is two-level: ~31.5k OracleCards, each owning a contiguous range of
 // the ~97k Printings (CardData.offsets is the CSR boundary table). Fields that
@@ -260,6 +318,32 @@ struct OracleFace {
     // Scryfall's color_indicator: the printed dot for a face whose color is not implied by its mana
     // cost (a transform back has no mana cost at all). Same WUBRGC bit layout as card_colors.
     color_indicator: u8,
+
+    // ── the SEARCHABLE half of a face (gen 28) ────────────────────────────────
+    //
+    // The text ids above answer "what does this face print"; these answer "does this face satisfy
+    // the predicate". They exist because the merge is lossy in exactly one direction: unions and
+    // joined texts let ANY face satisfy `t:`, `o:` and `c:`, but `_FACE_STAT_GROUPS` copies the
+    // power/toughness group and the loyalty group from ONE face, and the mana cost from the front
+    // face alone -- so a back face's numbers were printable and unsearchable.
+    //
+    // Measured against api.scryfall.com 2026-08-16: `pow>=3` matches Delver of Secrets (1/1 front,
+    // 3/2 back), `m:{R}` matches Valki // Tibalt (the {5}{B}{R} is the BACK's), `m={1}{R}` matches
+    // Fire // Ice (one half's cost, not the joined "{1}{R} // {1}{U}"). Every column is independent
+    // of every other: `pow=1 tou=2` matches Delver even though no single face is 1/2, and
+    // `pow>tou` matches Huntmaster of the Fells (2/2 // 4/4) on the 4-against-2 pair no face has.
+    // So this is a multi-VALUE column per card, not a per-face row -- see `face_num_values`.
+    //
+    // `mana_cost` carries the face's OWN cmc (the sum of its own pips, via `mana_cmc`), which is
+    // the value `m=` compares: Fire's is 2 where the card's is 4. `devotion` is left zero -- the
+    // devotion column stays card-level, unmeasured against Scryfall and unchanged by this.
+    creature_power: Option<i8>,
+    creature_toughness: Option<i8>,
+    planeswalker_loyalty: Option<u8>,
+    /// `None` when the face printed no mana cost at all -- a transform back, a flip back, the
+    /// land half of an MDFC. Measured: `!"Delver of Secrets // Insectile Aberration" m=0` is 404
+    /// on Scryfall, so an absent cost is not a cost of zero and must not answer `m=0`.
+    mana_cost: Option<ManaCost>,
 }
 
 /// One entry of Scryfall's `all_parts`: a card this one is related to.
@@ -779,6 +863,12 @@ struct FaceRow {
     defense_text_id: u32,
     card_colors: u8,
     color_indicator: u8,
+    // The searchable half — see OracleFace's own comment. Parsed here, at ingest, from the face's
+    // own printed strings, so the spill codec and both readers carry one representation.
+    creature_power: Option<i8>,
+    creature_toughness: Option<i8>,
+    planeswalker_loyalty: Option<u8>,
+    mana_cost: Option<ManaCost>,
     illustration_id: u128,
     card_artist_vid: u16,
     // The face's original-case artist string (see PrintingFace.card_artist_name_id).
@@ -1348,7 +1438,12 @@ fn str_list_color_mask(d: &Bound<PyDict>, key: &str) -> u8 {
 /// row's column names, because a face record is a snapshot of what Scryfall sent for that face.
 /// A face that is missing a key keeps the interner's NONE_STR, which is how "Scryfall omitted it"
 /// round-trips back to an absent key rather than a null.
-fn faces_from_pydict(d: &Bound<PyDict>, it: &mut Interner, artists: &mut VocabInterner) -> PyResult<Vec<FaceRow>> {
+fn faces_from_pydict(
+    d: &Bound<PyDict>,
+    it: &mut Interner,
+    artists: &mut VocabInterner,
+    mana: &mut ManaVocabInterner,
+) -> PyResult<Vec<FaceRow>> {
     let Some(value) = d.get_item("card_faces").ok().flatten() else {
         return Ok(Vec::new());
     };
@@ -1368,8 +1463,25 @@ fn faces_from_pydict(d: &Bound<PyDict>, it: &mut Interner, artists: &mut VocabIn
             Some(a) => artists.intern(a.to_lowercase())?,
             None => ARTIST_NONE,
         };
+        // The searchable half, parsed from the face's own printed strings — see OracleFace. An
+        // absent OR empty `mana_cost` is no cost at all, not a cost of zero.
+        let face_mana = opt_str(face, "mana_cost").filter(|s| !s.is_empty());
+        let (creature_power, creature_toughness, planeswalker_loyalty) = face_stat_nums(
+            opt_str(face, "type_line").as_deref(),
+            opt_str(face, "power").as_deref(),
+            opt_str(face, "toughness").as_deref(),
+            opt_str(face, "loyalty").as_deref(),
+        );
+        let mana_cost = match face_mana {
+            Some(s) => Some(face_mana_cost(&s, mana)?),
+            None => None,
+        };
         faces.push(FaceRow {
             card_artist_name_id,
+            creature_power,
+            creature_toughness,
+            planeswalker_loyalty,
+            mana_cost,
             card_name_id: it.intern(opt_str(face, "name").unwrap_or_default()),
             mana_cost_text_id: it.intern_opt(opt_str(face, "mana_cost")),
             type_line_id: it.intern(opt_str(face, "type_line").unwrap_or_default()),
@@ -1491,7 +1603,7 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
             .and_then(|v| v.extract::<bool>().ok())
             .unwrap_or(true),
 
-        card_faces: faces_from_pydict(d, it, artists)?,
+        card_faces: faces_from_pydict(d, it, artists, mana)?,
         all_parts: all_parts_from_pydict(d, it, vocab)?,
         compat: compat_from_pydict(d, vocab)?,
     })
@@ -2205,6 +2317,39 @@ fn union_sorted(a: Vec<u32>, b: Vec<u32>) -> Vec<u32> {
     out
 }
 
+/// The distinct values one card holds for one face-scoped stat column, merged value first.
+///
+/// ONE definition at build time, because THREE narrowing structures have to agree about it — the
+/// `power`/`toughness` numeric indexes, the joint `arith_tuple` postings, and the one-hot bit
+/// planes — and a query leaf is consumed by whichever of them the planner reaches first. When only
+/// two of the three were face-aware, `!"Thing in the Ice // Awoken Horror" pow>=7` still answered
+/// 404 while `pow>tou` on the same card answered 1: the plane had eaten the leaf. `tri`'s
+/// query-time twin is `filter::face_num_values`, which enumerates the identical set.
+///
+/// The merged value comes first and is always one of the faces' — `_FACE_STAT_GROUPS` copies a
+/// whole group from one face — so a single-faced card yields exactly the one value it always did.
+fn face_stat_values<T: Copy + PartialEq>(
+    card: &OracleCard,
+    card_val: impl Fn(&OracleCard) -> Option<T>,
+    face_val: impl Fn(&OracleFace) -> Option<T>,
+) -> Vec<T> {
+    let mut out: Vec<T> = Vec::new();
+    let mut push = |v: T| {
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    };
+    if let Some(v) = card_val(card) {
+        push(v);
+    }
+    for f in &card.faces {
+        if let Some(v) = face_val(f) {
+            push(v);
+        }
+    }
+    out
+}
+
 // ─── Numeric index ────────────────────────────────────────────────────────────
 // Sorted Vec<(i16, u32)> maps field value -> card index for cmc/power/toughness.
 // i16 covers both u8 (cmc: 0-255) and i8 (power/toughness: -128-127) without loss.
@@ -2213,11 +2358,34 @@ fn union_sorted(a: Vec<u32>, b: Vec<u32>) -> Vec<u32> {
 type NumericIndex = Vec<(i16, u32)>;
 
 fn build_numeric_index(cards: &[OracleCard], get_val: impl Fn(&OracleCard) -> Option<i16>) -> NumericIndex {
-    let mut idx: NumericIndex = cards
-        .iter()
-        .enumerate()
-        .filter_map(|(i, c)| get_val(c).map(|v| (v, i as u32)))
-        .collect();
+    build_numeric_index_multi(cards, |c, push| {
+        if let Some(v) = get_val(c) {
+            push(v);
+        }
+    })
+}
+
+/// The face-aware form: a card posts one entry per DISTINCT value it holds for the column, so a
+/// back face's power is reachable by the same binary search as the front's.
+///
+/// This is what makes `numeric_candidates` still `tight` under the per-face semantics: every
+/// posted card satisfies the comparison for at least one of its values, which is exactly what
+/// `tri` now answers. Without it a card whose only matching value is a back face's would never
+/// reach `tri` at all — narrowing, not verification, is where the rows were being lost.
+fn build_numeric_index_multi(cards: &[OracleCard], each_val: impl Fn(&OracleCard, &mut dyn FnMut(i16))) -> NumericIndex {
+    let mut idx: NumericIndex = Vec::with_capacity(cards.len());
+    for (i, c) in cards.iter().enumerate() {
+        let mut seen: [i16; 4] = [0; 4];
+        let mut n = 0usize;
+        each_val(c, &mut |v| {
+            if seen[..n].contains(&v) || n == seen.len() {
+                return;
+            }
+            seen[n] = v;
+            n += 1;
+            idx.push((v, i as u32));
+        });
+    }
     idx.sort_unstable();
     idx
 }
@@ -2275,7 +2443,12 @@ fn numeric_candidates(idx: &Archived<NumericIndex>, op: CmpOp, val: f64, n_cards
     };
     // Card space, so the domain is `n_cards` -- `MATERIALIZE_BITMAP_RATIO` reads the domain rather than
     // assuming printing space, which is the whole reason it is a ratio.
-    Some(sorted_ids(idx[start..end].iter().map(|p| u32::from(p.1)), end - start, n_cards))
+    // `_dedup` because the power/toughness indexes are face-aware: one card holds up to one value
+    // per face, so a range slice can name the same card more than once (Delver of Secrets is in
+    // the `pow>=1` slice at 1 and again at 3). The cmc index is unaffected — it posts one entry a
+    // card — but it shares this function, and deduping a set with no duplicates is a linear pass
+    // over an already-sorted vec.
+    Some(sorted_ids_dedup(idx[start..end].iter().map(|p| u32::from(p.1)), end - start, n_cards))
 }
 
 // ─── Arith-expression tuple postings (#743) ──────────────────────────────────
@@ -2351,19 +2524,43 @@ fn build_arith_tuple_index(cards: &[OracleCard]) -> ArithTupleIndex {
     let mut interner: HashMap<ArithTupleKey, usize> = HashMap::new();
     let mut keys: Vec<ArithTupleKey> = Vec::new();
     let mut postings: Vec<Vec<u32>> = Vec::new();
+    // A multi-face card interns the CROSS PRODUCT of its three face-scoped columns, not one
+    // tuple. That is what makes `pow>tou` answer Huntmaster of the Fells (2/2 // 4/4) the way
+    // api.scryfall.com does — the satisfying pair, 4 against 2, belongs to no single face — and it
+    // is the same value set `face_num_values` enumerates in `tri`, so the narrowing and the
+    // verification cannot disagree about which combinations a card has.
+    //
+    // Cost is bounded and small: only ~18% of cards have faces, at most two distinct values per
+    // column, and the distinct-key budget (ARITH_TUPLE_KEYS_PER_SQRT_CARD) is asserted below.
     for (i, c) in cards.iter().enumerate() {
-        let key = ArithTupleKey {
-            cmc: c.cmc,
-            power: c.creature_power,
-            toughness: c.creature_toughness,
-            loyalty: c.planeswalker_loyalty,
+        // `face_stat_values` is empty when the card has no value at all for the column; a single
+        // None slot keeps that card interning one combination with a NULL there, exactly as before.
+        let opt = |vs: Vec<i8>| -> Vec<Option<i8>> {
+            if vs.is_empty() { vec![None] } else { vs.into_iter().map(Some).collect() }
         };
-        let id = *interner.entry(key).or_insert_with(|| {
-            keys.push(key);
-            postings.push(Vec::new());
-            keys.len() - 1
-        });
-        postings[id].push(i as u32);
+        let powers = opt(face_stat_values(c, |c| c.creature_power, |f| f.creature_power));
+        let toughnesses = opt(face_stat_values(c, |c| c.creature_toughness, |f| f.creature_toughness));
+        let loy_vals = face_stat_values(c, |c| c.planeswalker_loyalty, |f| f.planeswalker_loyalty);
+        let loyalties: Vec<Option<u8>> =
+            if loy_vals.is_empty() { vec![None] } else { loy_vals.into_iter().map(Some).collect() };
+        for &power in &powers {
+            for &toughness in &toughnesses {
+                for &loyalty in &loyalties {
+                    let key = ArithTupleKey { cmc: c.cmc, power, toughness, loyalty };
+                    let id = *interner.entry(key).or_insert_with(|| {
+                        keys.push(key);
+                        postings.push(Vec::new());
+                        keys.len() - 1
+                    });
+                    // Cards are still visited in ascending index order, and a card contributes at
+                    // most once to any ONE combination, so every postings row stays sorted and
+                    // duplicate-free — the invariant `sorted_ids`/`scatter_bits` rely on.
+                    if postings[id].last() != Some(&(i as u32)) {
+                        postings[id].push(i as u32);
+                    }
+                }
+            }
+        }
     }
     debug_assert!(
         cards.len() < ARITH_TUPLE_GUARD_MIN_CARDS || keys.len() <= arith_tuple_key_budget(cards.len()),
@@ -2395,6 +2592,12 @@ fn arith_tuple_narrow(filter: &FilterExpr, idx: &Archived<ArithTupleIndex>, n_ca
     // cost of the narrowing (arithmetic on four small ints, no indirection past the key array).
     let mut matched: Vec<usize> = Vec::new();
     let mut count: usize = 0;
+    // A multi-face card interns several combinations, so "has a False combination" is no
+    // longer the same statement as "does not satisfy the predicate". The card-level verdict is
+    // the EXISTENTIAL over its combinations — any True wins, exactly as `tri` aggregates — so the
+    // negation must exclude every card that also has a True one. Collected here and subtracted
+    // below; for the positive arm this stays empty and costs nothing.
+    let mut also_true: Vec<usize> = Vec::new();
     for (t, key) in idx.keys.iter().enumerate() {
         // Widen exactly as field_num does (see ArithTupleKey's doc): u8/i8 → f64 is lossless and
         // matches field_num's `_ as f32 as f64` for these domains. The archived Option<u8>/<i8>
@@ -2403,25 +2606,40 @@ fn arith_tuple_narrow(filter: &FilterExpr, idx: &Archived<ArithTupleIndex>, n_ca
         let power = key.power.as_ref().map(|v| f64::from(*v));
         let toughness = key.toughness.as_ref().map(|v| f64::from(*v));
         let loyalty = key.loyalty.as_ref().map(|v| f64::from(*v));
-        if eval_arith_tuple_tri(lhs, *op, rhs, cmc, power, toughness, loyalty) == want {
+        let verdict = eval_arith_tuple_tri(lhs, *op, rhs, cmc, power, toughness, loyalty);
+        if verdict == want {
             matched.push(t);
             count += idx.postings[t].len();
+        } else if want == Tri::False && verdict == Tri::True {
+            also_true.push(t);
         }
     }
     let post_ids = || matched.iter().flat_map(|&t| idx.postings[t].iter().map(|x| u32::from(*x)));
+    // The subtraction the comment above describes, done as a card bitmap because that is the one
+    // shape that is O(cards) rather than O(rows x log rows) and needs no sorted inputs. Only the
+    // negated arm builds it, and only when some combination came out True.
+    if want == Tri::False && !also_true.is_empty() {
+        let true_bits = scatter_bits(also_true.iter().flat_map(|&t| idx.postings[t].iter().map(|x| u32::from(*x))), n_cards);
+        let kept: Vec<u32> = sorted_ids_dedup(post_ids(), count, n_cards)
+            .into_iter()
+            .filter(|&id| true_bits[(id >> 6) as usize] & (1u64 << (id & 63)) == 0)
+            .collect();
+        return Narrowed::tight(Candidates::Cards(kept));
+    }
     // Representation split (#636 convention, BITS_PROMOTE): a broad result becomes a card bitmap via
     // an O(count) scatter — no sort, and the word-wise form And/Or actually want for a broad set —
-    // while a sparse result keeps the sorted-vec merge path. Each card belongs to exactly one
-    // combination, so the selected postings rows are disjoint; the vec is sorted (combination order
-    // isn't card order) to restore the sorted-Cards invariant, reserving `count` up front to avoid
-    // the realloc churn that made the broad gather ~3× a bare numeric slice before this split.
+    // while a sparse result keeps the sorted-vec merge path. A multi-face card belongs to several
+    // combinations (gen 28), so the selected postings rows are no longer disjoint and the vec is
+    // deduped as well as sorted (combination order isn't card order) to restore the sorted-Cards
+    // invariant, reserving `count` up front to avoid the realloc churn that made the broad gather
+    // ~3× a bare numeric slice before this split.
     if count > *BITS_PROMOTE {
         return Narrowed::tight(Candidates::CardBits(scatter_bits(post_ids(), n_cards)));
     }
     // The case that prompted docs/issues/done/local-engine-candidate-materialize.md: up to 564 posting rows
     // concatenated, each sorted, the whole never so. Only reachable below `BITS_PROMOTE`, since the arm
     // above already hands back a bitmap past it.
-    Narrowed::tight(Candidates::Cards(sorted_ids(post_ids(), count, n_cards)))
+    Narrowed::tight(Candidates::Cards(sorted_ids_dedup(post_ids(), count, n_cards)))
 }
 
 // ─── Tag index ───────────────────────────────────────────────────────────────
@@ -4943,6 +5161,27 @@ const MATERIALIZE_BITMAP_RATIO: usize = 490;
 /// Same output either way given that, so this is a pure cost choice with no consumer effect. See
 /// `MATERIALIZE_BITMAP_RATIO`, and docs/issues/done/local-engine-candidate-materialize.md for the k-way merge
 /// that lost to both by 3-30x.
+/// `sorted_ids` for the callers whose iterator CAN name a card twice.
+///
+/// `sorted_ids` deliberately refuses to: its debug-build cross-check treats a duplicate as a
+/// caller bug, because for every pre-gen-28 source one posting meant one card. The face-aware
+/// numeric indexes broke that on purpose — a card posts one entry per distinct value it holds, so
+/// Delver of Secrets is in the `pow>=1` slice twice, once for 1 and once for 3 — and the
+/// arith-tuple postings likewise, since a card now interns a cross product of combinations.
+/// Rather than weaken the invariant everywhere, those two callers say so by name here.
+fn sorted_ids_dedup(ids: impl Iterator<Item = u32>, k: usize, domain: usize) -> Vec<u32> {
+    // Same cost split as `sorted_ids`; the bitmap arm collapses duplicates for free, so only the
+    // sort arm needs the extra pass.
+    if *RANGE_MATERIALIZE_BITMAP && k.saturating_mul(MATERIALIZE_BITMAP_RATIO) > domain {
+        bitmap_card_ids(&scatter_bits(ids, domain))
+    } else {
+        let mut v: Vec<u32> = ids.collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+}
+
 fn sorted_ids(ids: impl Iterator<Item = u32>, k: usize, domain: usize) -> Vec<u32> {
     let bitmap = *RANGE_MATERIALIZE_BITMAP && k.saturating_mul(MATERIALIZE_BITMAP_RATIO) > domain;
     // Debug builds run BOTH and compare, so every call site the fuzz suite reaches is a live check of
@@ -14054,7 +14293,17 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 //                `name:ofthe` 1,109 against `name:"ofthe"` 0, `name:limdul` 8 against
 //                `name:"limdul"` 0), and `!"…"` is collated too — so `!"Lim-Dul's Vault"` and
 //                `!"limduls vault"` now find the card that only `!"Lim-Dûl's Vault"` used to.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026081607;
+//   2026081608 — A FACE'S NUMBERS BECOME SEARCHABLE. `OracleFace` gains the parsed
+//                `creature_power` / `creature_toughness` / `planeswalker_loyalty` and its own
+//                `mana_cost`, so a back face's 3/2 and an MDFC back's {5}{B}{R} are things the
+//                filter can read rather than only print. The two card-space numeric indexes
+//                (`power`, `toughness`) and the joint `arith_tuple` postings are rebuilt over
+//                those values — one entry per DISTINCT value, and the cross product for the
+//                tuple — so an archive built by the older code would narrow `pow>=3` to the
+//                front faces alone and quietly drop 11 of the 115 rows on
+//                `f:pauper t:creature pow>=3 cmc<=2 r:common`. Both the struct layout and the
+//                index CONTENTS move, and the second is the half a header check cannot see.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026081608;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -14659,6 +14908,10 @@ impl QueryEngine {
                             defense_text_id: f.defense_text_id,
                             card_colors: f.card_colors,
                             color_indicator: f.color_indicator,
+                            creature_power: f.creature_power,
+                            creature_toughness: f.creature_toughness,
+                            planeswalker_loyalty: f.planeswalker_loyalty,
+                            mana_cost: f.mana_cost.clone(),
                         })
                         .collect(),
                 });
@@ -14869,8 +15122,15 @@ impl QueryEngine {
             name_trigram:   build_trigram_index(&cards, |c| collated_name_of(c, &strings)),
             oracle_trigram: build_oracle_text_index(&cards, &strings),
             cmc:            build_numeric_index(&cards, |c| c.cmc.map(|v| v as i16)),
-            power:          build_numeric_index(&cards, |c| c.creature_power.map(|v| v as i16)),
-            toughness:      build_numeric_index(&cards, |c| c.creature_toughness.map(|v| v as i16)),
+            // cmc stays single-valued: measured, mana value is card-level on every layout (see
+            // num_field_is_face_scoped). power/toughness post every face's value — see
+            // build_numeric_index_multi.
+            power:          build_numeric_index_multi(&cards, |c, push| {
+                for v in face_stat_values(c, |c| c.creature_power, |f| f.creature_power) { push(i16::from(v)); }
+            }),
+            toughness:      build_numeric_index_multi(&cards, |c, push| {
+                for v in face_stat_values(c, |c| c.creature_toughness, |f| f.creature_toughness) { push(i16::from(v)); }
+            }),
             rarity:         build_rarity_index(&printings, &offsets),
             subtypes:       build_tag_index(&cards, &coll_vocab, |c| &c.card_subtypes),
             keywords:       build_tag_index(&cards, &coll_vocab, |c| &c.card_keywords),
