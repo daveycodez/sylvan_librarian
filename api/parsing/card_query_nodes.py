@@ -893,34 +893,55 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         mana_jsonb_sql = "card.mana_cost_jsonb"
         cmc_sql = "card.cmc"
 
+        # NO PRINTED COST IS NOT A COST OF ZERO, and this lane could not tell them apart either.
+        # A land and Ornithopter both store `mana_cost_jsonb = '{}'`, because `{0}` is a number and
+        # so is not a pip; the difference survives only in `mana_cost_text`, which is '' on the
+        # land and '{0}' on Ornithopter (card_processing copies Scryfall's `mana_cost` straight
+        # across, and Scryfall emits both). Without this clause `m:{0}` is `'{}' <@ mana_cost_jsonb
+        # AND cmc >= 0`, which is every card in the table.
+        #
+        # Measured on api.scryfall.com 2026-08-17 at unique=prints: `m:{0} t:land` is 195 — the
+        # cards that print a literal {0} — against the whole land corpus, and `m:{0}` is 93,355
+        # against 105,839. The engine lane gates the same way, on the interned string.
+        #
+        # `<> ''` also excludes NULL, which is what a row with no `mana_cost` key at all stores:
+        # `NULL <> ''` is NULL, and a NULL conjunct is not TRUE, so both spellings of "no cost"
+        # fall out together and neither needs its own branch.
+        #
+        # `!=` IS THE EXCEPTION on the engine lane — an absent cost differs from every queried
+        # cost, so `m!={w} t:land` is 12,249 there — but `!=` never reaches this method: the
+        # caller admits only `<= < >= > =` and asserts on anything else. There is nothing to carry
+        # until this lane grows a `!=`.
+        costed = "card.mana_cost_text <> ''"
+
         if self.operator == "=":
-            return f"({mana_jsonb_sql} = {mana} AND {cmc_sql} = {cmc})"
+            return f"({costed} AND {mana_jsonb_sql} = {mana} AND {cmc_sql} = {cmc})"
 
         if self.operator == "<=":
             # Card costs <= query if:
             # 1. Card doesn't have more colored pips (card mana <@ query mana)
             # 2. Card doesn't cost more total (card cmc <= query cmc)
-            return f"({mana_jsonb_sql} <@ {mana} AND {cmc_sql} <= {cmc})"
+            return f"({costed} AND {mana_jsonb_sql} <@ {mana} AND {cmc_sql} <= {cmc})"
 
         if self.operator == "<":
             # Card costs < query if:
             # 1. Card doesn't have more colored pips (card mana <@ query mana)
             # 2. Card doesn't cost more total (card cmc <= query cmc)
             # 3. Costs are not identical
-            return f"({mana_jsonb_sql} <@ {mana} AND {cmc_sql} <= {cmc} AND {mana_jsonb_sql} <> {mana})"
+            return f"({costed} AND {mana_jsonb_sql} <@ {mana} AND {cmc_sql} <= {cmc} AND {mana_jsonb_sql} <> {mana})"
 
         if self.operator == ">=":
             # Card costs >= query if:
             # 1. Card has at least the colored pips (card mana @> query mana)
             # 2. Card costs at least as much total (card cmc >= query cmc)
-            return f"({mana} <@ {mana_jsonb_sql} AND {cmc_sql} >= {cmc})"
+            return f"({costed} AND {mana} <@ {mana_jsonb_sql} AND {cmc_sql} >= {cmc})"
 
         if self.operator == ">":
             # Card costs > query if:
             # 1. Card has at least the colored pips (card mana @> query mana)
             # 2. Card costs at least as much total (card cmc >= query cmc)
             # 3. Costs are not identical
-            return f"({mana} <@ {mana_jsonb_sql} AND {cmc_sql} >= {cmc} AND {mana_jsonb_sql} <> {mana})"
+            return f"({costed} AND {mana} <@ {mana_jsonb_sql} AND {cmc_sql} >= {cmc} AND {mana_jsonb_sql} <> {mana})"
 
         msg = f"Unsupported mana cost operator: {self.operator}"
         raise ValueError(msg)

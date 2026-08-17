@@ -161,9 +161,16 @@ def _make_cards(rng: random.Random) -> list[dict[str, Any]]:
         for sym, n in pips.items():
             mana_cost_jsonb[sym] = list(range(pos, pos + n))
             pos += n
+        # THE PRINTED COST STRING, which no synthetic row had — and once the engine started
+        # reading it, its absence made every card COSTLESS. A land prints "" on Scryfall and
+        # Ornithopter prints "{0}"; the two pack identically ({core: 0, hybrids: [], cmc: 0},
+        # because `{0}` is a number and contributes neither pip nor cmc), so the string is the only
+        # place the difference survives. Only its EMPTINESS is read — the symbols are for a reader.
+        mana_cost_text = "" if "Land" in types else ("".join(f"{{{sym}}}" * n for sym, n in pips.items()) or "{0}")
         card = {
             "oracle_id": f"00000000-0000-0000-0000-{i + 1:012d}",
             "mana_cost_jsonb": mana_cost_jsonb,
+            "mana_cost_text": mana_cost_text,
             "card_name": name,
             "card_name_folded": name.lower(),
             "oracle_text": oracle,
@@ -218,6 +225,14 @@ def _ref_mana(frag: str, card: dict[str, Any]) -> bool | None:
         True/False, or None when the row has no cmc and the answer would depend on it.
     """
     op = frag[len("mana")]
+    # NO PRINTED COST IS NOT A COST OF ZERO. A land and Ornithopter pack the same, and only the
+    # printed string separates them, so a card with no cost answers no `:` / `=` / `>` / `<`
+    # comparison — those all ask about a cost it does not have. Measured on api.scryfall.com
+    # 2026-08-17 at unique=prints: `m:{0} t:land` is 195, not the 12,254 lands in the corpus.
+    # `!=` IS THE EXCEPTION there (`m!={w} t:land` is 12,249 — an absent cost differs from every
+    # queried one), but FRAGMENTS carries no `mana!=`, so this reaches only `:` and `=`.
+    if not card["mana_cost_text"]:
+        return False
     want_pips: dict[str, int] = {}
     for ch in frag[len("mana") + 1 :]:
         want_pips[ch.upper()] = want_pips.get(ch.upper(), 0) + 1

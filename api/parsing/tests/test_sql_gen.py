@@ -168,34 +168,39 @@ def test_full_sql_translation(parse_query, input_query: str, expected_sql: str, 
         # mana: tests — unlike devotion, every op ANDs in a cmc compare
         # alongside jsonb containment/equality (see
         # _handle_mana_cost_approximate_comparison), and ":" normalizes to ">=".
+        #
+        # Every op also leads with `card.mana_cost_text <> ''`: NO PRINTED COST IS NOT A COST OF
+        # {0}. A land and Ornithopter both store `mana_cost_jsonb = '{}'`, so without that clause
+        # `m:{0}` is every row in the table. Measured on api.scryfall.com 2026-08-17 at
+        # unique=prints, `m:{0} t:land` is 195 and `m:{0}` is 93,355 of 105,839.
         (
             "mana:{g}",
-            r"(%(p_dict_eydHJzogWzFdfQ)s <@ card.mana_cost_jsonb AND card.cmc >= %(p_int_MQ)s)",
+            r"(card.mana_cost_text <> '' AND %(p_dict_eydHJzogWzFdfQ)s <@ card.mana_cost_jsonb AND card.cmc >= %(p_int_MQ)s)",
             {"p_dict_eydHJzogWzFdfQ": {"G": [1]}, "p_int_MQ": 1},
         ),
         (
             "mana={g}",
-            r"(card.mana_cost_jsonb = %(p_dict_eydHJzogWzFdfQ)s AND card.cmc = %(p_int_MQ)s)",
+            r"(card.mana_cost_text <> '' AND card.mana_cost_jsonb = %(p_dict_eydHJzogWzFdfQ)s AND card.cmc = %(p_int_MQ)s)",
             {"p_dict_eydHJzogWzFdfQ": {"G": [1]}, "p_int_MQ": 1},
         ),
         (
             "mana<={g}",
-            r"(card.mana_cost_jsonb <@ %(p_dict_eydHJzogWzFdfQ)s AND card.cmc <= %(p_int_MQ)s)",
+            r"(card.mana_cost_text <> '' AND card.mana_cost_jsonb <@ %(p_dict_eydHJzogWzFdfQ)s AND card.cmc <= %(p_int_MQ)s)",
             {"p_dict_eydHJzogWzFdfQ": {"G": [1]}, "p_int_MQ": 1},
         ),
         (
             "mana<{g}",
-            r"(card.mana_cost_jsonb <@ %(p_dict_eydHJzogWzFdfQ)s AND card.cmc <= %(p_int_MQ)s AND card.mana_cost_jsonb <> %(p_dict_eydHJzogWzFdfQ)s)",
+            r"(card.mana_cost_text <> '' AND card.mana_cost_jsonb <@ %(p_dict_eydHJzogWzFdfQ)s AND card.cmc <= %(p_int_MQ)s AND card.mana_cost_jsonb <> %(p_dict_eydHJzogWzFdfQ)s)",
             {"p_dict_eydHJzogWzFdfQ": {"G": [1]}, "p_int_MQ": 1},
         ),
         (
             "mana>={g}{r}",
-            r"(%(p_dict_eydHJzogWzFdLCAnUic6IFsxXX0)s <@ card.mana_cost_jsonb AND card.cmc >= %(p_int_Mg)s)",
+            r"(card.mana_cost_text <> '' AND %(p_dict_eydHJzogWzFdLCAnUic6IFsxXX0)s <@ card.mana_cost_jsonb AND card.cmc >= %(p_int_Mg)s)",
             {"p_dict_eydHJzogWzFdLCAnUic6IFsxXX0": {"G": [1], "R": [1]}, "p_int_Mg": 2},
         ),
         (
             "mana>{g}",
-            r"(%(p_dict_eydHJzogWzFdfQ)s <@ card.mana_cost_jsonb AND card.cmc >= %(p_int_MQ)s AND card.mana_cost_jsonb <> %(p_dict_eydHJzogWzFdfQ)s)",
+            r"(card.mana_cost_text <> '' AND %(p_dict_eydHJzogWzFdfQ)s <@ card.mana_cost_jsonb AND card.cmc >= %(p_int_MQ)s AND card.mana_cost_jsonb <> %(p_dict_eydHJzogWzFdfQ)s)",
             {"p_dict_eydHJzogWzFdfQ": {"G": [1]}, "p_int_MQ": 1},
         ),
         # X is its own pip symbol, not a hybrid, and contributes 0 to cmc
@@ -204,12 +209,12 @@ def test_full_sql_translation(parse_query, input_query: str, expected_sql: str, 
         # treats them the same.
         (
             "mana:{X}{R}",
-            r"(%(p_dict_eydYJzogWzFdLCAnUic6IFsxXX0)s <@ card.mana_cost_jsonb AND card.cmc >= %(p_int_MQ)s)",
+            r"(card.mana_cost_text <> '' AND %(p_dict_eydYJzogWzFdLCAnUic6IFsxXX0)s <@ card.mana_cost_jsonb AND card.cmc >= %(p_int_MQ)s)",
             {"p_dict_eydYJzogWzFdLCAnUic6IFsxXX0": {"X": [1], "R": [1]}, "p_int_MQ": 1},
         ),
         (
             "mana:xr",
-            r"(%(p_dict_eydYJzogWzFdLCAnUic6IFsxXX0)s <@ card.mana_cost_jsonb AND card.cmc >= %(p_int_MQ)s)",
+            r"(card.mana_cost_text <> '' AND %(p_dict_eydYJzogWzFdLCAnUic6IFsxXX0)s <@ card.mana_cost_jsonb AND card.cmc >= %(p_int_MQ)s)",
             {"p_dict_eydYJzogWzFdLCAnUic6IFsxXX0": {"X": [1], "R": [1]}, "p_int_MQ": 1},
         ),
     ],

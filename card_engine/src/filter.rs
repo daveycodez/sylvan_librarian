@@ -853,6 +853,19 @@ pub(crate) enum FilterExpr {
         /// semantics. Built all-unknown, so an unbound filter behaves as if
         /// every hybrid symbol were unknown (mirroring CollectionCmp).
         hybrid_ids: Vec<(u8, u8)>,
+        /// Each mana-vocab id's CMC CONTRIBUTION, indexed by id, resolved by bind() — 2 for a
+        /// TWOBRID (`{2/W}`), 1 for every other hybrid.
+        ///
+        /// Generic is `cmc - (what the pips account for)`, and a twobrid accounts for TWO. Without
+        /// this the subtraction credits it with one, and the shortfall becomes generic the card
+        /// does not have. Measured on api.scryfall.com 2026-08-17 — Beseech the Queen,
+        /// `{2/B}{2/B}{2/B}`, cmc 6, three pips: the true generic is 0, this read 6 - 3 = 3, and
+        /// `!"Beseech the Queen" m>={3}` answered the card where Scryfall answers nothing.
+        /// Corpus-wide, `m:{2/w} m:{2}` was 16 against Scryfall's 0.
+        ///
+        /// Empty until bind(), which is the same all-unknown posture `hybrid_ids` takes; a missing
+        /// id falls back to 1, the weight of every non-twobrid symbol.
+        hybrid_cmc: Vec<u8>,
         cmc: f32,
     },
 
@@ -862,6 +875,16 @@ pub(crate) enum FilterExpr {
         /// hybrid query pips expanded at build — same layout as
         /// ManaCost.devotion, so every comparison is lane arithmetic.
         pips: u64,
+        /// Each mana-vocab id's DEVOTION COLOUR MASK, indexed by id, resolved by bind(): the
+        /// lanes a pip of that symbol counts toward. `R/G` sets red and green; `2/W` and `W/P`
+        /// set white alone, since neither `2` nor `P` is a colour.
+        ///
+        /// Devotion is a count of PIPS, and `ManaCost.devotion` stores per-colour lanes with
+        /// hybrids expanded — so summing the queried lanes counts a `{R/G}` pip once for red and
+        /// again for green when both are queried. This table is what lets the sum be corrected
+        /// back to distinct pips. Empty until bind(); a missing id contributes no colours, which
+        /// costs a correction rather than inventing one.
+        hybrid_colors: Vec<u8>,
     },
 
     DateCmp {
@@ -1235,18 +1258,48 @@ fn hybrids_eq(card: &AHybrids, query: &[(u8, u8)]) -> bool {
 ///
 /// It is not in `core`: `mana_pip_counts` drops numeric symbols on purpose (they are not pips and
 /// have no lane), so a cost's generic used to survive only inside `cmc`, and comparing THAT is a
-/// measurably different question. Every non-X pip contributes exactly 1 to cmc and X contributes
-/// 0, so `cmc - (non-X pips)` is the generic exactly, for a query cost and a card cost alike —
-/// which is why the query side needs no new field and the store needs no new column.
+/// measurably different question. `cmc - (what the pips account for)` is the generic exactly, for a
+/// query cost and a card cost alike — which is why the query side needs no new field and the store
+/// needs no new column.
 ///
-/// Lane 7 is X (see `MANA_LANE_SYMS`) and is excluded; every other lane, and every hybrid, counts
-/// 1 each. Saturating and clamped at 0 so a cost this arithmetic cannot describe — a `{2/R}`, whose
-/// true cmc contribution is 2 rather than 1 — degrades to 0 instead of wrapping. Scryfall answers
-/// nothing to `m>={2/r}` and so does this, so that cost never reaches a comparison anyway.
-fn generic_of(core: u64, hybrids: impl Iterator<Item = u8>, cmc: f32) -> u8 {
-    let pips: u32 = (0..7).map(|l| u32::from(lane_get(core, l))).sum::<u32>() + hybrids.map(u32::from).sum::<u32>();
+/// WHAT A PIP ACCOUNTS FOR IS NOT ALWAYS 1. Lane 7 is X (see `MANA_LANE_SYMS`) and contributes 0,
+/// so it is excluded from the subtraction rather than credited; every other single symbol
+/// contributes 1; and a TWOBRID contributes 2, which is why `hybrid_cmc` exists and why hybrids
+/// arrive here as (vocab id, count) rather than as a bare count. Beseech the Queen is the case
+/// that named it: `{2/B}{2/B}{2/B}` at cmc 6 read as 6 - 3 = 3 generic when every pip weighed 1,
+/// and `m>={3}` answered a card whose generic is 0. Saturating and clamped at 0, so a weight this
+/// table cannot supply degrades to 0 instead of wrapping.
+fn generic_of(core: u64, hybrids: impl Iterator<Item = (u8, u8)>, cmc: f32, hybrid_cmc: &[u8]) -> u8 {
+    // Lanes 0..6 only: lane 7 is X, which is a real pip and contributes 0 to cmc, so subtracting
+    // it would invent generic. Every other single symbol contributes exactly 1.
+    let core_pips: u32 = (0..7).map(|l| u32::from(lane_get(core, l))).sum();
+    // A hybrid contributes its OWN weight, which is 2 for a twobrid and 1 for the rest — see
+    // `hybrid_cmc`. Unknown ids weigh 1, the common case and the safe one.
+    let hybrid_pips: u32 = hybrids
+        .map(|(id, n)| u32::from(hybrid_cmc.get(id as usize).copied().unwrap_or(1)) * u32::from(n))
+        .sum();
     let cmc = if cmc > 0.0 { cmc as u32 } else { 0 };
-    u8::try_from(cmc.saturating_sub(pips)).unwrap_or(u8::MAX)
+    u8::try_from(cmc.saturating_sub(core_pips + hybrid_pips)).unwrap_or(u8::MAX)
+}
+
+/// A mana symbol's contribution to converted mana cost: 2 for a TWOBRID (`2/W`), 1 otherwise.
+///
+/// Scryfall's cmc counts a twobrid as two — `{2/B}{2/B}{2/B}` is cmc 6, not 3 — while every other
+/// hybrid (`W/U`, `W/P`, `B/G/P`) counts one. The vocab interns the symbol without its braces, so
+/// the leading component is what decides it.
+fn hybrid_cmc_weight(sym: &str) -> u8 {
+    sym.split('/').next().and_then(|head| head.parse::<u8>().ok()).unwrap_or(1)
+}
+
+/// The devotion lanes a pip of `sym` counts toward, as a bitmask over WUBRGC.
+///
+/// `R/G` sets red and green — a hybrid pip is devotion to BOTH its colours. `2/W` and `W/P` set
+/// white alone: neither `2` nor `P` is a colour, and Phyrexian mana is devotion to its one colour.
+fn devotion_color_mask(sym: &str) -> u8 {
+    sym.split('/')
+        .filter_map(mana_lane)
+        .filter(|&lane| lane < 6)
+        .fold(0u8, |mask, lane| mask | (1u8 << lane))
 }
 
 /// Interned name ids (ascending, deduplicated) of the `flavor_names` records satisfying `pred`.
@@ -1402,8 +1455,21 @@ impl FilterExpr {
                 }
             }
             FilterExpr::Not(inner) => inner.bind(vocab, sorted_ids, artist_vocab, artist_vocab_collated, mana_vocab, flavor, strings),
-            FilterExpr::ManaCostCmp { hybrids, hybrid_ids, .. } if !hybrids.is_empty() => {
-                *hybrid_ids = bind_mana_hybrids(hybrids, mana_vocab);
+            // UNCONDITIONAL, unlike the other bind arms: the weights are read off the CARD's
+            // hybrids, not the query's, so `m:{2}` against a twobrid card needs them even though
+            // the query carries no hybrid symbol at all. Gating this on `!hybrids.is_empty()` —
+            // which is right for `hybrid_ids` — would have left the commonest twobrid query
+            // unweighted.
+            FilterExpr::ManaCostCmp { hybrids, hybrid_ids, hybrid_cmc, .. } => {
+                if !hybrids.is_empty() {
+                    *hybrid_ids = bind_mana_hybrids(hybrids, mana_vocab);
+                }
+                *hybrid_cmc = mana_vocab.iter().map(|s| hybrid_cmc_weight(s.as_str())).collect();
+            }
+            // Like ManaCostCmp's, UNCONDITIONAL: the masks are read off the CARD's hybrids, so a
+            // query naming no hybrid at all still needs them to correct its own sum.
+            FilterExpr::Devotion { hybrid_colors, .. } => {
+                *hybrid_colors = mana_vocab.iter().map(|s| devotion_color_mask(s.as_str())).collect();
             }
             FilterExpr::CollectionCmp { value, value_id, .. } => {
                 let i = sorted_ids.partition_point(|id| vocab[u16::from(*id) as usize].as_str() < value.as_str());
@@ -2139,7 +2205,7 @@ impl FilterExpr {
                 tri_bool((word >> shift) & 0b11 == *expected)
             }
 
-            FilterExpr::ManaCostCmp { op, core, hybrid_ids, cmc, .. } => {
+            FilterExpr::ManaCostCmp { op, core, hybrid_ids, hybrid_cmc, cmc, .. } => {
                 // Containment/equality over the pip multiset = the same test
                 // per lane (SWAR, all eight at once) and per hybrid entry
                 // (sorted-slice walks; both sides empty on ~97% of cards).
@@ -2175,10 +2241,10 @@ impl FilterExpr {
                 // pip lane compare in the same direction, cmc's does too (cmc is their sum), so
                 // keeping it would be redundant on the Ge/Le/Eq paths and would re-admit exactly
                 // the cards this excludes.
-                let q_generic = generic_of(*core, hybrid_ids.iter().map(|&(_, n)| n), *cmc);
+                let q_generic = generic_of(*core, hybrid_ids.iter().copied(), *cmc, hybrid_cmc);
                 let matches = |mc: &Archived<ManaCost>| {
                     let card_core = u64::from(mc.core);
-                    let c_generic = generic_of(card_core, mc.hybrids.iter().map(|e| e.1), f32::from(mc.cmc));
+                    let c_generic = generic_of(card_core, mc.hybrids.iter().map(|e| (e.0, e.1)), f32::from(mc.cmc), hybrid_cmc);
                     let ge = || lanes_ge(card_core, *core, LANES8_HI) && hybrids_ge(&mc.hybrids, hybrid_ids) && c_generic >= q_generic;
                     let le = || lanes_ge(*core, card_core, LANES8_HI) && hybrids_le(&mc.hybrids, hybrid_ids) && c_generic <= q_generic;
                     let eq = || c_generic == q_generic && card_core == *core && hybrids_eq(&mc.hybrids, hybrid_ids);
@@ -2191,13 +2257,46 @@ impl FilterExpr {
                         CmpOp::Ne => !eq(),
                     }
                 };
-                tri_bool(
+                // NO PRINTED COST IS NOT A COST OF ZERO, and the packed form cannot tell them
+                // apart: a land and Ornithopter both arrive as {core: 0, hybrids: [], cmc: 0},
+                // because `{0}` parses as a number and so contributes no pip and no cmc. The
+                // INTERNED STRING is where the difference survives, and it survives as EMPTY
+                // rather than absent — Scryfall prints `"mana_cost": ""` on a land and `"{0}"` on
+                // Ornithopter, and the card object has to keep emitting both, so the id is real
+                // either way and only its contents separate them.
+                //
+                // Measured on api.scryfall.com 2026-08-17, unique=prints:
+                //
+                //   m:{0} t:land   195     this answered 12,254 — every land in the corpus
+                //   m={0}          293     this answered 12,713
+                //   m:{0}       93,355     this answered 105,839
+                //   -m:{0}      12,442     this answered 0, because m:{0} had matched everything
+                //   m:{2} layout:meld  35  this answered 59 — the same cause, not a third one
+                //
+                // A costless card fails the containment and exactness comparisons rather than
+                // matching the zero ones, which is what makes `-m:{0}` return the lands: the
+                // negation is of the leaf, and the leaf is false for them.
+                //
+                // `!=` IS THE EXCEPTION, and measurement is the only reason this is not a blanket
+                // false: `m!={w} t:land` is 12,249 on Scryfall, so a card with no cost DOES
+                // satisfy "not exactly {W}". That is consistent rather than special — `!=` asks
+                // whether the costs differ, and an absent cost differs from every queried one,
+                // while `:` `=` `>` `<` all ask about a cost the card does not have.
+                //
+                // A FACE that prints a cost makes the card costed even when the card-level string
+                // is empty, which is the split-card shape: the face arm below is the one that
+                // answers, and gating it on the card-level string would silence it.
+                let has_cost = card.faces.iter().any(|f| f.mana_cost.is_some())
+                    || str_at(strings, u32::from(card.mana_cost_text_id)).is_some_and(|s| !s.is_empty());
+                tri_bool(if has_cost {
                     matches(&card.mana_cost)
-                        || card.faces.iter().any(|f| f.mana_cost.as_ref().is_some_and(matches)),
-                )
+                        || card.faces.iter().any(|f| f.mana_cost.as_ref().is_some_and(matches))
+                } else {
+                    matches!(op, CmpOp::Ne)
+                })
             }
 
-            FilterExpr::Devotion { op, pips } => {
+            FilterExpr::Devotion { op, pips, hybrid_colors } => {
                 // DEVOTION IS A QUESTION ABOUT THE QUERIED COLORS TAKEN TOGETHER, AND A HYBRID
                 // QUERIES **BOTH** OF ITS COLORS AS ONE QUANTITY.
                 //
@@ -2233,35 +2332,34 @@ impl FilterExpr {
                 // and not a constraint. That is the half that made `devotion={r}` 15 here:
                 // pinning the unqueried colors to zero excluded every red card that is also green.
                 //
-                // WHAT THIS STILL DOES NOT REPRODUCE, measured rather than assumed. The real
-                // quantity is the number of PIPS that are red or green, and the sum double-counts
-                // the one pip that is both: a `{R/G}` symbol adds 1 to each lane but is one pip.
+                // THE MEASURE IS DISTINCT PIPS, NOT A SUM OF LANES — the sum was the last
+                // approximation here and it is gone. `ManaCost.devotion` stores per-color lanes
+                // with hybrids EXPANDED, so a `{R/G}` symbol sits in red and in green; summing
+                // both queried lanes counts one pip twice. Two cards falsify the two obvious
+                // readings in opposite directions, and only the pip count answers both:
                 //
-                // TWO CARDS SETTLE THE MEASURE AND THEY PULL OPPOSITE WAYS, which is why neither
-                // the sum nor a per-lane max is the rule. Both have a Scryfall combined devotion
-                // of exactly 2 (each matches `devotion:{r/g}{r/g}` and neither matches
-                // `{r/g}{r/g}{r/g}`), measured 2026-08-16:
+                //                                       Svella {1}{R}{G}   Burning-Tree {R/G}{R/G}
+                //   Scryfall's combined devotion               2                    2
+                //   sum of the queried lanes                   2  OK                4  WRONG
+                //   max of the queried lanes                   1  WRONG             2  OK
+                //   DISTINCT PIPS matching either              2  OK                2  OK
                 //
-                //             cost         lanes      distinct pips   sum   max
-                //   Svella,   {1}{R}{G}    r=1 g=1          2          2     1
-                //   Burning-  {R/G}{R/G}   r=2 g=2          2          4     2
-                //   Tree Em.
+                // Burning-Tree answers `devotion:{r/g}{r/g}` on api.scryfall.com and NOT
+                // `devotion:{r/g}{r/g}{r/g}`; Svella is the sixteenth card of KHM's 16, carrying
+                // one red pip and one green one. The correction below is inclusion-exclusion over
+                // the card's own hybrid symbols, and it is provably ZERO for a single-color query
+                // (one bit in the mask cannot match twice), so every single-color comparison —
+                // and the exact devotion PLANE, which declines multi-lane queries anyway — is
+                // bit-identical to before.
                 //
-                // The SUM is right for Svella and wrong for Burning-Tree; a MAX is the reverse.
-                // Only the count of DISTINCT pips matching either queried color fits both, and
-                // that is a third quantity, not a choice between these two. The sum is taken
-                // because it is exact for every card carrying no hybrid pip of the queried pair —
-                // which is all but 61 cards for {R/G}, 58 for {W/U}, 64 for {B/G}.
-                //
-                // The per-color lanes themselves are NOT the approximation and need no correcting:
+                // The per-color lanes themselves were never the approximation and are untouched:
                 // Burning-Tree answers `devotion:{r}{r}` and `devotion:{g}{g}` on Scryfall, and so
-                // does this. It is only the measure ACROSS two queried lanes that is approximate.
+                // does this. It was only the measure ACROSS two queried lanes that was wrong.
                 //
-                // Correcting it needs the count of {R/G} pips in the card's own cost — the leaf
-                // has the per-color lanes and no per-hybrid-symbol count, and the devotion PLANES
-                // (two saturating bits per color) cannot hold one either, so this is a store and
-                // node change rather than an arithmetic one. The per-lane containment it replaced
-                // was wrong for EVERY card with pips in two queried colors.
+                // Verified set-scoped, where corpus vintage cannot reach: `e:rna
+                // devotion:{r/g}{r/g}` 24, `e:gtc devotion:{w/u}{w/u}` 16, `e:sok
+                // devotion:{b/g}{b/g}` 21, `e:rna devotion:{r/g}{r/g}{r/g}` 3, `e:khm
+                // devotion!={r/g}` 252, `e:khm devotion<={r/g}` 301 — all exact.
                 //
                 // A SECOND, SEPARATE RESIDUAL on Scryfall's side: `=` and `!=` with a hybrid value
                 // never match a card whose cost carries that hybrid pip. `devotion={r/g} m:{r/g}`
@@ -2277,7 +2375,8 @@ impl FilterExpr {
                 // against want 0.
                 //
                 // The two sides use DIFFERENT reductions and both are deliberate. `measure` sums
-                // the card's lanes (the approximation above). `want` takes the MAX of the query's
+                // the card's lanes and then backs out the double count below, which is the pip
+                // count. `want` takes the MAX of the query's
                 // lanes, because a query lane counts SYMBOLS: `{r/g}{r/g}` sets r=2 and g=2 and
                 // asks for two, not four. Max is exact over the whole domain Scryfall honors,
                 // since a single color has one nonzero lane and a hybrid's two lanes are equal by
@@ -2289,13 +2388,37 @@ impl FilterExpr {
                 // `e:khm t:instant devotion:{r}{g}` is all 36 instants).
                 let mut measure: u32 = 0;
                 let mut want: u8 = 0;
+                let mut query_mask: u8 = 0;
                 for c in 0..6 {
                     let k = lane_get(*pips, c);
                     if k > 0 {
                         measure += u32::from(lane_get(d, c));
                         want = want.max(k);
+                        query_mask |= 1u8 << c;
                     }
                 }
+                // BACK OUT THE DOUBLE COUNT. The lanes hold hybrids expanded, so a `{R/G}` pip
+                // sits in red AND green; summing both queried lanes counts one pip twice. Each
+                // hybrid symbol in the card's own cost gives back (matched queried colours - 1)
+                // per pip, which is inclusion-exclusion for the only overlap a mana symbol can
+                // have — a pip cannot be three of the queried colours unless the symbol says so,
+                // and the mask handles that case too.
+                //
+                // This is what makes the measure a count of DISTINCT PIPS rather than a sum of
+                // lanes. Both readings agree on every single-colour pip and differ only where a
+                // card carries a hybrid of the queried pair — 61 cards for {R/G}, 58 for {W/U},
+                // 64 for {B/G}.
+                let overcount: u32 = card
+                    .mana_cost
+                    .hybrids
+                    .iter()
+                    .map(|e| {
+                        let mask = hybrid_colors.get(usize::from(e.0)).copied().unwrap_or(0);
+                        let matched = (mask & query_mask).count_ones();
+                        u32::from(e.1) * matched.saturating_sub(1)
+                    })
+                    .sum();
+                let measure = measure.saturating_sub(overcount);
                 let want = u32::from(want);
                 tri_bool(match op {
                     CmpOp::Ge => measure >= want,
@@ -2543,7 +2666,7 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
         // where Scryfall answers 102, the same 102 as `m:{2}`.
         let cmc = mana_cmc(mana_str) + mana_bare_generic(mana_str) as f32;
         let cmp_op = match op { ":" => CmpOp::Ge, _ => str_op_to_cmp(op)? };
-        return Ok(FilterExpr::ManaCostCmp { op: cmp_op, core, hybrids, hybrid_ids, cmc });
+        return Ok(FilterExpr::ManaCostCmp { op: cmp_op, core, hybrids, hybrid_ids, hybrid_cmc: Vec::new(), cmc });
     }
 
     if attr == "devotion" {
@@ -2565,7 +2688,7 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
             }
         }
         let cmp_op = match op { ":" => CmpOp::Ge, _ => str_op_to_cmp(op)? };
-        return Ok(FilterExpr::Devotion { op: cmp_op, pips });
+        return Ok(FilterExpr::Devotion { op: cmp_op, pips, hybrid_colors: Vec::new() });
     }
 
     if matches!(attr, "card_colors" | "card_color_identity" | "produced_mana") {

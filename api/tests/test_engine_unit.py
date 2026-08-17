@@ -690,16 +690,25 @@ class TestDevotion:
         # A MULTI-COLOR PLAIN VALUE IS A SHAPE SCRYFALL REFUSES, not one it answers differently:
         # `devotion:{r}{g}` comes back with every card and the warning "Invalid expression
         # `devotion:{r}{g}` was ignored. Devotion can only match single color or hybrid mana."
-        # (measured 2026-08-16 -- `e:khm t:creature devotion:{r}{g}` is 151, the whole of
-        # `e:khm t:creature`, and `e:khm t:instant devotion:{r}{g}` is all 36 instants).
+        # Re-measured 2026-08-17: `e:khm t:creature devotion:{r}{g}` is the whole of
+        # `e:khm t:creature`, and `!"Boggart Ram-Gang" devotion={r}{r}{r}{g}{g}{g}` comes back
+        # with all five of its printings under that same warning.
         #
-        # So the sum this leaf computes has no reference answer here and is not asserted against
-        # one; what IS pinned is that the leaf does not crash and stays self-consistent. Every
-        # value Scryfall DOES answer -- a single color, or a hybrid, whose two lanes are equal by
-        # construction -- has one symbol count, which is the target the leaf compares against.
+        # So the measure this leaf computes has no reference answer here and is not asserted
+        # against one; what IS pinned is that the leaf does not crash and stays self-consistent.
+        # Every value Scryfall DOES answer -- a single color, or a hybrid, whose two lanes are
+        # equal by construction -- has one symbol count, which is the target it compares against.
+        #
+        # THE ANSWER MOVED WHEN THE MEASURE BECAME DISTINCT PIPS, and only on this refused shape.
+        # Boggart Ram-Gang is {R/G}{R/G}{R/G}: three pips, each red AND green. The summed lanes
+        # read 6 against a target of 3 and the row missed; the pip count reads 3, which is what
+        # its devotion to red-or-green actually is, and the row matches. Neither number is
+        # Scryfall's, because Scryfall answers this query with the whole corpus.
         total_r3g3, _ = _run(engine, 'devotion={R}{R}{R}{G}{G}{G} name="Boggart Ram-Gang"')
         total_r6, _ = _run(engine, 'devotion={R}{R}{R}{R}{R}{R} name="Boggart Ram-Gang"')
-        assert total_r3g3 == 0, "the summed measure is 6, against a target of 3"
+        assert total_r3g3 == 4, "three pips that are red or green, against a target of 3"
+        # Red ALONE is a single-lane query, which the pip correction cannot touch -- one bit cannot
+        # be matched twice by one pip -- so this stays exactly what it was: devotion to red is 3.
         assert total_r6 == 0, "and red alone is 3, not 6"
 
     def test_devotion_le_subset(self, engine: QueryEngine) -> None:

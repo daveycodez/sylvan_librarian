@@ -767,13 +767,16 @@ fn dev_eq(color: usize, k: u8) -> Option<PlaneExpr> {
 
 /// Compile a Devotion node exactly, mirroring `FilterExpr::Devotion`'s tri().
 ///
-/// That tri() compares the SUM of the queried devotion lanes against the number of symbols the
-/// query asked for — see its own note for the api.scryfall.com measurements. `compile_plane`'s
-/// contract is exactness and the estimator reports `exact(c)` on the strength of it, so this
-/// answers only the case it can answer exactly and DECLINES the rest.
+/// That tri() counts the card's DISTINCT PIPS matching any queried color — the sum of the queried
+/// lanes, less the double count a hybrid pip of the queried pair contributes — against the number
+/// of symbols the query asked for; see its own note for the api.scryfall.com measurements.
+/// `compile_plane`'s contract is exactness and the estimator reports `exact(c)` on the strength of
+/// it, so this answers only the case it can answer exactly and DECLINES the rest.
 ///
-/// ONE queried lane: the sum IS that lane, so each operator is one per-color comparison over the
-/// color's two saturating bit-slices, exactly as before.
+/// ONE queried lane: the measure IS that lane. The hybrid correction is provably zero here — a
+/// single queried color is one bit, and one bit cannot be matched twice by the same pip — so each
+/// operator is one per-color comparison over the color's two saturating bit-slices, exactly as
+/// before, and the exactness claim survives the correction untouched.
 ///
 /// TWO queried lanes (what a HYBRID value expands to): the planes hold a saturating 0/1/2/3+ per
 /// color and cannot add two of them — `d[r] + d[g] >= 2` is true for a card with one pip of each,
@@ -1386,7 +1389,7 @@ pub(crate) fn compile_plane(filter: &FilterExpr, bounds: &rkyv::Archived<BitPlan
         }
         // Devotion is card-level and two-valued (tri_bool always), so its
         // bit-sliced planes compile exactly within the saturation boundary.
-        FilterExpr::Devotion { op, pips } => compile_devotion(*op, *pips),
+        FilterExpr::Devotion { op, pips, .. } => compile_devotion(*op, *pips),
         FilterExpr::NumericCmp { lhs, op, rhs } => match (lhs, rhs) {
             (NumExpr::Field(NumField::RarityInt), NumExpr::Const(v)) => compile_rarity_cmp(*op, *v),
             (NumExpr::Const(v), NumExpr::Field(NumField::RarityInt)) => compile_rarity_cmp(flip_op(*op), *v),
