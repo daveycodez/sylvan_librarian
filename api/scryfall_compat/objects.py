@@ -370,7 +370,9 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
         # PRINTED string: `planeswalker_loyalty` is a u8 in the engine and cannot hold "X" or "1+*".
         ("loyalty", row.get("loyalty")),
         ("flavor_text", row.get("flavor_text") or None),
-        ("watermark", row.get("watermark")),
+        # Absent on a card WITH FACES, which carries it on the faces and nowhere else -- the Rust
+        # twin is the `key == "watermark"` gate in card_object.rs, and the measurement is there.
+        ("watermark", None if row.get("card_faces") else row.get("watermark")),
         ("frame", row.get("frame")),
         ("edhrec_rank", row.get("edhrec_rank")),
         ("penny_rank", row.get("penny_rank")),

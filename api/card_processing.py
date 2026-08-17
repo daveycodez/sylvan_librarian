@@ -165,6 +165,21 @@ _FACE_OBJECT_FIELDS = (
     "colors",
     "color_indicator",
     "flavor_text",
+    # WATERMARK IS PER FACE, and dropping it here loses the value twice over. Scryfall puts the
+    # watermark on the FACE and, on a card with `card_faces`, on NOTHING ELSE: 0 of the 12,098
+    # faced printings in the 2026-08-16 all_cards bulk carry a top-level `watermark`, against
+    # 36,437 unfaced ones that do. The face merge below then writes face 0's value into
+    # `card_watermark`, so a faced printing stored a top-level watermark Scryfall never sends AND
+    # lost every later face's.
+    #
+    # The loss is not display-only. `Research // Development` (dis/155) is simic on its front face
+    # and izzet on its back, and api.scryfall.com answers it for BOTH `wm:simic` and `wm:izzet`;
+    # this stored simic alone. 19 printings carry a watermark a later face alone has, and every one
+    # of the ten Ravnica guilds was short 1-2 rows.
+    #
+    # Position is Scryfall's own: the key sits between `flavor_text` and `artist` on every one of
+    # the 1,075 face occurrences in the bulk, and `_face_records` keeps this tuple's order.
+    "watermark",
     "artist",
     "artist_id",
     "illustration_id",

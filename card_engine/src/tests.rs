@@ -7952,6 +7952,178 @@ fn set_watermark_compose_leaves() {
 /// (`art:`/`is:`) as PrintingCompose leaves: `compose_printing_bits` must be bit-for-bit the residual
 /// path's truth for the positive `Ge` leaf, its negation, mixes with a range, and absent values —
 /// while `Eq`/`Gt` (loose) and `FrameData` (non-complete) must stay OFF the compose path.
+/// WATERMARK IS PER FACE, so `wm:` is a multi-VALUE leaf — and every structure that answers it has
+/// to enumerate the SAME values `tri` does or the exactness claim is a silent wrong answer.
+///
+/// `Research // Development` (dis/155) is simic on its front face and izzet on its back, and
+/// api.scryfall.com answers it for both. 19 printings in the 2026-08-16 default_cards bulk carry a
+/// watermark only a non-front face has, and this port had them all answering the front's alone.
+///
+/// The hazard the fix had to clear is not the filter: it is that `narrow_rec` calls the postings
+/// leaf TIGHT and `is_printing_composable` calls it EXACT, and nothing downstream re-checks either.
+/// So this asserts all four answers against one ground truth — `card_pass` + `residual_matches`,
+/// the trivalent walk the materializing plan verifies with — for EVERY operator `wm:` accepts:
+///
+/// - `Eq` — the one shape that narrows and composes. Postings, tight set, compose bits and the
+///   exact estimate must each equal the trivalent truth, on BOTH of a two-faced printing's values.
+/// - the ordering ops and the regex — no narrow arm and no compose arm, so they must DECLINE
+///   rather than answer approximately, exactly as they did when the field was scalar.
+#[test]
+fn watermark_is_per_face_and_every_leaf_still_matches_tri() {
+    let mut vocab = VocabInterner::new();
+    let cards = vec![
+        stub_card(1, TYPE_CREATURE, &[], &mut vocab),
+        stub_card(2, TYPE_CREATURE, &[], &mut vocab),
+        stub_card(3, TYPE_CREATURE, &[], &mut vocab),
+    ];
+    let mut data = store_of(cards, &[2, 2, 2], vocab); // pids 0,1 | 2,3 | 4,5
+    let mut interner = Interner::new();
+    let simic = interner.intern("simic".to_string());
+    let izzet = interner.intern("izzet".to_string());
+    let selesnya = interner.intern("selesnya".to_string());
+
+    // pid0: the divergence itself — a split printing whose two faces disagree. Its own
+    //       `card_watermark_id` is the FRONT face's, which is what the builder's face overlay
+    //       writes and what this port answered with alone.
+    // pid1: two faces AGREEING — the 137-printing majority. The postings must list it ONCE.
+    // pid2: unfaced, scalar watermark — the 36,437-printing ordinary case.
+    // pid3: faced with NO watermark on either face — must stay Null, matching neither polarity.
+    // pid4: faced, front bare, BACK carrying one. 0 printings in the live corpus, and handled
+    //       anyway: the front's absence is not the printing's, so this is False-or-True, never
+    //       Null. A cap of "one extra value" would answer this by accident; this does it by rule.
+    // pid5: nothing at all.
+    let face = |wm: u32| PrintingFace {
+        illustration_id: 0,
+        card_artist_vid: ARTIST_NONE,
+        card_artist_name_id: NONE_STR,
+        card_watermark_id: wm,
+        flavor_text_id: NONE_STR,
+        flavor_name_id: NONE_STR,
+    };
+    let plan: [(u32, Vec<u32>); 6] = [
+        (simic, vec![simic, izzet]),
+        (selesnya, vec![selesnya, selesnya]),
+        (izzet, vec![]),
+        (NONE_STR, vec![NONE_STR, NONE_STR]),
+        (NONE_STR, vec![NONE_STR, simic]),
+        (NONE_STR, vec![]),
+    ];
+    for (p, (own, faces)) in data.printings.iter_mut().zip(plan) {
+        p.card_watermark_id = own;
+        p.faces = faces.into_iter().map(face).collect();
+    }
+    data.strings = interner.strings;
+    derive_name_collation(&mut data);
+
+    // THE COMMIT PASS'S OWN FUNCTION, not a copy of it — a differential against a re-implemented
+    // index proves the two copies agree with each other and nothing about production.
+    data.indexes.watermarks = super::build_watermark_index(&data.printings, &data.strings);
+
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let n_printings = archived.printings.len();
+
+    let wm = |op: CmpOp, v: &str| FilterExpr::TextExact { field: super::TextField::Watermark, op, value: v.to_string() };
+
+    // GROUND TRUTH: the trivalent walk, per printing. Nothing here touches an index.
+    let brute = |f: &FilterExpr| -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut residual: Vec<&FilterExpr> = Vec::new();
+        let mut is_or = false;
+        for c in 0..archived.cards.len() {
+            let card = &archived.cards[c];
+            let tri = f.card_pass(card, &archived.strings, &mut residual, &mut is_or, 0);
+            for pid in u32::from(archived.offsets[c])..u32::from(archived.offsets[c + 1]) {
+                let matched = match tri {
+                    Tri::True => true,
+                    Tri::PrintingDep => FilterExpr::residual_matches(
+                        card, &archived.printings[pid as usize], &archived.strings, &residual, is_or,
+                    ),
+                    Tri::False | Tri::Null => false,
+                };
+                if matched {
+                    out.push(pid);
+                }
+            }
+        }
+        out
+    };
+
+    // The divergence, stated as the two counts it is: the split printing answers BOTH.
+    assert_eq!(brute(&wm(CmpOp::Eq, "simic")), vec![0, 4], "the front-face value and the back-only one");
+    assert_eq!(brute(&wm(CmpOp::Eq, "izzet")), vec![0, 2], "a NON-front face's value must answer too");
+    assert_eq!(brute(&wm(CmpOp::Eq, "selesnya")), vec![1], "two faces agreeing is still one printing");
+
+    // A printing with no value anywhere satisfies NEITHER polarity — the trivalent rule the whole
+    // nullable-field argument rests on, and the reason `-wm:` stays off the compose path.
+    for pid in [3usize, 5] {
+        let card = &archived.cards[u32::from(archived.indexes.printing_to_card[pid]) as usize];
+        let f = wm(CmpOp::Eq, "simic");
+        assert!(
+            f.eval_printing(card, &archived.printings[pid], &archived.strings) == Tri::Null,
+            "pid{pid} carries no watermark on any face and must answer NOTHING, not False"
+        );
+    }
+
+    for value in ["simic", "izzet", "selesnya", "absent"] {
+        let f = wm(CmpOp::Eq, value);
+        let want = brute(&f);
+
+        // 1. THE POSTINGS. The index is what everything below reads; if it disagrees with tri,
+        //    nothing downstream can be right.
+        let postings: Vec<u32> = archived
+            .indexes
+            .watermarks
+            .get(value)
+            .map_or_else(Vec::new, |v| v.iter().map(|x| u32::from(*x)).collect());
+        assert_eq!(postings, want, "indexes.watermarks[{value}] must be exactly the tri-true set");
+
+        // 2. THE NARROW LEAF, whose set `narrow_rec` marks TIGHT — every member satisfies the
+        //    subtree, which is what lets a `Not` above it complement the set soundly.
+        match narrow_candidates(&f, &archived.indexes, &archived.offsets, &archived.cards) {
+            Some(Candidates::Printings(v)) => {
+                assert_eq!(v, want, "the tight narrow set must be exactly the tri-true set for wm:{value}")
+            }
+            other => panic!("wm:{value} must narrow to printings, got {other:?}"),
+        }
+
+        // 3. THE COMPOSE BITS, which claim EXACT — no per-printing re-check happens after this.
+        assert!(super::is_printing_composable(&f, &archived.indexes), "wm:{value} must stay composable");
+        let bits = super::compose_printing_bits(&f, &archived.indexes, &archived.offsets, &archived.printings, n_printings);
+        let composed: Vec<u32> = (0..n_printings as u32).filter(|&p| bits[p as usize >> 6] & (1u64 << (p & 63)) != 0).collect();
+        assert_eq!(composed, want, "compose_printing_bits must be exactly the tri-true set for wm:{value}");
+
+        // 4. THE ESTIMATE, which reads the postings LENGTH as the match count. This is what the
+        //    per-printing dedup above is for: without it the 137 agreeing-face printings would each
+        //    be counted twice here while the bitmap stayed right.
+        let est = super::compose_printing_estimate(&f, &archived.indexes, &archived.offsets, n_printings).result;
+        assert_eq!(est, want.len(), "the bare-leaf estimate must be exact for wm:{value}");
+    }
+
+    // EVERY OTHER OPERATOR DECLINES rather than answering approximately. None of them has a narrow
+    // or compose arm, so they must reach the general path where `tri` is the answer — the hybrid
+    // devotion rule, applied to the shapes this fix did not measure Scryfall behaviour for.
+    for op in [CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge, CmpOp::Ne] {
+        let f = wm(op, "simic");
+        assert!(!super::is_printing_composable(&f, &archived.indexes), "only wm:= composes; {op:?} must decline");
+    }
+    let re = FilterExpr::TextRegex {
+        field: super::TextField::Watermark,
+        regex: regex::Regex::new("simic").expect("regex"),
+    };
+    assert!(!super::is_printing_composable(&re, &archived.indexes), "wm:/re/ must decline");
+    // ...and the regex still SEES every face, because it shares tri's value enumeration with the
+    // exact arm. pid0's back face is the only izzet a regex could find on it.
+    assert_eq!(
+        brute(&FilterExpr::TextRegex {
+            field: super::TextField::Watermark,
+            regex: regex::Regex::new("^izzet$").expect("regex"),
+        }),
+        vec![0, 2],
+        "the regex arm must enumerate the same per-face values the exact arm does"
+    );
+}
+
 #[test]
 fn collection_compose_leaves() {
     let mut vocab = VocabInterner::new();
@@ -12063,8 +12235,8 @@ fn two_faces() -> (Vec<OracleFace>, Vec<PrintingFace>) {
         },
     ];
     let printing = vec![
-        PrintingFace { illustration_id: 0xAAAA, card_artist_vid: 1, card_artist_name_id: NONE_STR, flavor_text_id: 7, flavor_name_id: NONE_STR },
-        PrintingFace { illustration_id: 0xBBBB, card_artist_vid: 2, card_artist_name_id: NONE_STR, flavor_text_id: NONE_STR, flavor_name_id: NONE_STR },
+        PrintingFace { illustration_id: 0xAAAA, card_artist_vid: 1, card_artist_name_id: NONE_STR, card_watermark_id: NONE_STR, flavor_text_id: 7, flavor_name_id: NONE_STR },
+        PrintingFace { illustration_id: 0xBBBB, card_artist_vid: 2, card_artist_name_id: NONE_STR, card_watermark_id: NONE_STR, flavor_text_id: NONE_STR, flavor_name_id: NONE_STR },
     ];
     (oracle, printing)
 }

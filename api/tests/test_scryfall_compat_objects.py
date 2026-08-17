@@ -186,6 +186,30 @@ class TestToScryfallCard:
         assert "/front/" in card["card_faces"][0]["image_uris"]["large"]
         assert "/back/" in card["card_faces"][1]["image_uris"]["large"]
 
+    def test_a_faced_card_carries_its_watermark_on_the_faces_and_never_at_top_level(self):
+        """A card with faces carries its watermark on the faces and nowhere else.
+
+        Scryfall sends a top-level `watermark` on 36,437 printings and on 0 of the 12,098 with
+        `card_faces` (whole 2026-08-16 all_cards bulk). A split card is ONE image and one piece of
+        cardboard, so no layout gate can stand in for "has faces": `Research // Development`
+        (dis/155) is simic on its front face and izzet on its back and carries neither at top level.
+        """
+        card = to_scryfall_card(
+            row(
+                name="Research // Development",
+                layout="split",
+                watermark="simic",
+                card_faces=[
+                    {"name": "Research", "mana_cost": "{2}{G}{U}", "watermark": "simic"},
+                    {"name": "Development", "mana_cost": "{4}{U}{R}", "watermark": "izzet"},
+                ],
+            )
+        )
+        assert "watermark" not in card
+        assert [f["watermark"] for f in card["card_faces"]] == ["simic", "izzet"]
+        # ...and an UNFACED printing is untouched: 36,437 of them carry the key exactly here.
+        assert to_scryfall_card(row(watermark="set"))["watermark"] == "set"
+
     def test_a_reversible_printing_keeps_nothing_of_the_card_at_top_level(self):
         """The one layout that omits `oracle_id`, `cmc` and `type_line` and puts them on the faces.
 

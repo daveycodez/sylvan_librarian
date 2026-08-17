@@ -379,6 +379,17 @@ struct RelatedCard {
 struct PrintingFace {
     illustration_id: u128,
     card_artist_vid: u16,
+    /// Scryfall's FACE-level `watermark`, interned (NONE_STR = absent).
+    ///
+    /// PER FACE, and per PRINTING within that — a guild watermark belongs to the printing that
+    /// prints it, not to the oracle text, so it rides here beside the art rather than on
+    /// `OracleFace`. `Printing.card_watermark_id` holds the FRONT face's copy (the importer's face
+    /// merge puts it there) and the value a card without faces carries; this is what makes
+    /// `Research // Development` answer `wm:izzet` as well as `wm:simic`.
+    ///
+    /// It is also the ONLY watermark a faced printing's card object emits — Scryfall sends a
+    /// top-level one on 0 of the 12,098 faced printings in the 2026-08-16 all_cards bulk.
+    card_watermark_id: u32,
     flavor_text_id: u32,
     // Scryfall's FACE-level `flavor_name`, interned (NONE_STR = absent). The card-level twin is
     // `Printing.flavor_name_id`, and a printing carries one or the other, never both: 28 face
@@ -996,6 +1007,8 @@ struct FaceRow {
     card_artist_vid: u16,
     // The face's original-case artist string (see PrintingFace.card_artist_name_id).
     card_artist_name_id: u32,
+    // The face's own watermark (see PrintingFace.card_watermark_id).
+    card_watermark_id: u32,
     flavor_text_id: u32,
     flavor_name_id: u32,
     // The per-face printed-language triple (PrintedFaceText before the commit pass splits it).
@@ -1686,6 +1699,10 @@ fn faces_from_pydict(
         };
         faces.push(FaceRow {
             card_artist_name_id,
+            // Scryfall's face watermarks are lowercase already — all 76 distinct values across the
+            // 2026-08-16 all_cards bulk, top level and face alike — so the one interned id serves
+            // both `wm:`, which compares lowercase, and the card object, which prints it.
+            card_watermark_id: it.intern_opt(opt_str(face, "watermark")),
             creature_power,
             creature_toughness,
             planeswalker_loyalty,
@@ -3056,6 +3073,36 @@ fn build_artist_index(printings: &[Printing], n_artists: usize) -> ArtistIndex {
         (vid != ARTIST_NONE).then_some(vid as usize)
     });
     ArtistIndex { offsets, printings: out }
+}
+
+/// The `watermark:` postings, keyed by value — EVERY value the printing carries, not just its own.
+///
+/// Watermark is per FACE (see `PrintingFace::card_watermark_id`), and `filter::tri` answers `wm:`
+/// existentially over exactly this set (`extra_text_field_values`). The two MUST enumerate
+/// identically: `is_printing_composable` claims these postings are an EXACT printing bitmap and
+/// `narrow_rec` marks them TIGHT, and nothing downstream re-checks a leaf either one called exact,
+/// so a value in one enumeration and not the other is a wrong answer rather than a slow one. This
+/// is a function and not an inline block so the differential test can call the SAME code the
+/// commit pass does, instead of a copy of it that can drift.
+///
+/// DEDUPED PER PRINTING, which is not cosmetic: `compose_printing_estimate` reads the postings
+/// LENGTH as the match count ("each posting is one distinct printing"), so the 137 faced printings
+/// of the 2026-08-16 default_cards bulk whose two faces AGREE would each be counted twice there
+/// while the bitmap stayed right.
+pub(crate) fn build_watermark_index(printings: &[Printing], strings: &[String]) -> TagIndex {
+    let mut idx: TagIndex = HashMap::new();
+    let mut seen: Vec<u32> = Vec::with_capacity(2);
+    for (i, p) in printings.iter().enumerate() {
+        seen.clear();
+        let own = std::iter::once(p.card_watermark_id);
+        for id in own.chain(p.faces.iter().map(|f| f.card_watermark_id)) {
+            if id != NONE_STR && !seen.contains(&id) {
+                seen.push(id);
+                idx.entry(strings[id as usize].as_str().to_string()).or_default().push(i as u32);
+            }
+        }
+    }
+    idx
 }
 
 /// Expand matching artist vocab ids to sorted printing ids via the CSR table.
@@ -14489,6 +14536,12 @@ fn faces_to_pylist<'py>(
             if let Some(v) = str_at(strings, u32::from(art.flavor_name_id)) {
                 d.set_item("flavor_name", v)?;
             }
+            // Same rule, and the reason the top-level key disappears on a faced printing: Scryfall
+            // puts the watermark HERE and on 0 of the 12,098 faced printings' top level
+            // (2026-08-16 all_cards). See PrintingFace::card_watermark_id.
+            if let Some(v) = str_at(strings, u32::from(art.card_watermark_id)) {
+                d.set_item("watermark", v)?;
+            }
         }
         // The printed-language triple, inserted only when this printing's face carries the key:
         // absence is exact per face (a prepare-layout Spanish printing localizes the front
@@ -14742,7 +14795,31 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 //                The alternative was to make the arm DECLINE when it found nothing, which sends
 //                every no-match `!"..."` to a full corpus scan for one query form's sake, and is
 //                pinned against by the tight-set tests. 71 ids cost less.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026081612;
+//   2026081613 — WATERMARK IS PER FACE, and this stored only the front's.
+//                `_FACE_OBJECT_FIELDS` did not carry `watermark`, so a non-front face's value was
+//                discarded at ingest while the face merge copied face 0's to the card level.
+//                `Research // Development` (dis/155) is simic on its front face and izzet on its
+//                back; api.scryfall.com answers it for BOTH `wm:simic` and `wm:izzet` and this
+//                answered simic alone. 19 printings in the 2026-08-16 default_cards bulk carry a
+//                watermark only a later face has, and every one of the ten Ravnica guilds was
+//                short 1-2 rows.
+//                `PrintingFace` gains `card_watermark_id`, which is where the value belongs and
+//                also the only place it fits: `Printing` has no padding left, so a second id there
+//                rounds the row across every printing for a value 156 of them carry, while this
+//                row exists only for the faced ones.
+//                THE HAZARD IS NOT THE FILTER. `narrow_rec` marks the watermark postings TIGHT and
+//                the compose path calls them EXACT, and nothing downstream re-checks either. So
+//                `indexes.watermarks` now holds every value a printing carries, deduped per
+//                printing (`build_watermark_index`), and `filter::tri` enumerates exactly the same
+//                set through an unbounded iterator rather than a "one more value" slot. The dedupe
+//                is load-bearing on its own: the compose estimate reads the postings LENGTH as the
+//                match count, so the 137 faced printings whose two faces AGREE would inflate it.
+//                The card object changes with it, in the OPPOSITE direction: a faced printing now
+//                emits the watermark on its FACES and not at top level, which is what Scryfall
+//                does on 0 of its 12,098 faced printings. `PrintingFace`'s size moves, so the
+//                header catches a stale archive — but it cannot see the other half: a stale
+//                `watermarks` index would silently answer the front face only.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026081613;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -15470,6 +15547,7 @@ impl QueryEngine {
                         illustration_id: f.illustration_id,
                         card_artist_vid: f.card_artist_vid,
                         card_artist_name_id: f.card_artist_name_id,
+                        card_watermark_id: f.card_watermark_id,
                         flavor_text_id: f.flavor_text_id,
                         flavor_name_id: f.flavor_name_id,
                     })
@@ -15653,16 +15731,7 @@ impl QueryEngine {
                 codes.dedup();
                 codes
             },
-            watermarks:     {
-                let mut idx: TagIndex = HashMap::new();
-                for (i, p) in printings.iter().enumerate() {
-                    if p.card_watermark_id != NONE_STR {
-                        let wm = strings[p.card_watermark_id as usize].as_str();
-                        idx.entry(wm.to_string()).or_default().push(i as u32);
-                    }
-                }
-                idx
-            },
+            watermarks:     build_watermark_index(&printings, &strings),
             released_at:    released_at_idx,
             price_usd:      price_usd_idx,
             price_eur:      price_eur_idx,

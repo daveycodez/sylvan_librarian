@@ -458,6 +458,16 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
         ("watermark", str_of(row, "watermark")),
         ("frame", str_of(row, "frame")),
     ] {
+        // A card WITH FACES carries its watermark on the FACES and nowhere else. Measured over the
+        // whole 2026-08-16 all_cards bulk: api.scryfall.com sends a top-level `watermark` on
+        // 36,437 printings and on 0 of the 12,098 that have `card_faces` — no layout, no face
+        // count and no image count produces an exception, so a split card (one image, one piece of
+        // cardboard) still carries it on its faces alone. The importer's face merge writes face 0's
+        // value into `card_watermark`, so without this gate every faced printing with a watermark
+        // emits a key Scryfall sends on none of them. See `_FACE_OBJECT_FIELDS`.
+        if key == "watermark" && faces.is_some() {
+            continue;
+        }
         if let Some(v) = value {
             write_key(out, &mut first, key);
             write_json_str(out, v);
