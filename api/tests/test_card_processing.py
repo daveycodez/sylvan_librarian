@@ -907,6 +907,36 @@ class TestEngineCardObjects:
         assert faces[0]["flavor_text"] == "Front flavor."
         assert "flavor_text" not in faces[1]
 
+    def test_a_reversible_printings_faces_keep_their_own_layout(self) -> None:
+        """The card's layout and its faces' layout are two DIFFERENT values, and both are searched.
+
+        A `reversible_card` printing is `reversible_card` at card level and `normal` (or
+        `adventure`, or `token`) on both of its faces -- the only place in the corpus Scryfall puts
+        `layout` on a face at all, 81 printings over 162 faces in the 2026-08-16 all_cards bulk.
+        `card_layout` is re-lifted from the card so it is not the front face's, and the face record
+        keeps the face's, because api.scryfall.com answers `is:reversible layout:reversible_card`
+        81 AND `is:reversible layout:normal` 77 -- the same printings under both.
+        """
+        row = preprocess_card(
+            create_test_card(
+                name="Temple Garden // Temple Garden",
+                layout="reversible_card",
+                card_faces=[
+                    {"name": "Temple Garden", "type_line": "Land", "layout": "normal"},
+                    {"name": "Temple Garden", "type_line": "Land", "layout": "normal"},
+                ],
+            ),
+        )[0]
+        assert row["card_layout"] == "reversible_card", "the printing's own, never the front face's"
+        assert [face["layout"] for face in row["card_faces"]] == ["normal", "normal"]
+        # ...and the joined name, which is what a reversible printing carries at top level.
+        assert row["card_name"] == "Temple Garden // Temple Garden"
+
+    def test_an_ordinary_faces_record_carries_no_layout(self) -> None:
+        """Absence round-trips: nothing but a reversible printing puts `layout` on a face."""
+        faces = preprocess_card(self._two_faced())[0]["card_faces"]
+        assert all("layout" not in face for face in faces)
+
     def test_single_faced_cards_have_no_face_records(self) -> None:
         """One face is not a face list; the column stays absent so the engine stores nothing."""
         assert "card_faces" not in preprocess_card(create_test_card(name="Solo Test"))[0]

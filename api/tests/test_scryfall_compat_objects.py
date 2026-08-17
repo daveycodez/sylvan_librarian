@@ -186,6 +186,37 @@ class TestToScryfallCard:
         assert "/front/" in card["card_faces"][0]["image_uris"]["large"]
         assert "/back/" in card["card_faces"][1]["image_uris"]["large"]
 
+    def test_a_reversible_printing_keeps_nothing_of_the_card_at_top_level(self):
+        """The one layout that omits `oracle_id`, `cmc` and `type_line` and puts them on the faces.
+
+        Measured across the whole 2026-08-16 all_cards bulk: all 81 `reversible_card` printings
+        omit the three, where a `transform` printing (the case above) sends all three. Their FACES
+        carry the card's own `oracle_id` and `cmc` instead, the same values on both, 0 of 81
+        disagreeing -- verified live on sld/1079 and ecl/351.
+        """
+        card = to_scryfall_card(
+            row(
+                name="Temple Garden // Temple Garden",
+                layout="reversible_card",
+                card_faces=[
+                    {"layout": "normal", "name": "Temple Garden", "type_line": "Land"},
+                    {"layout": "normal", "name": "Temple Garden", "type_line": "Land"},
+                ],
+            )
+        )
+        for key in ("oracle_id", "cmc", "type_line"):
+            assert key not in card, f"a reversible printing sends no top-level {key}"
+        assert card["layout"] == "reversible_card", "the CARD's layout is still its own"
+        for face in card["card_faces"]:
+            assert face["oracle_id"] == "11111111-2222-3333-4444-555555555555"
+            assert face["cmc"] == 1.0, "a DECIMAL, exactly as at top level"
+            assert face["layout"] == "normal", "the FACES' layout, which only this layout has"
+        # The two re-added keys go straight after `object`, then the stored record in its own
+        # order. Scryfall itself puts `cmc` further along (after `mana_cost`); JSON object order
+        # carries no meaning and this writer's rule is "re-added keys first", which is what the
+        # Rust twin does too -- the two agreeing is the property that matters here.
+        assert list(card["card_faces"][0])[:4] == ["object", "oracle_id", "cmc", "layout"]
+
     def test_related_cards_pass_through_when_present(self):
         parts = [{"object": "related_card", "id": "x", "component": "token", "name": "Goblin", "type_line": "Token"}]
         assert to_scryfall_card(row(all_parts=parts))["all_parts"] == parts

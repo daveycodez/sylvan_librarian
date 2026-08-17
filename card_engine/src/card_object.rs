@@ -254,9 +254,24 @@ fn write_purchase_uris(out: &mut Vec<u8>, row: &Map<String, Value>) {
     out.push(b'}');
 }
 
+/// The layout whose printings keep NOTHING of the card at top level — see `write_scryfall_card`.
+///
+/// One name rather than a set, because it is one: nothing else in the corpus omits `oracle_id`,
+/// and nothing else puts `layout` on a face.
+const REVERSIBLE_LAYOUT: &str = "reversible_card";
+
 /// The card's faces, with the two keys the engine deliberately does not store re-added: `object`
 /// is the constant, and a face's `image_uris` is the card's own CDN function with the face swapped.
-fn write_faces(out: &mut Vec<u8>, faces: &[Value], scryfall_id: &str, updated_at: Option<u64>) {
+fn write_faces(
+    out: &mut Vec<u8>,
+    faces: &[Value],
+    scryfall_id: &str,
+    updated_at: Option<u64>,
+    // The card's `oracle_id` and `cmc`, to be written on EVERY face -- `Some` only for a
+    // reversible printing, which is the one layout whose faces carry them (and whose top-level
+    // object omits them). Both faces of all 81 send the card's own values, never a second one.
+    card_ids: Option<(&str, Option<&Value>)>,
+) {
     out.push(b'[');
     for (index, face) in faces.iter().enumerate() {
         if index > 0 {
@@ -266,6 +281,15 @@ fn write_faces(out: &mut Vec<u8>, faces: &[Value], scryfall_id: &str, updated_at
         let mut first = true;
         write_key(out, &mut first, "object");
         write_json_str(out, "card_face");
+        if let Some((oid, cmc)) = card_ids {
+            write_key(out, &mut first, "oracle_id");
+            write_json_str(out, oid);
+            write_key(out, &mut first, "cmc");
+            match cmc.and_then(serde_json::Value::as_f64) {
+                Some(v) => serde_json::to_writer(&mut *out, &v).expect("number"),
+                None => out.extend_from_slice(b"null"),
+            }
+        }
         if let Value::Object(map) = face {
             for (key, value) in map {
                 // Absent stays absent: null, "" and [] all mean Scryfall did not send this face
@@ -305,6 +329,13 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     let set_id = str_of(row, "set_id");
     let image_updated_at = u64_of(row, "image_updated_at");
     let faces = list_of(row, "card_faces").filter(|f| !f.is_empty());
+    // A REVERSIBLE printing keeps NOTHING of the card at top level -- not even the three keys
+    // every other multi-face layout keeps. Measured across the whole 2026-08-16 all_cards bulk:
+    // all 81 of them omit `oracle_id`, `cmc` and `type_line`, where a `transform` printing sends
+    // all three (verified live on Delver of Secrets // Insectile Aberration). Its FACES carry
+    // their own `oracle_id` and `cmc` instead -- the card's, on both faces, 0 of 81 disagreeing --
+    // which is why omitting the top-level pair loses nothing.
+    let reversible = str_of(row, "layout") == Some(REVERSIBLE_LAYOUT);
 
     out.push(b'{');
     let mut first = true;
@@ -313,8 +344,10 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     write_json_str(out, "card");
     write_key(out, &mut first, "id");
     write_json_str(out, scryfall_id);
-    write_key(out, &mut first, "oracle_id");
-    write_json_str(out, oracle_id);
+    if !reversible {
+        write_key(out, &mut first, "oracle_id");
+        write_json_str(out, oracle_id);
+    }
     write_list(out, &mut first, "multiverse_ids", list_of(row, "multiverse_ids"));
     write_key(out, &mut first, "name");
     write_json_str(out, name);
@@ -331,18 +364,20 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     write_str_or_null(out, &mut first, "layout", str_of(row, "layout"));
     write_bool(out, &mut first, "highres_image", bool_of(row, "highres_image"));
     write_str_or_null(out, &mut first, "image_status", str_of(row, "image_status"));
-    write_key(out, &mut first, "cmc");
-    // As a DECIMAL, which is what api.scryfall.com answers with: `"cmc":1.0`, not `"cmc":1` (see
-    // https://api.scryfall.com/cards/named?exact=Lightning+Bolt). Writing the stored number
-    // directly emits `1`, because `magic.cards.cmc` is an integer column -- and that would also
-    // put the engine at odds with `to_scryfall_card`, which now carries the same value as a float.
-    // The two must agree byte for byte: the engine answers a card when it can and the SQL path
-    // answers it when the engine cannot, and a client must not be able to tell which one did.
-    match num_of(row, "cmc").and_then(serde_json::Value::as_f64) {
-        Some(v) => serde_json::to_writer(&mut *out, &v).expect("number"),
-        None => out.extend_from_slice(b"null"),
+    if !reversible {
+        write_key(out, &mut first, "cmc");
+        // As a DECIMAL, which is what api.scryfall.com answers with: `"cmc":1.0`, not `"cmc":1` (see
+        // https://api.scryfall.com/cards/named?exact=Lightning+Bolt). Writing the stored number
+        // directly emits `1`, because `magic.cards.cmc` is an integer column -- and that would also
+        // put the engine at odds with `to_scryfall_card`, which now carries the same value as a float.
+        // The two must agree byte for byte: the engine answers a card when it can and the SQL path
+        // answers it when the engine cannot, and a client must not be able to tell which one did.
+        match num_of(row, "cmc").and_then(serde_json::Value::as_f64) {
+            Some(v) => serde_json::to_writer(&mut *out, &v).expect("number"),
+            None => out.extend_from_slice(b"null"),
+        }
+        write_str_or_null(out, &mut first, "type_line", str_of(row, "type_line"));
     }
-    write_str_or_null(out, &mut first, "type_line", str_of(row, "type_line"));
     write_list(out, &mut first, "colors", list_of(row, "colors"));
     write_list(out, &mut first, "color_identity", list_of(row, "color_identity"));
     write_list(out, &mut first, "keywords", list_of(row, "card_keywords"));
@@ -403,7 +438,7 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     // which is why this is a branch rather than a fixed key set.
     if let Some(faces) = faces {
         write_key(out, &mut first, "card_faces");
-        write_faces(out, faces, scryfall_id, image_updated_at);
+        write_faces(out, faces, scryfall_id, image_updated_at, reversible.then_some((oracle_id, num_of(row, "cmc"))));
     } else {
         write_str_or_null(out, &mut first, "mana_cost", str_of(row, "mana_cost"));
         write_str_or_null(out, &mut first, "oracle_text", str_of(row, "oracle_text"));

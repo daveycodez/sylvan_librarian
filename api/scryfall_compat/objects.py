@@ -58,6 +58,11 @@ CARD_OBJECT_FIELDS = (
     "variation", "card_faces", "all_parts",
 )  # fmt: skip
 
+# The layout whose printings keep NOTHING of the card at top level -- see `to_scryfall_card`. One
+# name rather than a set, because it is one: nothing else in the corpus omits `oracle_id`, and
+# nothing else puts `layout` on a face. The Rust twin is `card_object.rs::REVERSIBLE_LAYOUT`.
+REVERSIBLE_LAYOUT = "reversible_card"
+
 # Scryfall's card back, one image for every normal card.
 CARD_BACK_ID = "0aeebaf5-8c7d-4636-9e82-8c27447861f7"
 
@@ -194,16 +199,25 @@ def _prices(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _faces(row: dict[str, Any]) -> list[dict[str, Any]]:
+def _faces(row: dict[str, Any], card_ids: tuple[str, float | None] | None = None) -> list[dict[str, Any]]:
     """The card's faces, with the two keys the engine deliberately does not store re-added.
 
     `object` is the constant "card_face", and a face's `image_uris` is the card's CDN function with
     front/back swapped, so neither is worth archive space.
+
+    Args:
+        row: The engine row.
+        card_ids: The card's `(oracle_id, cmc)`, to be written on EVERY face -- not None only for a
+            reversible printing, which is the one layout whose faces carry them (and whose
+            top-level object omits them). Both faces of all 81 send the card's own values, never a
+            second one.
     """
     faces = row.get("card_faces") or []
     out = []
     for index, face in enumerate(faces):
         built: dict[str, Any] = {"object": "card_face"}
+        if card_ids is not None:
+            built["oracle_id"], built["cmc"] = card_ids
         built.update({key: value for key, value in face.items() if value not in (None, "", [])})
         if len(faces) > 1:
             built["image_uris"] = _image_uris(
@@ -269,7 +283,16 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
     name = row.get("name") or ""
     set_code = row.get("set_code") or ""
     number = row.get("collector_number") or ""
-    faces = _faces(row)
+    layout = row.get("card_layout") or row.get("layout")
+    # A REVERSIBLE printing keeps NOTHING of the card at top level -- not even the three keys every
+    # other multi-face layout keeps. Measured across the whole 2026-08-16 all_cards bulk: all 81 of
+    # them omit `oracle_id`, `cmc` and `type_line`, where a `transform` printing sends all three
+    # (verified live on Delver of Secrets // Insectile Aberration). Its FACES carry their own
+    # `oracle_id` and `cmc` instead -- the card's, on both faces, 0 of 81 disagreeing -- which is
+    # why omitting the top-level trio loses nothing. The Rust twin is `write_scryfall_card`'s
+    # `reversible`, and the two must agree key for key.
+    reversible = layout == REVERSIBLE_LAYOUT
+    faces = _faces(row, (oracle_id, _decimal(row.get("cmc"))) if reversible else None)
 
     card: dict[str, Any] = {
         "object": "card",
@@ -281,7 +304,7 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
         "released_at": row.get("released_at"),
         "uri": f"{base_url}/cards/{scryfall_id}",
         "scryfall_uri": f"https://scryfall.com/card/{set_code}/{number}/{_slug(name)}?utm_source=api",
-        "layout": row.get("card_layout") or row.get("layout"),
+        "layout": layout,
         "highres_image": bool(row.get("highres_image")),
         "image_status": row.get("image_status"),
         "cmc": _decimal(row.get("cmc")),
@@ -320,6 +343,13 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
         "related_uris": _related_uris(name),
         "purchase_uris": _purchase_uris(row),
     }
+
+    # ...except on a reversible printing, which carries none of the three. Popped rather than built
+    # conditionally so every OTHER card's key order is provably the one above -- the Rust twin
+    # writes the same keys in the same order and the two are compared as text.
+    if reversible:
+        for key in ("oracle_id", "cmc", "type_line"):
+            del card[key]
 
     # A multi-face card carries its faces and NOT the top-level text they replace; a single-faced
     # one carries the text and no `card_faces`. Which keys sit at top level varies by LAYOUT, which

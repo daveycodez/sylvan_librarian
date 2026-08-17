@@ -131,6 +131,15 @@ _FACE_TEXT_SEPARATOR = "\n//\n"
 # `object` is the constant "card_face" and `image_uris` is a pure function of the card's id and the
 # face's position, so neither is stored; both are re-emitted on read.
 _FACE_OBJECT_FIELDS = (
+    # Scryfall's own FACE-level `layout`, which only `reversible_card` printings carry -- over the
+    # whole 2026-08-16 all_cards bulk exactly 81 cards have one, and all 81 are reversible. Kept
+    # HERE as well as re-lifted to `card_layout` below (the two are different values: sld/1079 is
+    # `reversible_card` at card level and `normal` on both faces), because `layout:` reads both --
+    # api.scryfall.com answers `is:reversible layout:reversible_card` 81 AND
+    # `is:reversible layout:normal` 77, the same printings under both. First in the tuple because
+    # it is first in Scryfall's own face record too, ahead of `name` and behind only the
+    # writer-supplied `object` and `oracle_id` (verified live on sld/1079 and ecl/351, 2026-08-16).
+    "layout",
     "name",
     # The face's printed-language text, in Scryfall's own key positions (printed_name after name,
     # printed_type_line after type_line, printed_text after oracle_text). Presence varies per face
