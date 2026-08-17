@@ -364,7 +364,11 @@ def create_all_condition_parsers(basic_parsers: dict, mana_parsers: dict, color_
     legality_condition = create_condition_parser(legality_attr_word, quoted_string | string_value_word)
     text_condition = create_condition_parser(text_attr_word, regex_pattern | quoted_string | string_value_word)
 
-    date_value = Regex(r"\d{4}(?:-\d{2}-\d{2})?")
+    # YYYY, YYYY-MM or YYYY-MM-DD — the three precisions `_date_window` turns into a range. The
+    # month was missing here and this grammar REJECTED `date:2021-02` outright, where the hand
+    # parser accepted it and silently answered `date:2021`; both are fixed together so the two
+    # implementations do not part company over a shape only one of them understands.
+    date_value = Regex(r"\d{4}(?:-\d{2}(?:-\d{2})?)?")
     date_condition = create_condition_parser(date_attr_word, date_value)
 
     year_value = Regex(r"\d{4}")
