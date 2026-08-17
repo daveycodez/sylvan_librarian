@@ -702,6 +702,15 @@ struct DivergentPrinting {
     printing_layout_id: u32,
     /// The joined top-level `name` those printings print ("Temple Garden // Temple Garden").
     card_name_id: u32,
+    /// That same joined name FOLDED and lowercased — the form `exact_name_matches` compares.
+    ///
+    /// `collate_name`'s parameter is named `folded_lower` and it means it: it strips
+    /// non-alphanumerics and does NOT lowercase, so handing it the display name above yields
+    /// `TempleGardenTempleGarden`, which no needle can ever equal. Folding is a BUILD-time
+    /// operation here (the engine has no runtime accent fold — see `collate_name`'s own note),
+    /// and the row already carries the right string in `card_name_folded`, so it is interned
+    /// beside the display name rather than recomputed.
+    card_name_folded_id: u32,
     /// Scryfall's FACE-level `layout` — a SECOND value those printings answer `layout:` with.
     ///
     /// Both faces of each of the 81 reversible printings carry the key and agree on its value
@@ -5743,6 +5752,11 @@ struct CardIndexes {
     name_bigrams:   NameBigramIndex,           // card space: exact 2-byte name containment (#639)
     name_unigrams:  NameUnigramIndex,          // card space: exact 1-byte name containment (#858)
     legal_divergent: Vec<u16>,                // card space: ids with divergent legality (#630 phase 2), postings not a plane — see build_divergent_ids
+    // card space: the 71 cards whose printings do not all print the CARD's name, each paired with
+    // the folded joined name its divergent printings print instead. Postings for the same reason
+    // as the line above — see `planes::build_name_divergent_ids`, which also says why the name
+    // rides along with the id rather than being looked up in the string table.
+    name_divergent: Vec<(u32, String)>,
     arith_tuple:    ArithTupleIndex,           // card space: joint (cmc,power,toughness,loyalty) postings for arith predicates (#743)
     // Lookup by id, which is the one addressing mode the store has never had. `Printing.scryfall_id`
     // and `OracleCard.oracle_id` are already the UUID's exact bits (parse_uuid_or_hash keeps them,
@@ -6734,9 +6748,10 @@ fn narrow_rec(
             // has no window at all, and a non-ASCII one keeps its own decline: both fall back to
             // the scan, which verifies every card instead.
             //
-            // Candidates are verified here with the same predicate the walk uses, so the result is
-            // exact — `tight_narrow_space` still reports ExactName as tight card space, and the Not
-            // arm's complement stays sound.
+            // Candidates found through the index are verified here with the same predicate the
+            // walk uses, so that half is exact. `tight_narrow_space` still reports ExactName as
+            // tight CARD space, which stays sound because it is only a static pre-reject: the Not
+            // arm re-reads the `tight` flag this arm actually returns and declines on a loose one.
             if cards.len() != n_cards || n_cards == 0 {
                 return None;
             }
@@ -6748,6 +6763,42 @@ fn narrow_rec(
             ids.retain(|&cid| {
                 crate::filter::exact_name_matches(cards[cid as usize].card_name_folded.as_str(), needle)
             });
+            // THE TRIGRAM INDEX IS BUILT FROM THE CARD'S NAME, and 81 printings print one their
+            // card does not: a reversible prints "Temple Garden // Temple Garden" where the card
+            // is "Temple Garden". That needle collates to `templegardentemplegarden`, which shares
+            // no trigram window with the card's `templegarden`, so the card is dropped HERE —
+            // before the leaf, which does know the divergent name, is ever asked. Measured on
+            // api.scryfall.com 2026-08-17: `!"Temple Garden // Temple Garden"`,
+            // `!"Mechtitan // Mechtitan"` and `!"Adrix and Nev, Twincasters // Adrix and Nev,
+            // Twincasters"` each answer 1 there, and each answered 0 here.
+            //
+            // `name_divergent` is the 71 cards that have such a printing, so this is a scan of 71
+            // and not of the corpus. The alternative fix — make this arm DECLINE when it finds
+            // nothing, and let the scan do the work — sends every no-match `!"..."` to a full
+            // corpus scan for one query form's sake, and is pinned against by the tight-set tests
+            // below; 71 ids cost less.
+            let mut divergent_only = false;
+            for entry in indexes.name_divergent.iter() {
+                let cid = u32::from(entry.0);
+                if crate::filter::exact_name_matches(entry.1.as_str(), needle) && !ids.contains(&cid) {
+                    ids.push(cid);
+                    divergent_only = true;
+                }
+            }
+            // TIGHTNESS IS A CARD-SPACE CLAIM, and it stops being true the moment a card is here
+            // for a name only SOME of its printings print. Temple Garden matches
+            // `!"Temple Garden // Temple Garden"` through one of its 20 printings; claiming tight
+            // hands back all 20, which is what this did with the additions above and no flag
+            // (measured 20, against Scryfall's 1). Loose sends the card to the per-printing
+            // verify, where the leaf's `divergent_of` gate answers for each printing on its own.
+            //
+            // Only the divergent additions cost tightness. A needle the trigram index answered by
+            // itself is still exact at card level — the overwhelmingly common case, and what keeps
+            // `!"Lightning Bolt"` on the cheap path.
+            if divergent_only {
+                ids.sort_unstable();
+                return Narrowed::loose(Candidates::Cards(ids));
+            }
             Narrowed::tight(Candidates::Cards(ids))
         }
 
@@ -14674,7 +14725,24 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 //                against api.scryfall.com's 106,635 under a filter that had already been fixed.
 //                The `OracleCard` row size moves, so the header catches a stale archive — but the
 //                totals table does not, which is why the constant moves too.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026081611;
+//   2026081612 — A REVERSIBLE PRINTING ANSWERS FOR THE NAME IT ACTUALLY PRINTS.
+//                2026081611 stored the joined name those 81 printings print, and `!"Temple Garden
+//                // Temple Garden"` still returned nothing where api.scryfall.com returns the one
+//                printing — measured 2026-08-17, and the same for `!"Mechtitan // Mechtitan"` and
+//                `!"Adrix and Nev, Twincasters // Adrix and Nev, Twincasters"`.
+//                A LEAF-ONLY FIX IS DEAD CODE. `narrow_rec`'s ExactName arm narrows through a
+//                trigram index built from the CARD's collated name and reports the result tight;
+//                the needle collates to `templegardentemplegarden`, which shares no trigram window
+//                with the card's `templegarden`, so the card is dropped before any leaf runs.
+//                Two stored things move. `CardIndexes` gains `name_divergent` — the 71 card ids
+//                with such a printing, each with the FOLDED joined name, a few KB — so the arm can
+//                union them in and scan 71 rather than the corpus. And `DivergentPrinting` gains
+//                `card_name_folded_id`, because `collate_name` does not lowercase and the display
+//                name folds to `TempleGardenTempleGarden`, which matches nothing.
+//                The alternative was to make the arm DECLINE when it found nothing, which sends
+//                every no-match `!"..."` to a full corpus scan for one query form's sake, and is
+//                pinned against by the tight-set tests. 71 ids cost less.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026081612;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -15319,6 +15387,13 @@ impl QueryEngine {
                     card.divergent.push(DivergentPrinting {
                         printing_layout_id: row.card_layout_id,
                         card_name_id: row.card_name_id,
+                        // Interned from the ROW, which already carries the folded form — see the
+                        // field's own note on why folding it here rather than at query time is
+                        // the only option this engine has.
+                        card_name_folded_id: {
+                            interner.strings.push(row.card_name_folded.as_str().to_owned());
+                            (interner.strings.len() - 1) as u32
+                        },
                         face_layout_id: row.card_face_layout_id,
                         faces: oracle_faces(&row.card_faces),
                     });
@@ -15619,6 +15694,7 @@ impl QueryEngine {
             name_bigrams:   build_name_bigram_index(&cards, &strings),
             name_unigrams:  build_name_unigram_index(&cards, &strings),
             legal_divergent: build_divergent_ids(&cards),
+            name_divergent: crate::planes::build_name_divergent_ids(&cards, &strings),
             arith_tuple:    build_arith_tuple_index(&cards),
             printing_by_scryfall_id: build_printing_by_scryfall_id(&printings),
             oracle_by_oracle_id:     build_oracle_by_oracle_id(&cards),

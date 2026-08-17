@@ -650,6 +650,37 @@ pub(crate) fn build_divergent_ids(cards: &[OracleCard]) -> Vec<u16> {
         .collect()
 }
 
+/// Ascending card ids carrying a DIVERGENT PRINTING — one that prints a name the card does not —
+/// each paired with the FOLDED joined name those printings print.
+///
+/// A list rather than a plane for the same reason as `build_divergent_ids` above, and by a wider
+/// margin: 71 of 38,626 cards have the property, so postings are smaller than a plane at any
+/// density this set could reach, and the caller wants the ids rather than a mask. `u32` rather
+/// than that list's `u16`: this one has no reason to sit under a card-count ceiling.
+///
+/// IT EXISTS BECAUSE THE NAME TRIGRAM INDEX IS BUILT FROM THE CARD'S NAME ALONE. A reversible
+/// printing prints its own joined name — "Temple Garden // Temple Garden" against the card's
+/// "Temple Garden" — and that needle collates to `templegardentemplegarden`, which shares no
+/// trigram window with `templegarden`. Without this list, `narrow_rec`'s ExactName arm drops such a
+/// card before any leaf can answer for it, and `!"Temple Garden // Temple Garden"` returns nothing
+/// where api.scryfall.com returns the one printing that prints it.
+///
+/// THE NAME RIDES ALONG rather than being an interned id: `narrow_rec` runs off `CardIndexes` and
+/// the card rows, with no string table in hand, and threading one through it and its ~50 call
+/// sites to save 71 short strings is the worse trade. The interned id on the record
+/// (`DivergentPrinting::card_name_folded_id`) is what the per-card LEAF reads, which does have
+/// `strings` and does not have the indexes.
+pub(crate) fn build_name_divergent_ids(cards: &[OracleCard], strings: &[String]) -> Vec<(u32, String)> {
+    cards
+        .iter()
+        .enumerate()
+        .filter_map(|(i, card)| {
+            let rec = card.divergent.first()?;
+            Some((i as u32, strings.get(rec.card_name_folded_id as usize)?.clone()))
+        })
+        .collect()
+}
+
 // ─── Plane expressions ────────────────────────────────────────────────────────
 
 /// A filter subtree compiled to mask algebra over planes. Evaluation is

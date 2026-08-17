@@ -116,10 +116,15 @@ pub(crate) fn has_printing_varying_leaf(f: &FilterExpr) -> bool {
         FilterExpr::PrintedNamePresent | FilterExpr::FlavorNameIn { .. } => true,
         FilterExpr::And(children) | FilterExpr::Or(children) => children.iter().any(has_printing_varying_leaf),
         FilterExpr::Not(inner) => has_printing_varying_leaf(inner),
+        // A REVERSIBLE PRINTING PRINTS ITS OWN JOINED NAME ("Temple Garden // Temple Garden"
+        // against the card's "Temple Garden"), so an exact-name match can settle differently for
+        // two printings of one card — 81 printings over 71 cards in the 2026-08-16 corpus. The
+        // twin of `filter::leaf_compares_printing_field`'s arm, and it fails SILENTLY when the two
+        // disagree, which is why they move together.
+        FilterExpr::ExactName(_) => true,
         // Exhaustive, not `_ => false`: a new variant must get a considered
         // answer here rather than silently inheriting "invariant".
         FilterExpr::True
-        | FilterExpr::ExactName(_)
         | FilterExpr::NameMatch { .. }
         | FilterExpr::OracleMatch { .. }
         // The oracle id is the card's own identity — every printing of it shares one.
