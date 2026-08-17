@@ -1116,9 +1116,35 @@ class TestAPIResourceCaching(unittest.TestCase):
         with patch.object(self.api_resource, "_engine", mock_engine):
             result = self.api_resource.random_search(num_cards=2)
 
-        mock_engine.sample_preferred.assert_called_once_with(2)
+        mock_engine.sample_preferred.assert_called_once_with(2, filters=api_resource_module._default_lane_exclusions())
         assert result["cards"] == fake_cards
         assert result["total_cards"] == 2
+
+    def test_random_search_scopes_the_draw_to_the_default_lane(self) -> None:
+        """The draw is filtered, and by the same two exclusions every other surface applies.
+
+        Asserted on the TREE the route hands the engine rather than on the identity of a cached
+        object: what matters is that the pool the sampler draws from is `-is:extra -is:variation`,
+        which is what the front page's grid stopped being when #927 imported the class.
+        """
+        from unittest.mock import MagicMock  # noqa: PLC0415
+
+        mock_engine = MagicMock()
+        mock_engine.size.return_value = 2
+        mock_engine.sample_preferred.return_value = []
+
+        with patch.object(self.api_resource, "_engine", mock_engine):
+            self.api_resource.random_search(num_cards=1)
+
+        sent = mock_engine.sample_preferred.call_args.kwargs["filters"].to_json()
+        assert sent["node_type"] == "AndNode"
+        operands = sent["kwargs"]["operands"]
+        assert [node["node_type"] for node in operands] == ["NotNode", "NotNode"]
+        negated = [node["kwargs"]["operand"] for node in operands]
+        assert {node["kwargs"]["lhs"]["kwargs"]["attribute_name"] for node in negated} == {"card_is_tags"}
+        assert sorted(tag for node in negated for tag in node["kwargs"]["rhs"]) == sorted(
+            [EXTRA_IS_TAG, api_resource_module.VARIATION_IS_TAG]
+        )
 
     def test_random_search_returns_empty_when_engine_not_loaded(self) -> None:
         """random_search returns empty result when the engine has no cards."""

@@ -15438,14 +15438,67 @@ impl QueryEngine {
     /// Return `n` randomly sampled oracle cards, each shown as its
     /// default-preferred printing — the first in the card's range, since
     /// printings are stored in descending default-prefer order.
-    #[pyo3(signature = (n, fields=None))]
-    fn sample_preferred<'py>(&self, py: Python<'py>, n: usize, fields: Option<Vec<String>>) -> PyResult<Bound<'py, PyList>> {
+    ///
+    /// # `filters` is what lets a random lane scope itself
+    ///
+    /// Without it this method sampled `0..n_cards` and there was nothing a route could do about
+    /// it: the pool lives in here, so `/random_search` drew from the WHOLE corpus — including the
+    /// extras class #927 stopped dropping — while `/cards/search` and `/cards/random` both exclude
+    /// it by default. `_apply_extras_default` says an empty query is left alone because "the
+    /// by-name and random lanes do their own scoping"; this is the argument that lets the random
+    /// lane keep that promise.
+    ///
+    /// THE FILTERED POOL IS THE QUERY'S ANSWER, NOT A SECOND IMPLEMENTATION OF IT. A `Some(tree)`
+    /// runs the ordinary paging path — the same `bind_and_split_filter` and the same dispatch
+    /// `query()` uses — with the page opened to the whole match set, and samples the rows it
+    /// returns. So "which cards may this draw return" is the same question, answered by the same
+    /// code, as "which cards does a search for that query return". A separate candidate walk here
+    /// would be a second evaluator of the same filter, and the two would drift.
+    ///
+    /// `None` keeps the old O(n) sampling untouched, so a caller that wants the whole corpus does
+    /// not pay for a page over it. An empty query is `None` rather than a `TrueNode`: paging the
+    /// corpus to rediscover that everything matches is the one case where the filtered path is
+    /// both slower and no more correct, and Python is where that decision already lives.
+    #[pyo3(signature = (n, filters=None, fields=None))]
+    fn sample_preferred<'py>(
+        &self,
+        py: Python<'py>,
+        n: usize,
+        filters: Option<&Bound<PyAny>>,
+        fields: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyList>> {
         let resolved_fields = resolve_fields(fields)?;
         let mmap = self.get_mmap()?;
         // Safety: see the access_unchecked justification in query().
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
 
-        let pool_len = data.cards.len();
+        // The pool the draw samples: every card, or the cards the filter admits.
+        let filtered: Option<Vec<(&AOracleCard, &APrinting)>> = match filters {
+            Some(tree) => {
+                // `limit` is the whole match set: this is the one caller that wants every row
+                // rather than a page, and the gather bounds its buffer by the limit, so the limit
+                // is what opens it. The card count is that same page with a buffer the store can
+                // actually hold. `unique=card` because the draw is over CARDS, and the rest are
+                // the search defaults — no caller can ask for an order here, and one row per card
+                // is what a sample of cards means.
+                let params = QueryParams::from_strs("card", "default", "edhrec", "asc", data.cards.len(), 0);
+                let (plane_expr, mut filter_expr, sort_bound, unsplit) =
+                    bind_and_split_filter(py, tree, "card", data, params.sort_col)?;
+                let ctx = QueryCtx::from(data);
+                // The same dispatch query() makes, including the annex arm: a `lang:` leaf in the
+                // filter widens the pool exactly as it widens a search's answer, rather than
+                // silently drawing from the monolingual half of the corpus it asked about.
+                let (_total, page) = if unsplit.widens_to_annex() {
+                    run_query_widened(data, &params.with_sort_bound(sort_bound), &unsplit)
+                } else {
+                    run_query_routed(&ctx, &params.with_sort_bound(sort_bound), &mut filter_expr, Some(&unsplit), plane_expr.as_ref())
+                };
+                Some(page)
+            }
+            None => None,
+        };
+
+        let pool_len = filtered.as_ref().map_or(data.cards.len(), Vec::len);
         let take = n.min(pool_len);
 
         use rand::RngExt;
@@ -15456,12 +15509,23 @@ impl QueryEngine {
         }
 
         let dicts: Vec<Bound<PyDict>> = chosen.iter()
-            .map(|&cid| {
-                let card = &data.cards[cid];
-                // The random pool is built from cards, so a card with no canonical printing would
-                // read an unrelated row rather than fail; see preferred_vpid.
-                let preferred = preferred_vpid(data, cid).unwrap_or_default() as usize;
-                card_to_pydict(py, card, &data.printings[preferred], &data.strings, &data.coll_vocab, &resolved_fields)
+            .map(|&i| {
+                let (card, printing) = match &filtered {
+                    // The printing the QUERY chose, not the card's default-preferred one. They
+                    // differ exactly when the filter rejects the default printing and admits
+                    // another — a card whose only non-extra printing is its second is the case —
+                    // and answering with the rejected printing would put the excluded row back in
+                    // a draw that just excluded it.
+                    Some(rows) => rows[i],
+                    None => {
+                        let card = &data.cards[i];
+                        // The random pool is built from cards, so a card with no canonical printing
+                        // would read an unrelated row rather than fail; see preferred_vpid.
+                        let preferred = preferred_vpid(data, i).unwrap_or_default() as usize;
+                        (card, &data.printings[preferred])
+                    }
+                };
+                card_to_pydict(py, card, printing, &data.strings, &data.coll_vocab, &resolved_fields)
             })
             .collect::<PyResult<_>>()?;
         PyList::new(py, dicts)

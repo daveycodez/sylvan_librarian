@@ -489,6 +489,34 @@ def _variations_predicate() -> QueryNode:
     return parse_scryfall_query(f"is:{VARIATION_IS_TAG}").root
 
 
+@lru_cache(maxsize=1)
+def _default_lane_exclusions() -> Query:
+    """The default-lane exclusions ALONE, with no caller query under them.
+
+    What a route searches with when it has no query at all and still must not answer from the two
+    classes the default lane hides. `/random_search` is the caller, and it is the case the TrueNode
+    exemption in `_apply_extras_default` deliberately does NOT cover -- those are two different
+    questions that look like one:
+
+      - `/cards/search?q=` and `/cards/random` with no `q` ask for EVERYTHING, and the exemption
+        keeps that meaning. Whether Scryfall's own bare `/cards/random` hides the class was never
+        established (it echoes nothing back), so narrowing it would be an inference.
+      - `/random_search` asks for "some random cards" and has no query language to say anything
+        else. Its answer contained no extras at all until #927 stopped dropping the class on
+        import, so restoring that is not a new policy for the route; it is the route's own prior
+        behaviour, and the alternative is a front page that opens on tokens and art-series cards.
+
+    Built from the same two predicate nodes the two splices conjoin, so there is still exactly one
+    definition of each exclusion rather than a third spelling of the tags.
+
+    Returns:
+        A Query whose root is `-is:extra -is:variation`, cached because nothing mutates it.
+    """
+    query = parse_scryfall_query("")
+    query.root = AndNode([NotNode(_extras_predicate()), NotNode(_variations_predicate())])
+    return query
+
+
 def _apply_variations_default(parsed_query: Query, *, include_variations: bool) -> None:
     """Conjoin `-is:variation` onto a parsed query in place unless the caller asked for them.
 
@@ -3102,6 +3130,14 @@ class APIResource(ScryfallCardsRoutes):
     ) -> dict[str, Any]:
         """Return one or more random cards in the same envelope shape as search().
 
+        The draw is SCOPED to the default lane, and it could not be until the engine's sampler took
+        a filter: the pool lives inside the store, so a route holding no filter argument had
+        nothing to exclude with. Every other surface hides the extras class by default -- the
+        splices in `_search` for `/cards/search` and `/search`, the two flags on `/cards/random` --
+        and this one drew tokens, art-series cards and memorabilia from the moment #927 stopped
+        dropping them, on the request the front page makes on every load. See
+        `_default_lane_exclusions` for why an empty query is left alone and this is not.
+
         Args:
             falcon_response: The Falcon response object.
             num_cards: The number of random cards to return (default is 1).
@@ -3118,7 +3154,7 @@ class APIResource(ScryfallCardsRoutes):
             self._trigger_background_reload_if_needed()
             cards = []
         else:
-            cards = list(self._engine.sample_preferred(num_cards))
+            cards = list(self._engine.sample_preferred(num_cards, filters=_default_lane_exclusions()))
         total_cards = len(cards)
         if shape == ResponseShape.COLUMNAR:
             cards = _columnarize_cards(cards)

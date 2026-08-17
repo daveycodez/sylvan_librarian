@@ -1220,6 +1220,59 @@ class TestOffsetPagination:
         assert total >= 1
 
 
+class TestSamplePreferred:
+    """The random draw takes a FILTER, and the pool it samples is that filter's own answer."""
+
+    @staticmethod
+    def _corpus() -> list[dict]:
+        """Twelve cards, every third one an extra — close to the real store's share of the class."""
+        return [
+            {
+                "card_name": f"Card {i}",
+                "oracle_id": f"o{i}",
+                "scryfall_id": str(uuid.UUID(int=i)),
+                "card_is_tags": {"extra": True} if i % 3 == 0 else {},
+            }
+            for i in range(12)
+        ]
+
+    def test_unfiltered_draw_reaches_every_card(self, fresh_engine: Callable[[], QueryEngine]) -> None:
+        e = fresh_engine()
+        e.reload(self._corpus())
+        drawn = list(e.sample_preferred(12))
+        assert len(drawn) == 12, "no filter means the whole corpus is the pool, extras included"
+
+    def test_a_filtered_draw_samples_only_matching_cards(self, fresh_engine: Callable[[], QueryEngine]) -> None:
+        """Over enough seeds that a leak shows: the draw is random, the membership is not.
+
+        This is the assertion the front page needed and could not have: `/random_search` sampled
+        `0..n_cards` inside the store, so no route above it could exclude anything.
+        """
+        e = fresh_engine()
+        e.reload(self._corpus())
+        allowed = {c["name"] for c in _run(e, "-is:extra", unique="card")[1]}
+        assert len(allowed) == 8, "8 of the 12 fixture cards are not extras"
+
+        for _ in range(40):
+            drawn = list(e.sample_preferred(3, filters=parse_scryfall_query("-is:extra")))
+            assert len(drawn) == 3, "the filter admits 8 cards, so 3 are always available"
+            for card in drawn:
+                assert card["name"] in allowed, f"{card['name']} is an is:extra card the filter excluded"
+
+    def test_the_pool_is_the_querys_answer(self, fresh_engine: Callable[[], QueryEngine]) -> None:
+        """Asking for more than the filter admits yields the filter's answer EXACTLY.
+
+        The equality is the point: "what may this draw return" and "what does a search for that
+        query return" are one question with one implementation, so the two cannot drift apart.
+        """
+        e = fresh_engine()
+        e.reload(self._corpus())
+        total, matching = _run(e, "-is:extra", unique="card")
+        drawn = list(e.sample_preferred(12, filters=parse_scryfall_query("-is:extra")))
+        assert len(drawn) == total == 8, "the pool is the match set, not the corpus"
+        assert sorted(c["name"] for c in drawn) == sorted(c["name"] for c in matching)
+
+
 class TestFieldSelection:
     """fields= selects which keys come back per card; None keeps the historical 9."""
 
