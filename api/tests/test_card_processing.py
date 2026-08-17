@@ -449,11 +449,16 @@ class TestCardProcessing:
         assert result[0]["flavor_text"] == "A flavor line."
 
     def test_preprocess_card_handles_non_numeric_power_toughness(self) -> None:
-        """Test preprocess_card handles non-numeric power/toughness values."""
+        """A printed `*` is ZERO; anything else non-numeric is still absent.
+
+        `tou<1` is 434 on api.scryfall.com against this engine's 273 and `tou=0` 432 against 272 --
+        160 cards, every one of them `*`-statted -- because absent compares false against
+        everything. Scryfall's own `tou:*` answers the same 432 as `tou=0`.
+        """
         card = create_test_card(
             keywords=[],
-            power="*",  # Non-numeric
-            toughness="X",  # Non-numeric
+            power="*",
+            toughness="X",  # Not a star and not a number: still absent.
             prices={},
         )
 
@@ -461,8 +466,34 @@ class TestCardProcessing:
 
         assert len(result) == 1
         result = result[0]
-        assert result["creature_power"] is None
+        assert result["creature_power"] == 0
         assert result["creature_toughness"] is None
+        # The printed strings are untouched -- they are what the card object serves.
+        assert result["creature_power_text"] == "*"
+
+    @pytest.mark.parametrize(
+        ("printed", "expected"),
+        [
+            ("*", 0),
+            ("1+*", 1),  # Allosaurus Rider, and api.scryfall.com answers pow=1 for it
+            ("*+1", 1),  # Souls of the Lost, tou=1
+            ("2+*", 2),  # Aysen Crusader, pow=2 and NOT pow=0
+            ("7-*", 7),
+            ("*\u00b2", 0),
+            ("3", 3),
+            ("-1", -1),
+            ("1.5", 1),  # int(float(...)) truncates, as maybe_int has always done
+            ("?", None),
+            ("X", None),
+        ],
+    )
+    def test_preprocess_card_substitutes_zero_for_a_printed_star(self, printed: str, expected: int | None) -> None:
+        """Every starred form the corpus prints, and the two non-numbers that stay absent."""
+        card = create_test_card(keywords=[], power=printed, prices={})
+
+        result = preprocess_card(card)[0]
+
+        assert result["creature_power"] == expected
 
     def test_preprocess_hound_tamer_dfc(self) -> None:
         """A real transform card merges to one row: front stats, both faces searchable."""

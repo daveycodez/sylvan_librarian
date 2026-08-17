@@ -63,6 +63,50 @@ def maybe_int(val: str | int | float | None) -> int | None:
     return int(float(val))
 
 
+@maybeify
+def maybe_stat_int(val: str | int | float | None) -> int | None:
+    """Convert a printed POWER or TOUGHNESS to int, where `*` IS A NUMBER AND IT IS ZERO.
+
+    `maybe_int` reads `*` as absent, and absent compares false against everything, so the whole
+    `*`-statted population fell out of every power/toughness comparison: `tou<1` is 434 on
+    api.scryfall.com against this engine's 273, `tou=0` 432 against 272 -- 160 cards. Scryfall's
+    own `tou:*` answers the same 432 as `tou=0`; the star is not a third state there.
+
+    The star is SUBSTITUTED, not the value replaced -- the printed arithmetic still runs. Measured
+    2026-08-17, one card per form:
+
+        Allosaurus Rider   power     1+*   matches pow=1, not pow=0
+        Souls of the Lost  toughness *+1   matches tou=1
+        Aysen Crusader     power     2+*   matches pow=2, and NOT pow=0
+
+    The corpus prints six starred forms -- `*`, `1+*`, `*+1`, `2+*`, `7-*` and one `*\u00b2` --
+    and this grammar covers exactly those: a term is a signed number or a star, and the terms are
+    summed. A form it does not recognise raises and `maybeify` returns None, which is the
+    pre-existing behaviour and the safe direction to be wrong in.
+
+    Loyalty deliberately keeps `maybe_int`: the two cards printing `*` there are funny-set cards
+    api.scryfall.com will not answer for at all, so there is no measurement to follow.
+    """
+    try:
+        return int(float(val))
+    except (ValueError, TypeError):
+        pass
+    text = str(val).strip()
+    if "*" not in text:
+        raise ValueError(text)
+    total = 0.0
+    sign = 1
+    for index, term in enumerate(re.split(r"(?<=.)([+-])", text)):
+        if index % 2:
+            sign = -1 if term == "-" else 1
+            continue
+        term = term.strip()
+        if term in {"*", "*\u00b2"}:
+            continue  # `*` and `*` squared are both zero
+        total += sign * float(term)
+    return int(total)
+
+
 def rarity_text_to_int(rarity_text: str) -> int:
     """Convert rarity text to int."""
     rarity_map = {
@@ -563,8 +607,11 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
 
     card["planeswalker_loyalty"] = maybe_int(card.get("loyalty"))
     if "Creature" in card_types or {"Vehicle", "Spacecraft"} & set(card_subtypes):
-        card["creature_power"] = maybe_int(card.get("power"))
-        card["creature_toughness"] = maybe_int(card.get("toughness"))
+        # `maybe_stat_int`, not `maybe_int`: a printed `*` is ZERO on both sides of a
+        # power/toughness comparison -- see its docstring for the three cards that pin the
+        # arithmetic. The printed strings two lines down are untouched.
+        card["creature_power"] = maybe_stat_int(card.get("power"))
+        card["creature_toughness"] = maybe_stat_int(card.get("toughness"))
         card["creature_power_text"] = card.get("power")
         card["creature_toughness_text"] = card.get("toughness")
     else:
