@@ -5,7 +5,7 @@ use super::{
     assign_artwork_groups, build_artwork_base_from, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
     cards_of_printings, count_common_keywords, count_common_types,
     build_artist_index, build_printing_value_index, build_arith_tuple_index, is_arith_tuple_route, range_candidates, narrow_candidates, narrow_candidates_exact, rarity_candidates,
-    perm_primary_key, range_too_broad_to_narrow, run_query, run_query_routed, run_query_with_plan, explain, explain_analyze, AcquireFacts, PlanEstimate, PlanTrial,
+    absent_sorts_highest, perm_primary_key, range_too_broad_to_narrow, run_query, run_query_routed, run_query_with_plan, explain, explain_analyze, AcquireFacts, PlanEstimate, PlanTrial,
     acquire_plan_features, take_phase_stats, PagingTaken, CountSource, NarrowedRepr,
     EXACT_VALUE_TOTALS, RangeCardCounts, narrow_rec, ValueTotals, PairTotals, build_all_value_totals, build_pair_totals, build_range_card_counts, exact_result_total,
     PhysicalPlan, PlanScope, CandidatePlan, ComposePaging, trigram_candidates, finalize_trigram_index, PrintingValueIndex, NARROW_FLOOR,
@@ -7269,7 +7269,7 @@ fn artwork_group_ids_handle_more_than_64_groups() {
 /// expectation is deliberately unchanged: that is the evidence only the ascending side moved, and
 /// therefore that only the ascending permutations need rebuilding.
 #[test]
-fn sort_permutations_put_nulls_lowest_in_both_directions() {
+fn sort_permutations_put_a_missing_magnitude_lowest() {
     let mut vocab = VocabInterner::new();
     let mut cards = vec![
         stub_card(1, TYPE_CREATURE, &[], &mut vocab),
@@ -7282,22 +7282,69 @@ fn sort_permutations_put_nulls_lowest_in_both_directions() {
     let data = store_of(cards, &[1, 1, 1], vocab);
     let perms = build_sort_permutations(&data.cards);
     assert_eq!(perms.cmc[0], vec![1, 2, 0], "asc: null, 1, 5");
-    assert_eq!(perms.cmc[1], vec![0, 2, 1], "desc: 5, 1, null — unchanged");
+    assert_eq!(perms.cmc[1], vec![0, 2, 1], "desc: 5, 1, null");
 }
 
-/// The definition, pinned directly on the key function rather than through a permutation: for every
-/// nullable column, absent sorts below every real value ascending and above it descending.
+/// And a missing RANK goes where the highest value goes — LAST ascending, FIRST descending, the
+/// exact opposite end, in the same stored array shape.
+///
+/// Measured on api.scryfall.com over `e:khm order=edhrec unique=prints` (425 printings, 33 of them
+/// unranked): ascending page 1 runs 199, 378, 378 … 8068 with not one null in its 175 rows, and
+/// `dir=desc` page 1 LEADS with 33 nulls before 13065, 13021, 13021 …
+///
+/// `edhrec` is the DEFAULT `order=`, so this is the ordering an unordered search gets.
 #[test]
-fn a_missing_primary_sorts_lowest_in_both_directions() {
-    for descending in [false, true] {
-        let absent = perm_primary_key(None, descending);
-        for v in [-1000.0f32, -1.5, 0.0, 1.0, 42.0, 514_202.0, f32::MAX] {
-            let present = perm_primary_key(Some(v), descending);
-            assert_ne!(present, absent, "a real value collided with the sentinel (v={v}, desc={descending})");
-            if descending {
-                assert!(present < absent, "desc: {v} should sort before absent");
-            } else {
-                assert!(present > absent, "asc: {v} should sort after absent");
+fn sort_permutations_put_a_missing_rank_highest() {
+    let mut vocab = VocabInterner::new();
+    let mut cards = vec![
+        stub_card(1, TYPE_CREATURE, &[], &mut vocab),
+        stub_card(2, TYPE_CREATURE, &[], &mut vocab),
+        stub_card(3, TYPE_CREATURE, &[], &mut vocab),
+    ];
+    cards[0].edhrec_rank = Some(500);
+    cards[1].edhrec_rank = None;
+    cards[2].edhrec_rank = Some(12);
+    let data = store_of(cards, &[1, 1, 1], vocab);
+    let perms = build_sort_permutations(&data.cards);
+    assert_eq!(perms.edhrec[0], vec![2, 0, 1], "asc: 12, 500, unranked LAST");
+    assert_eq!(perms.edhrec[1], vec![1, 0, 2], "desc: unranked FIRST, 500, 12");
+    // The inverses are built per direction rather than derived, so they have to move with it.
+    assert_eq!(perms.edhrec_inv[0], vec![1, 2, 0], "asc inverse: card 1 is unranked, so position 2");
+    assert_eq!(perms.edhrec_inv[1], vec![1, 0, 2], "desc inverse: card 1 is unranked, so position 0");
+}
+
+/// The definition, pinned directly on the key function rather than through a permutation, for every
+/// column: absent sits on the side `absent_sorts_highest` names, and the direction reflects it.
+///
+/// Table-driven off the enum so a column ADDED to `SortCol` cannot silently inherit an
+/// unconsidered answer — the match in `absent_sorts_highest` has no wildcard arm.
+#[test]
+fn a_missing_primary_sorts_on_its_column_side() {
+    let columns = [
+        (SortCol::Cmc, false),
+        (SortCol::Power, false),
+        (SortCol::Toughness, false),
+        (SortCol::Rarity, false),
+        (SortCol::PriceUsd, false),
+        (SortCol::Cubecobra, false),
+        (SortCol::Name, false),
+        (SortCol::EdhrecRank, true),
+    ];
+    for (sort_col, highest) in columns {
+        assert_eq!(absent_sorts_highest(sort_col), highest, "the measured table moved for {sort_col:?}");
+        for descending in [false, true] {
+            let absent = perm_primary_key(None, sort_col, descending);
+            for v in [-1000.0f32, -1.5, 0.0, 1.0, 42.0, 514_202.0, f32::MAX] {
+                let present = perm_primary_key(Some(v), sort_col, descending);
+                assert_ne!(present, absent, "a real value collided with the sentinel ({sort_col:?} v={v} desc={descending})");
+                // Absent is "above every value" for the HIGHEST arm, and the direction negates the
+                // comparison exactly as it negates the value.
+                let absent_first = highest == descending;
+                if absent_first {
+                    assert!(present > absent, "{sort_col:?} desc={descending}: {v} should sort after absent");
+                } else {
+                    assert!(present < absent, "{sort_col:?} desc={descending}: {v} should sort before absent");
+                }
             }
         }
     }

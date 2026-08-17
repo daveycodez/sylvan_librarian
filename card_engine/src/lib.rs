@@ -2210,23 +2210,73 @@ fn bound_from_cmp(op: CmpOp, v: f64) -> SortBound {
     }
 }
 
+/// Which side a MISSING value sorts on, PER COLUMN — Scryfall does not answer this the same way
+/// for every `order=`, and a single global rule is wrong for one half of the table whichever way it
+/// is written.
+///
+/// # The measurements
+///
+/// One page-1 request per (column, direction) against api.scryfall.com over `e:khm unique=prints`
+/// (425 printings), reading the sorted field off the head and tail of the page, on 2026-08-17 —
+/// re-confirming the 2026-08-11 rows this rule was first written from:
+///
+/// ```text
+/// column      asc head            desc head             absent sorts
+/// power       null,null,null…     "8","8","8"…          LOWEST   (19 nulls, trailing desc)
+/// toughness   null,null,null…     "8","8","8"…          LOWEST   (20 nulls)
+/// usd         null,null,null…     null,"66.82"…         LOWEST   (see the foil note)
+/// edhrec      199,378,378…        null,null,null…       HIGHEST  (33 nulls, none on asc page 1)
+/// ```
+///
+/// So it splits on what the column MEANS: a magnitude (power, a price) that is missing behaves
+/// like a value below every real one, while a RANK that is missing — "this card is not ranked" —
+/// behaves like a position after every real one. Both directions genuinely reflect it; it is
+/// pinned to neither end.
+///
+/// `edhrec` carries more weight than its single row suggests: it is the DEFAULT `order=`, so
+/// treating its nulls as lowest puts every unranked card at the head of an unordered search.
+///
+/// THE `usd` DESC HEAD IS NOT A COUNTEREXAMPLE, and it is why this table is read off both
+/// directions rather than trusted from one. `khm/407` leads `order=usd dir=desc` with
+/// `prices.usd = null` — because its `usd_foil` is $106.04 and Scryfall's price key coalesces the
+/// foil price. The rows that are genuinely price-less (the Arena `A-*` printings, every price
+/// null) lead ASCENDING, which is the reading this table records.
+///
+/// # Unmeasured columns keep the old rule, deliberately
+///
+/// `cubecobra` has no `order=` on api.scryfall.com at all, and `cmc`, `rarity` and `name` had no
+/// null on the probed corpus. Every one of them stays LOWEST, which is what they already did; a
+/// column added to the HIGHEST arm without a measurement behind it is the failure this table
+/// exists to prevent.
+const fn absent_sorts_highest(sort_col: SortCol) -> bool {
+    match sort_col {
+        // The rank family, and the default `order=`.
+        SortCol::EdhrecRank => true,
+        SortCol::Cmc
+        | SortCol::Power
+        | SortCol::Toughness
+        | SortCol::Rarity
+        | SortCol::PriceUsd
+        | SortCol::Cubecobra
+        | SortCol::Name => false,
+    }
+}
+
 /// The permutation's PRIMARY key: the sort column's value, direction folded in by negation, absent
-/// sorting as the LOWEST value. One function because three places must agree on it exactly —
+/// sorting on the side `absent_sorts_highest` gives that column. One function because three places
+/// must agree on it exactly —
 /// `build_sort_permutations` orders by it, `sort_key_bits` builds every gathered plan's key from it,
 /// and `walk_bounds` binary-searches for it to find where a value interval starts and ends in that
 /// order. A divergence between those would not be a slow walk, it would be a walk that starts past
 /// real matches and silently returns the wrong page.
 ///
-/// # Absent sorts lowest, not last
+/// # The absent side is a property of the COLUMN
 ///
-/// Measured against api.scryfall.com on 2026-08-11: `set:m10 order=power dir=asc` leads with the
-/// null-power cards and `dir=desc` trails with them, and `t:creature order=usd dir=asc` leads with
-/// the unpriced Alchemy cards. So a missing value behaves like a value below every real one, and
-/// the direction genuinely moves it — it is not pinned to either end.
-///
-/// This is a change of SHAPE, not of constant. The old sentinel was `u32::MAX` on both directions,
-/// which put absent past every finite key either way precisely BECAUSE it did not participate in
-/// the direction reflection. Now it does.
+/// This is a change of SHAPE, not of constant. The original sentinel was `u32::MAX` on both
+/// directions, which put absent past every finite key either way precisely BECAUSE it did not
+/// participate in the direction reflection. Now it does — and WHICH end it reflects from comes
+/// from `absent_sorts_highest`, because a missing rank and a missing magnitude sit on opposite
+/// sides. The SENTINEL therefore moves with the column, and so does the clamp that reserves it.
 ///
 /// The clamp is belt-and-braces rather than decoration: `f32_sort_bits` maps only a negative NaN
 /// with an all-ones mantissa to `u32::MAX`, and the corpus minimum (`-f32::MAX`) to `0x0080_0000`,
@@ -2238,10 +2288,13 @@ fn bound_from_cmp(op: CmpOp, v: f64) -> SortBound {
 /// a null can never satisfy a comparison against its own column. That is the half of the old
 /// argument still doing the work — `walk_bounds` stays correct because a null-bearing card cannot
 /// match the bound, not because the null sits at a particular end.
-fn perm_primary_key(value: Option<f32>, descending: bool) -> u32 {
+fn perm_primary_key(value: Option<f32>, sort_col: SortCol, descending: bool) -> u32 {
+    // The sentinel end for this (column, direction): absent-highest ascending and absent-lowest
+    // descending both put absent at the TOP of the key space; the other two put it at the bottom.
+    let absent_at_top = absent_sorts_highest(sort_col) != descending;
     match value {
         None => {
-            if descending {
+            if absent_at_top {
                 u32::MAX
             } else {
                 0
@@ -2250,7 +2303,7 @@ fn perm_primary_key(value: Option<f32>, descending: bool) -> u32 {
         Some(v) => {
             let k = f32_sort_bits(if descending { -v } else { v });
             debug_assert!(k != 0 && k != u32::MAX, "a real value collided with the absent sentinel");
-            if descending { k.min(u32::MAX - 1) } else { k.max(1) }
+            if absent_at_top { k.min(u32::MAX - 1) } else { k.max(1) }
         }
     }
 }
@@ -2296,12 +2349,12 @@ fn walk_bounds<'p>(
     // that ordering cannot disagree.
     let key_at = |pos: usize| {
         let cid = u32::from(all[pos]) as usize;
-        perm_primary_key(sort_col_card_value(&cards[cid], sort_col), descending)
+        perm_primary_key(sort_col_card_value(&cards[cid], sort_col), sort_col, descending)
     };
     // Under `desc` the key is negated, so the interval's ends swap roles: the largest VALUE has the
     // smallest key and therefore comes first.
     let (first_v, last_v) = if descending { (bound.hi, bound.lo) } else { (bound.lo, bound.hi) };
-    let key_of = |v: f64| perm_primary_key(Some(v as f32), descending);
+    let key_of = |v: f64| perm_primary_key(Some(v as f32), sort_col, descending);
     // `partition_point` over positions: the first position whose key reaches the interval, and the
     // first position past it. Both sides are inclusive in value, so `start` excludes keys strictly
     // before the interval and `end` includes the whole tie block at its far edge.
@@ -2333,11 +2386,16 @@ fn partition_point(len: usize, pred: impl Fn(usize) -> bool) -> usize {
 fn build_sort_permutations(cards: &[OracleCard]) -> SortPermutations {
     // Purely card-space now: the printings/offsets arguments existed only to read the first stored
     // printing's prefer_score, which is no longer a sort key (see the closure below).
-    let perm = |get: &dyn Fn(&OracleCard) -> Option<f32>, descending: bool| -> Vec<u32> {
+    // `sort_col` is passed rather than inferred from `get`, because the absent side is a property
+    // of the COLUMN now (`absent_sorts_highest`) and this is the one place that BAKES that choice
+    // into the archive. A permutation built for the wrong column would put its nulls at the wrong
+    // end of a stored array, where the gathered plans' keys would still be right — the two halves
+    // disagreeing is what makes it a wrong page rather than a slow one.
+    let perm = |get: &dyn Fn(&OracleCard) -> Option<f32>, sort_col: SortCol, descending: bool| -> Vec<u32> {
         let mut ids: Vec<u32> = (0..cards.len() as u32).collect();
         ids.sort_unstable_by_key(|&i| {
             let c = &cards[i as usize];
-            let pk = perm_primary_key(get(c), descending);
+            let pk = perm_primary_key(get(c), sort_col, descending);
             let e = c.edhrec_rank.unwrap_or(u32::MAX);
             // Canonical secondary: the first (store-preferred) printing's
             // default prefer score, matching sort_key_bits' third component
@@ -2353,18 +2411,18 @@ fn build_sort_permutations(cards: &[OracleCard]) -> SortPermutations {
     // Inverse built per direction, not derived from one another — ties keep
     // fixed relative order in both directions (see the struct doc above), so
     // reversing one inverse would get tied groups' internal order backwards.
-    let both = |get: &dyn Fn(&OracleCard) -> Option<f32>| -> ([Vec<u32>; 2], [Vec<u32>; 2]) {
-        let asc = perm(get, false);
-        let desc = perm(get, true);
+    let both = |get: &dyn Fn(&OracleCard) -> Option<f32>, sort_col: SortCol| -> ([Vec<u32>; 2], [Vec<u32>; 2]) {
+        let asc = perm(get, sort_col, false);
+        let desc = perm(get, sort_col, true);
         let inv = [invert_perm(&asc), invert_perm(&desc)];
         ([asc, desc], inv)
     };
-    let (edhrec, edhrec_inv) = both(&|c| c.edhrec_rank.map(|v| v as f32));
-    let (cubecobra, cubecobra_inv) = both(&|c| c.cubecobra_score);
-    let (cmc, cmc_inv) = both(&|c| c.cmc.map(|v| v as f32));
-    let (power, power_inv) = both(&|c| c.creature_power.map(|v| v as f32));
-    let (toughness, toughness_inv) = both(&|c| c.creature_toughness.map(|v| v as f32));
-    let (name, name_inv) = both(&|c| Some(c.name_rank as f32));
+    let (edhrec, edhrec_inv) = both(&|c| c.edhrec_rank.map(|v| v as f32), SortCol::EdhrecRank);
+    let (cubecobra, cubecobra_inv) = both(&|c| c.cubecobra_score, SortCol::Cubecobra);
+    let (cmc, cmc_inv) = both(&|c| c.cmc.map(|v| v as f32), SortCol::Cmc);
+    let (power, power_inv) = both(&|c| c.creature_power.map(|v| v as f32), SortCol::Power);
+    let (toughness, toughness_inv) = both(&|c| c.creature_toughness.map(|v| v as f32), SortCol::Toughness);
+    let (name, name_inv) = both(&|c| Some(c.name_rank as f32), SortCol::Name);
     SortPermutations {
         edhrec, cubecobra, cmc, power, toughness, name,
         edhrec_inv, cubecobra_inv, cmc_inv, power_inv, toughness_inv, name_inv,
@@ -5309,6 +5367,9 @@ fn prefer_score(card: &AOracleCard, p: &APrinting, prefer: Prefer) -> f64 {
 }
 
 #[derive(Clone, Copy)]
+// `Debug` so a table-driven test can NAME the column it is asserting about — an "absent sorted on
+// the wrong side" failure that cannot say which column is a failure nobody can act on.
+#[derive(Debug)]
 enum SortCol { Cmc, Power, Toughness, Rarity, PriceUsd, Cubecobra, EdhrecRank, Name }
 
 fn orderby_to_col(orderby: &str) -> SortCol {
@@ -5355,7 +5416,7 @@ fn sort_key_bits(card: &AOracleCard, p: &APrinting, sort_col: SortCol, descendin
     // with. It was written out longhand here as a second copy of that one-liner; two copies of a
     // sentinel is exactly the kind of thing that drifts, and a drift between them is not a slow
     // walk but a walk that starts past real matches and silently returns the wrong page.
-    let pk = perm_primary_key(primary, descending);
+    let pk = perm_primary_key(primary, sort_col, descending);
     let e = card.edhrec_rank.as_ref().map(|v| u32::from(*v)).unwrap_or(u32::MAX);
     let sc = p.prefer_score.as_ref().map_or(u32::MAX, |v| f32_sort_bits(-f32::from(*v)));
     ((pk as u128) << 64) | ((e as u128) << 32) | (sc as u128)
