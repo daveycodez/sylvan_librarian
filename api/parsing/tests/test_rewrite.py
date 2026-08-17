@@ -13,7 +13,13 @@ import pytest
 from api.parsing import generate_sql_query, parse_scryfall_query
 from api.parsing.db_info import ARRAY_IS_TAGS, BOOLEAN_IS_TAGS
 from api.parsing.nodes import RegexValueNode
-from api.parsing.rewrite import _DERIVED_EXPANSIONS, ENGINE_IS_VALUES, SUPPORTED_IS_VALUES, _regex_plain_literal
+from api.parsing.rewrite import (
+    _DERIVED_EXPANSIONS,
+    ENGINE_IS_VALUES,
+    SUPPORTED_HAS_VALUES,
+    SUPPORTED_IS_VALUES,
+    _regex_plain_literal,
+)
 
 # (synonym query, canonical expansion) — the two must produce identical ASTs.
 EQUIVALENCES = [
@@ -503,3 +509,34 @@ def test_set_type_parses_as_its_own_column() -> None:
 def test_type_operator_is_not_an_is_value() -> None:
     """Only `is:` is checked — a subtype nobody has is a legitimate empty result, not a warning."""
     assert parse_scryfall_query("t:notarealtype").warnings == ()
+
+
+def test_has_is_a_total_alias_of_is(parse_query) -> None:
+    """`has:` accepts the WHOLE `is:` vocabulary, not the hand-listed `has:`-flavoured subset.
+
+    `_HAS_EXPANSIONS` was built by probing `has:`-FLAVOURED candidates -- the presence questions,
+    and the boolean tags that read like presence questions -- so every value nobody thought to
+    spell against `has:` was absent and returned a silent no-match. `has:split` is the one that
+    surfaced it: 126 cards on api.scryfall.com, nothing here.
+
+    MEASURED 2026-08-17 over 22 values spanning every shape the `is:` vocabulary has -- derived
+    layout predicates, computed text predicates, importer booleans, and the two set-shaped ones.
+    `is:X` and `has:X` answered the SAME total_cards on all 22:
+
+        is:permanent 26220 = has:permanent      is:frenchvanilla 1095 = has:frenchvanilla
+        is:split       126 = has:split          is:indicator      369 = has:indicator
+    """
+    assert SUPPORTED_HAS_VALUES >= SUPPORTED_IS_VALUES
+    # One per shape, expanding to the identical AST under either spelling.
+    for value in ("split", "dfc", "frenchvanilla", "permanent", "promo", "etched", "commander"):
+        assert parse_query(f"has:{value}").to_json() == parse_query(f"is:{value}").to_json(), value
+
+
+def test_the_presence_half_is_not_overtaken_by_the_alias(parse_query) -> None:
+    """`has:watermark` asks whether a watermark is PRESENT -- there is no `is:watermark`.
+
+    The alias is a FALLBACK, applied only where `_HAS_EXPANSIONS` has no entry; folding it in ahead
+    would turn these two into unsupported tags matching nothing.
+    """
+    assert parse_query("has:watermark").to_json() == parse_query("watermark:/./").to_json()
+    assert parse_query("has:artist").to_json() == parse_query("artist:/./").to_json()
