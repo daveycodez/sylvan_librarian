@@ -1226,7 +1226,8 @@ class ScryfallCardsRoutes:
             falcon_response: The Falcon response to write to.
             q: The partial name.
             pretty: Whether to indent JSON output.
-            include_extras: Accepted, ignored -- the corpus holds no extras to include.
+            include_extras: Accepted, ignored -- Scryfall's own catalog excludes extras
+                unconditionally, and so does the engine (`autocomplete_names`).
 
         Returns:
             A Catalog object of card names.
@@ -1241,6 +1242,13 @@ class ScryfallCardsRoutes:
 
         # The ENGINE first, for the same reason the fuzzy match above now does: `autocomplete` was
         # added by "Fuzzy Name Match and Autocomplete, Computed Not Stored" and nothing called it.
+        #
+        # AND IT DELIBERATELY DISAGREES WITH THE SQL BELOW NOW. That query orders by
+        # `length(card_name)`; api.scryfall.com orders by `pg_trgm` similarity over the COLLATED
+        # name and hides extras, which is measured in `autocomplete_names`' own comment (30
+        # prefixes, 546 adjacent pairs, zero inversions). The SQL cannot express either half --
+        # neither the collation nor the extras class exists as a column -- so it stays what it has
+        # always been, the degraded answer for a request the engine could not serve at all.
         engine = self._engine_for_lookup()
         if engine is not None:
             try:

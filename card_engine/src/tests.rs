@@ -12943,55 +12943,113 @@ fn printings_of_one_card_do_not_look_ambiguous() {
     assert!(matches!(fuzzy_name_match(a, "lightning bolt", crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD), FuzzyOutcome::Hit { .. }));
 }
 
-#[test]
-fn autocomplete_matches_the_sql_routes_set_and_order() {
+/// A catalog fixture: one card per (printed name, is_extra), one printing each.
+///
+/// The printed name is pushed into `strings` AFTER `store_of` (which fills `card_name_collated_id`
+/// from the folded name and pushes to the same table), so the two never fight over an index.
+fn autocomplete_store(entries: &[(&str, bool)]) -> CardData {
     let mut vocab = VocabInterner::new();
-    let mut interner = Interner::new();
     let mut cards = Vec::new();
-    // Matched on the lowercased key, ANSWERED with the printed name -- the two differ, which is
-    // the point: a catalog entry is something a client hands back to /cards/named?exact=.
-    // "Aftershock" is the substring case: it contains "sho" without starting with it.
-    for (i, name) in ["Shock", "Shatter", "Shockwave", "Aftershock", "Counterspell"].iter().enumerate() {
+    for (i, (name, _)) in entries.iter().enumerate() {
         let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
+        c.card_name_folded = InlineStr::from_str(&name.to_lowercase());
         c.card_name_lower = InlineStr::from_str(&name.to_lowercase());
-        c.card_name_id = interner.intern((*name).to_string());
         cards.push(c);
     }
-    let bytes = rkyv::to_bytes::<Error>(&cards).expect("serialize");
-    let a = rkyv::access::<Archived<Vec<OracleCard>>, Error>(&bytes).expect("access");
-    let string_bytes = rkyv::to_bytes::<Error>(&interner.strings).expect("serialize strings");
-    let strings = rkyv::access::<Archived<Vec<String>>, Error>(&string_bytes).expect("access strings");
+    let counts = vec![1usize; entries.len()];
+    let mut data = store_of(cards, &counts, vocab);
+    for (i, (name, _)) in entries.iter().enumerate() {
+        data.strings.push((*name).to_string());
+        data.cards[i].card_name_id = (data.strings.len() - 1) as u32;
+    }
+    // The `is:extra` tag, on the printings of the cards Scryfall hides.
+    let extra_vid = data.coll_vocab.len() as u16;
+    data.coll_vocab.push(crate::EXTRA_IS_TAG.to_string());
+    data.coll_vocab_sorted = sorted_vocab_ids(&data.coll_vocab);
+    for (i, (_, extra)) in entries.iter().enumerate() {
+        if *extra {
+            data.printings[i].card_is_tags.push(extra_vid);
+        }
+    }
+    data
+}
 
-    // The SQL this route falls back to is
-    //   WHERE lower(card_name) LIKE '%needle%' ORDER BY rank, length(card_name), card_name
-    // with rank 0 for a prefix match and 1 for a bare substring. The route asks the ENGINE first,
-    // so a disagreement is not a fallback -- it is two different answers to one request, and this
-    // one is what ships. Every assertion below is that query's behaviour.
+/// The catalog's SET and ORDER, both measured against api.scryfall.com (2026-08-17) rather than
+/// against the SQL this route falls back to.
+#[test]
+fn autocomplete_orders_by_trigram_similarity_and_hides_extras() {
+    let data = autocomplete_store(&[
+        ("Light Up the Night", false),
+        ("Lightning Angel", false),
+        ("Lightning Bolt", false),
+        ("Serra Avenger", false),
+        ("Serenity", false),
+        // A token: in this corpus, and in none of Scryfall's answers.
+        ("Shark", true),
+        ("Shatter", false),
+        ("Shockwave", false),
+        ("Shock", false),
+        // The substring case: it contains "sho" without starting with it.
+        ("Aftershock", false),
+        // Collates to "goblin", so "gob" is a PREFIX of it.
+        ("_____ Goblin", false),
+        ("Goblin Welder", false),
+    ]);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
-    // Substring matches are IN the set, and rank behind every prefix match. Verified against
+    // THE ORDER IS SIMILARITY, NOT LENGTH, and these are the two shapes where the two disagree.
+    // `Light Up the Night` is 15 collated characters against `Lightning Angel`'s 14 and leads it,
+    // because `igh` and `ght` each occur twice and a trigram SET holds one of each. `Lightning
+    // Bolt` (13) sits between them, which is the ordering length would also give -- the point is
+    // that the 15 and the 13 TIE.
+    assert_eq!(
+        autocomplete_names(a, "lig", 20),
+        vec!["Light Up the Night", "Lightning Bolt", "Lightning Angel"],
+        "a repeated window shrinks the trigram set, so the longer name leads"
+    );
+    // `Serra Avenger` (12) leads `Serenity` (8) because it ends in "er" and so carries the "er "
+    // window "  ser " closes with. Nothing about length can express this.
+    assert_eq!(
+        autocomplete_names(a, "ser", 20),
+        vec!["Serra Avenger", "Serenity"],
+        "sharing the needle's closing window outranks being four characters shorter"
+    );
+
+    // Substring matches are IN the set and rank behind every prefix match. Verified against
     // api.scryfall.com, where q=bolt answers Bolt Bend .. Boltwing Marauder THEN Firebolt,
     // Rift Bolt -- a prefix-only catalog would never offer the client "Aftershock" at all.
     assert_eq!(
-        autocomplete_names(a, strings, "sho", 20),
+        autocomplete_names(a, "sho", 20),
         vec!["Shock", "Shockwave", "Aftershock"],
         "prefix matches rank 0, substring matches rank 1"
     );
+    assert_eq!(autocomplete_names(a, "SHO", 20), vec!["Shock", "Shockwave", "Aftershock"], "case-insensitive");
+    // "Shark" is a token and never reaches a client, so it is absent here and does not consume
+    // the cap below either.
     assert_eq!(
-        autocomplete_names(a, strings, "SHO", 20),
-        vec!["Shock", "Shockwave", "Aftershock"],
-        "case-insensitive"
-    );
-    // Within a rank the order is by LENGTH then name, not alphabetical: Shock(5), Shatter(7),
-    // Shockwave(9). Alphabetical would put Shatter first, which is what this returned before.
-    assert_eq!(
-        autocomplete_names(a, strings, "sh", 20),
+        autocomplete_names(a, "sh", 20),
         vec!["Shock", "Shatter", "Shockwave", "Aftershock"],
-        "length then name within a rank, and PRINTED -- a lowercase entry is not a name Scryfall prints"
+        "the catalog excludes extras, and answers with the PRINTED name"
     );
-    // The cap applies to the ORDERED list, so it keeps the shortest prefix match rather than
+    // The cap applies to the ORDERED list, so it keeps the best prefix match rather than
     // whichever name the corpus happened to reach first.
-    assert_eq!(autocomplete_names(a, strings, "sh", 1), vec!["Shock"], "capped, after ordering");
-    assert!(autocomplete_names(a, strings, "zzz", 20).is_empty());
+    assert_eq!(autocomplete_names(a, "sh", 1), vec!["Shock"], "capped, after ordering");
+
+    // The rank split and the predicate are asked of the COLLATED name: api.scryfall.com answers
+    // q=gob with `_____ Goblin` FIRST, and answers q=ningbolt with `Lightning Bolt` -- "ningbolt"
+    // is a substring of "lightningbolt" and of no spelling that keeps the space.
+    assert_eq!(
+        autocomplete_names(a, "gob", 20),
+        vec!["_____ Goblin", "Goblin Welder"],
+        "underscores are not part of the name the prefix rank is asked about"
+    );
+    assert_eq!(autocomplete_names(a, "ningbolt", 20), vec!["Lightning Bolt"], "the predicate is collated too");
+
+    assert!(autocomplete_names(a, "zzz", 20).is_empty());
+    // The route's own two-character floor, re-asked of the COLLATED needle: `q=a` is an empty
+    // catalog on api.scryfall.com, and a needle that collates to one letter is that query.
+    assert!(autocomplete_names(a, "s", 20).is_empty(), "under two collated characters is an empty catalog");
 }
 
 #[test]
