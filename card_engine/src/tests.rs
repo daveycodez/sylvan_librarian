@@ -7350,6 +7350,39 @@ fn a_missing_primary_sorts_on_its_column_side() {
     }
 }
 
+/// The same rule through the QUERY path rather than the stored array: `order=edhrec` must page an
+/// unranked card last ascending and first descending, whichever plan the router picks.
+///
+/// This is the shape of the api.scryfall.com anchor — `e:khm order=edhrec dir=desc` page 1 leads
+/// with 33 unranked printings — reduced to a fixture the engine suite can run offline. `run_query`
+/// rather than `build_sort_permutations` is the point: it is the half a reader would expect to
+/// follow from the permutation and does not have to, because a gathered plan builds its own key.
+#[test]
+fn order_edhrec_pages_an_unranked_card_last_ascending_and_first_descending() {
+    let mut vocab = VocabInterner::new();
+    let mut cards = vec![
+        stub_card(1, TYPE_CREATURE, &[], &mut vocab),
+        stub_card(2, TYPE_CREATURE, &[], &mut vocab),
+        stub_card(3, TYPE_CREATURE, &[], &mut vocab),
+    ];
+    cards[0].edhrec_rank = Some(13065);
+    cards[1].edhrec_rank = None;
+    cards[2].edhrec_rank = Some(199);
+    let data = store_of(cards, &[1, 1, 1], vocab);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+
+    // scryfall_id is the printing index + 1 (store_of), so the unranked card is printing 1 -> id 2.
+    let ids = |direction: &str| -> Vec<u128> {
+        let mut filter = FilterExpr::True;
+        let (_total, page) =
+            run_query(&QueryCtx::from(archived), &mut filter, None, "card", "default", "edhrec", direction, 100, 0);
+        page.iter().map(|(_, p)| u128::from(p.scryfall_id)).collect()
+    };
+    assert_eq!(ids("asc"), vec![3, 1, 2], "asc: 199, 13065, then the unranked card");
+    assert_eq!(ids("desc"), vec![2, 1, 3], "desc: the unranked card, then 13065, 199");
+}
+
 #[test]
 fn set_code_and_date_narrowing() {
     let mut vocab = VocabInterner::new();

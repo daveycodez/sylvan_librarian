@@ -7267,16 +7267,21 @@ fn compose_printing_estimate(
 /// A null-valued printing is ABSENT from the value index by construction, so the walk can only ever
 /// enumerate non-null rows. It handles the leftovers by declining — `seen < want && seen < total` —
 /// and that is a SUFFIX test: it detects "there are rows I could not place, and they sort after
-/// everything I did". With absent sorting LOWEST (see `perm_primary_key`), on ascending the rows it
-/// cannot place sort BEFORE everything it emits, so the test never fires: the walk fills the page
-/// from real values, exits via its `seen == want` break, and returns a confidently wrong page 0.
-/// Not a fallback — a silently wrong answer.
+/// everything I did". In the direction where this column's absent side sorts FIRST (see
+/// `absent_sorts_highest`), the rows it cannot place sort BEFORE everything it emits, so the test
+/// never fires: the walk fills the page from real values, exits via its `seen == want` break, and
+/// returns a confidently wrong page 0. Not a fallback — a silently wrong answer.
 ///
-/// So ascending is only offered when the index covers every printing, i.e. the column has no nulls
-/// anywhere in this store and "nulls first" is vacuous. `len()` is the indexed-printing count, so the
-/// comparison is exact and — this is the part that matters for the router — it is a STORE-level
-/// constant available identically to `compose_paging_with_total`'s prediction and to the fastpath
-/// itself, so the two cannot disagree about which branch will run.
+/// So that direction is only offered when the index covers every printing, i.e. the column has no
+/// nulls anywhere in this store and "nulls first" is vacuous. `len()` is the indexed-printing count,
+/// so the comparison is exact and — this is the part that matters for the router — it is a
+/// STORE-level constant available identically to `compose_paging_with_total`'s prediction and to the
+/// fastpath itself, so the two cannot disagree about which branch will run.
+///
+/// WHICH direction that is now comes from the column, not from a constant. Both walkable columns
+/// (`usd`, `rarity`) are absent-LOWEST, so it is still ascending that needs totality and nothing
+/// about the current behaviour moves; deriving it means a column that ever joins the HIGHEST arm
+/// cannot leave this gate pointing at the safe direction while the keys point at the other one.
 ///
 /// `card_rarity_int` is non-null across the production corpus, so `order=rarity` keeps its walk in
 /// both directions; only `order=usd dir=asc` falls to the gather, which is the direction where most
@@ -7292,7 +7297,10 @@ fn orderby_walk_available(sort_col: SortCol, descending: bool, indexes: &Archive
         _ => return false,
     };
     //  is one entry per printing, so its length IS the corpus printing count.
-    descending || idx.len() == indexes.printing_to_card.len()
+    // The safe direction is the one where the ABSENT rows land after everything the walk can emit,
+    // because the suffix test is the only thing that can see them.
+    let absent_sorts_last = absent_sorts_highest(sort_col) != descending;
+    absent_sorts_last || idx.len() == indexes.printing_to_card.len()
 }
 
 /// The routed path's time, split into DISJOINT phases that cover all of `run_query_routed`.
