@@ -3435,9 +3435,27 @@ fn assign_printing_ranks<K: Ord>(
     }
 }
 
-/// Rank printings by set code, the sort key for `order=set`.
+/// Rank printings by set code, the sort key for `order=set` — and, since `order=released` breaks a
+/// date tie by set before collector number, the TOP HALF of that column's second key too.
+///
+/// That packing is why the rank is asserted to fit 16 bits (`sort_col_secondary` shifts it left by
+/// 16 into a 32-bit lane it shares with `collector_rank`). The field stays `u32`, so this is a
+/// contract on the VALUE, not on the layout: 1,100-odd set codes across the whole corpus against
+/// 65,535, and a corpus that ever outgrew it would be a loud build failure rather than a rank that
+/// silently overwrote the collector number beside it.
 fn assign_set_ranks(printings: &mut [Printing], foreign: &mut [Printing]) {
-    assign_printing_ranks(printings, foreign, |p| p.card_set_code.as_str().to_owned(), |p, r| p.set_rank = r);
+    assign_printing_ranks(
+        printings,
+        foreign,
+        |p| p.card_set_code.as_str().to_owned(),
+        |p, r| {
+            assert!(
+                r <= u32::from(u16::MAX),
+                "set_rank outgrew the 16 bits order=released's second key packs it into — widen that lane"
+            );
+            p.set_rank = r;
+        },
+    );
 }
 
 /// Decide `OracleCard.single_set` — the whole of `is:unique` — for every card.
@@ -7648,28 +7666,62 @@ fn f32_sort_bits(v: f32) -> u32 {
     if b & (1 << 31) != 0 { !b } else { b | (1 << 31) }
 }
 
-/// The sort column's SECOND key, where the column has one: today only `order=set`, whose second
-/// key is the collector number (see `assign_collector_ranks`).
+/// The sort column's SECOND key, where the column has one: `order=set`, whose second key is the
+/// collector number (see `assign_collector_ranks`), and `order=released`, whose second key is the
+/// SET and then the collector number inside it, packed into the one 32-bit lane as
+/// `(set_rank << 16) | collector_rank`.
 ///
 /// Direction is folded in here as it is in the primary, because the second key belongs to the
 /// primary ordering rather than to the tiebreaks below it — `order=set&dir=desc&q=e:khm` answers
 /// 407, 406, 405 … (measured 2026-08-16), so reversing the set without reversing the number
 /// inside it would be a third order Scryfall never serves. Complement rather than `MAX - rank`:
-/// the ranks are dense from 0, so the two agree.
+/// the ranks are dense from 0, so the two agree. Complementing the PACKED word complements each
+/// half in place (`!((s << 16) | c) == ((!s) << 16) | (!c)` for 16-bit halves), so the
+/// lexicographic pair reverses as one — which is what the measurement below requires.
+///
+/// # Why `released` carries a SET half, measured against api.scryfall.com on 2026-08-16
+///
+/// Cards sharing a release date come back SET-GROUPED, not interleaved by collector number: over
+/// 102 sampled multi-set date groups (five type queries, both directions, `unique=prints`) the sets
+/// were contiguous in 102 of 102. `date=2025-04-11` answers all of tdm, then all of tdc, then all
+/// of ptdm; a collector-number-only second key answers tdc:1, tdm:5, ptdm:5p, tdc:6 …, which is a
+/// row order Scryfall never serves. The whole chain is direction-aware: on every date group tried,
+/// `dir=desc` was the EXACT reversal of `dir=asc`, sets included.
+///
+/// The set order INSIDE a date is Scryfall-internal and is not any field it publishes — tdm before
+/// its commander deck tdc, but mkc before its expansion mkm, which no parent/child, `set_type` or
+/// promo rule can hold at once. Nothing fit better than the set CODE across `id`, `tcgplayer_id`,
+/// `card_count`, `printed_size`, `set_type`, `parent_set_code`, `block_code`, the /sets listing
+/// order and the set name (the code fits 36 of 48 sampled adjacent set pairs, the next best 30).
+///
+/// So the code is what goes in, and the GROUPING it buys is the larger half. Replayed over 26
+/// released-ordered pages (3,152 rows, every cached api.scryfall.com listing at or above the
+/// eight-distinct-date floor, 24 of them carrying a multi-set date tie), positional agreement is
+///
+///     collector number alone   86.96%      (2,741 of 3,152 rows)
+///     set then collector       98.89%      (3,117 of 3,152 rows)
+///
+/// improving 16 pages and costing 6 — the 6 being pages whose only multi-set group is one of the
+/// outliers above, where the alphabetical block order inverts Scryfall's. Their rows are still
+/// grouped by set; it is two adjacent blocks that swap. That residual 1.11% is the whole of what
+/// Scryfall's private set order costs this column.
 ///
 /// Every other column returns 0, which costs those keys nothing: a constant segment cannot change
 /// any comparison, so their order is bit-for-bit what it was before this key existed.
 fn sort_col_secondary(p: &APrinting, sort_col: SortCol, descending: bool) -> u32 {
-    match sort_col {
-        // `released` shares `set`'s second key, measured 2026-08-16: within one release date khm
-        // answers 407, 406, 405 … under `dir=desc` and 1, 2, 3 … under `dir=asc`, so the collector
-        // number follows the primary's direction here exactly as it does under `order=set`.
-        SortCol::Set | SortCol::Released => {
-            let rank = u32::from(u16::from(p.collector_rank));
-            if descending { !rank } else { rank }
-        }
-        _ => 0,
-    }
+    let key = match sort_col {
+        SortCol::Set => u32::from(u16::from(p.collector_rank)),
+        // `released` breaks a date tie by set and then by the collector number within it, measured
+        // 2026-08-16: within one set khm answers 407, 406, 405 … under `dir=desc` and 1, 2, 3 …
+        // under `dir=asc`, so the collector number follows the primary's direction here exactly as
+        // it does under `order=set`, and the set half above it follows it too.
+        //
+        // `assign_set_ranks` is what holds the shift to 16 bits (it asserts the rank fits); the
+        // collector half is `u16` by declaration.
+        SortCol::Released => (u32::from(p.set_rank) << 16) | u32::from(u16::from(p.collector_rank)),
+        _ => return 0,
+    };
+    if descending { !key } else { key }
 }
 
 /// Order-preserving integer sort key, computed once per match instead of inside the
@@ -7723,8 +7775,8 @@ type Match = (u128, u32, u32);
 /// so this is a total order over `Match`.
 fn page_cmp(a: &Match, b: &Match) -> std::cmp::Ordering {
     // Keys 1-3 only (`>> 32` drops the last lane, prefer_score), then CARD, then printing.
-    // "Keys 1-3" is primary, the column's second key (0 for every column but `set`), and edhrec
-    // rank — see `sort_key_bits` for the lane layout.
+    // "Keys 1-3" is primary, the column's second key (0 for every column but `set` and
+    // `released`), and the name rank — see `sort_key_bits` for the lane layout.
     //
     // Key 3 must not decide across cards, because the two sides cannot agree on it. The prebuilt
     // permutation bakes in `printings[offsets[i]]`'s prefer_score -- the first STORED printing, chosen

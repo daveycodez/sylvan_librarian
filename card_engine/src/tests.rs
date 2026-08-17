@@ -13246,3 +13246,75 @@ fn single_set_counts_sets_across_the_annex() {
     assert!(cards[2].single_set, "an annex row in the same set changes nothing");
 }
 
+
+/// `order=released` breaks a date tie by SET first and collector number second, both following the
+/// primary's direction.
+///
+/// Measured against api.scryfall.com on 2026-08-16. Cards sharing a release date come back
+/// SET-GROUPED, not interleaved by collector number: `date=2025-04-11` answers all of tdm, then all
+/// of tdc, then all of ptdm, and 102 of 102 sampled multi-set date groups (five type queries, both
+/// directions, `unique=prints`) were contiguous by set. On every group tried, `dir=desc` was the
+/// exact reversal of `dir=asc`, sets included.
+///
+/// The fixture's four rows are chosen so the two candidate rules DISAGREE rather than merely differ
+/// in confidence: zza's "500" sits above zzb's "1" ascending, which a collector-number-only key
+/// cannot produce at any direction — it answers zzb:1, zza:9, zzb:10, zza:500. Passing this is
+/// therefore evidence about the RULE, not just about the code agreeing with itself. The ranks come
+/// from `assign_set_ranks` and `assign_collector_ranks` rather than being written by hand, so the
+/// packing is exercised against the values the build actually produces.
+#[test]
+fn order_released_breaks_a_date_tie_by_set_then_collector_number() {
+    // (set code, collector number) — two sets, one shared date, numbers that interleave across them.
+    let rows = [("zzb", "1"), ("zza", "500"), ("zza", "9"), ("zzb", "10")];
+    let numbers: Vec<String> = rows.iter().map(|&(_, n)| n.to_string()).collect();
+    let mut printings: Vec<Printing> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, &(set, n))| {
+            let mut p = stub_printing(i as u128, i as u128, None);
+            p.card_set_code = InlineStr::from_str(set);
+            p.collector_number_id = i as u32;
+            p.collector_number_int = n.chars().filter(char::is_ascii_digit).collect::<String>().parse().ok();
+            p.released_at_int = Some(20_210_611);
+            p
+        })
+        .collect();
+    let mut none: Vec<Printing> = Vec::new();
+    assign_set_ranks(&mut printings, &mut none);
+    assign_collector_ranks(&mut printings, &mut none, &numbers);
+
+    let mut vocab = VocabInterner::new();
+    let card = stub_card(1, TYPE_CREATURE, &[], &mut vocab);
+    let mut data = store_of(vec![card], &[rows.len()], vocab);
+    for (dst, src) in data.printings.iter_mut().zip(&printings) {
+        dst.card_set_code = src.card_set_code;
+        dst.set_rank = src.set_rank;
+        dst.collector_rank = src.collector_rank;
+        dst.collector_number_int = src.collector_number_int;
+        dst.released_at_int = src.released_at_int;
+    }
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+
+    let order = |descending: bool| -> Vec<String> {
+        let card = &archived.cards[0];
+        let mut all: Vec<(u128, String)> = archived
+            .printings
+            .iter()
+            .zip(&rows)
+            .map(|(p, &(set, n))| (sort_key_bits(card, p, SortCol::Released, descending), format!("{set}:{n}")))
+            .collect();
+        all.sort_unstable_by_key(|&(k, _)| k);
+        all.into_iter().map(|(_, label)| label).collect()
+    };
+
+    let asc = order(false);
+    assert_eq!(asc, ["zza:9", "zza:500", "zzb:1", "zzb:10"], "a shared date groups by set, then by number");
+    // The order a collector-number-only second key produces, spelled out so the disagreement is
+    // visible rather than implied — it is what this column answered before the set half existed.
+    assert_ne!(asc, ["zzb:1", "zza:9", "zzb:10", "zza:500"]);
+
+    let mut reversed = asc.clone();
+    reversed.reverse();
+    assert_eq!(order(true), reversed, "dir=desc reverses the set with the date, and the number with the set");
+}
