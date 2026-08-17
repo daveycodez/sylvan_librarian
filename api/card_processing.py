@@ -524,6 +524,14 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
         # "X & X", and the string is not re-splittable afterwards either — "Hari & Deepti" is ONE
         # artist of ten printings.
         merged_row["card_artist"] = card.get("artist")
+        # ...and so is the LAYOUT, which is the one other key a FACE can genuinely carry. Scryfall
+        # puts `layout` on the faces of reversible cards and on nothing else: over the whole
+        # 2026-08-15 all_cards bulk exactly 81 cards have a face-level `layout`, and all 81 are
+        # `reversible_card`. The overlay above put the face's value on every face row, so
+        # `card_layout` came out of the FRONT face -- 77 of the 81 stored as `normal`, 3 as
+        # `adventure`, 1 as `token` -- and `layout:reversible_card` answered nothing at all.
+        if "layout" in card:
+            merged_row["card_layout"] = card["layout"].lower()
         merged_row["printed_name"] = card.get("printed_name")
         merged_row["flavor_name"] = card.get("flavor_name")
         merged_row["printed_type_line"] = card.get("printed_type_line")
