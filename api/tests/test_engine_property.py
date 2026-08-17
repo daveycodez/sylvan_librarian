@@ -198,6 +198,49 @@ def _tri_cmp(value: float | None, op: str, rhs: float) -> bool | None:
     return {"=": value == rhs, "<": value < rhs, "<=": value <= rhs, ">": value > rhs, ">=": value >= rhs}[op]
 
 
+def _ref_mana(frag: str, card: dict[str, Any]) -> bool | None:
+    """Evaluate one `mana:`/`mana=` fragment against one printing row.
+
+    GENERIC MANA IS A COUNTED PIP, NOT A CMC. `m:{2}` asks for two GENERIC, and comparing cmc
+    instead let every colored pip pay for it: `m={r}{r} t:creature` is 24 on api.scryfall.com and
+    `m={r}{r} m:{2} t:creature` is 0 (2026-08-16), where a cmc compare answered all 24.
+
+    Generic is not stored on either side; it is recovered as `cmc - non-X pips`, because every
+    non-X symbol contributes exactly 1 to cmc and X contributes 0 (confirmed on real Scryfall:
+    Fireball {X}{R} has cmc 1.0, not 2.0). Clamped at 0 so a cost this arithmetic cannot describe
+    degrades rather than going negative.
+
+    Args:
+        frag: The fragment, e.g. `mana:uu` or `mana=gg`.
+        card: One printing row from the synthetic corpus.
+
+    Returns:
+        True/False, or None when the row has no cmc and the answer would depend on it.
+    """
+    op = frag[len("mana")]
+    want_pips: dict[str, int] = {}
+    for ch in frag[len("mana") + 1 :]:
+        want_pips[ch.upper()] = want_pips.get(ch.upper(), 0) + 1
+    # Every fragment in FRAGMENTS is written as bare color letters, so the query cost's cmc is
+    # exactly its own non-X pip count and its generic is 0. Spelled out rather than derived,
+    # because deriving `n - n` would only look like arithmetic. That zero is exactly why the cmc
+    # compare this replaced was a DIFFERENT question and not a redundant one.
+    want_generic = 0
+    # Unlike devotion, mana: never splits hybrid symbols (they're opaque keys), so a hybrid counts
+    # 1 toward cmc and 1 toward the pips, exactly as a plain color pip does.
+    have_pips = {sym: len(positions) for sym, positions in card["mana_cost_jsonb"].items()}
+    cmc = card["cmc"]
+    have_generic = None if cmc is None else max(0, int(cmc) - sum(n for sym, n in have_pips.items() if sym != "X"))
+    if op == ":":
+        if not all(have_pips.get(sym, 0) >= n for sym, n in want_pips.items()):
+            return False
+        return None if have_generic is None else have_generic >= want_generic
+    # "=": the exact same distinct symbols with the same counts, and the same generic.
+    if have_pips != want_pips:
+        return False
+    return None if have_generic is None else have_generic == want_generic
+
+
 def _ref_leaf(frag: str, card: dict[str, Any]) -> bool | None:  # noqa: PLR0911, PLR0912, C901
     """Evaluate one query fragment against one printing row, SQL-ternary style."""
     field, _, rest = frag.partition(":")
@@ -250,31 +293,21 @@ def _ref_leaf(frag: str, card: dict[str, Any]) -> bool | None:  # noqa: PLR0911,
         want: dict[str, int] = {}
         for ch in frag[len("devotion") + 1 :]:
             want[ch.upper()] = want.get(ch.upper(), 0) + 1
-        ge = all(counts.get(c, 0) >= k for c, k in want.items())
-        if op == ":":
-            return ge
-        # "=": exact per-color counts AND no devotion outside the queried colors
-        return all(counts.get(c, 0) == k for c, k in want.items()) and all(c in want for c, n in counts.items() if n > 0)
+        # A devotion query asks about the QUERIED COLORS TAKEN TOGETHER: the measure is the sum of
+        # this card's devotion over the colors the query names, and the target is the number of
+        # SYMBOLS the query wrote (which is the largest per-color count, since a hybrid symbol
+        # raises two colors at once). Measured on api.scryfall.com 2026-08-16 over
+        # `e:khm t:creature`: `devotion:{r}{r}` is 7 and `devotion:{g}{g}` is 8, so a per-lane OR
+        # cannot exceed 15 -- and `devotion:{r/g}{r/g}` is 16.
+        #
+        # A color the query LEFT OUT is not a constraint. Pinning the unqueried colors to zero
+        # under "=" -- which this used to do -- excluded every red card that is also green:
+        # `devotion={r}` is 20 there, and that reading answered 15.
+        measure = sum(counts.get(c, 0) for c in want)
+        symbols = max(want.values())
+        return measure >= symbols if op == ":" else measure == symbols
     if frag.startswith(("mana:", "mana=")):
-        op = frag[len("mana")]
-        want_pips: dict[str, int] = {}
-        for ch in frag[len("mana") + 1 :]:
-            want_pips[ch.upper()] = want_pips.get(ch.upper(), 0) + 1
-        # X contributes 0 to cmc (confirmed on real Scryfall: Fireball {X}{R}
-        # has cmc 1.0, not 2.0) — every other symbol contributes 1.
-        want_cmc = sum(n for sym, n in want_pips.items() if sym != "X")
-        # Unlike devotion, mana: never splits hybrid symbols (they're opaque
-        # keys) and every op ANDs in a cmc compare alongside pip containment.
-        have_pips = {sym: len(positions) for sym, positions in card["mana_cost_jsonb"].items()}
-        cmc = card["cmc"]
-        if op == ":":
-            if not all(have_pips.get(sym, 0) >= n for sym, n in want_pips.items()):
-                return False
-            return None if cmc is None else cmc >= want_cmc
-        # "=": the exact same distinct symbols with the same counts, and the same cmc.
-        if have_pips != want_pips:
-            return False
-        return None if cmc is None else cmc == want_cmc
+        return _ref_mana(frag, card)
     if frag.startswith('!"'):
         return card["card_name"].lower() == frag[2:-1].lower()
     if field == "name":
