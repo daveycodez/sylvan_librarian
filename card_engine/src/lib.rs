@@ -11945,14 +11945,12 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 // per distinct line at bind time and expands to an exact card set. No struct size moves, so the
 // header cannot catch this on its own: a store without the index would answer every `t:` query
 // with zero rows.
-
 //
 // 2026082302 — `o:` DROPS REMINDER TEXT. `oracle_text_lower_id` is now
 // `strip_reminder_text(...)` lowercased rather than a plain `to_lowercase()`, so the interned
 // strings, the oracle trigram index and its word dictionary are all different bytes for the same
 // card — and a reader pairing this code with a pre-strip archive would silently search reminder
 // text again. Nothing about the emitted `oracle_text` changes.
-
 //
 // 2026082303 — `fo:`/`fulloracle:` gets the text `o:` stopped searching. `OracleCard`
 // gains `oracle_full_lower_id`, the lowercase oracle text WITHOUT the reminder strip, so the two
