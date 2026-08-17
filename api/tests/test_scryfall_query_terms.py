@@ -60,7 +60,9 @@ class TestUntouched:
             "name:/^Whenever/ e:khm",
             "cmc>=3 pow>tou",
             "otag:draw atag:forest",
-            "-cn:1 -date:2021 -cmc!=3",
+            # `-cn:1` only. `-date:2021` and `-cmc!=3` used to sit on this line as untouched terms
+            # and they are not -- see TestNegatedComparison below, which measured both.
+            "-cn:1 -r>=rare -c>=2 -produces>=2",
             "m:{2}{R}",
             "r>=rare f:modern lang:ja oracleid:0d5f3b41-1b4d-4d8b-8d4c-3f1b2c9e8a70",
         ],
@@ -117,9 +119,107 @@ class TestNegatedNumericEquality:
             f"Invalid expression \u201c{term}\u201d was ignored. Unknown keyword \u201c{keyword}\u201d.",
         ]
 
-    @pytest.mark.parametrize("query", ["-t:creature e:lea", "-cn:1", "-date:2021", "-cmc!=3", "-cmc>3 e:lea"])
+    @pytest.mark.parametrize("query", ["-t:creature e:lea", "-cn:1", "-o:flying e:khm", "-is:foil e:khm"])
     def test_negation_itself_is_fine(self, query):
-        assert scryfall_term_policy(query).warnings == []
+        result = scryfall_term_policy(query)
+        assert result.warnings == []
+        assert result.query == query
+
+
+# The general case of the class above, measured on api.scryfall.com 2026-08-16 with the anchor
+# `e:khm t:creature` = 151. A row answering 151 is a term that did nothing; see
+# _NEGATION_HONORING_COMPARISONS in query_terms.py for the full 65-row table.
+_ALWAYS = "-cmc<0"
+
+
+class TestNegatedComparison:
+    """A negated comparison is not applied -- it is always-true, and silently so."""
+
+    #   pow>=1 = 146 / -pow>=1 = 151     cmc!=3 = 106 / -cmc!=3 = 151
+    #   tou!=1 = 133 / -tou!=1 = 151     usd>=1 =  28 / -usd>=1 = 151
+    @pytest.mark.parametrize("keyword", ["pow", "power", "tou", "toughness", "cmc", "mv", "loy", "usd", "eur", "tix", "year", "cn"])
+    @pytest.mark.parametrize("operator", [">", ">=", "<", "<=", "!="])
+    def test_every_operator_on_every_column_scryfall_honors_positive(self, keyword, operator):
+        result = scryfall_term_policy(f"-{keyword}{operator}1 e:khm t:creature")
+        assert result.query == f"{_ALWAYS} e:khm t:creature"
+        assert result.warnings == []
+
+    # `name>zzz`, `t>creature` and `nonsense>=1` are all 404 positive -- so the negated form matching
+    # everything is ordinary -- but `-nonsense>=1 e:khm t:creature` is 151 with NO `warnings` key,
+    # where `nonsense:1` is ignored-and-warned. That silence is the assertion.
+    @pytest.mark.parametrize("term", ["-name>zzz", "-o>draw", "-t>creature", "-layout>normal", "-nonsense>=1", "-subtype>=1"])
+    def test_a_text_column_or_an_unknown_keyword_takes_it_too_and_stays_quiet(self, term):
+        result = scryfall_term_policy(f"{term} e:khm")
+        assert result.query == f"{_ALWAYS} e:khm"
+        assert result.warnings == []
+
+    # Each of these is ignored-and-warned unnegated and 151-with-no-warning negated.
+    @pytest.mark.parametrize("term", ["-lang>zz", "-f>notaformat", "-oracleid>abc", "-cmc>=notanumber"])
+    def test_it_runs_before_the_value_validators_because_scryfalls_does(self, term):
+        result = scryfall_term_policy(f"{term} e:khm")
+        assert result.query == f"{_ALWAYS} e:khm"
+        assert result.warnings == []
+
+    # `r>=rare` 52 / `-r>=rare` 99, `c>=2` 19 / `-c>=2` 132, `m>=2` 102 / `-m>=2` 49,
+    # `produces>=2` 5 / `-produces>=2` 146, `devotion>={r}{r}` 7 / negated 144 -- all exact
+    # complements of the 151 anchor, so the boundary is the KEYWORD and not the operator.
+    @pytest.mark.parametrize(
+        "term",
+        [
+            "-c>=2",
+            "-color>=2",
+            "-colors>=2",
+            "-colour>=2",
+            "-colours>=2",
+            "-id>=2",
+            "-identity>=2",
+            "-ci>=2",
+            "-commander>=2",
+            "-r>=rare",
+            "-rarity!=rare",
+            "-m>=2",
+            "-mana!=2",
+            "-produces>=2",
+            "-devotion>={R}{R}",
+        ],
+    )
+    def test_the_set_comparison_columns_negate_correctly_and_must_be_left_alone(self, term):
+        assert scryfall_term_policy(f"{term} e:khm").query == f"{term} e:khm"
+
+    def test_a_parenthesised_group_is_honored_the_fault_is_how_minus_binds_to_a_leaf(self):
+        # `-(cmc>=3) e:khm t:creature` = 39, the complement of `cmc>=3`'s 112, where the bare
+        # `-cmc>=3` = 151.
+        assert scryfall_term_policy("-(cmc>=3) e:khm").query == "-(cmc>=3) e:khm"
+        assert scryfall_term_policy("-(pow>=1 t:god) e:khm").query == "-(pow>=1 t:god) e:khm"
+
+    def test_it_is_a_tautology_not_a_dropped_term_which_only_an_or_can_tell_apart(self):
+        # `(-pow>=1 or t:god) e:khm` = 323, all of Kaldheim; `(t:god) e:khm` = 13, which is what a
+        # REMOVED arm answers. And `-pow>=1` alone is 200 with the whole 33,599-card corpus, where
+        # `-pow:1` alone is the 400 "All of your terms were ignored." -- two different mechanisms.
+        assert scryfall_term_policy("(-pow>=1 or t:god) e:khm").query == f"({_ALWAYS} or t:god) e:khm"
+        alone = scryfall_term_policy("-pow>=1")
+        assert alone.query == _ALWAYS
+        assert alone.all_ignored is False
+        assert alone.warnings == []
+        assert scryfall_term_policy("-pow:1").all_ignored is True
+
+    def test_the_two_mechanisms_coexist_without_borrowing_each_others_sentence(self):
+        # `-pow>=1 -cmc:3 e:khm t:creature` is 151 warning ONLY about `-cmc:3`.
+        result = scryfall_term_policy("-pow>=1 -cmc:3 e:khm")
+        assert result.query == f"{_ALWAYS} e:khm"
+        assert result.warnings == [
+            "Invalid expression \u201c-cmc:3\u201d was ignored. The value must be a number, or \u201ceven\u201d/\u201codd\u201d",
+        ]
+
+    # Measured with values that separate all three readings: `date>=2022` = 11 and `-date>=2022` = 11
+    # (honored would be 140, dropped would be the anchor's 151); `date<2022` = 141 = `-date<2022`.
+    # `year`, the same column under another name, takes the tautology instead -- `year>=2022` = 11,
+    # `-year>=2022` = 151 -- which the first test pins.
+    @pytest.mark.parametrize("operator", [">", ">=", "<", "<=", "!=", ":", "="])
+    def test_date_discards_the_minus_instead_every_operator_included(self, operator):
+        result = scryfall_term_policy(f"-date{operator}2021 e:khm")
+        assert result.query == f"date{operator}2021 e:khm"
+        assert result.warnings == []
 
 
 class TestValues:

@@ -97,14 +97,131 @@ _DIRECTIVE_KEYWORDS = frozenset({"unique", "order", "sort", "dir", "direction", 
 # Measured (`-<kw>:<value>` alone, so the answer is the 400 that carries the whole warning):
 # `-cmc:3`, `-mv:3`, `-manavalue:3` earn the value sentence; `-pow:1`, `-power:1`, `-tou:1`,
 # `-toughness:1`, `-loy:3`, `-loyalty:3`, `-usd:0`, `-eur:0`, `-tix:0`, `-year:1993` earn "Unknown
-# keyword" WITH THE MINUS INSIDE THE QUOTES. `-cn:1`, `-number:1`, `-date:2021` and `-cmc!=3` are
-# all honored, so this is equality-and-these-columns rather than negation.
+# keyword" WITH THE MINUS INSIDE THE QUOTES. `-cn:1` and `-number:1` are honored -- `cn:` is the
+# STRING collector-number column, and only its integer twin `cn>=` is caught by the rule below -- so
+# this table is equality-and-these-columns rather than negation as such.
+#
+# THIS COMMENT USED TO CLAIM `-date:2021` AND `-cmc!=3` WERE HONORED TOO. Both claims were wrong,
+# and re-measuring them is what produced the two tables below: `-cmc!=3 e:khm t:creature` is 151,
+# the unfiltered anchor, where `cmc!=3` is 106; and `-date:2021` is 141, exactly what the UNNEGATED
+# `date:2021` answers. Neither is honored; they are simply quiet about it, which is why a comment
+# could carry the error.
 _NEGATED_EQUALITY_UNKNOWN_KEYWORD = frozenset({"pow", "power", "tou", "toughness", "loy", "loyalty", "usd", "eur", "tix", "year"})
 
 # The mana-value spellings, whose negated equality earns the value sentence instead.
 _MANA_VALUE_KEYWORDS = frozenset({"cmc", "mv", "manavalue"})
 
 _MANA_VALUE_REASON = "The value must be a number, or \u201ceven\u201d/\u201codd\u201d"
+
+# A LEADING `-` ON A COMPARISON LEAF IS NOT APPLIED BY SCRYFALL. The term becomes always-true.
+#
+# This is the general case of the table above, and it is SILENT -- no warning, no 400, nothing in
+# the response that says a term was not applied. That silence is why it went unnoticed while the
+# equality half, which announces itself, has been implemented here since the policy was written.
+#
+# --- THE MEASUREMENT ---------------------------------------------------------
+#
+# Anchor `e:khm t:creature` = 151, one request per row, api.scryfall.com 2026-08-16. A row that
+# answers 151 is a term that did nothing:
+#
+#              positive   negated                  positive   negated
+#   pow>=1        146       151        year>=2022      11        151
+#   pow>1         125       151        year!=2021      11        151
+#   tou>=1        150       151        cn>=100        112        151
+#   tou!=1        133       151        edhrec>=5000   112        151
+#   pt>=3         141       151        artists>=2       0        151
+#   cmc>=3        112       151        paperprints>=2  87        151
+#   cmc!=3        106       151        papersets>=2    86        151
+#   loy>=3          1       151        pow>=tou       106        151
+#   usd>=1         28       151        cmc>=notanumber  0        151
+#   eur>=1         27       151
+#
+# All five of `>` `>=` `<` `<=` `!=` were probed on each of pow, tou, cmc, loy, usd, eur, tix, year,
+# cn, edhrec, artists, paperprints, papersets -- 65 rows, every one of them 151.
+#
+# --- IT IS A TAUTOLOGY, NOT A DROPPED TERM -----------------------------------
+#
+# The distinction decides the implementation, because the two differ under `or`:
+#
+#   -pow>=1                       200, 33,599 -- the WHOLE corpus, no warnings
+#   -pow:1                        400 "All of your terms were ignored." + its warning
+#   (-pow>=1 or t:god) e:khm      323 -- all of Kaldheim
+#   (t:god) e:khm                  13 -- what a REMOVED arm would have answered
+#   (-pow:1 or t:god) e:khm        13 + its warning -- the ignore machinery really does remove
+#
+# So this cannot be routed through the ignore machinery: the term survives as a leaf that matches
+# everything. `-pow>=1 f:notaformat e:khm t:creature` is 151 warning ONLY about `f:notaformat`,
+# which pins that the two mechanisms coexist without borrowing each other's sentence.
+#
+# --- WHERE THE RULE STOPS ----------------------------------------------------
+#
+# `-( ... )` is honored throughout -- `-(cmc>=3) e:khm t:creature` is 39, the complement of
+# `cmc>=3`'s 112, where the bare `-cmc>=3` is 151. The fault is in how `-` binds to a comparison
+# LEAF, not in negation.
+#
+# And the set-comparison columns negate correctly, which is what makes this a table of keywords
+# rather than a rule about the operator (positive, negated, and 151 minus the positive):
+#
+#   r>=rare       52   99 ok     c>=2        19  132 ok     m>=2      102   49 ok
+#   r!=rare      114   37 ok     c!=2       135   16 ok     m!=2      151    0 ok
+#   rarity>=rare  52   99 ok     colour>=2   19  132 ok     produces>=2 5  146 ok
+#                                id>=2       19  132 ok     devotion>={r}{r} 7 144 ok
+#
+# Every alias of those columns was probed and agrees (`color colors colour colours`,
+# `id identity ci commander`, `r rarity`, `m mana`). The upstream-only spellings
+# `color_identity`/`coloridentity` are deliberately NOT here: Scryfall does not know them, so on
+# Scryfall they take the tautology like any other unknown keyword -- and _NOT_SCRYFALL_KEYWORDS
+# drops them before this rule is reached anyway.
+#
+# On a TEXT column or an unknown keyword the positive comparison already matches nothing
+# (`name>zzz`, `t>creature`, `nonsense>=1` are all 404 with no warning), so the negated form
+# matching everything is ordinary boolean negation rather than a fault -- but the answer to
+# reproduce is the same tautology, and routing those through here is what stops
+# `-nonsense>=1 e:khm t:creature` emitting an unknown-keyword warning Scryfall does not (measured:
+# 151, `warnings` absent). It is also why this runs BEFORE the value validators: `-lang>zz`,
+# `-f>notaformat` and `-oracleid>abc` are 151 with no warning where their unnegated twins are
+# ignored-and-warned.
+_NEGATION_HONORING_COMPARISONS = frozenset(
+    {
+        "c",
+        "color",
+        "colors",
+        "colour",
+        "colours",
+        "id",
+        "identity",
+        "ci",
+        "commander",
+        "r",
+        "rarity",
+        "m",
+        "mana",
+        "produces",
+        "devotion",
+    }
+)
+
+# `date` is the third behaviour: the `-` is DISCARDED and the term applied POSITIVELY.
+#
+# Not dropped (that would answer the anchor's 151) and not honored (that would answer the
+# complement) -- measured on every operator, with values chosen so the three readings differ:
+#
+#                     positive   negated   honored would be
+#   date>=2022           11        11            140
+#   date<2022           141       141             11
+#   date>2021            11        11            141
+#   date<=2021          141       141             11
+#   date!=2021           11        11            141
+#   date:2021           141       141             11
+#   date=2021           141       141             11
+#
+# `year`, the other spelling of the same underlying column, does NOT do this: `year>=2022` is 11 and
+# `-year>=2022` is 151, the ordinary tautology above. Two keywords onto one column, two different
+# faults -- which is why this is a keyword table and not a column one.
+#
+# `-(date>2021) e:khm t:creature` is 141, the honest complement of 11, so this too is the leaf
+# binding rather than negation.
+_DATE_KEYWORDS = frozenset({"date"})
 
 # `f:`/`format:`/`legal:`/`banned:`/`restricted:` -- Scryfall's game formats. The `legalities` key
 # set of a live card object, plus the search-only spellings measured as honored. `pauperedh` and
@@ -283,6 +400,8 @@ _KNOWN_KEYWORDS = (
     | _DIRECTIVE_KEYWORDS
     | _MANA_VALUE_KEYWORDS
     | _NEGATED_EQUALITY_UNKNOWN_KEYWORD
+    | _NEGATION_HONORING_COMPARISONS
+    | _DATE_KEYWORDS
     | _FORMAT_KEYWORDS
     | _LANGUAGE_KEYWORDS
     | _RARITY_KEYWORDS
@@ -317,6 +436,18 @@ _EXPRESSION_ECHO_LIMIT = 20
 # never negative, so this leaf is empty by arithmetic rather than by a special node type, and it
 # composes correctly under `-` and `or` the way a dropped term would not.
 _NEVER_MATCHES = "cmc<0"
+
+# A term that always matches, substituted for a negated comparison Scryfall does not apply.
+#
+# The negation of `_NEVER_MATCHES` rather than a positive tautology such as `cmc>=0`, because the
+# two are not the same term over a column that can be absent: `cmc>=0` asks the index for rows whose
+# mana value compares, and the complement of the empty set is every row including those. It is also
+# the cheaper of the two -- the engine builds the empty leaf and complements it, where `cmc>=0` is a
+# full range scan.
+#
+# `_classify_leaf`'s output is spliced into the rebuilt query and never re-classified, so this
+# spelling being itself a negated comparison costs nothing; it is idempotent regardless.
+_ALWAYS_MATCHES = f"-{_NEVER_MATCHES}"
 
 # The operators whose characters do NOT stay on the word when the value is missing. See
 # _dangling_operator_term.
@@ -656,6 +787,28 @@ def _is_unknown_keyword(keyword: str) -> bool:
     return keyword not in _KNOWN_KEYWORDS and keyword not in _SCRYFALL_ONLY_KEYWORDS
 
 
+def _unapplied_negation(negated: bool, equality: bool, keyword: str, term: str) -> str | None:
+    """What a leading `-` Scryfall does not apply leaves behind, or None when it is applied.
+
+    Args:
+        negated: Whether the term carried a leading `-`.
+        equality: Whether the operator is `:` or `=`, which the table above already covers.
+        keyword: The lowercased keyword.
+        term: The raw text of the term, as the client wrote it.
+
+    Returns:
+        The text the rebuilt query carries in place of `term`, or None to leave the term alone.
+        See _NEGATION_HONORING_COMPARISONS and _DATE_KEYWORDS for the measurements.
+    """
+    if not negated:
+        return None
+    if keyword in _DATE_KEYWORDS:
+        return term[1:]
+    if not equality and keyword not in _NEGATION_HONORING_COMPARISONS:
+        return _ALWAYS_MATCHES
+    return None
+
+
 def _classify_leaf(term: str) -> tuple[bool, str, str | None]:
     """Decide what becomes of one leaf term.
 
@@ -681,10 +834,18 @@ def _classify_leaf(term: str) -> tuple[bool, str, str | None]:
     if raw_value == "":
         return True, _dangling_operator_term(negated, match.group(2), operator), None
 
+    equality = operator in {":", "="}
+
+    # BEFORE the unknown-keyword rule and before every value validator, because Scryfall applies it
+    # there: `-nonsense>=1`, `-subtype>=1`, `-lang>zz`, `-f>notaformat` and `-oracleid>abc` are all
+    # the anchor's 151 with an ABSENT `warnings` key, where each unnegated twin is
+    # ignored-and-warned.
+    unapplied_negation = _unapplied_negation(negated, equality, keyword, term)
+    if unapplied_negation is not None:
+        return True, unapplied_negation, None
+
     if _is_unknown_keyword(keyword):
         return False, term, f"Unknown keyword \u201c{'-' if negated else ''}{keyword}\u201d."
-
-    equality = operator in {":", "="}
 
     if negated and equality:
         if keyword in _MANA_VALUE_KEYWORDS:
