@@ -2236,14 +2236,32 @@ impl FilterExpr {
                 // WHAT THIS STILL DOES NOT REPRODUCE, measured rather than assumed. The real
                 // quantity is the number of PIPS that are red or green, and the sum double-counts
                 // the one pip that is both: a `{R/G}` symbol adds 1 to each lane but is one pip.
-                // Burning-Tree Emissary ({R/G}{R/G}) answers `devotion:{r/g}{r/g}` on Scryfall and
-                // NOT `devotion:{r/g}{r/g}{r/g}`, so its combined devotion is 2 there and 4 here.
+                //
+                // TWO CARDS SETTLE THE MEASURE AND THEY PULL OPPOSITE WAYS, which is why neither
+                // the sum nor a per-lane max is the rule. Both have a Scryfall combined devotion
+                // of exactly 2 (each matches `devotion:{r/g}{r/g}` and neither matches
+                // `{r/g}{r/g}{r/g}`), measured 2026-08-16:
+                //
+                //             cost         lanes      distinct pips   sum   max
+                //   Svella,   {1}{R}{G}    r=1 g=1          2          2     1
+                //   Burning-  {R/G}{R/G}   r=2 g=2          2          4     2
+                //   Tree Em.
+                //
+                // The SUM is right for Svella and wrong for Burning-Tree; a MAX is the reverse.
+                // Only the count of DISTINCT pips matching either queried color fits both, and
+                // that is a third quantity, not a choice between these two. The sum is taken
+                // because it is exact for every card carrying no hybrid pip of the queried pair —
+                // which is all but 61 cards for {R/G}, 58 for {W/U}, 64 for {B/G}.
+                //
+                // The per-color lanes themselves are NOT the approximation and need no correcting:
+                // Burning-Tree answers `devotion:{r}{r}` and `devotion:{g}{g}` on Scryfall, and so
+                // does this. It is only the measure ACROSS two queried lanes that is approximate.
+                //
                 // Correcting it needs the count of {R/G} pips in the card's own cost — the leaf
                 // has the per-color lanes and no per-hybrid-symbol count, and the devotion PLANES
                 // (two saturating bits per color) cannot hold one either, so this is a store and
-                // node change rather than an arithmetic one. It is wrong only for cards that carry
-                // a hybrid pip of the queried pair (61 cards for {R/G}); the per-lane OR it
-                // replaced was wrong for every card with pips in two queried colors.
+                // node change rather than an arithmetic one. The per-lane containment it replaced
+                // was wrong for EVERY card with pips in two queried colors.
                 //
                 // A SECOND, SEPARATE RESIDUAL on Scryfall's side: `=` and `!=` with a hybrid value
                 // never match a card whose cost carries that hybrid pip. `devotion={r/g} m:{r/g}`
@@ -2255,9 +2273,20 @@ impl FilterExpr {
                 let d = u64::from(card.mana_cost.devotion);
                 // The card's devotion to the queried colors TOGETHER, against the number of
                 // symbols the query asked for. A lane the query leaves at zero contributes
-                // nothing — including the vacuous all-zero query, which the parser cannot produce
-                // (a devotion value that is not a single color or a hybrid is ignored-and-warned
-                // before the engine sees it) and which lands here as measure 0 against want 0.
+                // nothing — including the vacuous all-zero query, which lands here as measure 0
+                // against want 0.
+                //
+                // The two sides use DIFFERENT reductions and both are deliberate. `measure` sums
+                // the card's lanes (the approximation above). `want` takes the MAX of the query's
+                // lanes, because a query lane counts SYMBOLS: `{r/g}{r/g}` sets r=2 and g=2 and
+                // asks for two, not four. Max is exact over the whole domain Scryfall honors,
+                // since a single color has one nonzero lane and a hybrid's two lanes are equal by
+                // construction. Outside that domain there is nothing to be exact about: a
+                // multi-color PLAIN value is REFUSED rather than answered — `devotion:{r}{g}`
+                // comes back with the whole corpus and the warning "Invalid expression … was
+                // ignored. Devotion can only match single color or hybrid mana." (measured
+                // 2026-08-16: `e:khm t:creature devotion:{r}{g}` is all 151 creatures, and
+                // `e:khm t:instant devotion:{r}{g}` is all 36 instants).
                 let mut measure: u32 = 0;
                 let mut want: u8 = 0;
                 for c in 0..6 {

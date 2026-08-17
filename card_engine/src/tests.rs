@@ -13236,3 +13236,86 @@ fn equals_is_a_synonym_for_colon_on_text_and_collection_columns() {
         _ => panic!("m= must build a ManaCostCmp"),
     }
 }
+
+// THE HYBRID RESIDUAL, PINNED WITH THE TWO CARDS THAT SETTLE THE MEASURE.
+//
+// Both have a Scryfall combined R/G devotion of exactly 2 — each matches `devotion:{r/g}{r/g}`
+// and neither matches `devotion:{r/g}{r/g}{r/g}` (api.scryfall.com, 2026-08-16) — and they pull
+// the model in opposite directions:
+//
+//                                cost         lanes      distinct pips   sum   max
+//   Svella, Ice Shaper           {1}{R}{G}    r=1 g=1          2          2     1
+//   Burning-Tree Emissary        {R/G}{R/G}   r=2 g=2          2          4     2
+//
+// So NEITHER a summed measure nor a per-lane max is Scryfall's rule; the quantity is the number
+// of DISTINCT pips matching either queried color, which the store cannot express (the leaf holds
+// per-color lanes and no per-hybrid-symbol count, and the devotion planes hold two saturating
+// bits per color). The sum is taken because it is exact for every card carrying no hybrid pip of
+// the queried pair, and Svella is that case.
+//
+// This test records where the two part company, so a later correction cannot quietly break the
+// Svella direction while fixing the Burning-Tree one: the day the residual is closed, the four
+// `known_divergence` rows flip and this test fails loudly.
+#[test]
+fn a_hybrid_pip_of_the_queried_pair_is_the_known_devotion_residual() {
+    let mut vocab = VocabInterner::new();
+    let mut mana_vocab: Vec<String> = Vec::new();
+    let costs: &[&[(&str, u8)]] = &[&[("R", 1), ("G", 1)], &[("R/G", 2)]];
+    let cards: Vec<OracleCard> = costs
+        .iter()
+        .enumerate()
+        .map(|(i, &pips)| {
+            let mut c = stub_card(i as u128 + 1, TYPE_CREATURE, &[], &mut vocab);
+            c.mana_cost = mana_cost_of(pips, &mut mana_vocab);
+            let mut ident = 0u8;
+            for (lane, sym) in ["W", "U", "B", "R", "G"].iter().enumerate() {
+                if super::lane_get(c.mana_cost.devotion, lane) > 0 {
+                    ident |= super::color_list_to_mask(&[sym]);
+                }
+            }
+            c.card_color_identity = ident;
+            c
+        })
+        .collect();
+    let mut data = store_of(cards, &[1usize; 2], vocab);
+    data.mana_vocab = mana_vocab;
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+
+    // A hybrid query value reaches the engine as BOTH lanes raised — that expansion is the
+    // parser's, and it is what makes the query side's max a symbol count.
+    let hybrid_rg = |n: u8| FilterExpr::Devotion { op: CmpOp::Ge, pips: packed_pips(&[("R", n), ("G", n)]) };
+    let hits = |f: &FilterExpr| -> Vec<usize> {
+        archived
+            .cards
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| f.eval_card(c, &archived.strings) == Tri::True)
+            .map(|(i, _)| i)
+            .collect()
+    };
+    const SVELLA: usize = 0;
+    const BURNING_TREE: usize = 1;
+
+    // AGREES WITH SCRYFALL: both cards at one and two symbols, neither above their real devotion
+    // in the single-color lanes.
+    assert_eq!(hits(&hybrid_rg(1)), [SVELLA, BURNING_TREE], "devotion:{{r/g}} — both, and Scryfall answers both");
+    assert_eq!(hits(&hybrid_rg(2)), [SVELLA, BURNING_TREE], "devotion:{{r/g}}{{r/g}} — both, and Scryfall answers both");
+    // The per-color lanes are exact and are NOT what is approximate here: Burning-Tree answers
+    // `devotion:{r}{r}` and `devotion:{g}{g}` on Scryfall, and Svella answers neither.
+    for sym in ["R", "G"] {
+        let f = FilterExpr::Devotion { op: CmpOp::Ge, pips: packed_pips(&[(sym, 2)]) };
+        assert_eq!(hits(&f), [BURNING_TREE], "devotion:{{{sym}}}{{{sym}}} is a single-lane query and stays exact");
+    }
+
+    // KNOWN DIVERGENCE: Scryfall answers NEITHER card at three symbols or more. Svella agrees
+    // because its summed measure (2) is its distinct-pip count; Burning-Tree does not, because
+    // the sum counts each {R/G} symbol twice and reaches 4.
+    for n in 3..=4u8 {
+        assert_eq!(
+            hits(&hybrid_rg(n)),
+            [BURNING_TREE],
+            "devotion:{{r/g}}x{n}: Scryfall answers nothing, and only the hybrid-pip card diverges"
+        );
+    }
+}
