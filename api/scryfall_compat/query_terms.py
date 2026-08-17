@@ -223,6 +223,106 @@ _NEGATION_HONORING_COMPARISONS = frozenset(
 # binding rather than negation.
 _DATE_KEYWORDS = frozenset({"date"})
 
+# THE KEYWORDS SCRYFALL ACTUALLY IMPLEMENTS `>` `>=` `<` `<=` `!=` FOR. Everything else -- a text
+# column this parser knows, a directive, or a keyword nobody knows -- is HONORED AND MATCHES
+# NOTHING under those five operators, silently.
+#
+# --- THE ENUMERATION ---------------------------------------------------------------------------
+#
+# Not reasoned about: every alias in `DB_COLUMNS` and every directive name was probed as
+# `<alias>>=0 e:khm t:creature` against api.scryfall.com, 2026-08-16, one request each. `>=0` is the
+# discriminator because it is satisfiable on every numeric column, so a 404 means the comparison did
+# not happen rather than that it happened and found nothing. 78 rows fell into three classes:
+#
+#   COMPARES (200, a real count)
+#     c ci color colors colour colours commander id identity   151 (colour count)
+#     cmc mv manavalue m mana                                  151
+#     pow power tou toughness                                  151
+#     cn number year                                           151
+#     usd eur tix                                              141
+#     loy loyalty                                                1
+#     produces                                                 151
+#
+#   COMPARES, AND CHECKS ITS VALUE (200 + an ignored-term warning on a bad value)
+#     r rarity        `Unknown rarity "0."`
+#     date            `Invalid date or unknown set code "0"`
+#     devotion        `Devotion can only match single color or hybrid mana.`
+#
+#   MATCHES NOTHING (404, and NO `warnings` key)
+#     a art artist arttag atag banned border e s set f format legal restricted flavor fo ft
+#     fulloracle function frame has is keyword kw lang language layout name o oracle oracle_id
+#     oracleid oracletag otag set_type settype st t type watermark wm
+#     unique sort order direction dir prefer            (the directive names take it too)
+#     nonsense                                          (and so does any unknown keyword)
+#
+# --- WHY IT IS ONE RULE AND NOT TWO ------------------------------------------------------------
+#
+# The unknown-keyword case and the text-column case reach the same answer by the same route, and the
+# pairs that separate them are the proof:
+#
+#   nonsense:1   200, 151 + `Unknown keyword "nonsense".`   nonsense>=1   404, no warning
+#   t:creature   200, 151                                   t>creature    404, no warning
+#   f:notaformat 200, 151 + `Unknown game format`           f>notaformat  404, no warning
+#   lang:zz      200, 151 + `Unknown language `zz``         lang>zz       404, no warning
+#
+# Under `:`/`=` each of those runs a validator and ignores the term; under a comparison NONE of them
+# does, and the term survives matching nothing. So this must run BEFORE the unknown-keyword rule and
+# before every value validator -- a comparison never reaches them.
+#
+# `nonsense>1`, `nonsense<1`, `nonsense<=1` and `nonsense!=1` are all the same 404, so it is the
+# whole comparison family and not `>=` alone.
+#
+# --- WHAT IS DELIBERATELY NOT IN THE SET -------------------------------------------------------
+#
+# `edhrec`, `artists`, `paperprints`, `papersets` and `pt` are numeric columns Scryfall compares
+# (`edhrec>=5000 e:khm t:creature` = 112) and this parser has no spelling for. They are not in
+# _SCRYFALL_ONLY_KEYWORDS either, so they were already being reported as unknown keywords; under
+# this rule they answer the 404 an unknown keyword answers instead of the 151 the ignore machinery
+# answered. Both are wrong against Scryfall's count, and putting them in the set would be worse -- a
+# term kept for a keyword the parser cannot lex is a 400.
+_COMPARABLE_KEYWORDS = frozenset(
+    {
+        # colour and colour-identity counts
+        "c",
+        "color",
+        "colors",
+        "colour",
+        "colours",
+        "ci",
+        "id",
+        "identity",
+        "commander",
+        "produces",
+        # mana
+        "m",
+        "mana",
+        "devotion",
+        # numeric columns
+        "cmc",
+        "mv",
+        "manavalue",
+        "pow",
+        "power",
+        "tou",
+        "toughness",
+        "loy",
+        "loyalty",
+        "usd",
+        "eur",
+        "tix",
+        "cn",
+        "number",
+        "year",
+        # ordered enums / dates
+        "r",
+        "rarity",
+        "date",
+    }
+)
+
+# The five operators the table above is about; `:` and `=` are the other, older mechanism.
+_COMPARISON_OPERATORS = frozenset({">", ">=", "<", "<=", "!="})
+
 # `f:`/`format:`/`legal:`/`banned:`/`restricted:` -- Scryfall's game formats. The `legalities` key
 # set of a live card object, plus the search-only spellings measured as honored. `pauperedh` and
 # `frontier` are NOT among them -- both come back ignored-and-warned, which makes this a measured
@@ -382,6 +482,14 @@ _PRODUCES_NAMES = _COLOR_NAMES - {"colorless", "colourless", "brown"}
 _COLOR_LETTERS = "wubrgcm"
 _COLORED_LETTERS = "wubrg"
 
+_DEVOTION_KEYWORDS = frozenset({"devotion"})
+
+# Colour letters, and the rest of the alphabet a mana symbol may be spelled from.
+_DEVOTION_COLORS = "wubrg"
+_MANA_SYMBOL_PARTS = frozenset("wubrgcsxyzp")
+
+_DEVOTION_REASON = "Devotion can only match single color or hybrid mana."
+
 _FORMAT_KEYWORDS = frozenset({"f", "format", "legal", "banned", "restricted"})
 _LANGUAGE_KEYWORDS = frozenset({"lang", "language"})
 _RARITY_KEYWORDS = frozenset({"r", "rarity"})
@@ -401,6 +509,7 @@ _KNOWN_KEYWORDS = (
     | _MANA_VALUE_KEYWORDS
     | _NEGATED_EQUALITY_UNKNOWN_KEYWORD
     | _NEGATION_HONORING_COMPARISONS
+    | _COMPARABLE_KEYWORDS
     | _DATE_KEYWORDS
     | _FORMAT_KEYWORDS
     | _LANGUAGE_KEYWORDS
@@ -647,6 +756,69 @@ def _color_reason(value: str, keyword: str) -> str | None:
     return None
 
 
+def _devotion_reason(value: str) -> str | None:
+    """Why Scryfall refuses this devotion value, or None when it accepts it.
+
+    `devotion:` takes ONE colour, repeated -- or one hybrid PAIR, repeated. Anything else is
+    ignored-and-warned, in both polarities and under every operator, in two different sentences
+    depending on whether Scryfall recognised the symbol at all. Measured against api.scryfall.com
+    2026-08-16, anchor `e:khm t:creature` = 151::
+
+        HONORED    {r} 27   {R} 27   r 27   {r}{r} 7   rr 7   {r}{r}{r} 404 (nothing that deep)
+                   {r/g} 62   {g/r} 62   {r/g}{r/g} 16   {r/g}{g/r} 16
+
+        "Devotion can only match single color or hybrid mana."
+                   {w}{u}   {r}{g}   rg          two different colours
+                   {r}{r/g}                      a colour and a hybrid do not mix
+                   {c} {s} {x} {1}               recognized symbols that are not a colour
+                   {2/r} {r/p}                   hybrids with a non-colour half
+                   2                             any non-symbol value
+
+        "Unknown mana symbols \u201c<VALUE, UPPERCASED>\u201d."
+                   {p} -> "{P}"    {} -> "{}"    notmana -> "NOTMANA"
+
+    So `{c}`, `{s}`, `{x}`, `{1}`, `{2/r}` and `{r/p}` ARE mana symbols and simply are not devotion,
+    while a lone `{p}` and an empty `{}` are not symbols at all. Order-insensitivity of the hybrid
+    pair is measured, not assumed: `{g/r}` and `{r/g}` answer the same 62, and mixing the two
+    spellings in one value answers the same 16 as either alone.
+
+    Args:
+        value: The value with one layer of quotes removed.
+
+    Returns:
+        Scryfall's sentence, or None.
+    """
+    lower = value.lower()
+    unknown = f"Unknown mana symbols \u201c{value.upper()}\u201d."
+    if lower.startswith("{"):
+        # `{a}{b}{c}` -- anything that is not a closed brace group makes the whole value unreadable.
+        groups = re.findall(r"\{[^{}]*\}", lower)
+        if "".join(groups) != lower:
+            return unknown
+        symbols = [group[1:-1] for group in groups]
+    else:
+        symbols = list(lower)
+    if not symbols:
+        return unknown
+    signatures = set()
+    for symbol in symbols:
+        parts = symbol.split("/")
+        # A symbol Scryfall does not know at all: an empty group, or a part outside the mana
+        # alphabet. A LONE `p` is in that class too -- `{p}` is "Unknown mana symbols", where
+        # `{r/p}` is a symbol Scryfall knows and rejects for devotion.
+        if any(part not in _MANA_SYMBOL_PARTS and not part.isdigit() for part in parts):
+            return unknown
+        if parts == ["p"]:
+            return unknown
+        # Known, but devotion counts colour pips only: every half must be a colour.
+        if not all(part in _DEVOTION_COLORS for part in parts):
+            return _DEVOTION_REASON
+        signatures.add("".join(sorted(set(parts))))
+    if len(signatures) > 1:
+        return _DEVOTION_REASON
+    return None
+
+
 def _unquote(value: str) -> str:
     """Strip one layer of matching quotes, so a validator reads the value the lexer would."""
     if len(value) >= _DELIMITED_MINIMUM and value[0] in "\"'" and value.endswith(value[0]):
@@ -844,6 +1016,19 @@ def _classify_leaf(term: str) -> tuple[bool, str, str | None]:
     if unapplied_negation is not None:
         return True, unapplied_negation, None
 
+    # BEFORE the unknown-keyword rule and before every value validator, because Scryfall's
+    # comparison operators reach neither. A keyword outside _COMPARABLE_KEYWORDS -- a text column, a
+    # directive name, or a keyword nobody knows -- is HONORED and matches nothing under `>` `>=` `<`
+    # `<=` `!=`, with no `warnings` key at all. `nonsense>=1`, `t>creature`, `f>notaformat`,
+    # `lang>zz`, `oracleid>abc` and `is>foil` are one 404 each; their `:` twins are all
+    # ignored-and-warned. See _COMPARABLE_KEYWORDS for the 78-row enumeration.
+    #
+    # The _SCRYFALL_ONLY exemption inside _is_unknown_keyword does not apply here: it exists so a
+    # keyword Scryfall honors is not silently dropped, and this rule drops nothing -- it answers
+    # Scryfall's own empty result.
+    if operator in _COMPARISON_OPERATORS and keyword not in _COMPARABLE_KEYWORDS:
+        return True, _NEVER_MATCHES, None
+
     if _is_unknown_keyword(keyword):
         return False, term, f"Unknown keyword \u201c{'-' if negated else ''}{keyword}\u201d."
 
@@ -865,21 +1050,22 @@ def _classify_leaf(term: str) -> tuple[bool, str, str | None]:
             return False, term, f"Unknown keyword \u201c{keyword}\u201d."
         return True, _NEVER_MATCHES, None
 
-    reason = _value_reason(keyword, equality, value, raw_value)
+    reason = _value_reason(keyword, value, raw_value)
     if reason is not None:
         return False, term, reason
     return True, term, None
 
 
-def _value_reason(keyword: str, equality: bool, value: str, raw_value: str) -> str | None:
+def _value_reason(keyword: str, value: str, raw_value: str) -> str | None:
     """Why Scryfall refuses this keyword's VALUE, or None when it accepts it.
 
     Split out of `_classify_leaf` so each half stays readable: that one decides which RULE applies
-    to a term, this one applies the per-keyword vocabularies.
+    to a term, this one applies the per-keyword vocabularies. It no longer takes the operator: the
+    comparison rule in `_classify_leaf` answers every keyword Scryfall does not compare before this
+    is reached, and the keywords that DO reach it check their value under every operator alike.
 
     Args:
         keyword: The lowercased keyword before the operator.
-        equality: Whether the operator was `:` or `=` rather than a comparison.
         value: The value with one layer of quotes removed.
         raw_value: The value exactly as written, so a regex literal keeps its slashes.
 
@@ -890,9 +1076,19 @@ def _value_reason(keyword: str, equality: bool, value: str, raw_value: str) -> s
         return f"Unknown game format \u201c{value}\u201d"
     if keyword in _LANGUAGE_KEYWORDS and value.lower() not in _SCRYFALL_LANGUAGES:
         return f"Unknown language `{value}`"
-    if keyword in _RARITY_KEYWORDS and equality and value.lower() not in _SCRYFALL_RARITIES:
+    # EVERY operator, not only `:`/`=`. Rarity is an ordered enum, so `r>rare` is a comparison
+    # Scryfall really performs -- and it checks the value under a comparison exactly as it does under
+    # equality. Measured, anchor `e:khm t:creature` = 151: `r:notarare`, `r=notarare`, `r>notarare`,
+    # `r>=notarare`, `r<notarare` and `r!=notarare` are all 151 carrying `Unknown rarity
+    # "notarare."`, and `rarity>=0` is 151 carrying `Unknown rarity "0."`.
+    if keyword in _RARITY_KEYWORDS and value.lower() not in _SCRYFALL_RARITIES:
         # The full stop INSIDE the quotes is Scryfall's, not a typo here.
         return f"Unknown rarity \u201c{value}.\u201d"
+    # Devotion checks its value under every operator and in both polarities -- see _devotion_reason.
+    if keyword in _DEVOTION_KEYWORDS:
+        devotion_reason = _devotion_reason(value)
+        if devotion_reason is not None:
+            return devotion_reason
     if keyword in _ORACLE_ID_KEYWORDS and not _UUID_V4_RE.match(value):
         return "You must provide a valid v4 UUID."
     if keyword in _COLOR_KEYWORDS:

@@ -105,6 +105,107 @@ class TestUnknownKeywords:
         assert scryfall_term_policy(f"{keyword}:x e:khm").warnings == []
 
 
+class TestComparisonScryfallDoesNotImplement:
+    """A comparison operator on a keyword Scryfall does not compare is honored and matches nothing.
+
+    ONE rule, not two. An unknown keyword under `>` `>=` `<` `<=` `!=` and a TEXT column under the
+    same five reach the same answer by the same route: the term is kept, it matches nothing, and
+    there is no `warnings` key at all. Under `:`/`=` both run a validator and are ignored-and-warned
+    instead, which is the pair that separates the two mechanisms::
+
+        nonsense:1   151 + `Unknown keyword "nonsense".`   nonsense>=1   404, no warning
+        t:creature   151                                   t>creature    404, no warning
+        f:notaformat 151 + `Unknown game format`           f>notaformat  404, no warning
+        lang:zz      151 + `Unknown language `zz``         lang>zz       404, no warning
+
+    The boundary is a KEYWORD table, enumerated rather than guessed: every alias in DB_COLUMNS and
+    every directive name was probed as `<alias>>=0 e:khm t:creature` against api.scryfall.com on
+    2026-08-16. See _COMPARABLE_KEYWORDS for the three classes the 78 rows fell into.
+    """
+
+    @pytest.mark.parametrize("operator", [">", ">=", "<", "<=", "!="])
+    def test_an_unknown_keyword_under_a_comparison_is_not_the_ignore_machinery(self, operator):
+        result = scryfall_term_policy(f"nonsense{operator}1 e:khm t:creature")
+        assert result.warnings == []
+        assert result.query == "cmc<0 e:khm t:creature"
+
+    @pytest.mark.parametrize("operator", [":", "="])
+    def test_and_under_equality_it_still_is(self, operator):
+        assert scryfall_term_policy(f"nonsense{operator}1 e:khm").warnings == [
+            f"Invalid expression \u201cnonsense{operator}1\u201d was ignored. Unknown keyword \u201cnonsense\u201d.",
+        ]
+
+    @pytest.mark.parametrize("term", ["t>creature", "t!=creature", "o!=flying", "name!=a", "a>guay", "ft>zzz", "wm>zzz"])
+    def test_a_text_column_under_a_comparison_matches_nothing(self, term):
+        result = scryfall_term_policy(f"{term} e:khm")
+        assert result.warnings == []
+        assert result.query == "cmc<0 e:khm"
+
+    @pytest.mark.parametrize("term", ["t:creature", "o:flying", "name:a", "t=creature"])
+    def test_the_equality_twins_are_ordinary_searches(self, term):
+        assert scryfall_term_policy(f"{term} e:khm").query == f"{term} e:khm"
+
+    @pytest.mark.parametrize("term", ["f>notaformat", "lang>zz", "oracleid>abc", "is>foil", "layout>normal", "border>black"])
+    def test_it_runs_before_every_value_validator(self, term):
+        """Which is why those go quiet under a comparison.
+
+        `f>notaformat`, `lang>zz`, `oracleid>abc` and `is>foil` are one 404 each with no warning,
+        where `f:notaformat`, `lang:zz` and `oracleid:abc` are all ignored-and-warned.
+        """
+        result = scryfall_term_policy(f"{term} e:khm t:creature")
+        assert result.warnings == []
+        assert result.query == "cmc<0 e:khm t:creature"
+
+    @pytest.mark.parametrize("keyword", ["unique", "sort", "order", "direction", "dir", "prefer"])
+    def test_the_directive_names_take_it_too(self, keyword):
+        assert scryfall_term_policy(f"{keyword}>=0 e:khm").query == "cmc<0 e:khm"
+
+    @pytest.mark.parametrize(
+        "term",
+        [
+            "c>=2",
+            "ci>=2",
+            "colour>=2",
+            "commander>=2",
+            "id>=2",
+            "produces>=2",
+            "m>=2",
+            "cmc>=3",
+            "mv>=3",
+            "manavalue>=3",
+            "pow>=1",
+            "power>=1",
+            "tou>=1",
+            "toughness>=1",
+            "loy>=3",
+            "loyalty>=3",
+            "usd>=1",
+            "eur>=1",
+            "tix>=1",
+            "cn>=100",
+            "number>=100",
+            "year>=2022",
+            "date>=2022",
+            "r>=rare",
+            "rarity>=rare",
+        ],
+    )
+    def test_the_keywords_scryfall_does_compare_are_untouched(self, term):
+        assert scryfall_term_policy(f"{term} e:khm").query == f"{term} e:khm"
+
+    @pytest.mark.parametrize("term", ["-nonsense>=1", "-t>creature", "-lang>zz"])
+    def test_the_negated_form_still_takes_the_tautology(self, term):
+        """And this rule does not steal it.
+
+        `-nonsense>=1` and `-t>creature` are 151 with `warnings` absent -- the always-true leaf the
+        negation rule installs, NOT this rule's empty one. The negation block runs first, so a
+        negated comparison never reaches here.
+        """
+        result = scryfall_term_policy(f"{term} e:khm t:creature")
+        assert result.warnings == []
+        assert result.query == "-cmc<0 e:khm t:creature"
+
+
 class TestNegatedNumericEquality:
     """Scryfall cannot express it, and says so in two different sentences."""
 
@@ -248,6 +349,79 @@ class TestValues:
             "Invalid expression \u201cr:notarare\u201d was ignored. Unknown rarity \u201cnotarare.\u201d",
         ]
         assert scryfall_term_policy("r>=rare e:khm").warnings == []
+
+    @pytest.mark.parametrize("operator", [":", "=", ">", ">=", "<", "<=", "!="])
+    def test_rarity_checks_its_value_under_every_operator(self, operator):
+        """Rarity is an ordered enum, so `r>rare` is a comparison Scryfall really performs.
+
+        It therefore checks the value under a comparison exactly as it does under equality. Anchor
+        `e:khm t:creature` = 151, one request each: all seven answer 151 carrying the same sentence.
+        With an equality-only guard this surface answered `400 Failed to parse query` for the five
+        comparisons, because nothing removed the term and the parser rejects a word that is not a
+        rarity.
+        """
+        term = f"r{operator}notarare"
+        assert scryfall_term_policy(f"{term} e:khm t:creature").warnings == [
+            f"Invalid expression \u201c{term}\u201d was ignored. Unknown rarity \u201cnotarare.\u201d",
+        ]
+
+    def test_a_number_is_not_a_rarity_either(self):
+        assert scryfall_term_policy("rarity>=0 e:khm").warnings == [
+            "Invalid expression \u201crarity>=0\u201d was ignored. Unknown rarity \u201c0.\u201d",
+        ]
+
+    @pytest.mark.parametrize("term", ["r>rare", "r<=mythic", "r!=common", "-r>=rare"])
+    def test_the_rarity_comparisons_scryfall_performs_are_untouched(self, term):
+        assert scryfall_term_policy(f"{term} e:khm").warnings == []
+
+    @pytest.mark.parametrize(
+        ("value", "reason"),
+        [
+            ("2", "Devotion can only match single color or hybrid mana."),
+            ("{c}", "Devotion can only match single color or hybrid mana."),
+            ("{s}", "Devotion can only match single color or hybrid mana."),
+            ("{x}", "Devotion can only match single color or hybrid mana."),
+            ("{1}", "Devotion can only match single color or hybrid mana."),
+            ("{2/r}", "Devotion can only match single color or hybrid mana."),
+            ("{r/p}", "Devotion can only match single color or hybrid mana."),
+            ("{w}{u}", "Devotion can only match single color or hybrid mana."),
+            ("{r}{g}", "Devotion can only match single color or hybrid mana."),
+            ("rg", "Devotion can only match single color or hybrid mana."),
+            ("{r}{r/g}", "Devotion can only match single color or hybrid mana."),
+            # Not a mana symbol at all -- a different sentence, and the echo is the value as
+            # written with `upper()` applied.
+            ("{p}", "Unknown mana symbols \u201c{P}\u201d."),
+            ("{}", "Unknown mana symbols \u201c{}\u201d."),
+            ("notmana", "Unknown mana symbols \u201cNOTMANA\u201d."),
+        ],
+    )
+    def test_devotion_takes_one_colour_or_one_hybrid_pair(self, value, reason):
+        assert scryfall_term_policy(f"devotion:{value} e:khm").warnings == [
+            f"Invalid expression \u201cdevotion:{value}\u201d was ignored. {reason}",
+        ]
+
+    @pytest.mark.parametrize(
+        "value",
+        ["{r}", "{R}", "r", "{r}{r}", "rr", "{r}{r}{r}", "{r/g}", "{g/r}", "{r/g}{r/g}", "{r/g}{g/r}"],
+    )
+    def test_the_devotion_values_scryfall_honors(self, value):
+        """One colour repeated, one hybrid pair repeated, either brace order, braced or not.
+
+        Order-insensitivity is measured rather than assumed: `{g/r}` and `{r/g}` answer the same 62,
+        and mixing the two spellings in one value answers the same 16 as either alone.
+        """
+        assert scryfall_term_policy(f"devotion:{value} e:khm").warnings == []
+
+    @pytest.mark.parametrize("term", ["devotion:2", "devotion>2", "devotion>=2", "-devotion:2", "-devotion>2"])
+    def test_devotion_checks_its_value_in_both_polarities(self, term):
+        """A VALUE check, not a negation rule.
+
+        `devotion` is in _NEGATION_HONORING_COMPARISONS, which is what lets a negated comparison
+        reach the validator instead of being swallowed as an always-true leaf.
+        """
+        assert scryfall_term_policy(f"{term} e:khm t:creature").warnings == [
+            f"Invalid expression \u201c{term}\u201d was ignored. Devotion can only match single color or hybrid mana.",
+        ]
 
     def test_oracle_id_must_be_a_v4_uuid(self):
         assert scryfall_term_policy("oracleid:notauuid e:khm").warnings == [

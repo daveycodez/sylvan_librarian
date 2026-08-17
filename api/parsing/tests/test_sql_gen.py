@@ -1495,3 +1495,43 @@ testcases_proper_subset_masks = {
 )
 def test_proper_subset_masks(query_mask: int, expected: list[int]) -> None:
     assert _proper_subset_masks(query_mask) == expected
+
+
+@pytest.mark.parametrize(
+    "operator",
+    [":", "=", "<", "<=", ">", ">=", "!="],
+)
+def test_a_bare_year_means_the_same_to_date_as_it_does_to_year(parse_query, operator: str) -> None:
+    """A PARTIAL DATE IS A RANGE, NOT A POINT, and `date:2021` is `year:2021`.
+
+    `date:` compiled to one point comparison against the raw value, which is the START of the
+    window the value names -- the correct bound for `<` and `>=` and wrong for the other four.
+    Measured against api.scryfall.com 2026-08-16 over the whole default corpus::
+
+                      Scryfall   a point comparison answers
+        date:2021        3,834   0 (released_at == 2021-01-01)
+        date<=2021      22,888   20,966 (answered date<2021)
+        date>2021       18,639   20,086 (answered date>=2021)
+        date!=2021      32,774   33,599 (the whole corpus, nothing was ever equal)
+
+    `year:` has emitted the window all along, which is what makes this assertion the right shape:
+    the two spellings of one column must compile to the same SQL, and now do.
+    """
+    date_context = QueryContext()
+    date_sql = parse_query(f"date{operator}2021").to_sql(date_context)
+    if operator == "!=":
+        # The one operator `_handle_year_search` refuses; assert the window directly instead.
+        assert date_sql == ("(card.released_at < %(p_str_MjAyMS0wMS0wMQ)s OR card.released_at >= %(p_str_MjAyMi0wMS0wMQ)s)")
+        assert dict(date_context) == {"p_str_MjAyMS0wMS0wMQ": "2021-01-01", "p_str_MjAyMi0wMS0wMQ": "2022-01-01"}
+        return
+    year_context = QueryContext()
+    year_sql = parse_query(f"year{operator}2021").to_sql(year_context)
+    assert date_sql == year_sql
+    assert dict(date_context) == dict(year_context)
+
+
+def test_a_full_date_is_still_one_point(parse_query) -> None:
+    """It is its own window, so nothing about it changes."""
+    context = QueryContext()
+    assert parse_query("date:2021-02-05").to_sql(context) == "(card.released_at = %(p_str_MjAyMS0wMi0wNQ)s)"
+    assert dict(context) == {"p_str_MjAyMS0wMi0wNQ": "2021-02-05"}

@@ -564,6 +564,39 @@ class ExactNameNode(QueryNode):
         return f'exact name is "{self.value}"'
 
 
+# `_date_window`'s three shapes, named because ruff refuses the bare literals.
+_YEAR_DIGITS = 4
+_YEAR_MONTH_PARTS = 2
+_DECEMBER = 12
+
+
+def _date_window(value: str) -> tuple[str, str] | None:
+    """The half-open [start, after_end) a PARTIAL date value covers, or None for a full date.
+
+    `2021` is the whole of 2021 and `2021-02` is the whole of February; a `YYYY-MM-DD` names one
+    day and needs no window. Half-open rather than inclusive so no month-length or leap-year table
+    is needed, and so the SQL matches the shape `_handle_year_search` already emits.
+
+    Args:
+        value: The date value as the parser produced it.
+
+    Returns:
+        `(start, after_end)` as ISO date strings, or None when the value is a full date.
+    """
+    parts = value.split("-")
+    if not all(part.isdigit() for part in parts):
+        return None
+    if len(parts) == 1 and len(parts[0]) == _YEAR_DIGITS:
+        year = int(parts[0])
+        return f"{year}-01-01", f"{year + 1}-01-01"
+    if len(parts) == _YEAR_MONTH_PARTS:
+        year, month = int(parts[0]), int(parts[1])
+        if month == _DECEMBER:
+            return f"{year}-12-01", f"{year + 1}-01-01"
+        return f"{year}-{month:02d}-01", f"{year}-{month + 1:02d}-01"
+    return None
+
+
 class CardBinaryOperatorNode(BinaryOperatorNode):
     """Card-specific binary operator node with custom SQL generation."""
 
@@ -911,8 +944,24 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
     def _handle_date_search(self, context: QueryContext) -> str:
         """Handle date search queries.
 
-        For 'date:' searches, compares against the full released_at date.
-        Accepts either YYYY or YYYY-MM-DD format.
+        A PARTIAL DATE IS A RANGE, NOT A POINT. `date:2021` means "released in 2021", so each
+        operator reads off the end of that window it needs; comparing one padded value answers a
+        different question for four of the six. Measured against api.scryfall.com 2026-08-16 over
+        the whole default corpus, `date:<year>` against `year:<year>` -- the same column under its
+        other spelling, whose handler below has had the window all along::
+
+                          Scryfall   a point comparison answers
+            date:2021        3,834   0 (released_at == 2021-01-01)
+            date=2021        3,834   0
+            date<2021       20,966   20,966 ok
+            date<=2021      22,888   20,966
+            date>2021       18,639   20,086
+            date>=2021      20,086   20,086 ok
+            date!=2021      32,774   33,599 (the whole corpus, nothing was ever equal)
+
+        Month precision is the same rule one level down: `date:2021-02` is 504 and equals
+        `date>=2021-02 date<2021-03`, and `date>=2021-02` is 20,085. A FULL date is its own window
+        and still compiles to the single comparison it always did.
 
         Args:
             context: SQL parameter context.
@@ -925,10 +974,24 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         # Normalize : operator to =
         operator = "=" if self.operator == ":" else self.operator
 
-        # For date searches, compare against the full date
-        # The value should be in YYYY-MM-DD or YYYY format
-        placeholder = context.add(search_value)
-        return f"(card.released_at {operator} {placeholder})"
+        window = _date_window(str(search_value))
+        if window is None:
+            # A full date, or a spelling this handler does not model: one point, as before.
+            placeholder = context.add(search_value)
+            return f"(card.released_at {operator} {placeholder})"
+
+        start, after_end = window
+        if operator == "=":
+            return f"({context.add(start)} <= card.released_at AND card.released_at < {context.add(after_end)})"
+        if operator == "!=":
+            return f"(card.released_at < {context.add(start)} OR card.released_at >= {context.add(after_end)})"
+        if operator == ">":
+            return f"(card.released_at >= {context.add(after_end)})"
+        if operator == "<=":
+            return f"(card.released_at < {context.add(after_end)})"
+        # `<` and `>=` are the two the point comparison already got right: both read the START of
+        # the window, which is exactly what the unpadded value meant.
+        return f"(card.released_at {operator} {context.add(start)})"
 
     def _handle_year_search(self, context: QueryContext) -> str:
         """Handle year search queries.
