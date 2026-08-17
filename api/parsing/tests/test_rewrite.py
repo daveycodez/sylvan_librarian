@@ -33,7 +33,10 @@ EQUIVALENCES = [
     ("is:permanent", "t:creature or t:artifact or t:enchantment or t:land or t:planeswalker or t:battle"),
     ("is:party", "t:creature (t:cleric or t:rogue or t:warrior or t:wizard or kw:changeling)"),
     ("is:outlaw", "t:assassin or t:mercenary or t:pirate or t:rogue or t:warlock or kw:changeling"),
-    ("is:vanilla", 't:creature o=""'),
+    # `o=""` was a tautology on api.scryfall.com too — `t:creature o=""` is 18,753 there, exactly
+    # `t:creature`, while `is:vanilla` is 363. The presence regex, negated, is the empty-text test
+    # that exists: 352 on Scryfall and 352 on this corpus.
+    ("is:vanilla", "t:creature -o:/./"),
     ("is:bear", "t:creature pow=2 tou=2 cmc=2"),
     # layout family
     ("is:split", "layout:split"),
