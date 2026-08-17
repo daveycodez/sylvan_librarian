@@ -641,7 +641,10 @@ fn text_field_value<'a>(
     match field {
         TextField::NameLower       => StrVal::Known(card.card_name_lower.as_str()),
         TextField::OracleTextLower => opt_sv(str_at(strings, u32::from(card.oracle_text_lower_id))),
-        TextField::Layout          => opt_sv(str_at(strings, u32::from(card.card_layout_id))),
+        // PRINTING-level (see Printing::card_layout_id): a reversible printing and an ordinary
+        // printing of the same card give different answers, so no card-level value can stand in
+        // for either.
+        TextField::Layout          => printing.map_or(StrVal::PDep, |p| opt_sv(str_at(strings, u32::from(p.card_layout_id)))),
         TextField::FlavorTextLower => printing.map_or(StrVal::PDep, |p| opt_sv(str_at(strings, u32::from(p.flavor_text_lower_id)))),
         // Rewritten to ArtistMatch by bind(); printings carry no artist strings.
         TextField::ArtistLower     => StrVal::Null,
@@ -1095,10 +1098,18 @@ fn leaf_compares_printing_field(f: &FilterExpr) -> bool {
         },
         // Exhaustive over TextField (no `matches!`), same reason as num_pdep.
         FilterExpr::TextExact { field, .. } | FilterExpr::TextRegex { field, .. } => match field {
-            TextField::FlavorTextLower | TextField::SetCode | TextField::Border | TextField::Watermark | TextField::CollectorNumber => {
-                true
-            }
-            TextField::NameLower | TextField::OracleTextLower | TextField::ArtistLower | TextField::Layout => false,
+            // `Layout` joined this list when the field moved to the printing, and is the reason the
+            // list is worth reading twice: it sat in the card-level arm below while
+            // `card_layout_id` lived on the OracleCard, and leaving it there would have let the
+            // verifier settle `layout:` at card level and never look at the printing whose value
+            // now decides it.
+            TextField::FlavorTextLower
+            | TextField::SetCode
+            | TextField::Layout
+            | TextField::Border
+            | TextField::Watermark
+            | TextField::CollectorNumber => true,
+            TextField::NameLower | TextField::OracleTextLower | TextField::ArtistLower => false,
         },
         // Exhaustive over CollField (no `matches!`), same reason as num_pdep.
         FilterExpr::CollectionCmp { field, .. } => match field {

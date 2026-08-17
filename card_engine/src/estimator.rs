@@ -99,7 +99,12 @@ pub(crate) fn has_printing_varying_leaf(f: &FilterExpr) -> bool {
         FilterExpr::TextContains { field, .. } => matches!(field, TextSearchField::FlavorTextLower),
         FilterExpr::TextExact { field, .. } | FilterExpr::TextRegex { field, .. } => matches!(
             field,
-            TextField::FlavorTextLower | TextField::SetCode | TextField::Border | TextField::Watermark | TextField::CollectorNumber
+            TextField::FlavorTextLower
+                | TextField::SetCode
+                | TextField::Layout
+                | TextField::Border
+                | TextField::Watermark
+                | TextField::CollectorNumber
         ),
         FilterExpr::CollectionCmp { field, .. } => {
             matches!(field, CollField::ArtTags | CollField::IsTags | CollField::FrameData)
