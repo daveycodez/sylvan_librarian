@@ -981,6 +981,42 @@ class TestRandom:
         resp = dispatch(compat_corpus, "/cards/random", "q=%21%22No+Such+Compat+Card%22")
         assert resp.status == falcon.HTTP_404
 
+    # ── the extras gate, which this route ran without ────────────────────────
+    #
+    # A DRAW, so the assertions are built to be deterministic rather than sampled: the query
+    # matches the extras printing and nothing else, so the gate turns the whole match set empty
+    # and the answer is the 404 every time. Measured on api.scryfall.com 2026-08-17 with the same
+    # shape — `/cards/random?q=t:goblin cmc=0` (no trigger, all extras) is 404 there, and
+    # `&include_extras=true` returns q07/T12.
+
+    def test_the_extras_class_is_hidden_from_the_draw(self, compat_corpus: APIResource):
+        """`!"…"` fires no trigger, so this is the default lane, and the class is excluded in it."""
+        resp = dispatch(compat_corpus, "/cards/random", "q=%21%22Compat+Substitute%22")
+        assert resp.status == falcon.HTTP_404
+
+    def test_include_extras_true_draws_the_extra(self, compat_corpus: APIResource):
+        body = payload(dispatch(compat_corpus, "/cards/random", "q=%21%22Compat+Substitute%22&include_extras=true"))
+        assert body["id"] == EXTRA_ID
+
+    def test_a_trigger_term_draws_it_without_the_flag(self, compat_corpus: APIResource):
+        """`is:extra` is an unconditional trigger, so the gate opens on the term alone.
+
+        The same rule `/cards/search` runs, read with the same helper rather than a second copy of
+        it — a query that names the class can never answer nothing.
+        """
+        body = payload(dispatch(compat_corpus, "/cards/random", "q=is%3Aextra&include_extras=false"))
+        assert body["id"] == EXTRA_ID
+
+    def test_a_set_term_on_an_extras_set_is_the_conditional_trigger(self, compat_corpus: APIResource, monkeypatch):
+        """The one trigger that asks the store: a set term enables extras iff that set holds one.
+
+        The table is stubbed for the same reason the `/cards/search` twin stubs it — it is folded
+        into the archive at build, so a fixture engine is not the thing under test here.
+        """
+        monkeypatch.setattr(compat_corpus, "_sets_with_extras", lambda: frozenset({EXTRAS_SET_CODE}))
+        body = payload(dispatch(compat_corpus, "/cards/random", f"q=e%3A{EXTRAS_SET_CODE}"))
+        assert body["id"] == EXTRA_ID
+
     def test_repeated_draws_are_not_all_the_same_card(self, compat_corpus: APIResource, monkeypatch):
         """The draw's SQL text and parameters never vary, so a memoized result would pin one card.
 

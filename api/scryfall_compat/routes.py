@@ -65,6 +65,7 @@ from api.scryfall_compat.objects import (
 )
 from api.scryfall_compat.query_terms import scryfall_term_policy
 from api.settings import settings
+from api.utils import db_utils
 from api.utils.routing import route
 
 if TYPE_CHECKING:
@@ -1198,6 +1199,13 @@ class ScryfallCardsRoutes:
         every lookup here except the random draw: that one is deliberately non-deterministic for a
         fixed query and parameter set, so caching it would replay one card forever.
 
+        `maybe_json` IS THE OTHER HALF OF `_run_query` THIS HAS TO KEEP, and it was missing:
+        `generate_sql_query` emits a plain dict for a `card_is_tags @> …` containment test, and
+        psycopg refuses to adapt a bare dict ("cannot adapt type 'dict' using placeholder '%s'").
+        The count above goes through `_run_query`, which wraps every parameter, so the failure
+        was on the DRAW alone — `/cards/random?q=is:reserved` was already a 500 before this route
+        gained an extras gate, and every gated draw would carry the same shape.
+
         Args:
             query: The SQL to run.
             params: Bound parameters.
@@ -1205,6 +1213,7 @@ class ScryfallCardsRoutes:
         Returns:
             The result rows.
         """
+        params = {k: db_utils.maybe_json(v) for k, v in params.items()}
         with self._conn_pool.connection() as conn, conn.cursor() as cursor:
             self._set_statement_timeout(cursor, 10_000)
             cursor.execute(query, params)
@@ -2188,9 +2197,14 @@ class ScryfallCardsRoutes:
         face: str = "front",
         version: str = DEFAULT_IMAGE_VERSION,
         pretty: str = "false",
+        include_extras: str = "false",
+        include_variations: str = "false",
         **_: object,
     ) -> dict[str, Any] | None:
         """Return one random card, optionally restricted by a search query.
+
+        `include_extras` and `include_variations` are honored here exactly as `/cards/search`
+        honors them, because api.scryfall.com honors them here -- see the gate below.
 
         Args:
             falcon_response: The Falcon response to write to.
@@ -2199,12 +2213,23 @@ class ScryfallCardsRoutes:
             face: Which face an image request wants.
             version: Which image size an image request wants.
             pretty: Whether to indent JSON output.
+            include_extras: Whether the draw may return the extras class; a trigger term in `q`
+                forces it on.
+            include_variations: Whether the draw may return variation printings.
 
         Returns:
             A card object, or a Scryfall error object.
         """
         is_pretty = _as_bool(pretty)
         self._require_setup_complete()
+        # THE BARE DRAW STAYS UNGATED, deliberately: no `q` means no tree to conjoin onto, and
+        # `_apply_extras_default` exempts a `TrueNode` for this exact lane anyway ("it is what the
+        # by-name and random lanes search with, and they do their own scoping"). Whether
+        # api.scryfall.com's own bare `/cards/random` hides the extras class was NOT established —
+        # it echoes nothing, the only observable is the card it returns, and separating a ~10%
+        # extras share from zero takes tens of draws. Gating it on the strength of the `q`
+        # measurement below would be an inference, and the inference could quietly remove a sixth
+        # of the corpus from this endpoint.
         where, params = "TRUE", {}
         if q and q.strip():
             # The same ignore-and-continue policy `/cards/search` runs, because Scryfall runs it
@@ -2226,13 +2251,59 @@ class ScryfallCardsRoutes:
                     pretty=is_pretty,
                 )
             try:
-                where, params = generate_sql_query(parse_scryfall_query(policy.query))
+                parsed = parse_scryfall_query(policy.query)
             except ValueError:
                 return self._scryfall_respond(
                     falcon_response,
                     bad_request_error(f'Failed to parse query: "{q}"'),
                     pretty=is_pretty,
                 )
+
+            # THE SAME TWO GATES `/cards/search` RESOLVES, because api.scryfall.com resolves them
+            # on this route too. This draw builds its own SQL instead of going through `_search`,
+            # which is exactly how it came to skip them: `_search` is where
+            # `_apply_extras_default` runs, and nothing on this path called it. The consequence was
+            # one route contradicting the other on the same query -- `/cards/random?q=lightning
+            # bolt` could draw the Strixhaven art-series printing (astx/76) that
+            # `/cards/search?q=lightning bolt` can never return.
+            #
+            # MEASURED HERE RATHER THAN ASSUMED FROM `/cards/search`, 2026-08-17, two requests.
+            # `t:goblin cmc=0` fires no trigger and its whole population is extras (404 bare
+            # against 87 with the flag), so it separates the two hypotheses in one draw:
+            #
+            #   /cards/random?q=t:goblin cmc=0                      -> 404 "0 cards matched this
+            #                                                          search, a random card could
+            #                                                          not be returned."
+            #   /cards/random?q=t:goblin cmc=0&include_extras=true  -> 200 Goblin // Blood (q07/T12)
+            #
+            # So the default exclusion applies and the parameter is read -- a random endpoint that
+            # silently stopped answering from a sixth of its corpus would have been the worse bug,
+            # which is why this was probed before being ported from the sibling route.
+            #
+            # The auto-enable is the SAME rule and the same helpers, not a second reading of it:
+            # `_extras_triggers` for the syntactic force, `_sets_with_extras` for the one
+            # conditional trigger, and `_mentions_is_tag` for variations. Both must be read BEFORE
+            # either splice, or the `NOT is:variation` this is about to add would itself read as
+            # the caller's own `is:variation` term.
+            triggers = _extras_triggers(parsed)
+            forced = triggers.forced
+            if not forced and triggers.sets:
+                forced = not self._sets_with_extras().isdisjoint(triggers.sets)
+
+            # Local import for the same circularity reason `/cards/search` imports
+            # `VARIATION_IS_TAG` locally. The two splices are imported rather than rebuilt from
+            # nodes here: one implementation of "conjoin `-is:extra`" is the whole point, and a
+            # second one in this module would be free to drift from the one `_search` applies.
+            from api.api_resource import (  # noqa: PLC0415
+                VARIATION_IS_TAG,
+                _apply_extras_default,
+                _apply_variations_default,
+            )
+
+            effective_variations = _mentions_is_tag(parsed, VARIATION_IS_TAG) or _as_bool(include_variations)
+            _apply_extras_default(parsed, include_extras=forced or _as_bool(include_extras))
+            _apply_variations_default(parsed, include_variations=effective_variations)
+            where, params = generate_sql_query(parsed)
 
         # This response must not be cached at either layer. The HTTP cache would pin one card as
         # "the" random card for the generation, and _run_query's cache would do the same a level
