@@ -165,7 +165,35 @@ pub(crate) const BORDER_PLANES: usize = BORDER_TRACKED + 1;
 pub(crate) const PLANE_BORDER: usize = PLANE_RARITY_HI + 1;
 pub(crate) const PLANE_BORDER_OTHER: usize = PLANE_BORDER + BORDER_TRACKED;
 
-pub(crate) const PLANE_COUNT: usize = PLANE_BORDER + BORDER_PLANES;
+/// One-hot planes over the WHOLE `colors` mask, one per possible value, beside the per-COLOUR
+/// planes above rather than instead of them.
+///
+/// The per-colour planes cannot express what `c=`/`c<=`/`c:wu` now mean. A card holds a SET of
+/// colour masks — its faces' — and the comparison is existential over that set (see
+/// `filter::face_color_masks`), while the six planes hold only the set's UNION. Extus // Awaken
+/// the Blood Avatar is {W,B} // {B,R}: `c=wb` is 1 on api.scryfall.com and `eq_expr` over the
+/// union answers False, `c:brw` is 404 there and `and_of` over the union answers True. Both
+/// directions are wrong, and a plane expression may not be either — `compile_plane`'s whole
+/// contract is exactness, so an inexact colour plane is not a slower answer, it is a wrong one.
+///
+/// A one-hot plane per VALUE fixes it the same way the numeric planes already do for
+/// power/toughness: every comparison becomes an OR of the planes whose value satisfies it, and a
+/// card with two faces has two bits set, so `or_of` IS the existential. `filter::color_cmp` is
+/// evaluated at compile time against each value, so the plane expression and `tri` cannot come to
+/// different conclusions about what the operator means.
+///
+/// SIXTY-FOUR, not thirty-two, for the reason `COLOR_PLANES` is already six: `colors` never
+/// contains C, but keeping the mask algebra total over whatever mask the parser emits costs 32
+/// planes (~126 KB at the full 31.5k-card corpus, against ~1.15 MB of planes already) and removes
+/// an invariant about Scryfall's data that nothing here could enforce.
+///
+/// Only `colors` gets these. `color_identity` and `produced_mana` are card-level — measured, not
+/// assumed: `id=wbr` on Extus is 1 while `id=wb` and `id=2` are 404, and Scryfall's face objects
+/// carry neither key — so their per-colour planes stay exactly as they were.
+pub(crate) const COLOR_MASK_PLANES: usize = 64;
+pub(crate) const PLANE_COLOR_MASK: usize = PLANE_BORDER + BORDER_PLANES;
+
+pub(crate) const PLANE_COUNT: usize = PLANE_COLOR_MASK + COLOR_MASK_PLANES;
 
 /// #724: which border values get a *printing-space* one-hot plane (bit per printing, exact). The
 /// density-chosen broad head only — distinct from #664's card-space `BORDER_TRACKED_VALUES`, which
@@ -366,10 +394,24 @@ pub(crate) fn build_bit_planes(cards: &[OracleCard], printings: &[Printing], off
                 None => set(PLANE_BORDER_OTHER),
             }
         }
-        for b in 0..COLOR_PLANES {
-            if card.card_colors & (1 << b) != 0 {
-                set(PLANE_COLORS + b);
+        // EVERY face's mask, not just the merged row's union — the same existential the numeric
+        // planes above reproduce for power/toughness, and the same reason: `compile_plane` ORs the
+        // satisfying values, so a card with a bit at {W,B} and another at {B,R} answers `c=wb` and
+        // `c=br` alike and `c:brw` neither. See PLANE_COLOR_MASK.
+        //
+        // The per-colour `PLANE_COLORS` planes are derived from the same set rather than read off
+        // `card.card_colors`, so the two encodings of the same fact cannot drift: the union of the
+        // faces' masks IS `card_colors` (`_FACE_FLAG_UNIONS` builds it that way), and saying so
+        // once here is cheaper than an invariant nobody re-checks.
+        for m in crate::face_color_masks(card) {
+            set(PLANE_COLOR_MASK + m as usize);
+            let mut bits = m;
+            while bits != 0 {
+                set(PLANE_COLORS + bits.trailing_zeros() as usize);
+                bits &= bits - 1;
             }
+        }
+        for b in 0..COLOR_PLANES {
             if card.card_color_identity & (1 << b) != 0 {
                 set(PLANE_IDENTITY + b);
             }
@@ -1300,6 +1342,24 @@ pub(crate) fn compile_plane(filter: &FilterExpr, bounds: &rkyv::Archived<BitPlan
             // plane complement unsound, so refuse rather than assume.
             if u16::from(*mask) & !((1 << COLOR_PLANES) - 1) != 0 {
                 return None;
+            }
+            // `colors` is the per-face column, so its planes are per-VALUE and the expression is
+            // the OR of the values that satisfy the operator — the existential `tri` answers.
+            // The two card-level columns keep the per-colour mask algebra unchanged.
+            if matches!(field, ColorField::Colors) {
+                // ONE exception, and it is the hot one: `c:r` and its four siblings. A single-bit
+                // all-of Ge asks whether one colour is present in ANY face, and that is precisely
+                // what the union plane holds (`∃m: b ∈ m` ⟺ `b ∈ ⋃m`), so the most common colour
+                // query in the corpus stays a single plane read instead of an OR of 32.
+                if matches!(op, CmpOp::Ge) && mask.count_ones() == 1 {
+                    return Some(cmp_expr(base, COLOR_PLANES, u16::from(*mask), *op, false));
+                }
+                return Some(or_of(
+                    (0..COLOR_MASK_PLANES)
+                        .filter(|&m| crate::filter::color_cmp(m as u8, *op, *mask))
+                        .map(|m| PlaneExpr::Plane((PLANE_COLOR_MASK + m) as u16))
+                        .collect(),
+                ));
             }
             Some(cmp_expr(base, COLOR_PLANES, u16::from(*mask), *op, false))
         }

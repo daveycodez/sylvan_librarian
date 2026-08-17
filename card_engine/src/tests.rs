@@ -11679,7 +11679,7 @@ fn two_faces() -> (Vec<OracleFace>, Vec<PrintingFace>) {
             creature_toughness_text_id: 6,
             planeswalker_loyalty_text_id: NONE_STR,
             defense_text_id: NONE_STR,
-            card_colors: 0b0000_0001, // W
+            card_colors: Some(0b0000_0001), // W
             color_indicator: 0,
             // The front's 2/2 and its {W} cost, parsed — the searchable half of the same face.
             creature_power: Some(2),
@@ -11696,7 +11696,7 @@ fn two_faces() -> (Vec<OracleFace>, Vec<PrintingFace>) {
             creature_toughness_text_id: 16,
             planeswalker_loyalty_text_id: NONE_STR,
             defense_text_id: NONE_STR,
-            card_colors: 0b0000_1000, // R
+            card_colors: Some(0b0000_1000), // R
             color_indicator: 0b0000_1000,
             // A bigger back face with no cost of its own: the shape `pow>=3` used to miss.
             creature_power: Some(5),
@@ -11736,9 +11736,11 @@ fn faces_survive_the_archive_round_trip() {
     assert_eq!(archived_card.faces[0].creature_power_text_id, 5);
     assert_eq!(archived_card.faces[1].creature_power_text_id, 15);
 
-    // Colors are per face, which is how `c:r` reaches a red back on a white front.
-    assert_eq!(archived_card.faces[0].card_colors, 0b0000_0001);
-    assert_eq!(archived_card.faces[1].card_colors, 0b0000_1000);
+    // Colors are per face, which is how `c:r` reaches a red back on a white front. `Some` because
+    // this face DECLARED a `colors` key -- a split face declares none, and the two must not read
+    // the same (see face_color_masks).
+    assert_eq!(archived_card.faces[0].card_colors, Some(0b0000_0001));
+    assert_eq!(archived_card.faces[1].card_colors, Some(0b0000_1000));
     assert_eq!(archived_card.faces[1].color_indicator, 0b0000_1000);
 
     // Art: per printing, and distinct per face.
@@ -11785,7 +11787,7 @@ fn a_face_satisfies_a_numeric_predicate_the_merged_row_cannot() {
                 creature_toughness_text_id: NONE_STR,
                 planeswalker_loyalty_text_id: NONE_STR,
                 defense_text_id: NONE_STR,
-                card_colors: 0,
+                card_colors: None,
                 color_indicator: 0,
                 creature_power: p,
                 creature_toughness: t,
@@ -11859,6 +11861,176 @@ fn a_face_satisfies_a_numeric_predicate_the_merged_row_cannot() {
     let plain = rkyv::access::<Archived<OracleCard>, Error>(&plain).expect("access");
     assert!(matches_tri(t(plain, &num(NumField::Power, CmpOp::Ge, 3.0)), Tri::False));
     assert!(matches_tri(t(plain, &num(NumField::Loyalty, CmpOp::Ge, 1.0)), Tri::Null));
+}
+
+// ─── per-face colours ────────────────────────────────────────────────────────
+
+const C_W: u8 = 0b0_0001;
+const C_U: u8 = 0b0_0010;
+const C_B: u8 = 0b0_0100;
+const C_R: u8 = 0b0_1000;
+
+/// The cards the live probes named, in the shape the store holds them: the merged UNION the
+/// `_FACE_FLAG_UNIONS` policy writes, and each face's own `colors` — `None` where Scryfall sent no
+/// `colors` key for that face at all, which is every split and flip half.
+///
+/// `(name, card_colors, faces)`. Verified against api.scryfall.com's own JSON on 2026-08-16: the
+/// two split halves of Fire // Ice carry `name`/`mana_cost`/`type_line` and nothing else, while
+/// Kabira Plateau carries `"colors": []`.
+const COLOR_FIXTURE: &[(&str, u8, &[Option<u8>])] = &[
+    ("Fire // Ice", C_U | C_R, &[None, None]),
+    ("Delver of Secrets // Insectile Aberration", C_U, &[Some(C_U), Some(C_U)]),
+    ("Kabira Takedown // Kabira Plateau", C_W, &[Some(C_W), Some(0)]),
+    ("Valki, God of Lies // Tibalt, Cosmic Impostor", C_B | C_R, &[Some(C_B), Some(C_B | C_R)]),
+    ("Extus, Oriq Overlord // Awaken the Blood Avatar", C_W | C_B | C_R, &[Some(C_W | C_B), Some(C_B | C_R)]),
+    // The 82% path, both ends of it: a mono-red card and a colourless one, neither with faces.
+    ("Lightning Bolt", C_R, &[]),
+    ("Sol Ring", 0, &[]),
+];
+
+fn color_fixture_store() -> CardData {
+    let mut vocab = VocabInterner::new();
+    let cards: Vec<OracleCard> = COLOR_FIXTURE
+        .iter()
+        .enumerate()
+        .map(|(i, (_, mask, faces))| {
+            let mut c = stub_card(i as u128 + 1, TYPE_CREATURE, &[], &mut vocab);
+            c.card_colors = *mask;
+            // The identity is deliberately the union on every card: it is card-level, and holding
+            // it apart from `colors` is what proves the two columns did not get the same treatment.
+            c.card_color_identity = *mask;
+            c.faces = faces
+                .iter()
+                .map(|m| OracleFace {
+                    card_name_id: NONE_STR,
+                    mana_cost_text_id: NONE_STR,
+                    type_line_id: NONE_STR,
+                    oracle_text_id: NONE_STR,
+                    creature_power_text_id: NONE_STR,
+                    creature_toughness_text_id: NONE_STR,
+                    planeswalker_loyalty_text_id: NONE_STR,
+                    defense_text_id: NONE_STR,
+                    card_colors: *m,
+                    color_indicator: 0,
+                    creature_power: None,
+                    creature_toughness: None,
+                    planeswalker_loyalty: None,
+                    mana_cost: None,
+                })
+                .collect();
+            c
+        })
+        .collect();
+    let counts = vec![1usize; COLOR_FIXTURE.len()];
+    let mut data = store_of(cards, &counts, vocab);
+    data.indexes.planes = build_bit_planes(&data.cards, &data.printings, &data.offsets, &data.strings);
+    data
+}
+
+/// The per-face colour rule, as MEASURED against api.scryfall.com on 2026-08-16 rather than as
+/// inferred from `_merge_processed_faces`. Each assertion below is a live probe scoped with
+/// `!"Full // Name"`, so the reference answer is 1 or 404.
+///
+/// The rows that choose the shape are the Extus ones. `c=wb` and `c=br` are both 1 there and
+/// `c:brw` and `c=3` are both 404 — so the card holds its two FACES' masks and NOT their union,
+/// which is the opposite of the stat columns, whose merged value is copied from a face and can be
+/// listed beside them for free. And `!"Fire // Ice" c:c` is 404, which is why a face with no
+/// `colors` key inherits the card's mask instead of reading as colourless.
+#[test]
+fn a_face_satisfies_a_colour_predicate_the_merged_union_cannot() {
+    let data = color_fixture_store();
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let card = |name: &str| {
+        let i = COLOR_FIXTURE.iter().position(|(n, _, _)| *n == name).expect("fixture card");
+        &archived.cards[i]
+    };
+    let hit = |name: &str, f: &FilterExpr| f.eval_card(card(name), &archived.strings) == Tri::True;
+    let c = |op, mask| FilterExpr::ColorCmp { field: ColorField::Colors, op, mask };
+    let id = |op, mask| FilterExpr::ColorCmp { field: ColorField::ColorIdentity, op, mask };
+
+    // c=b -> 1 on Valki // Tibalt: the FRONT's mask alone, where the union is {B,R}.
+    let valki = "Valki, God of Lies // Tibalt, Cosmic Impostor";
+    assert!(hit(valki, &c(CmpOp::Eq, C_B)));
+    assert!(hit(valki, &c(CmpOp::Eq, C_B | C_R)), "the back's own mask still matches too");
+    assert!(hit(valki, &c(CmpOp::Le, C_B)), "c<=b: B is a subset of B");
+
+    // c:c -> 1 on Kabira Takedown // Kabira Plateau: the land back DECLARED `"colors": []`.
+    let kabira = "Kabira Takedown // Kabira Plateau";
+    assert!(hit(kabira, &c(CmpOp::Ge, 0)), "c:c");
+    assert!(hit(kabira, &c(CmpOp::Eq, C_W)), "c=w, on the front");
+
+    // The union is NOT a value the card holds. c:brw and c=3 are 404 on Extus; c=wb and c=br are 1.
+    let extus = "Extus, Oriq Overlord // Awaken the Blood Avatar";
+    assert!(!hit(extus, &c(CmpOp::Ge, C_W | C_B | C_R)), "c:brw -> 404: no face is {{W,B,R}}");
+    assert!(hit(extus, &c(CmpOp::Eq, C_W | C_B)), "c=wb -> 1");
+    assert!(hit(extus, &c(CmpOp::Eq, C_B | C_R)), "c=br -> 1");
+    assert!(hit(extus, &c(CmpOp::Le, C_W | C_B)), "c<=wb -> 1");
+    assert!(!hit(extus, &c(CmpOp::Gt, C_W | C_B)), "c>wb -> 404");
+    assert!(hit(extus, &c(CmpOp::Lt, C_W | C_B | C_R)), "c<wbr -> 1");
+    assert!(hit(extus, &c(CmpOp::Ge, C_R)), "c:r -> 1, on the back");
+    // ...while the IDENTITY on the same card is the union and only the union. Measured:
+    // `id=wbr` is 1, `id=wb` and `id=2` are 404.
+    assert!(hit(extus, &id(CmpOp::Eq, C_W | C_B | C_R)));
+    assert!(!hit(extus, &id(CmpOp::Eq, C_W | C_B)));
+
+    // THE REGRESSION GUARD. Fire // Ice's halves declare no `colors` at all, so they are the
+    // card's {U,R} — c:r is 1 (it always was), and c:c is 404 (a bare mask 0 would answer 1).
+    let fire = "Fire // Ice";
+    assert!(hit(fire, &c(CmpOp::Ge, C_R)), "c:r on Fire // Ice, which worked before this change");
+    assert!(hit(fire, &c(CmpOp::Ge, C_U)), "c:u likewise");
+    assert!(!hit(fire, &c(CmpOp::Ge, 0)), "c:c -> 404: an absent key is not a colourless face");
+    assert!(hit(fire, &c(CmpOp::Eq, C_U | C_R)), "c=ur -> 1: the joined mask IS each half's");
+    assert!(!hit(fire, &c(CmpOp::Eq, C_R)), "c=r -> 404");
+
+    // Two faces that agree are one value: Delver is mono-blue on both halves.
+    let delver = "Delver of Secrets // Insectile Aberration";
+    assert!(hit(delver, &c(CmpOp::Eq, C_U)));
+    assert!(!hit(delver, &c(CmpOp::Ge, 0)), "c:c -> 404");
+
+    // The 82% path is untouched: no faces, one mask, exactly the pre-gen-29 answers.
+    assert!(hit("Lightning Bolt", &c(CmpOp::Eq, C_R)));
+    assert!(!hit("Lightning Bolt", &c(CmpOp::Ge, 0)));
+    assert!(hit("Sol Ring", &c(CmpOp::Ge, 0)), "c:c on a colourless card");
+}
+
+/// THE FOURTH STRUCTURE. A colour leaf is consumed by whichever narrowing reaches it first, and
+/// `compile_plane`'s contract is EXACTNESS — a plane expression is not re-verified, so a plane
+/// that disagrees with `tri` is a wrong answer rather than a slow one.
+///
+/// The stats work found this exact failure with a live probe after three of its four structures
+/// were already correct (`!"Thing in the Ice // Awoken Horror" pow>=7` still answered 404 because
+/// the plane had eaten the leaf). This asserts the agreement instead of probing for it: every
+/// operator against every one of the 32 colour masks, over every fixture card, both structures.
+#[test]
+fn the_colour_planes_answer_exactly_what_tri_answers() {
+    let data = color_fixture_store();
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let planes = &archived.indexes.planes;
+    let words = &archived.indexes.oracle_trigram.words;
+    let ops = [
+        ("Eq", CmpOp::Eq), ("Ne", CmpOp::Ne), ("Lt", CmpOp::Lt),
+        ("Le", CmpOp::Le), ("Gt", CmpOp::Gt), ("Ge", CmpOp::Ge),
+    ];
+    let mut bits: Vec<u64> = Vec::new();
+    for field in [ColorField::Colors, ColorField::ColorIdentity] {
+        for (name, op) in ops {
+            for mask in 0u8..32 {
+                let f = FilterExpr::ColorCmp { field, op, mask };
+                let pe = compile_plane(&f, planes, words).expect("every colour mask must compile");
+                eval_planes(&pe, planes, &mut bits);
+                for (cid, (card_name, _, _)) in COLOR_FIXTURE.iter().enumerate() {
+                    let want = f.eval_card(&archived.cards[cid], &archived.strings) == Tri::True;
+                    assert_eq!(
+                        bitmap_contains(&bits, cid as u32),
+                        want,
+                        "op {name} mask {mask:#07b} on {card_name}: the plane and tri disagree",
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// `face_stat_nums` is `card_processing.py`'s `maybe_int` behind the same creature-like gate the

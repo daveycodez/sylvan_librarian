@@ -314,7 +314,15 @@ struct OracleFace {
     // Battles print their defense on the FACE, never at top level -- every battle so far is a
     // transform card, so without this the number is simply lost (Invasion of Alara's `defense: 7`).
     defense_text_id: u32,
-    card_colors: u8,
+    /// The face's own `colors`, and `None` when Scryfall sent NO `colors` key for it.
+    ///
+    /// The distinction is load-bearing and not cosmetic. A `split` or `flip` face carries no
+    /// `colors` at all (Fire // Ice's two halves have `name`/`mana_cost`/`type_line` and nothing
+    /// else), while an MDFC land back carries `"colors": []` — DECLARED colourless. Reading both
+    /// as the bare mask 0 would make `!"Fire // Ice" c:c` answer 1, which api.scryfall.com answers
+    /// 404. An absent key means "this face has no colour opinion of its own"; the card's own mask
+    /// stands in for it. See `face_color_masks`.
+    card_colors: Option<u8>,
     // Scryfall's color_indicator: the printed dot for a face whose color is not implied by its mana
     // cost (a transform back has no mana cost at all). Same WUBRGC bit layout as card_colors.
     color_indicator: u8,
@@ -323,9 +331,13 @@ struct OracleFace {
     //
     // The text ids above answer "what does this face print"; these answer "does this face satisfy
     // the predicate". They exist because the merge is lossy in exactly one direction: unions and
-    // joined texts let ANY face satisfy `t:`, `o:` and `c:`, but `_FACE_STAT_GROUPS` copies the
+    // joined texts let ANY face satisfy `t:` and `o:`, but `_FACE_STAT_GROUPS` copies the
     // power/toughness group and the loyalty group from ONE face, and the mana cost from the front
     // face alone -- so a back face's numbers were printable and unsearchable.
+    //
+    // `card_colors` above is the third shape and the opposite failure: the union is not lossy, it
+    // is INVENTED. No face of Extus // Awaken the Blood Avatar is {W,B,R}, so `c:brw` matched here
+    // and 404s on Scryfall -- see `face_color_masks`.
     //
     // Measured against api.scryfall.com 2026-08-16: `pow>=3` matches Delver of Secrets (1/1 front,
     // 3/2 back), `m:{R}` matches Valki // Tibalt (the {5}{B}{R} is the BACK's), `m={1}{R}` matches
@@ -861,7 +873,8 @@ struct FaceRow {
     // Battles print their defense on the FACE, never at top level -- every battle so far is a
     // transform card, so without this the number is simply lost (Invasion of Alara's `defense: 7`).
     defense_text_id: u32,
-    card_colors: u8,
+    /// `None` when the face carried no `colors` key at all — see OracleFace's own field.
+    card_colors: Option<u8>,
     color_indicator: u8,
     // The searchable half — see OracleFace's own comment. Parsed here, at ingest, from the face's
     // own printed strings, so the spill codec and both readers carry one representation.
@@ -1432,6 +1445,14 @@ fn str_list_color_mask(d: &Bound<PyDict>, key: &str) -> u8 {
     color_list_to_mask(&colors.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
+/// `str_list_color_mask` with the ABSENT case kept apart from the empty one.
+///
+/// `["W"]` is `Some(1)`, `[]` is `Some(0)` and a missing key is `None` — the three states
+/// `face_color_masks` needs and the plain mask collapses two of.
+fn opt_str_list_color_mask(d: &Bound<PyDict>, key: &str) -> Option<u8> {
+    d.get_item(key).ok().flatten().filter(|v| !v.is_none()).map(|_| str_list_color_mask(d, key))
+}
+
 /// The card's faces, front first; empty for the ~82% of cards with one face.
 ///
 /// Keys here are Scryfall's own (see `_FACE_OBJECT_FIELDS` in api/card_processing.py), not the
@@ -1490,7 +1511,9 @@ fn faces_from_pydict(
             creature_toughness_text_id: it.intern_opt(opt_str(face, "toughness")),
             planeswalker_loyalty_text_id: it.intern_opt(opt_str(face, "loyalty")),
             defense_text_id: it.intern_opt(opt_str(face, "defense")),
-            card_colors: str_list_color_mask(face, "colors"),
+            // Absent `colors` stays absent — a split or flip face has no colour of its own and
+            // must inherit the card's, not read as colourless. See `face_color_masks`.
+            card_colors: opt_str_list_color_mask(face, "colors"),
             color_indicator: str_list_color_mask(face, "color_indicator"),
             illustration_id: opt_str(face, "illustration_id").map_or(0, |s| parse_uuid_or_hash(&s)),
             card_artist_vid,
@@ -2345,6 +2368,40 @@ fn face_stat_values<T: Copy + PartialEq>(
     for f in &card.faces {
         if let Some(v) = face_val(f) {
             push(v);
+        }
+    }
+    out
+}
+
+/// The distinct colour masks one card holds, which is what `c:`/`c=`/`c<=`/`c=N` compare against.
+///
+/// NOT the same shape as `face_stat_values`, and the difference is measured. A stat column's
+/// merged value is COPIED from one face, so listing it beside the faces' costs nothing. A colour
+/// column's merged value is a UNION — `_FACE_FLAG_UNIONS` in `_merge_processed_faces` — and a
+/// union is a value no face has. Including it is exactly the over-match this fixes:
+///
+///   `!"Extus, Oriq Overlord // Awaken the Blood Avatar" c:brw`   ours 1, Scryfall 404
+///   `!"Extus, Oriq Overlord // Awaken the Blood Avatar" c=3`     ours 1, Scryfall 404
+///
+/// The faces are {W,B} and {B,R}; only the union is {W,B,R}. So a card with faces holds ITS
+/// FACES' masks and nothing else, and `card_colors` — still the union of exactly these — survives
+/// only as the value single-faced cards hold and as the `⋃` the per-colour planes encode.
+///
+/// A face with NO `colors` key inherits the card's mask rather than contributing 0. Split and flip
+/// faces are the whole of that case (Fire // Ice, Erayo // Erayo's Essence: `name`, `mana_cost`,
+/// `type_line` and nothing more), and reading their absence as colourless would answer
+/// `!"Fire // Ice" c:c` with 1 where Scryfall answers 404 — while an MDFC land back's DECLARED
+/// `"colors": []` must keep meaning colourless, which is `!"Kabira Takedown // Kabira Plateau"
+/// c:c` = 1 on both sides. `filter::face_color_masks` is the query-time twin.
+fn face_color_masks(card: &OracleCard) -> Vec<u8> {
+    if card.faces.is_empty() {
+        return vec![card.card_colors];
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(card.faces.len());
+    for f in &card.faces {
+        let m = f.card_colors.unwrap_or(card.card_colors);
+        if !out.contains(&m) {
+            out.push(m);
         }
     }
     out
@@ -14098,7 +14155,8 @@ fn faces_to_pylist<'py>(
         d.set_item("toughness", str_at(strings, u32::from(face.creature_toughness_text_id)))?;
         d.set_item("loyalty", str_at(strings, u32::from(face.planeswalker_loyalty_text_id)))?;
         d.set_item("defense", str_at(strings, u32::from(face.defense_text_id)))?;
-        d.set_item("colors", identity_letters(face.card_colors))?;
+        // `unwrap_or(0)`: this writer has always emitted the key on every face.
+        d.set_item("colors", identity_letters(face.card_colors.as_ref().map_or(0, |v| *v)))?;
         d.set_item("color_indicator", identity_letters(face.color_indicator))?;
         // Art is per printing, and a printing may carry fewer face-art records than the card has
         // faces; those faces simply have no art rather than borrowing the wrong face's.
@@ -14303,7 +14361,16 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 //                front faces alone and quietly drop 11 of the 115 rows on
 //                `f:pauper t:creature pow>=3 cmc<=2 r:common`. Both the struct layout and the
 //                index CONTENTS move, and the second is the half a header check cannot see.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026081608;
+//   2026081609 — A FACE'S COLOURS BECOME SEARCHABLE, AND THE UNION STOPS BEING. `OracleFace`'s
+//                `card_colors` becomes `Option<u8>` — `None` where Scryfall sent no `colors` key
+//                at all, which is every split and flip face — and `colors` comparisons run
+//                existentially over the faces' masks instead of over the merged row's union. A
+//                new one-hot plane block (`PLANE_COLOR_MASK`, 64 planes) carries the value set,
+//                because the per-colour planes hold only its union and were answering `c=wb` on
+//                Extus // Awaken the Blood Avatar False and `c:brw` True where api.scryfall.com
+//                answers 1 and 404. Both the struct layout and the plane CONTENTS move, and an
+//                archive built by the older code has no mask planes to read at all.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026081609;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {

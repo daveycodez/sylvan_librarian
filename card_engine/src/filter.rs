@@ -466,6 +466,67 @@ fn card_colors(card: &AOracleCard, f: ColorField) -> u8 {
     }
 }
 
+// ─── per-face colours ────────────────────────────────────────────────────────
+//
+// `colors` is the one colour column a face has of its own, and Scryfall compares the query against
+// EVERY face's mask, existentially — the same shape the stat columns take, and for the same
+// measured reason. Each row below is a live probe against api.scryfall.com on 2026-08-16, scoped
+// with `!"Full // Name"` so the answer is 1 or 404:
+//
+//   c=b     on Valki, God of Lies // Tibalt (B // BR)             -> 1    the FRONT's mask alone
+//   c:c     on Kabira Takedown // Kabira Plateau (W // [])        -> 1    the land back is colourless
+//   c=wb    on Extus // Awaken the Blood Avatar (WB // BR)        -> 1    one face exactly
+//   c=br    on Extus                                              -> 1    the other face exactly
+//   c:brw   on Extus                                              -> 404  NO face is {W,B,R}
+//   c=3     on Extus                                              -> 404  no face has three
+//   c=2     on Extus                                              -> 1    both faces have two
+//   c<=b    on Valki // Tibalt                                    -> 1    B ⊆ B
+//   c:c     on Fire // Ice (split, faces declare NO colours)      -> 404  the faces are the card's
+//
+// The last row is the one that constrains the SHAPE rather than the semantics: a split or flip
+// face carries no `colors` key at all, so reading its absence as the mask 0 would answer 1 there.
+// The middle rows are why the card's own union is NOT a member of the set — `c:brw` and `c=3` are
+// satisfied by {W,B,R} and by nothing else, and {W,B,R} is a value no face of Extus has.
+//
+// `color_identity` and `produced_mana` are card-level and stay that way, measured the same way and
+// agreeing on both sides already: `id=wbr` on Extus is 1 while `id=wb` and `id=2` are 404 (the
+// identity really is the card's three colours, not either face's two), and Scryfall's face objects
+// carry neither key. Mana VALUE is card-level for the identical reason — see
+// `num_field_is_face_scoped`.
+
+/// One card's colour comparison against one mask. The single definition the two structures that
+/// decide a colour leaf share: `tri`'s ColorCmp arm below, and `planes::compile_plane`, which
+/// evaluates it at COMPILE time against every possible mask to pick the planes to OR. Stating the
+/// operator once is what makes the plane expression and `tri` unable to disagree about it.
+pub(crate) fn color_cmp(bits: u8, op: CmpOp, mask: u8) -> bool {
+    match op {
+        // mask == 0 means the query was literally "c"/"colorless" (see
+        // get_colors_comparison_object on the Python side), not "at
+        // least zero colors" -- bits & 0 == 0 is vacuously true for
+        // every card, so Ge must fall back to exact equality here.
+        CmpOp::Ge => if mask == 0 { bits == 0 } else { bits & mask == mask },
+        CmpOp::Eq => bits == mask,
+        CmpOp::Le => bits & !mask == 0,
+        CmpOp::Lt => bits & !mask == 0 && bits != mask,
+        CmpOp::Gt => bits & mask == mask && bits != mask,
+        CmpOp::Ne => bits != mask,
+    }
+}
+
+/// The distinct colour masks this card holds — the query-time twin of `lib::face_color_masks`,
+/// which enumerates the identical set at build time for the planes. Read that one's doc for why
+/// the card's union is excluded and why an absent face `colors` inherits it.
+///
+/// Returns `None` for the two card-level columns and for the ~82% of cards with no faces, which is
+/// the caller's signal to keep using the single card-level mask it already read.
+fn face_color_masks(card: &AOracleCard, f: ColorField) -> Option<impl Iterator<Item = u8> + '_> {
+    if card.faces.is_empty() || !matches!(f, ColorField::Colors) {
+        return None;
+    }
+    let card_mask = card.card_colors;
+    Some(card.faces.iter().map(move |face| face.card_colors.as_ref().map_or(card_mask, |v| *v)))
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum CollField {
     Subtypes,
@@ -1989,18 +2050,12 @@ impl FilterExpr {
             }
 
             FilterExpr::ColorCmp { field, op, mask } => {
-                let bits = card_colors(card, *field);
-                tri_bool(match op {
-                    // mask == 0 means the query was literally "c"/"colorless" (see
-                    // get_colors_comparison_object on the Python side), not "at
-                    // least zero colors" -- bits & 0 == 0 is vacuously true for
-                    // every card, so Ge must fall back to exact equality here.
-                    CmpOp::Ge => if *mask == 0 { bits == 0 } else { bits & mask == *mask },
-                    CmpOp::Eq => bits == *mask,
-                    CmpOp::Le => bits & !mask == 0,
-                    CmpOp::Lt => bits & !mask == 0 && bits != *mask,
-                    CmpOp::Gt => bits & mask == *mask && bits != *mask,
-                    CmpOp::Ne => bits != *mask,
+                // Existential over the faces' own masks — see `face_color_masks`. The card-level
+                // mask answers for the 82% of cards with no faces and for every card-level column,
+                // where `face_color_masks` declines and this is exactly the pre-gen-28 line.
+                tri_bool(match face_color_masks(card, *field) {
+                    Some(masks) => masks.into_iter().any(|bits| color_cmp(bits, *op, *mask)),
+                    None => color_cmp(card_colors(card, *field), *op, *mask),
                 })
             }
 
