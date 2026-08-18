@@ -91,7 +91,8 @@ pub(crate) const PLANE_RESTRICTED_ABSENT: usize = PLANE_RESTRICTED_EXISTS + MAX_
 /// high values, e.g. toughness up to 30) and a shared "<0" low-tail bucket
 /// for power/toughness only (a mana value is never negative, so cmc never
 /// needs one). The interior is a lattice of INTEGER points, so a fractional
-/// cmc goes to the hi bucket however small it is — see `set_numeric_plane`.
+/// value in ANY of the three goes to a bucket however small it is — see
+/// `set_numeric_plane`.
 /// Buckets are cumulative planes built with the exact same machinery as the
 /// interior values — "power<=0" is
 /// just another plane, no different from "power==5" — which is what lets a
@@ -293,6 +294,11 @@ fn devotion_count(card: &OracleCard, lane: usize) -> u8 {
 /// (they fall back to `numeric_candidates`) but can never make one answer
 /// wrongly: `bucket_verdict` reasons only from the endpoints and monotonicity,
 /// which holds wherever in the number line the bucket's members sit.
+///
+/// Power and toughness reach this the same way cmc does, and a fraction there
+/// picks whichever bucket it is nearest: a NEGATIVE off-lattice value goes to
+/// the lo bucket by the first arm, which tracks its own [min,max] and so is
+/// sound for the same reason. Only the interior lattice is closed to them.
 fn set_numeric_plane(
     set: &mut impl FnMut(usize),
     v: Option<f32>,
@@ -455,18 +461,18 @@ pub(crate) fn build_bit_planes(cards: &[OracleCard], printings: &[Printing], off
             }
         }
         // #655: a mana value is never negative, so cmc has no low bucket.
-        // Power/toughness are Option<i8> and do (Char-Rumbler and similar).
+        // Power/toughness are signed and do (Char-Rumbler and similar).
         set_numeric_plane(&mut set, card.cmc, PLANE_CMC, None, (PLANE_CMC_HI, &mut cmc_hi));
         set_numeric_plane(
             &mut set,
-            card.creature_power.map(f32::from),
+            card.creature_power,
             PLANE_POWER,
             Some((PLANE_POWER_LO, &mut power_lo)),
             (PLANE_POWER_HI, &mut power_hi),
         );
         set_numeric_plane(
             &mut set,
-            card.creature_toughness.map(f32::from),
+            card.creature_toughness,
             PLANE_TOUGHNESS,
             Some((PLANE_TOUGHNESS_LO, &mut toughness_lo)),
             (PLANE_TOUGHNESS_HI, &mut toughness_hi),

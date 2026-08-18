@@ -192,8 +192,18 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
 
     card["planeswalker_loyalty"] = maybe_int(card.get("loyalty"))
     if "Creature" in card_types or {"Vehicle", "Spacecraft"} & set(card_subtypes):
-        card["creature_power"] = maybe_int(card.get("power"))
-        card["creature_toughness"] = maybe_int(card.get("toughness"))
+        # Power and toughness are STRINGS in Scryfall's schema, and eleven cards print a HALF in
+        # them: /cards/named?exact=Little+Girl answers "power":".5", "toughness":".5", and the
+        # other ten are Unhinged's Ass cycle plus Fraction Jackson, Cardpecker, Stone-Cold
+        # Basilisk and Vile Bile. maybe_int here did `int(float(val))`, which rounded each onto
+        # its floor — where it then MATCHED that floor, so `power=2` picked up every 2.5. The
+        # columns are `real` as of 2026-08-17-01-fractional-power-toughness.sql, so keep the
+        # float. Non-numeric printings (`*`, `1+*`, `?`, `∞`) still fall through to None exactly
+        # as before: maybe_float and maybe_int reject them identically, via the same
+        # ValueError/TypeError in @maybeify. The printed string is preserved verbatim either way
+        # in creature_power_text/creature_toughness_text below.
+        card["creature_power"] = maybe_float(card.get("power"))
+        card["creature_toughness"] = maybe_float(card.get("toughness"))
         card["creature_power_text"] = card.get("power")
         card["creature_toughness_text"] = card.get("toughness")
     else:

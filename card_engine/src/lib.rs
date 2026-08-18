@@ -268,8 +268,17 @@ struct OracleCard {
     // drops funny sets, so today every stored value is integral and this only stops the
     // TYPE from being the thing that loses the fraction.
     cmc: Option<f32>,
-    creature_power: Option<i8>,       // can be negative (e.g. Char-Rumbler)
-    creature_toughness: Option<i8>,
+    // Fractional for the same reason cmc above is, and from the same corner of the same corpus.
+    // Scryfall types power/toughness as STRINGS, and eleven Unhinged cards print a HALF in them:
+    // Little Girl ".5"/".5", Fraction Jackson "1"/"1.5", Smart Ass "2.5"/"1", Stone-Cold Basilisk
+    // "2.5"/"5", Vile Bile "2.5"/"2.5", Assquatch "3.5"/"3.5", Bad Ass "3.5"/"1", Dumb Ass
+    // "3.5"/"2", Cheap Ass "1"/"3.5", Fat Ass "2"/"3.5", Cardpecker "1.5"/"1". The importer's
+    // int(float(...)) cast truncated each onto its floor, and the failure that leaves is the same
+    // asymmetric pair cmc had: `power=2.5` finding nothing is visible, while `power=2` silently
+    // gaining a 2.5 card is not. Still SIGNED — power is genuinely negative on Char-Rumbler and
+    // Spinal Parasite, which is why the low-tail plane bucket exists.
+    creature_power: Option<f32>,
+    creature_toughness: Option<f32>,
     planeswalker_loyalty: Option<u8>, // always 1-12
     edhrec_rank: Option<u32>,         // up to ~30k unique cards
     cubecobra_score: Option<f32>,
@@ -378,8 +387,8 @@ struct CardRow {
     released_at_int: Option<u32>,
 
     cmc: Option<f32>,
-    creature_power: Option<i8>,
-    creature_toughness: Option<i8>,
+    creature_power: Option<f32>,
+    creature_toughness: Option<f32>,
     planeswalker_loyalty: Option<u8>,
     card_rarity_int: Option<u8>,
     collector_number_int: Option<u16>,
@@ -616,10 +625,6 @@ fn opt_f32(d: &Bound<PyDict>, key: &str) -> Option<f32> {
     })
 }
 
-fn opt_i8(d: &Bound<PyDict>, key: &str) -> Option<i8> {
-    opt_f32(d, key).map(|v| v as i8)
-}
-
 fn opt_u8(d: &Bound<PyDict>, key: &str) -> Option<u8> {
     opt_f32(d, key).map(|v| v as u8)
 }
@@ -771,9 +776,12 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
 
         // Read as f32, not truncated to an integer: `mana_cost` below already asked for the
         // same key as an f32, so an integer cmc here was the only place the two disagreed.
+        // Power and toughness read the same way, and `opt_i8` is gone with them — they were its
+        // only two callers. A `real` column arrives from psycopg as a Python float, and the
+        // truncating `as i8` on the way in was the last place a printed half could be lost.
         cmc: opt_f32(d, "cmc"),
-        creature_power: opt_i8(d, "creature_power"),
-        creature_toughness: opt_i8(d, "creature_toughness"),
+        creature_power: opt_f32(d, "creature_power"),
+        creature_toughness: opt_f32(d, "creature_toughness"),
         planeswalker_loyalty: opt_u8(d, "planeswalker_loyalty"),
         card_rarity_int: opt_u8(d, "card_rarity_int"),
         collector_number_int: opt_u16(d, "collector_number_int"),
@@ -1605,22 +1613,26 @@ fn numeric_candidates(idx: &Archived<NumericIndex>, op: CmpOp, val: f64, n_cards
 
 /// One card's joint numeric key. Derived Hash/Eq handle the NULL (`None`) cases
 /// natively at build-time interning — no sentinel encoding. `f64::from` on the
-/// stored ints is lossless (all four domains fit exactly in f32, so also f64) and
+/// stored values is lossless (all four domains fit exactly in f32, so also f64) and
 /// matches field_num's own widening exactly (the differential test asserts this).
 ///
-/// cmc is held as its `f32::to_bits` pattern rather than as an `f32`, because this key
-/// is a HashMap key and f32 has neither `Eq` nor `Hash`. The two ways bit equality can
-/// disagree with numeric equality are NaN (never equal to itself) and ±0.0 (equal but
-/// bitwise distinct); neither reaches here, because every value is a mana value Postgres
-/// stored — a finite, non-negative number, and Scryfall's own `0` for a zero-cost card
-/// arrives as +0.0. Interning on bits is therefore exactly interning on value, and a
-/// mis-intern would cost only a duplicate combination, never a wrong verdict: each
-/// combination is re-evaluated from its own stored key.
+/// cmc, power and toughness are held as their `f32::to_bits` patterns rather than as `f32`s,
+/// because this key is a HashMap key and f32 has neither `Eq` nor `Hash`. The two ways bit
+/// equality can disagree with numeric equality are NaN (never equal to itself) and ±0.0
+/// (equal but bitwise distinct). NaN cannot reach here — every value is a number Postgres
+/// stored, so it is finite by construction. ±0.0 is a real possibility on power and toughness
+/// in a way it never was on cmc: a mana value is non-negative, but power is signed, and while
+/// Scryfall prints "0" (which parses to +0.0) rather than "-0", `+ 0.0` on the way in
+/// normalizes the negative zero onto the positive one so a value every comparison treats as
+/// equal cannot intern as two combinations and inflate the distinct-key budget. Interning on
+/// bits is therefore exactly interning on value, and a mis-intern would cost only a duplicate
+/// combination, never a wrong verdict: each combination is re-evaluated from its own stored
+/// key.
 #[derive(Archive, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash)]
 struct ArithTupleKey {
     cmc_bits: Option<u32>,
-    power: Option<i8>,
-    toughness: Option<i8>,
+    power_bits: Option<u32>,
+    toughness_bits: Option<u32>,
     loyalty: Option<u8>,
 }
 
@@ -1675,10 +1687,11 @@ fn build_arith_tuple_index(cards: &[OracleCard]) -> ArithTupleIndex {
     let mut keys: Vec<ArithTupleKey> = Vec::new();
     let mut postings: Vec<Vec<u32>> = Vec::new();
     for (i, c) in cards.iter().enumerate() {
+        // `+ 0.0` normalizes -0.0 onto +0.0 before interning — see ArithTupleKey's own comment.
         let key = ArithTupleKey {
-            cmc_bits: c.cmc.map(f32::to_bits),
-            power: c.creature_power,
-            toughness: c.creature_toughness,
+            cmc_bits: c.cmc.map(|v| (v + 0.0).to_bits()),
+            power_bits: c.creature_power.map(|v| (v + 0.0).to_bits()),
+            toughness_bits: c.creature_toughness.map(|v| (v + 0.0).to_bits()),
             loyalty: c.planeswalker_loyalty,
         };
         let id = *interner.entry(key).or_insert_with(|| {
@@ -1719,15 +1732,16 @@ fn arith_tuple_narrow(filter: &FilterExpr, idx: &Archived<ArithTupleIndex>, n_ca
     let mut matched: Vec<usize> = Vec::new();
     let mut count: usize = 0;
     for (t, key) in idx.keys.iter().enumerate() {
-        // Widen exactly as field_num does (see ArithTupleKey's doc): u8/i8 → f64 is lossless and
-        // matches field_num's `_ as f32 as f64` for these domains. The archived Option<u8>/<i8>
-        // store their scalars natively (no endian wrapper), so `f64::from(*v)` reads them directly.
-        // cmc goes back through `from_bits` first — same round trip `to_bits` made at build time,
-        // so what field_num would read off the card and what this reads off the key are the same
-        // f32 before either widens to f64.
-        let cmc = key.cmc_bits.as_ref().map(|v| f64::from(f32::from_bits(u32::from(*v))));
-        let power = key.power.as_ref().map(|v| f64::from(*v));
-        let toughness = key.toughness.as_ref().map(|v| f64::from(*v));
+        // Widen exactly as field_num does (see ArithTupleKey's doc): u8 → f64 is lossless and
+        // matches field_num's `_ as f32 as f64` for loyalty's domain. The archived Option<u8>
+        // stores its scalar natively (no endian wrapper), so `f64::from(*v)` reads it directly.
+        // The three f32 columns go back through `from_bits` first — same round trip `to_bits`
+        // made at build time, so what field_num would read off the card and what this reads off
+        // the key are the same f32 before either widens to f64.
+        let bits_to_f64 = |v: &rkyv::Archived<u32>| f64::from(f32::from_bits(u32::from(*v)));
+        let cmc = key.cmc_bits.as_ref().map(bits_to_f64);
+        let power = key.power_bits.as_ref().map(bits_to_f64);
+        let toughness = key.toughness_bits.as_ref().map(bits_to_f64);
         let loyalty = key.loyalty.as_ref().map(|v| f64::from(*v));
         if eval_arith_tuple_tri(lhs, *op, rhs, cmc, power, toughness, loyalty) == want {
             matched.push(t);
@@ -2355,7 +2369,9 @@ fn sort_col_card_value(card: &AOracleCard, sort_col: SortCol) -> Option<f32> {
     match sort_col {
         SortCol::EdhrecRank => card.edhrec_rank.as_ref().map(|v| u32::from(*v) as f32),
         SortCol::Cubecobra  => card.cubecobra_score.as_ref().map(|v| f32::from(*v)),
-        // Single bytes, so archived and native are the same type — no `u8::from` to unwrap.
+        // All three are `f32` columns now, so the `f32::from` here unwraps rkyv's endian-aware
+        // archived scalar rather than widening an integer — the same shape `cubecobra_score`
+        // above has, not the single-byte identity these two lines used to be.
         SortCol::Cmc        => card.cmc.as_ref().map(|v| f32::from(*v)),
         SortCol::Power      => card.creature_power.as_ref().map(|v| f32::from(*v)),
         SortCol::Toughness  => card.creature_toughness.as_ref().map(|v| f32::from(*v)),
@@ -2455,8 +2471,8 @@ fn build_sort_permutations(cards: &[OracleCard]) -> SortPermutations {
     let (edhrec, edhrec_inv) = both(&|c| c.edhrec_rank.map(|v| v as f32));
     let (cubecobra, cubecobra_inv) = both(&|c| c.cubecobra_score);
     let (cmc, cmc_inv) = both(&|c| c.cmc);
-    let (power, power_inv) = both(&|c| c.creature_power.map(|v| v as f32));
-    let (toughness, toughness_inv) = both(&|c| c.creature_toughness.map(|v| v as f32));
+    let (power, power_inv) = both(&|c| c.creature_power);
+    let (toughness, toughness_inv) = both(&|c| c.creature_toughness);
     let (name, name_inv) = both(&|c| Some(c.name_rank as f32));
     SortPermutations {
         edhrec, cubecobra, cmc, power, toughness, name,
@@ -11784,7 +11800,18 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 // slip straight through. That is the case this field exists for, and reading an old store under
 // the new layout would reinterpret integer cmc bytes as float bits and answer nonsense rather
 // than fail loudly.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026082301;
+//
+// 2026082302 — `creature_power` and `creature_toughness` went `Option<i8>` -> `Option<f32>` on
+// `OracleCard`, and `ArithTupleKey`'s two matching fields went with them (`power`/`toughness` ->
+// `power_bits`/`toughness_bits`). Eleven Unhinged cards print a HALF in those columns and the
+// integer cast truncated each onto the value it would then wrongly ANSWER — the same defect cmc
+// had, one column family over.
+// THIS IS THE CASE THE VERSION FIELD EXISTS FOR, and unlike cmc's it is not also caught by luck:
+// `size_of::<AOracleCard>` measures 304 both before and after (padding absorbed the 12 bytes the
+// two columns gained), `size_of::<APrinting>` is untouched at 160, and `ArithTupleKey` is not
+// measured by the header at all. Without this bump, get_mmap would accept an archive written by
+// the old build and read i8 power bytes as f32 bits.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026082302;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -12341,8 +12368,8 @@ impl QueryEngine {
             name_trigram:   build_trigram_index(&cards, |c| c.card_name_folded.as_str()),
             oracle_trigram: build_oracle_text_index(&cards, &strings),
             cmc:            build_numeric_index(&cards, |c| c.cmc),
-            power:          build_numeric_index(&cards, |c| c.creature_power.map(f32::from)),
-            toughness:      build_numeric_index(&cards, |c| c.creature_toughness.map(f32::from)),
+            power:          build_numeric_index(&cards, |c| c.creature_power),
+            toughness:      build_numeric_index(&cards, |c| c.creature_toughness),
             rarity:         build_rarity_index(&printings, &offsets),
             subtypes:       build_hybrid_tag_index(&cards, &coll_vocab, |c| &c.card_subtypes),
             keywords:       build_hybrid_tag_index(&cards, &coll_vocab, |c| &c.card_keywords),

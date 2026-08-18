@@ -420,6 +420,52 @@ class TestCardProcessing:
 
         assert result[0]["cmc"] == 1
 
+    def test_preprocess_card_keeps_a_fractional_power_and_toughness(self) -> None:
+        """A printed half survives the import cast, in the column the query compares.
+
+        Power and toughness are STRINGS in Scryfall's schema, and eleven cards print a half
+        in them — checked against the live API on 2026-08-17,
+        /cards/named?exact=Little+Girl answers "power":".5", "toughness":".5". The cast here
+        used to be int(float(val)), which turned .5 into 0.
+        """
+        card = create_test_card(name="Little Girl", power=".5", toughness=".5")
+
+        result = preprocess_card(card)
+
+        assert result[0]["creature_power"] == 0.5
+        assert result[0]["creature_toughness"] == 0.5
+
+    def test_preprocess_card_does_not_round_a_half_onto_its_floor(self) -> None:
+        """The direction an integer column gets wrong SILENTLY.
+
+        `power=2` finding nothing when a 2.5 card exists would be visible. `power=2`
+        matching that card is not — and truncation does the second, not the first.
+        """
+        card = create_test_card(name="Smart Ass", power="2.5", toughness="1")
+
+        result = preprocess_card(card)
+
+        assert result[0]["creature_power"] == 2.5
+        assert result[0]["creature_power"] != 2
+
+    def test_preprocess_card_keeps_whole_stats_whole(self) -> None:
+        """Widening the cast must not perturb the rows that are already integral."""
+        card = create_test_card(name="Grizzly Bears", power="2", toughness="2")
+
+        result = preprocess_card(card)
+
+        assert result[0]["creature_power"] == 2
+        assert result[0]["creature_toughness"] == 2
+
+    def test_preprocess_card_keeps_a_negative_power(self) -> None:
+        """Power is signed and stays so: Char-Rumbler and Spinal Parasite print -1."""
+        card = create_test_card(name="Spinal Parasite", power="-1", toughness="-1")
+
+        result = preprocess_card(card)
+
+        assert result[0]["creature_power"] == -1
+        assert result[0]["creature_toughness"] == -1
+
     def test_preprocess_hound_tamer_dfc(self) -> None:
         """Test preprocess_card processes Hound Tamer DFC sample data correctly."""
         sample_file = _SAMPLE_DATA_DIR / "hound_tamer.json"
