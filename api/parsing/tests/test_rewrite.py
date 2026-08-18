@@ -33,10 +33,6 @@ EQUIVALENCES = [
     ("is:permanent", "t:creature or t:artifact or t:enchantment or t:land or t:planeswalker or t:battle"),
     ("is:party", "t:creature (t:cleric or t:rogue or t:warrior or t:wizard or kw:changeling)"),
     ("is:outlaw", "t:assassin or t:mercenary or t:pirate or t:rogue or t:warlock or kw:changeling"),
-    # `o=""` was a tautology on api.scryfall.com too — `t:creature o=""` is 18,753 there, exactly
-    # `t:creature`, while `is:vanilla` is 363. The presence regex, negated, is the empty-text test
-    # that exists: 352 on Scryfall and 352 on this corpus.
-    ("is:vanilla", "t:creature -o:/./"),
     ("is:bear", "t:creature pow=2 tou=2 cmc=2"),
     # layout family
     ("is:split", "layout:split"),
@@ -418,9 +414,9 @@ def test_engine_answered_is_values_are_supported_and_stored_nowhere() -> None:
     """The `is:` values the ENGINE answers from a field are supported, and only from there.
 
     Two directions, and the second is the one that bites. Supported: a predicate that works and
-    still warns is worse than one that does neither. Stored nowhere: if `localizedname` or `unique`
-    ever became an importer tag as well, the engine would keep intercepting the leaf and the stored
-    tag would be dead weight nobody could observe.
+    still warns is worse than one that does neither. Stored nowhere: if `localizedname`, `unique` or
+    `vanilla` ever became an importer tag as well, the engine would keep intercepting the leaf and
+    the stored tag would be dead weight nobody could observe.
     """
     assert ENGINE_IS_VALUES <= SUPPORTED_IS_VALUES
     assert not (ENGINE_IS_VALUES & frozenset(BOOLEAN_IS_TAGS))
@@ -454,6 +450,9 @@ def test_engine_answered_is_values_are_supported_and_stored_nowhere() -> None:
         # them would be the exact defect SUPPORTED_IS_VALUES exists to remove, in reverse.
         "is:localizedname",
         "is:unique",
+        "is:vanilla",
+        # ...and through the `has:` alias, which resolves to the same engine leaf.
+        "has:vanilla",
     ],
 )
 def test_supported_is_values_do_not_warn(query: str) -> None:
@@ -531,7 +530,9 @@ def test_has_is_a_total_alias_of_is(parse_query) -> None:
     """
     assert SUPPORTED_HAS_VALUES >= SUPPORTED_IS_VALUES
     # One per shape, expanding to the identical AST under either spelling.
-    for value in ("split", "dfc", "frenchvanilla", "permanent", "promo", "etched", "commander"):
+    # ...including an ENGINE-answered one. `vanilla` expands to nothing at all, so the alias has to
+    # reach the leaf itself rather than a rewrite of it.
+    for value in ("split", "dfc", "frenchvanilla", "permanent", "promo", "etched", "commander", "vanilla"):
         assert parse_query(f"has:{value}").to_json() == parse_query(f"is:{value}").to_json(), value
 
 
