@@ -531,6 +531,86 @@ fn face_color_masks(card: &AOracleCard, f: ColorField) -> Option<impl Iterator<I
     Some(card.faces.iter().map(move |face| face.card_colors.as_ref().map_or(card_mask, |v| *v)))
 }
 
+// ─── the front face, and `is:vanilla` ────────────────────────────────────────
+//
+// `is:vanilla` is the third face-scoped shape after the numeric columns above and the colour masks
+// beside them, and the only one that is not existential. It is a predicate rather than the
+// `t:creature -o:/./` expansion the parser used to give it because that rewrite reads the MERGED
+// row, whose oracle text is every face's joined: a card whose FRONT face prints nothing loses to
+// the half that does. 352 on both sides against Scryfall's own 363.
+//
+// THREE RULES, each measured against api.scryfall.com on 2026-08-17, and only the first is the
+// question the diagnosis started from:
+//
+//   1. THE FRONT FACE ANSWERS — not the merged row, and NOT any face. `is:vanilla o:/./` is 12
+//      there and all 12 are adventures whose creature front is blank behind an Instant/Sorcery half
+//      that prints (`Beluna's Gatekeeper // Entry Denied`). The back is NOT enough: all four of
+//      `Kaslem's Stonetree`, `Ecstatic Awakener`, `Chosen of Markov` and `Skin Invasion` have a
+//      blank creature BACK behind a front that prints, and `is:vanilla` on the four is 0. The token
+//      rows settle it in the other direction — `is:vanilla is:dfc` is 18 there, and it holds
+//      `Servo // Thopter` and `Goblin // Blood` (blank front, printing back) while leaving out
+//      `Elemental // Centaur` and `Fish // Kraken` (printing front, blank back).
+//
+//   2. THE CREATURE TEST IS THE CARD'S, not the front face's. `City's Blessing // Elemental` and
+//      `Copy // Horror` are both in that 18, and neither FRONT is a creature — the back is. So the
+//      card must be a creature somewhere and its front must be silent, which is exactly the pair
+//      `card_types` and `faces[0]` already hold.
+//
+//   3. A LAND IS NEVER VANILLA. `t:creature -o:/./ -is:vanilla` is exactly 1 there and it is
+//      `Dryad Arbor`, whose land types grant `{T}: Add {G}` with nothing printed to say so.
+//      `is:vanilla t:land` is 0 there with and without `include_extras`, while
+//      `t:creature t:land -o:/./` is 2 — Dryad Arbor and the `Forest Dryad` token. Both candidates,
+//      neither vanilla, and over the whole 540,484-row import those 2 are the only rows the clause
+//      removes: a creature with no printed text produces mana only through a land type.
+//
+// And the text read is the printed text WITHOUT its reminder text: `Icehide Golem` ("({S} can be
+// paid with one mana from a snow source.)") and `Infinity Elemental` ("(This creature has INFINITE
+// POWER.)") are both vanilla there and neither prints an empty string.
+//
+// 352 + 12 − 1 = 363, which is Scryfall's own count — and card for card, not merely the same size:
+// the full 363 was fetched in three pages and diffed against this engine's own by `oracle_id`, and
+// both set differences are empty. Every field this reads is already in the archive, so nothing is
+// stored for it and no format moves.
+
+/// Whether a printed oracle text leaves nothing behind once its reminder text is removed.
+///
+/// A depth walk rather than a strip-and-compare: the question is only whether ANY character
+/// survives outside the parentheses, so nothing needs to be built. Reminder text nests in practice
+/// (`Dryad Arbor`'s parenthetical quotes an ability), which is why the depth is counted rather than
+/// the first `)` taken.
+///
+/// This is the blankness half of the rule `o:` will want in full when the reminder-text work lands;
+/// at that point this collapses onto whatever that introduces, rather than staying a second copy.
+fn text_blank_after_reminders(text: &str) -> bool {
+    let mut depth = 0usize;
+    for c in text.chars() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 && !c.is_whitespace() => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+/// `is:vanilla` / `has:vanilla`: a creature whose FRONT face prints no rules text.
+///
+/// The type half is two mask bits the build already parsed off the whole type line, so it needs no
+/// face walk; the text half is one face read, or the card's own text for the ~82% with no faces —
+/// where the card IS its one face.
+fn card_is_vanilla(card: &AOracleCard, strings: &AStrings) -> bool {
+    let bits = u16::from(card.card_types);
+    if bits & super::TYPE_CREATURE == 0 || bits & super::TYPE_LAND != 0 {
+        return false;
+    }
+    let text_id = match card.faces.first() {
+        None => card.oracle_text_id,
+        Some(front) => front.oracle_text_id,
+    };
+    str_at(strings, u32::from(text_id)).is_none_or(text_blank_after_reminders)
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum CollField {
     Subtypes,
@@ -829,6 +909,16 @@ pub(crate) enum FilterExpr {
     /// alone would have called all 130 unique and been wrong 130 times.
     SingleSet,
 
+    /// `is:vanilla` — and `has:vanilla` — a creature whose FRONT face prints no rules text.
+    /// Card-level and total, off fields the archive already holds; nothing to bind and nothing per
+    /// printing.
+    ///
+    /// A PREDICATE rather than the `t:creature -o:/./` expansion it replaces, because the merged
+    /// row cannot answer it: the join hides a blank front behind the half that prints. See
+    /// `card_is_vanilla` for the three measured rules — the front face, the card-level creature
+    /// test, and the land face that is never vanilla.
+    VanillaFace,
+
     /// `oracleid:<uuid>` — the oracle card whose `oracle_id` equals `id` (`parse_uuid_or_hash`'s
     /// u128, 0 for an unparseable value, which no stored id ever equals). Card-level and total,
     /// with nothing for `bind()` to resolve — bind() sees the vocab tables, not `CardIndexes` —
@@ -970,6 +1060,10 @@ pub(crate) fn verify_cost_tier(f: &FilterExpr) -> u32 {
     match f {
         FilterExpr::TextRegex { regex, .. } => regex_tier(regex.as_str()),
         FilterExpr::TextContains { .. } => TEXT_SCAN_NS100,
+        // Two mask bits reject all but the creatures, and the survivors walk one string: the FRONT
+        // face's printed text, or the card's own. That walk is a scan, so it is ranked as one — the
+        // model must not under-charge a predicate on the strength of the branch it usually takes.
+        FilterExpr::VanillaFace => TEXT_SCAN_NS100,
         FilterExpr::Devotion { .. } | FilterExpr::ManaCostCmp { .. } => SET_LOOKUP_NS100,
         FilterExpr::ArtistMatch { .. }
         | FilterExpr::FlavorMatch { .. }
@@ -1161,6 +1255,8 @@ fn leaf_compares_printing_field(f: &FilterExpr) -> bool {
         // How many SETS the card has been printed in is the card's fact too, decided at build over
         // every printing of it; no printing can change the answer.
         | FilterExpr::SingleSet
+        // Faces and their texts are oracle data — every printing of the card prints the same ones.
+        | FilterExpr::VanillaFace
         | FilterExpr::ColorCmp { .. }
         | FilterExpr::TypeCmp { .. }
         | FilterExpr::ManaCostCmp { .. }
@@ -2056,6 +2152,10 @@ impl FilterExpr {
 
             FilterExpr::SingleSet => tri_bool(card.single_set),
 
+            // Two-valued: a card either has a silent creature front or it does not, and a card with
+            // no text at all interns "" rather than NONE_STR, so absence is never an SQL NULL here.
+            FilterExpr::VanillaFace => tri_bool(card_is_vanilla(card, strings)),
+
             FilterExpr::SetTypeMatch { vid, .. } => {
                 let Some(p) = printing else { return Tri::PrintingDep };
                 if u16::from(p.compat.set_type_id) == super::VOCAB_NONE {
@@ -2792,8 +2892,8 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
             _                  => CollField::FrameData,
         };
         let value  = rhs.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        // Two `is:` values the importer stores no tag for, because a field already on the row
-        // answers them (see `rewrite.ENGINE_IS_VALUES`, which is what keeps the parser from
+        // Three `is:` values the importer stores no tag for, because fields already on the row
+        // answer them (see `rewrite.ENGINE_IS_VALUES`, which is what keeps the parser from
         // reporting them unsupported). They arrive as `card_is_tags` membership like every other
         // `is:` value and turn into their own leaf HERE rather than in the parser, so the tag
         // vocabulary stays what the importer writes and nothing has to be stored twice.
@@ -2801,6 +2901,7 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
             match value.as_str() {
                 "localizedname" => return Ok(FilterExpr::PrintedNamePresent),
                 "unique" => return Ok(FilterExpr::SingleSet),
+                "vanilla" => return Ok(FilterExpr::VanillaFace),
                 _ => {}
             }
         }
