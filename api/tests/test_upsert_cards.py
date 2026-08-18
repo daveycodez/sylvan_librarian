@@ -6,9 +6,10 @@ import logging
 import multiprocessing
 import uuid
 from typing import TYPE_CHECKING
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import psycopg
+import pytest
 
 from api.admin_resource import AdminResource
 from api.api_resource import APIResource
@@ -17,9 +18,6 @@ from api.db.bulk_upsert import bulk_upsert
 from api.scryfall_bulk_data_fetcher import BulkDataKey
 from api.tests.helpers import make_raw_card, search_kwargs
 from api.tests.support import mock_app_context
-
-if TYPE_CHECKING:
-    import pytest
 
 # ---------------------------------------------------------------------------
 # Status-code tests
@@ -382,6 +380,112 @@ class TestFractionalPowerAndToughness:
             ("creature_power", "real"),
             ("creature_toughness", "real"),
         ]
+
+
+def _row_for(api_resource: APIResource, scryfall_id: str) -> dict | None:
+    with api_resource._conn_pool.connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            """SELECT card_types, creature_power, creature_toughness,
+                      creature_power_text, creature_toughness_text
+               FROM magic.cards WHERE scryfall_id = %(sid)s""",
+            {"sid": scryfall_id},
+        )
+        return cursor.fetchone()
+
+
+def _summoned(name: str, power: str, toughness: str, type_line: str = "Summon — Dinosaur") -> dict:
+    card = make_raw_card(name=name)
+    card["type_line"] = type_line
+    card["power"] = power
+    card["toughness"] = toughness
+    return card
+
+
+class TestPrintedStatsOnANoncanonicalTypeLine:
+    """A printed power/toughness survives a type line that does not say Creature.
+
+    Eighteen printings print one — checked against the live API on 2026-08-17,
+    `-t:creature -t:vehicle -t:spacecraft (pow>=0 or pow<0) include:extras` with unique=prints
+    returns exactly that many. Mostly the pre-Sixth-Edition `Summon` template, which Scryfall
+    preserves verbatim rather than rewriting to `Creature` (Old Fogey `Summon — Dinosaur` 7/7,
+    Flanking Licid `Summon Licid` 1/1); Atinlay Igpay's `Eaturecray — Igpay` 3/3 is the
+    pig-latin one. Scryfall searches all of them numerically, so the printed keys and not the
+    parsed type are what decide whether a stat exists.
+
+    These write through the real _upsert_cards path, which is the only way to cover BOTH halves
+    of the fix at once: creature_attributes_null_for_non_creatures would have rejected every
+    insert below, so a passing test here is also the evidence that
+    2026-08-17-02-printed-stats-on-any-type-line.sql applied.
+
+    The corpus itself is unchanged: all eighteen printings fail preprocess_card's legality
+    filter, and most also fail the funny-set, playtest or paper-games rules. These construct
+    their own cards, as the fractional-stat tests above do.
+    """
+
+    def test_a_summon_type_line_keeps_its_printed_stats(self, api_resource: APIResource) -> None:
+        """Old Fogey's shape: `Summon — Dinosaur`, 7/7, and Scryfall counts it under `tou>=3.5`."""
+        card = _summoned("Old Fogey Import Test", "7", "7")
+        api_resource._upsert_cards([card])
+        assert _stats_for(api_resource, card["id"]) == (7, 7)
+
+    def test_an_unparseable_type_line_keeps_its_printed_stats(self, api_resource: APIResource) -> None:
+        """Atinlay Igpay's shape: not a word the parser knows in either position, still 3/3."""
+        card = _summoned("Atinlay Igpay Import Test", "3", "3", type_line="Eaturecray — Igpay")
+        api_resource._upsert_cards([card])
+        assert _stats_for(api_resource, card["id"]) == (3, 3)
+
+    def test_the_stored_row_is_still_not_a_creature(self, api_resource: APIResource) -> None:
+        """The negative that makes this the right fix rather than a parser change.
+
+        Widening parse_type_line to read `Summon` as `Creature` would have kept the stats too,
+        and would have put eighteen printings into `t:creature` that print no such word. The
+        printed text columns come along with the numbers; the type does not.
+        """
+        card = _summoned("Summon Not A Creature Test", "7", "7")
+        api_resource._upsert_cards([card])
+
+        row = _row_for(api_resource, card["id"])
+        assert row is not None
+        assert "Creature" not in row["card_types"]
+        assert row["creature_power_text"] == "7"
+        assert row["creature_toughness_text"] == "7"
+
+    def test_a_printed_stat_is_findable_through_the_sql_search_path(self, api_resource: APIResource) -> None:
+        """The stat is searchable, and searching it does not drag the row into `t:creature`.
+
+        Membership rather than equality on the result set, as this fixture's session-shared
+        database requires.
+        """
+        card = _summoned("Summon Search Test", "7", "7")
+        api_resource._upsert_cards([card])
+
+        found = {c["name"] for c in api_resource._search_sql(**search_kwargs("power=7", limit=100))["cards"]}
+        assert "Summon Search Test" in found
+        # Conjoined with the stat rather than bare, so the assertion cannot pass merely by the
+        # row falling off the end of a truncated `t:creature` result set.
+        creatures = {c["name"] for c in api_resource._search_sql(**search_kwargs("power=7 t:creature", limit=100))["cards"]}
+        assert "Summon Search Test" not in creatures
+
+    def test_a_non_creature_row_without_a_printed_stat_is_still_rejected(self, api_resource: APIResource) -> None:
+        """The half of the old constraint the migration deliberately keeps.
+
+        The numeric columns are this project's parse of the printed text ones, so a number with
+        no printed string beside it on a row claiming no creature type is a derived value that
+        arrived from somewhere it should not have. Written as raw SQL because the import path
+        cannot produce it -- which is the point of asking the table to reject it.
+        """
+        card = make_raw_card(name="Bare Numeric Stat Test")
+        api_resource._upsert_cards([card])
+
+        with (
+            pytest.raises(psycopg.errors.CheckViolation),
+            api_resource._conn_pool.connection() as conn,
+            conn.cursor() as cursor,
+        ):
+            cursor.execute(
+                "UPDATE magic.cards SET creature_power = 2 WHERE scryfall_id = %(sid)s",
+                {"sid": card["id"]},
+            )
 
 
 # ---------------------------------------------------------------------------
