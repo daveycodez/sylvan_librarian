@@ -147,7 +147,8 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
         return [card]
 
     # Lift the card name before processing faces, because it shouldn't be clobbered by card_faces
-    if "card_name" not in card:
+    is_merged_face = "card_name" in card
+    if not is_merged_face:
         # Non-recursive case: first time seeing this card
         card["card_name"] = card.get("name")
     else:
@@ -191,7 +192,27 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
     card["card_subtypes"] = card_subtypes
 
     card["planeswalker_loyalty"] = maybe_int(card.get("loyalty"))
-    if "Creature" in card_types or {"Vehicle", "Spacecraft"} & set(card_subtypes):
+    # The parsed type line is the ORDINARY reason a row carries stats. It is not the only one, and
+    # Scryfall does not treat it as one. Eighteen printings print a real power and toughness behind
+    # a type line that says neither Creature nor Vehicle nor Spacecraft: the pre-Sixth-Edition
+    # `Summon` template (Old Fogey `Summon — Dinosaur`, Flanking Licid `Summon Licid`,
+    # Shichifukujin Dragon `Summon Dragon`) and Atinlay Igpay's pig-latin `Eaturecray — Igpay`.
+    # Checked against the live API on 2026-08-17, `-t:creature -t:vehicle -t:spacecraft (pow>=0 or
+    # pow<0) include:extras` with unique=prints returns exactly those eighteen — and Scryfall
+    # answers each of them NUMERICALLY, so the printed keys, not the parsed type, are what decide
+    # whether a stat exists. A raw `power`/`toughness` key is sufficient on its own here.
+    #
+    # THE TYPE PARSE IS NOT WIDENED, which is the whole point of spelling it this way. `Summon` and
+    # `Eaturecray` stay the unrecognised words they are, so no row here starts answering
+    # `t:creature`; only the stat it actually prints becomes visible. Widening parse_type_line
+    # instead would have made the counts agree and quietly broken `t:creature`.
+    #
+    # Whole cards only, never a merged face: `merged = card | face_data` lets a face inherit the
+    # CARD-level `power`, and Scryfall publishes one there for adventures — Obyra's Attendants is
+    # `3`/`4` at the top level while its Adventure face prints none. For a face the parsed type
+    # line is the only trustworthy signal. Costs nothing: all eighteen printings are single-faced.
+    has_printed_stats = not is_merged_face and (card.get("power") is not None or card.get("toughness") is not None)
+    if "Creature" in card_types or {"Vehicle", "Spacecraft"} & set(card_subtypes) or has_printed_stats:
         # Power and toughness are STRINGS in Scryfall's schema, and eleven cards print a HALF in
         # them: /cards/named?exact=Little+Girl answers "power":".5", "toughness":".5", and the
         # other ten are Unhinged's Ass cycle plus Fraction Jackson, Cardpecker, Stone-Cold
