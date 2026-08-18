@@ -483,12 +483,19 @@ class TestCardProcessing:
             ("3", 3),
             ("-1", -1),
             ("1.5", 1),  # int(float(...)) truncates, as maybe_int has always done
-            ("?", None),
+            # `?` IS ZERO TOO, measured rather than reasoned from the star: Shellephant (ust/121)
+            # prints it on both sides and api.scryfall.com answers `tou=0` 1, `tou>=0` 1,
+            # `tou>0` 0. Read as absent it satisfied no comparison at all -- the whole of
+            # `toughness<1` answering 433 against 434.
+            ("?", 0),
             ("X", None),
+            # `∞` stays absent: Infinity Elemental is `ulst`, which api.scryfall.com does not
+            # answer for, so there is no measurement to follow.
+            ("∞", None),
         ],
     )
     def test_preprocess_card_substitutes_zero_for_a_printed_star(self, printed: str, expected: int | None) -> None:
-        """Every starred form the corpus prints, and the two non-numbers that stay absent."""
+        """Every starred form the corpus prints, `?`, and the non-numbers that stay absent."""
         card = create_test_card(keywords=[], power=printed, prices={})
 
         result = preprocess_card(card)[0]

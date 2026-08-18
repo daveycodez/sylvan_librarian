@@ -65,7 +65,7 @@ def maybe_int(val: str | int | float | None) -> int | None:
 
 @maybeify
 def maybe_stat_int(val: str | int | float | None) -> int | None:
-    """Convert a printed POWER or TOUGHNESS to int, where `*` IS A NUMBER AND IT IS ZERO.
+    """Convert a printed POWER or TOUGHNESS to int, where `*` AND `?` ARE NUMBERS AND BOTH ARE ZERO.
 
     `maybe_int` reads `*` as absent, and absent compares false against everything, so the whole
     `*`-statted population fell out of every power/toughness comparison: `tou<1` is 434 on
@@ -84,6 +84,19 @@ def maybe_stat_int(val: str | int | float | None) -> int | None:
     summed. A form it does not recognise raises and `maybeify` returns None, which is the
     pre-existing behaviour and the safe direction to be wrong in.
 
+    A PRINTED `?` IS ZERO ON ITS OWN MEASUREMENT, not by analogy with the star. `Shellephant`
+    (ust/121) prints `?` on both sides, and on api.scryfall.com 2026-08-17
+    `!"Shellephant" tou=0` is 1, `tou>=0` is 1 and `tou>0` is 0 -- so Scryfall holds exactly 0
+    for it, the same value it holds for a star. Read as ABSENT it satisfied no comparison against
+    its own column at all, which is why it fell out of the range queries and not just the equality
+    ones: `toughness<1` answered 433 here against Scryfall's 434, and `?` was the whole of that
+    one row. The corpus prints `?` on three cards (Shellephant, `Loopy Lobster` cmb1,
+    `Catch of the Day` mb2) and only Shellephant is in a set api.scryfall.com answers for at all.
+
+    `\u221e` is deliberately NOT here: `Infinity Elemental` is `ulst`, which api.scryfall.com does
+    not answer for either, so there is no measurement to follow -- the same rule that keeps
+    loyalty's two starred cards on `maybe_int` below.
+
     Loyalty deliberately keeps `maybe_int`: the two cards printing `*` there are funny-set cards
     api.scryfall.com will not answer for at all, so there is no measurement to follow.
     """
@@ -92,7 +105,7 @@ def maybe_stat_int(val: str | int | float | None) -> int | None:
     except (ValueError, TypeError):
         pass
     text = str(val).strip()
-    if "*" not in text:
+    if "*" not in text and "?" not in text:
         raise ValueError(text)
     total = 0.0
     sign = 1
@@ -101,8 +114,8 @@ def maybe_stat_int(val: str | int | float | None) -> int | None:
             sign = -1 if piece == "-" else 1
             continue
         term = piece.strip()
-        if term in {"*", "*\u00b2"}:
-            continue  # `*` and `*` squared are both zero
+        if term in {"*", "*\u00b2", "?"}:
+            continue  # `*`, `*` squared and `?` are all zero
         total += sign * float(term)
     return int(total)
 
