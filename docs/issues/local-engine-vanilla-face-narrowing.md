@@ -27,7 +27,7 @@ witness measured against api.scryfall.com:
 So an index keyed on `oracle_text = ''` would have to be intersected with the type mask and then
 *re-verified* against the stripped text anyway — it would narrow to a set that is both missing rows and
 holding rows it must not. There is nothing to salvage in that shape. The same disposes of the old
-"it would also serve any user-written `o:\"\"` emptiness test" justification: that test is a different
+"it would also serve any user-written `o:""` emptiness test" justification: that test is a different
 predicate from this one, and no longer shares a plan with it.
 
 ## What survives: nothing narrows, and the estimator says exactly that
@@ -42,9 +42,9 @@ The predicate has no index of any kind behind it:
   rejects most cards before the string read, but the model must not under-charge a predicate on the
   strength of the branch it usually takes.
 
-So the shape of the complaint is unchanged from the version of this doc that was wrong about
-everything else — a whole-corpus verify for a small answer — and the estimate is still far off, just
-differently: `n / 2` = **19,313** against a true **696**, 28× over.
+The shape of the complaint is the one thing the old version of this doc had right — a whole-corpus
+verify for a small answer — and the estimate is still far off, just differently: `n / 2` = **19,313**
+against a true **696**, 28× over.
 
 ## Measured
 
@@ -78,8 +78,8 @@ Divide by ten for the per-partition figure a single Durable Object pays: **323 �
 The controlled comparison is `is:unique`, which takes the *same* acquire path — no narrowing arm,
 `unknown(n)`, whole-corpus verify — and differs only in the verify: one bool on the card against a mask
 test plus a string read. `is:vanilla` costs **1.7×** it while returning **30× fewer** cards, i.e. while
-doing strictly less ordering and paging work downstream. That gap is the verify, and it is a lower
-bound on it.
+doing strictly less ordering and paging work downstream — so the 1,318 µs between them is a *lower*
+bound on what the verify costs.
 
 Two structural facts sit behind that number, both measured on the same store: **20,073 of the 38,626
 cards** (52%) pass the type mask and go on to read a string, and **696** survive the text test — 363 of
@@ -98,9 +98,11 @@ to verify.
   `PrintingDep`. That is the property that makes a complement exact, so `-is:vanilla` narrows too.
 - **Sparse.** 696 of 38,626 cards, 1.8%.
 
-At that density a card-space postings list of u32 ids is **~2.8 KB** and a `BitPlanes` bit (#630, "card
-space: transposed low-cardinality dims") is **~4.7 KB**; postings win on size at 1-in-55 and compose
-worse, so the choice is a bench, not an argument. Either way the query stops touching card structs.
+At that density a card-space postings list of u32 ids is **~2.8 KB** and a bit in `BitPlanes`
+([#630](./done/00630-engine-card-bitplanes.md), "card space: transposed low-cardinality dims") is
+**~4.7 KB**. Postings are the smaller at 1-in-55; the plane is the one that composes with the type
+plane the query already touches. Which of those wins is a bench, not an argument — but either way the
+query stops touching card structs.
 
 Two entries have to move with it, and neither is automatic: `never_null` (lib.rs) is deliberately tiny
 — today it holds `NameLower`/`NameCollated` and nothing else — and `is_total_two_valued` (estimator.rs)
