@@ -11688,7 +11688,8 @@ const FIELD_TABLE: &[(&str, FieldExtractor)] = &[
     // shapes match RESULT_FIELD_COLUMNS in api/api_resource.py, which reshapes the SQL
     // path's raw columns to agree with these).
     ("layout", |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.card_layout_id)).into_pyobject(py)?.into_any())),
-    ("cmc", |py, c, _p, _s, _v| Ok(c.cmc.as_ref().copied().into_pyobject(py)?.into_any())),
+    // f32_le on this branch (a mana value is a decimal): to_native(), not copied().
+    ("cmc", |py, c, _p, _s, _v| Ok(c.cmc.as_ref().map(|v| v.to_native()).into_pyobject(py)?.into_any())),
     ("rarity", |py, _c, p, _s, _v| {
         Ok(p.card_rarity_int.as_ref().and_then(|v| rarity_int_to_text(*v)).into_pyobject(py)?.into_any())
     }),
