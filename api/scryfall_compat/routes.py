@@ -525,7 +525,7 @@ class ScryfallCardsRoutes:
         Returns:
             The result rows.
         """
-        with self._conn_pool.connection() as conn, conn.cursor() as cursor:
+        with self.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
             self._set_statement_timeout(cursor, 10_000)
             cursor.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
@@ -540,13 +540,13 @@ class ScryfallCardsRoutes:
         if not settings.enable_engine:
             return None
         try:
-            if self._engine.size() == 0:
+            if self.app_context.engine.size() == 0:
                 self._trigger_background_reload_if_needed()
                 return None
         # An engine that cannot report its size cannot serve, whatever the reason.
         except Exception:  # noqa: BLE001
             return None
-        return self._engine
+        return self.app_context.engine
 
     def _engine_card(self, fetch: Callable[[Any], dict[str, Any] | None]) -> dict[str, Any] | _EngineMiss | None:
         """Run one engine lookup, or report that the engine could not serve it.
