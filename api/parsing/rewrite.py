@@ -268,6 +268,12 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     # two overlap on the ten two-colour Phyrexian symbols ({G/W/P} ...), which are both, and they
     # part company on {B/P} (Phyrexian, not hybrid -- one colour) and {C/P} (the same).
     #
+    # {C/P} is in the symbology but NOT in the `m:` half below: no printed cost carries it
+    # (`mana:{C/P}` and `o:"{c/p}"` both answer zero on api.scryfall.com, 2026-08-21), and the
+    # mana-symbol validator (#909) rejects it in a query -- `{C/P}` is not one of the shapes it
+    # accepts -- so naming it would make the whole expansion a parse error for a term that can
+    # match nothing.
+    #
     # Verified against api.scryfall.com card for card -- all 603 `is:hybrid` and all 73
     # `is:phyrexian` fetched and diffed against the 2026-08-16 bulk: ZERO cards Scryfall names are
     # missed by either rule, and every extra this corpus would add comes from a set the import does
@@ -289,7 +295,7 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
         "m:{2/B} or m:{2/R} or m:{2/G} or m:{C/W} or m:{C/U} or m:{C/B} or m:{C/R} or m:{C/G}"
     ),
     ("is", "phyrexian"): (
-        "m:{W/P} or m:{U/P} or m:{B/P} or m:{R/P} or m:{G/P} or m:{C/P} or m:{W/U/P} or m:{W/B/P} or "
+        "m:{W/P} or m:{U/P} or m:{B/P} or m:{R/P} or m:{G/P} or m:{W/U/P} or m:{W/B/P} or "
         "m:{U/B/P} or m:{U/R/P} or m:{B/R/P} or m:{B/G/P} or m:{R/G/P} or m:{R/W/P} or m:{G/W/P} or "
         'm:{G/U/P} or o:"{w/p}" or o:"{u/p}" or o:"{b/p}" or o:"{r/p}" or o:"{g/p}" or o:"{c/p}" or '
         'o:"{w/u/p}" or o:"{w/b/p}" or o:"{u/b/p}" or o:"{u/r/p}" or o:"{b/r/p}" or o:"{b/g/p}" or '

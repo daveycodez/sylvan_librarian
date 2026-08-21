@@ -29,8 +29,8 @@ from api.parsing.db_info import (
     PARSER_CLASS_TO_FIELD_INFOS,
     ParserClass,
 )
-from api.parsing.mana_symbols import first_invalid_mana_symbol
 from api.parsing.hand_parser import fold_typographic_quotes
+from api.parsing.mana_symbols import first_invalid_mana_symbol
 from api.parsing.nodes import (
     AndNode,
     BinaryOperatorNode,
