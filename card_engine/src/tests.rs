@@ -12000,6 +12000,8 @@ fn autocomplete_matches_the_sql_routes_set_and_order() {
     // whichever name the corpus happened to reach first.
     assert_eq!(autocomplete_names(a, "sh", 1), vec!["Shock"], "capped, after ordering");
     assert!(autocomplete_names(a, "zzz", 20).is_empty());
+}
+
 // ─── Price orderings pick the group's cheapest printing ───────────────────────
 //
 // See `prefer_for_sort`. Scryfall ranks a card by its CHEAPEST printing in the ordered
