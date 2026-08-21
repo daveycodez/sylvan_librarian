@@ -10,8 +10,7 @@ from typing import Any, ClassVar
 
 import pytest
 
-from api.card_processing import preprocess_card
-from api.parsing.card_query_nodes import extract_frame_data_from_raw_card
+from api.card_processing import extract_frame_data_from_raw_card, preprocess_card
 
 # Project root directory for accessing sample data
 _PROJECT_ROOT = pathlib.Path(__file__).parent.parent.parent
@@ -323,6 +322,15 @@ class TestCardProcessing:
         assert result["price_tix"] == 0.01
         assert result["card_set_code"] == "m15"
 
+    def test_preprocess_card_lists_its_one_illustration(self) -> None:
+        """A single-faced card shows one piece of art, and a card with none shows an empty list."""
+        with_art = preprocess_card(create_test_card(illustration_id="44444444-4444-4444-4444-444444444444"))[0]
+        assert with_art["illustration_ids"] == ["44444444-4444-4444-4444-444444444444"]
+
+        without_art = preprocess_card(create_test_card())[0]
+        assert without_art["illustration_id"] is None
+        assert without_art["illustration_ids"] == []
+
     def test_preprocess_card_processes_frame_data(self) -> None:
         """Test preprocess_card processes frame data correctly."""
         card_with_frame = create_test_card(
@@ -606,6 +614,43 @@ class TestFaceMerging:
         merged = preprocess_card(self._battle_card())[0]
         assert merged["mana_cost_text"] == "{2}{U}"
         assert merged["illustration_id"] == "11111111-1111-1111-1111-111111111111"
+
+    def test_illustration_ids_list_every_face_front_first(self) -> None:
+        """The art a printing SHOWS is all of it, which is what art tags attach to.
+
+        `illustration_id` stays the front's for display, so the back's art exists nowhere else on
+        the row -- and `arttag:snow e:khm` is 75 on Scryfall against 73 for the front-only reading.
+        """
+        merged = preprocess_card(self._battle_card())[0]
+        assert merged["illustration_ids"] == [
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        ]
+
+    def test_faces_sharing_the_cards_art_collapse_to_one_illustration(self) -> None:
+        """A split card (Fire // Ice) has one illustration on the CARD and none on its faces.
+
+        Both face rows therefore inherit the same id, and the merge must dedupe rather than list
+        it twice -- there is one piece of art to attach tags to.
+        """
+        card = create_test_card(
+            name="Flame // Frost",
+            layout="split",
+            illustration_id="33333333-3333-3333-3333-333333333333",
+            card_faces=[
+                {"name": "Flame", "type_line": "Instant", "mana_cost": "{R}", "oracle_text": "Deal 2 damage."},
+                {"name": "Frost", "type_line": "Instant", "mana_cost": "{U}", "oracle_text": "Tap target creature."},
+            ],
+        )
+        merged = preprocess_card(card)[0]
+        assert merged["illustration_ids"] == ["33333333-3333-3333-3333-333333333333"]
+
+    def test_a_face_with_no_art_at_all_contributes_nothing(self) -> None:
+        """A missing illustration is absent from the list, not a null entry in it."""
+        card = self._battle_card()
+        del card["card_faces"][1]["illustration_id"]
+        merged = preprocess_card(card)[0]
+        assert merged["illustration_ids"] == ["11111111-1111-1111-1111-111111111111"]
 
     def test_oracle_text_joins_faces_with_separator(self) -> None:
         """Each face's text is substring-searchable in the one joined column.

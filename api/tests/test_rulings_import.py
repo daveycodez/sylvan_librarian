@@ -178,11 +178,11 @@ class TestImportRulingsQuietly:
 
     def test_a_rulings_failure_does_not_abort_the_import(self, stub_api_resource) -> None:
         """Rulings are the one import step nothing downstream reads, so they must not be fatal."""
-        with patch("api.api_resource._import_rulings", side_effect=RuntimeError("bulk file is garbage")):
-            stub_api_resource._import_rulings_quietly()
+        with patch("api.admin_resource._import_rulings", side_effect=RuntimeError("bulk file is garbage")):
+            stub_api_resource.admin._import_rulings_quietly()
 
     def test_a_successful_refresh_calls_the_importer(self, stub_api_resource) -> None:
-        with patch("api.api_resource._import_rulings", return_value=77_961) as importer:
-            stub_api_resource._import_rulings_quietly()
+        with patch("api.admin_resource._import_rulings", return_value=77_961) as importer:
+            stub_api_resource.admin._import_rulings_quietly()
 
         importer.assert_called_once()

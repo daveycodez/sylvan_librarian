@@ -121,8 +121,8 @@ def _delver() -> dict:
 @pytest.fixture(name="compat_corpus", scope="module")
 def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
     """Load this module's cards and their rulings once, then hand back the resource."""
-    api_resource._upsert_cards([copy.deepcopy(card) for card in (_bolt(), _bear(), _delver())])
-    with api_resource._conn_pool.connection() as conn, conn.cursor() as cursor:
+    api_resource.admin._upsert_cards([copy.deepcopy(card) for card in (_bolt(), _bear(), _delver())])
+    with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
         cursor.execute("DELETE FROM magic.rulings WHERE oracle_id = %(oracle_id)s", {"oracle_id": BOLT_ORACLE_ID})
         # Three rulings across two dates, two of them same-day: a single ruling cannot tell one
         # ordering from another, which is how the ascending sort went unnoticed. Inserted oldest
