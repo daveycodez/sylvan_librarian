@@ -5,8 +5,7 @@ from __future__ import annotations
 import logging
 import multiprocessing
 import uuid
-from typing import TYPE_CHECKING
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import psycopg
 import pytest
@@ -221,7 +220,7 @@ class TestBooleanIsTags:
 
 
 def _cmc_for(api_resource: APIResource, scryfall_id: str) -> float | None:
-    with api_resource._conn_pool.connection() as conn, conn.cursor() as cursor:
+    with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
         cursor.execute("SELECT cmc FROM magic.cards WHERE scryfall_id = %(sid)s", {"sid": scryfall_id})
         row = cursor.fetchone()
     return row["cmc"] if row else None
@@ -244,7 +243,7 @@ class TestFractionalManaValue:
         card = make_raw_card(name="Half Mana Import Test")
         card["mana_cost"] = "{HW}"
         card["cmc"] = 0.5
-        api_resource._upsert_cards([card])
+        api_resource.admin._upsert_cards([card])
         assert _cmc_for(api_resource, card["id"]) == 0.5
 
     def test_whole_mana_value_still_stores_whole(self, api_resource: APIResource) -> None:
@@ -252,7 +251,7 @@ class TestFractionalManaValue:
         card = make_raw_card(name="Whole Mana Import Test")
         card["mana_cost"] = "{2}{R}"
         card["cmc"] = 3
-        api_resource._upsert_cards([card])
+        api_resource.admin._upsert_cards([card])
         assert _cmc_for(api_resource, card["id"]) == 3
 
     def test_a_half_is_findable_through_the_sql_search_path(self, api_resource: APIResource) -> None:
@@ -264,7 +263,7 @@ class TestFractionalManaValue:
         card = make_raw_card(name="Half Mana Search Test")
         card["mana_cost"] = "{HW}"
         card["cmc"] = 0.5
-        api_resource._upsert_cards([card])
+        api_resource.admin._upsert_cards([card])
 
         found = {c["name"] for c in api_resource._search_sql(**search_kwargs("mv=0.5", limit=100))["cards"]}
         assert "Half Mana Search Test" in found
@@ -278,7 +277,7 @@ class TestFractionalManaValue:
         A passing round trip alone would not distinguish a `real` column from an `integer`
         one that happened to be handed whole numbers.
         """
-        with api_resource._conn_pool.connection() as conn, conn.cursor() as cursor:
+        with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
             cursor.execute(
                 """SELECT data_type FROM information_schema.columns
                    WHERE table_schema = 'magic' AND table_name = 'cards' AND column_name = 'cmc'""",
@@ -289,7 +288,7 @@ class TestFractionalManaValue:
 
 
 def _stats_for(api_resource: APIResource, scryfall_id: str) -> tuple[float | None, float | None] | None:
-    with api_resource._conn_pool.connection() as conn, conn.cursor() as cursor:
+    with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
         cursor.execute(
             "SELECT creature_power, creature_toughness FROM magic.cards WHERE scryfall_id = %(sid)s",
             {"sid": scryfall_id},
@@ -322,19 +321,19 @@ class TestFractionalPowerAndToughness:
 
     def test_a_half_stores_as_a_half(self, api_resource: APIResource) -> None:
         card = _creature("Half Stat Import Test", ".5", ".5")
-        api_resource._upsert_cards([card])
+        api_resource.admin._upsert_cards([card])
         assert _stats_for(api_resource, card["id"]) == (0.5, 0.5)
 
     def test_a_half_does_not_store_as_its_floor(self, api_resource: APIResource) -> None:
         """The silent direction: 2.5 truncated onto 2 would then ANSWER `power=2`."""
         card = _creature("Two And A Half Import Test", "2.5", "1")
-        api_resource._upsert_cards([card])
+        api_resource.admin._upsert_cards([card])
         assert _stats_for(api_resource, card["id"]) == (2.5, 1)
 
     def test_whole_stats_still_store_whole(self, api_resource: APIResource) -> None:
         """The rows that were already integral must read back unchanged."""
         card = _creature("Whole Stat Import Test", "3", "4")
-        api_resource._upsert_cards([card])
+        api_resource.admin._upsert_cards([card])
         assert _stats_for(api_resource, card["id"]) == (3, 4)
 
     def test_a_non_numeric_stat_is_still_null(self, api_resource: APIResource) -> None:
@@ -344,7 +343,7 @@ class TestFractionalPowerAndToughness:
         and maybe_float rejects these exactly where maybe_int did.
         """
         card = _creature("Star Stat Import Test", "*", "1+*")
-        api_resource._upsert_cards([card])
+        api_resource.admin._upsert_cards([card])
         assert _stats_for(api_resource, card["id"]) == (None, None)
 
     def test_a_half_is_findable_through_the_sql_search_path(self, api_resource: APIResource) -> None:
@@ -354,7 +353,7 @@ class TestFractionalPowerAndToughness:
         database requires — other tests in this class import half-stat cards of their own.
         """
         card = _creature("Half Stat Search Test", "2.5", "1")
-        api_resource._upsert_cards([card])
+        api_resource.admin._upsert_cards([card])
 
         found = {c["name"] for c in api_resource._search_sql(**search_kwargs("power=2.5", limit=100))["cards"]}
         assert "Half Stat Search Test" in found
@@ -368,7 +367,7 @@ class TestFractionalPowerAndToughness:
         A passing round trip alone would not distinguish a `real` column from an `integer`
         one that happened to be handed whole numbers.
         """
-        with api_resource._conn_pool.connection() as conn, conn.cursor() as cursor:
+        with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
             cursor.execute(
                 """SELECT column_name, data_type FROM information_schema.columns
                    WHERE table_schema = 'magic' AND table_name = 'cards'
@@ -383,7 +382,7 @@ class TestFractionalPowerAndToughness:
 
 
 def _row_for(api_resource: APIResource, scryfall_id: str) -> dict | None:
-    with api_resource._conn_pool.connection() as conn, conn.cursor() as cursor:
+    with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
         cursor.execute(
             """SELECT card_types, creature_power, creature_toughness,
                       creature_power_text, creature_toughness_text
@@ -425,13 +424,13 @@ class TestPrintedStatsOnANoncanonicalTypeLine:
     def test_a_summon_type_line_keeps_its_printed_stats(self, api_resource: APIResource) -> None:
         """Old Fogey's shape: `Summon — Dinosaur`, 7/7, and Scryfall counts it under `tou>=3.5`."""
         card = _summoned("Old Fogey Import Test", "7", "7")
-        api_resource._upsert_cards([card])
+        api_resource.admin._upsert_cards([card])
         assert _stats_for(api_resource, card["id"]) == (7, 7)
 
     def test_an_unparseable_type_line_keeps_its_printed_stats(self, api_resource: APIResource) -> None:
         """Atinlay Igpay's shape: not a word the parser knows in either position, still 3/3."""
         card = _summoned("Atinlay Igpay Import Test", "3", "3", type_line="Eaturecray — Igpay")
-        api_resource._upsert_cards([card])
+        api_resource.admin._upsert_cards([card])
         assert _stats_for(api_resource, card["id"]) == (3, 3)
 
     def test_the_stored_row_is_still_not_a_creature(self, api_resource: APIResource) -> None:
@@ -442,7 +441,7 @@ class TestPrintedStatsOnANoncanonicalTypeLine:
         printed text columns come along with the numbers; the type does not.
         """
         card = _summoned("Summon Not A Creature Test", "7", "7")
-        api_resource._upsert_cards([card])
+        api_resource.admin._upsert_cards([card])
 
         row = _row_for(api_resource, card["id"])
         assert row is not None
@@ -457,7 +456,7 @@ class TestPrintedStatsOnANoncanonicalTypeLine:
         database requires.
         """
         card = _summoned("Summon Search Test", "7", "7")
-        api_resource._upsert_cards([card])
+        api_resource.admin._upsert_cards([card])
 
         found = {c["name"] for c in api_resource._search_sql(**search_kwargs("power=7", limit=100))["cards"]}
         assert "Summon Search Test" in found
@@ -475,11 +474,11 @@ class TestPrintedStatsOnANoncanonicalTypeLine:
         cannot produce it -- which is the point of asking the table to reject it.
         """
         card = make_raw_card(name="Bare Numeric Stat Test")
-        api_resource._upsert_cards([card])
+        api_resource.admin._upsert_cards([card])
 
         with (
             pytest.raises(psycopg.errors.CheckViolation),
-            api_resource._conn_pool.connection() as conn,
+            api_resource.app_context.reader_pool.connection() as conn,
             conn.cursor() as cursor,
         ):
             cursor.execute(
