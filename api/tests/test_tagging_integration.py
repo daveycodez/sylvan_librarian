@@ -254,7 +254,7 @@ class TestUnionArtTags:
 
 
 def _art_tags_of(api_resource: APIResource, scryfall_id: str) -> dict:
-    with api_resource._conn_pool.connection() as conn, conn.cursor() as cursor:
+    with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
         cursor.execute("SELECT card_art_tags FROM magic.cards WHERE scryfall_id = %(sid)s", {"sid": scryfall_id})
         row = cursor.fetchone()
     return row["card_art_tags"] if row else {}
@@ -290,7 +290,7 @@ class TestArtTagsAgainstPostgres:
             {"name": "Snowfront Tester", "type_line": "Creature — Human", "illustration_id": self.FRONT_ILLUSTRATION},
             {"name": "Snowback Tester", "type_line": "Creature — Insect", "illustration_id": self.BACK_ILLUSTRATION},
         ]
-        assert api_resource._upsert_cards([card])["status"] == "success"
+        assert api_resource.admin._upsert_cards([card])["status"] == "success"
         return card["id"]
 
     def test_a_back_face_tagging_lands_on_the_card(self, api_resource: APIResource) -> None:
@@ -298,7 +298,7 @@ class TestArtTagsAgainstPostgres:
         fetcher = MagicMock()
         fetcher.stream_data_for_key.return_value = iter(self._art_dump(self.BACK_ILLUSTRATION, "snow"))
 
-        import_art_tags(api_resource._conn_pool, fetcher)
+        import_art_tags(api_resource.app_context.reader_pool, fetcher)
 
         assert _art_tags_of(api_resource, scryfall_id) == {"snow": True}
 
@@ -308,7 +308,7 @@ class TestArtTagsAgainstPostgres:
         fetcher = MagicMock()
         fetcher.stream_data_for_key.return_value = iter(self._art_dump(self.FRONT_ILLUSTRATION, "human"))
 
-        import_art_tags(api_resource._conn_pool, fetcher)
+        import_art_tags(api_resource.app_context.reader_pool, fetcher)
 
         assert _art_tags_of(api_resource, scryfall_id) == {"human": True}
 
@@ -317,10 +317,10 @@ class TestArtTagsAgainstPostgres:
         scryfall_id = self._import_dfc(api_resource)
         fetcher = MagicMock()
         fetcher.stream_data_for_key.return_value = iter(self._art_dump(self.BACK_ILLUSTRATION, "snow"))
-        import_art_tags(api_resource._conn_pool, fetcher)
+        import_art_tags(api_resource.app_context.reader_pool, fetcher)
         assert _art_tags_of(api_resource, scryfall_id) == {"snow": True}
 
         fetcher.stream_data_for_key.return_value = iter([])
-        import_art_tags(api_resource._conn_pool, fetcher)
+        import_art_tags(api_resource.app_context.reader_pool, fetcher)
 
         assert _art_tags_of(api_resource, scryfall_id) == {}

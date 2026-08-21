@@ -387,19 +387,19 @@ class TestIllustrationIds:
 
     @staticmethod
     def _stored(api_resource: APIResource, scryfall_id: str) -> list[str]:
-        with api_resource._conn_pool.connection() as conn, conn.cursor() as cursor:
+        with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
             cursor.execute("SELECT illustration_ids FROM magic.cards WHERE scryfall_id = %s", (scryfall_id,))
             return cursor.fetchone()["illustration_ids"]
 
     def test_a_merged_row_stores_both_faces(self, api_resource: APIResource) -> None:
         card = _dfc_raw_card(self.FRONT, self.BACK)
-        api_resource._upsert_cards([card])
+        api_resource.admin._upsert_cards([card])
         assert self._stored(api_resource, card["id"]) == [self.FRONT, self.BACK]
 
     def test_a_single_faced_row_stores_its_one(self, api_resource: APIResource) -> None:
         card = make_raw_card()
         card["illustration_id"] = "cccccccc-0000-4000-8000-000000000003"
-        api_resource._upsert_cards([card])
+        api_resource.admin._upsert_cards([card])
         assert self._stored(api_resource, card["id"]) == ["cccccccc-0000-4000-8000-000000000003"]
 
     def test_the_migration_backfill_agrees_with_preprocessing(self, api_resource: APIResource) -> None:
@@ -412,12 +412,12 @@ class TestIllustrationIds:
         dfc = _dfc_raw_card(self.FRONT, self.BACK)
         solo = make_raw_card()
         solo["illustration_id"] = "cccccccc-0000-4000-8000-000000000004"
-        api_resource._upsert_cards([dfc, solo])
+        api_resource.admin._upsert_cards([dfc, solo])
 
         migration = (pathlib.Path(__file__).parent.parent / "db" / "2026-08-16-01-illustration-ids.sql").read_text()
         backfill = migration[migration.index("WITH shown") :]
 
-        with api_resource._conn_pool.connection() as conn, conn.cursor() as cursor:
+        with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
             cursor.execute("UPDATE magic.cards SET illustration_ids = '[]'::jsonb")
             cursor.execute(backfill)
             conn.commit()
