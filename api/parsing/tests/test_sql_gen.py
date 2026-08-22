@@ -220,12 +220,12 @@ def test_full_sql_translation(parse_query, input_query: str, expected_sql: str, 
         # Snow, likewise: bare 's' means the same thing as braced '{s}' (#954).
         (
             "mana:{S}",
-            r"(%(p_dict_eydTJzogWzFdfQ)s <@ card.mana_cost_jsonb AND card.cmc >= %(p_int_MQ)s)",
+            r"(card.mana_cost_text <> '' AND %(p_dict_eydTJzogWzFdfQ)s <@ card.mana_cost_jsonb AND card.cmc >= %(p_int_MQ)s)",
             {"p_dict_eydTJzogWzFdfQ": {"S": [1]}, "p_int_MQ": 1},
         ),
         (
             "mana:s",
-            r"(%(p_dict_eydTJzogWzFdfQ)s <@ card.mana_cost_jsonb AND card.cmc >= %(p_int_MQ)s)",
+            r"(card.mana_cost_text <> '' AND %(p_dict_eydTJzogWzFdfQ)s <@ card.mana_cost_jsonb AND card.cmc >= %(p_int_MQ)s)",
             {"p_dict_eydTJzogWzFdfQ": {"S": [1]}, "p_int_MQ": 1},
         ),
     ],

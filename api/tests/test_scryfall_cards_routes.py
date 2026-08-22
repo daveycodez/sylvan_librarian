@@ -139,7 +139,7 @@ def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
     # /cards/search runs through _search, which prefers the in-process engine when its store is
     # loaded -- a store built before this insert would answer every query here with zero rows.
     api_resource.app_context.reload_engine(force=True)
-    api_resource._clear_caches()
+    api_resource.admin._clear_caches()
     return api_resource
 
 
@@ -424,7 +424,7 @@ class TestRandom:
         monkeypatch.setattr(
             compat_corpus,
             "_query_cache",
-            GenerationCache(factory=lambda: LRUCache(maxsize=1_000), generation=compat_corpus._cache_generation),
+            GenerationCache(factory=lambda: LRUCache(maxsize=1_000), generation=compat_corpus.app_context.cache_generation),
         )
         drawn = {payload(dispatch(compat_corpus, "/cards/random"))["id"] for _ in range(20)}
         assert len(drawn) > 1
