@@ -14145,6 +14145,8 @@ fn order_released_breaks_a_date_tie_by_set_then_collector_number() {
     let mut reversed = asc.clone();
     reversed.reverse();
     assert_eq!(order(true), reversed, "dir=desc reverses the set with the date, and the number with the set");
+}
+
 // `=` IS `:` ON A TEXT OR COLLECTION COLUMN — the one operator on those columns that carries no
 // information of its own.
 //
