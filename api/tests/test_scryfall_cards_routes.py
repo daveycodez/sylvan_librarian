@@ -153,7 +153,7 @@ def _extra() -> dict:
 @pytest.fixture(name="compat_corpus", scope="module")
 def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
     """Load this module's cards and their rulings once, then hand back the resource."""
-    api_resource.admin._upsert_cards([copy.deepcopy(card) for card in (_bolt(), _bear(), _delver())])
+    api_resource.admin._upsert_cards([copy.deepcopy(card) for card in (_bolt(), _bear(), _delver(), _extra())])
     with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
         cursor.execute("DELETE FROM magic.rulings WHERE oracle_id = %(oracle_id)s", {"oracle_id": BOLT_ORACLE_ID})
         # Three rulings across two dates, two of them same-day: a single ruling cannot tell one
@@ -1029,7 +1029,7 @@ class TestRandom:
         monkeypatch.setattr(
             compat_corpus,
             "_query_cache",
-            GenerationCache(factory=lambda: LRUCache(maxsize=1_000), generation=compat_corpus._cache_generation),
+            GenerationCache(factory=lambda: LRUCache(maxsize=1_000), generation=compat_corpus.app_context.cache_generation),
         )
         drawn = {payload(dispatch(compat_corpus, "/cards/random"))["id"] for _ in range(20)}
         assert len(drawn) > 1

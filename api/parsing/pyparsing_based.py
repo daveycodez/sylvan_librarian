@@ -404,7 +404,7 @@ def create_all_condition_parsers(basic_parsers: dict, mana_parsers: dict, color_
     # parser accepted it and silently answered `date:2021`; both are fixed together so the two
     # implementations do not part company over a shape only one of them understands.
     date_value = Regex(r"\d{4}(?:-\d{2}(?:-\d{2})?)?")
-    date_condition = create_condition_parser(date_attr_word, date_value)
+    date_condition = create_condition_parser(date_attr_word, date_value, operators=EQ_ALIAS_OPERATORS)
 
     year_value = Regex(r"\d{4}")
     year_condition = create_condition_parser(year_attr_word, year_value, operators=EQ_ALIAS_OPERATORS)
