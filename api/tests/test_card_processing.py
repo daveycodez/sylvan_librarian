@@ -10,8 +10,7 @@ from typing import Any, ClassVar
 
 import pytest
 
-from api.card_processing import preprocess_card
-from api.parsing.card_query_nodes import extract_frame_data_from_raw_card
+from api.card_processing import extract_frame_data_from_raw_card, preprocess_card
 
 # Project root directory for accessing sample data
 _PROJECT_ROOT = pathlib.Path(__file__).parent.parent.parent
@@ -323,6 +322,15 @@ class TestCardProcessing:
         assert result["price_tix"] == 0.01
         assert result["card_set_code"] == "m15"
 
+    def test_preprocess_card_lists_its_one_illustration(self) -> None:
+        """A single-faced card shows one piece of art, and a card with none shows an empty list."""
+        with_art = preprocess_card(create_test_card(illustration_id="44444444-4444-4444-4444-444444444444"))[0]
+        assert with_art["illustration_ids"] == ["44444444-4444-4444-4444-444444444444"]
+
+        without_art = preprocess_card(create_test_card())[0]
+        assert without_art["illustration_id"] is None
+        assert without_art["illustration_ids"] == []
+
     def test_preprocess_card_processes_frame_data(self) -> None:
         """Test preprocess_card processes frame data correctly."""
         card_with_frame = create_test_card(
@@ -449,11 +457,16 @@ class TestCardProcessing:
         assert result[0]["flavor_text"] == "A flavor line."
 
     def test_preprocess_card_handles_non_numeric_power_toughness(self) -> None:
-        """Test preprocess_card handles non-numeric power/toughness values."""
+        """A printed `*` is ZERO; anything else non-numeric is still absent.
+
+        `tou<1` is 434 on api.scryfall.com against this engine's 273 and `tou=0` 432 against 272 --
+        160 cards, every one of them `*`-statted -- because absent compares false against
+        everything. Scryfall's own `tou:*` answers the same 432 as `tou=0`.
+        """
         card = create_test_card(
             keywords=[],
-            power="*",  # Non-numeric
-            toughness="X",  # Non-numeric
+            power="*",
+            toughness="X",  # Not a star and not a number: still absent.
             prices={},
         )
 
@@ -461,8 +474,41 @@ class TestCardProcessing:
 
         assert len(result) == 1
         result = result[0]
-        assert result["creature_power"] is None
+        assert result["creature_power"] == 0
         assert result["creature_toughness"] is None
+        # The printed strings are untouched -- they are what the card object serves.
+        assert result["creature_power_text"] == "*"
+
+    @pytest.mark.parametrize(
+        ("printed", "expected"),
+        [
+            ("*", 0),
+            ("1+*", 1),  # Allosaurus Rider, and api.scryfall.com answers pow=1 for it
+            ("*+1", 1),  # Souls of the Lost, tou=1
+            ("2+*", 2),  # Aysen Crusader, pow=2 and NOT pow=0
+            ("7-*", 7),
+            ("*\u00b2", 0),
+            ("3", 3),
+            ("-1", -1),
+            ("1.5", 1),  # int(float(...)) truncates, as maybe_int has always done
+            # `?` IS ZERO TOO, measured rather than reasoned from the star: Shellephant (ust/121)
+            # prints it on both sides and api.scryfall.com answers `tou=0` 1, `tou>=0` 1,
+            # `tou>0` 0. Read as absent it satisfied no comparison at all -- the whole of
+            # `toughness<1` answering 433 against 434.
+            ("?", 0),
+            ("X", None),
+            # `∞` stays absent: Infinity Elemental is `ulst`, which api.scryfall.com does not
+            # answer for, so there is no measurement to follow.
+            ("∞", None),
+        ],
+    )
+    def test_preprocess_card_substitutes_zero_for_a_printed_star(self, printed: str, expected: int | None) -> None:
+        """Every starred form the corpus prints, `?`, and the non-numbers that stay absent."""
+        card = create_test_card(keywords=[], power=printed, prices={})
+
+        result = preprocess_card(card)[0]
+
+        assert result["creature_power"] == expected
 
     def test_preprocess_hound_tamer_dfc(self) -> None:
         """A real transform card merges to one row: front stats, both faces searchable."""
@@ -569,6 +615,43 @@ class TestFaceMerging:
         assert merged["mana_cost_text"] == "{2}{U}"
         assert merged["illustration_id"] == "11111111-1111-1111-1111-111111111111"
 
+    def test_illustration_ids_list_every_face_front_first(self) -> None:
+        """The art a printing SHOWS is all of it, which is what art tags attach to.
+
+        `illustration_id` stays the front's for display, so the back's art exists nowhere else on
+        the row -- and `arttag:snow e:khm` is 75 on Scryfall against 73 for the front-only reading.
+        """
+        merged = preprocess_card(self._battle_card())[0]
+        assert merged["illustration_ids"] == [
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        ]
+
+    def test_faces_sharing_the_cards_art_collapse_to_one_illustration(self) -> None:
+        """A split card (Fire // Ice) has one illustration on the CARD and none on its faces.
+
+        Both face rows therefore inherit the same id, and the merge must dedupe rather than list
+        it twice -- there is one piece of art to attach tags to.
+        """
+        card = create_test_card(
+            name="Flame // Frost",
+            layout="split",
+            illustration_id="33333333-3333-3333-3333-333333333333",
+            card_faces=[
+                {"name": "Flame", "type_line": "Instant", "mana_cost": "{R}", "oracle_text": "Deal 2 damage."},
+                {"name": "Frost", "type_line": "Instant", "mana_cost": "{U}", "oracle_text": "Tap target creature."},
+            ],
+        )
+        merged = preprocess_card(card)[0]
+        assert merged["illustration_ids"] == ["33333333-3333-3333-3333-333333333333"]
+
+    def test_a_face_with_no_art_at_all_contributes_nothing(self) -> None:
+        """A missing illustration is absent from the list, not a null entry in it."""
+        card = self._battle_card()
+        del card["card_faces"][1]["illustration_id"]
+        merged = preprocess_card(card)[0]
+        assert merged["illustration_ids"] == ["11111111-1111-1111-1111-111111111111"]
+
     def test_oracle_text_joins_faces_with_separator(self) -> None:
         """Each face's text is substring-searchable in the one joined column.
 
@@ -633,7 +716,10 @@ class TestFaceMerging:
             ],
         )
         merged = preprocess_card(card)[0]
-        assert merged["creature_power"] is None  # "*" is non-numeric
+        # `*` is ZERO, and `1+*` is 1 -- see maybe_stat_int. The point of this test is that the
+        # numeric and _text columns come from the SAME face, which they still do.
+        assert merged["creature_power"] == 0
+        assert merged["creature_toughness"] == 1
         assert merged["creature_power_text"] == "*"
         assert merged["creature_toughness_text"] == "1+*"
 

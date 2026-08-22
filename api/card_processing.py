@@ -13,15 +13,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
-def extract_image_location_uuid(card: dict[str, Any]) -> str:
-    """Extract the image location UUID from a card."""
-    for image_location in card.get("image_uris", {}).values():
-        if ".jpg" in image_location:
-            return image_location.rpartition("/")[-1].partition(".")[0]
-    msg = f"No image location found for card: {card}"
-    raise AssertionError(msg)
-
-
 # Card types that can exist as a permanent on the battlefield. Devotion (MTG
 # comprehensive rules) is defined only over permanents' mana costs, confirmed
 # against the real Scryfall API (devotion: never matches a pure Instant/Sorcery,
@@ -63,6 +54,63 @@ def maybe_int(val: str | int | float | None) -> int | None:
     return int(float(val))
 
 
+@maybeify
+def maybe_stat_int(val: str | int | float | None) -> int | None:
+    """Convert a printed POWER or TOUGHNESS to int, where `*` AND `?` ARE NUMBERS AND BOTH ARE ZERO.
+
+    `maybe_int` reads `*` as absent, and absent compares false against everything, so the whole
+    `*`-statted population fell out of every power/toughness comparison: `tou<1` is 434 on
+    api.scryfall.com against this engine's 273, `tou=0` 432 against 272 -- 160 cards. Scryfall's
+    own `tou:*` answers the same 432 as `tou=0`; the star is not a third state there.
+
+    The star is SUBSTITUTED, not the value replaced -- the printed arithmetic still runs. Measured
+    2026-08-17, one card per form:
+
+        Allosaurus Rider   power     1+*   matches pow=1, not pow=0
+        Souls of the Lost  toughness *+1   matches tou=1
+        Aysen Crusader     power     2+*   matches pow=2, and NOT pow=0
+
+    The corpus prints six starred forms -- `*`, `1+*`, `*+1`, `2+*`, `7-*` and one `*\u00b2` --
+    and this grammar covers exactly those: a term is a signed number or a star, and the terms are
+    summed. A form it does not recognise raises and `maybeify` returns None, which is the
+    pre-existing behaviour and the safe direction to be wrong in.
+
+    A PRINTED `?` IS ZERO ON ITS OWN MEASUREMENT, not by analogy with the star. `Shellephant`
+    (ust/121) prints `?` on both sides, and on api.scryfall.com 2026-08-17
+    `!"Shellephant" tou=0` is 1, `tou>=0` is 1 and `tou>0` is 0 -- so Scryfall holds exactly 0
+    for it, the same value it holds for a star. Read as ABSENT it satisfied no comparison against
+    its own column at all, which is why it fell out of the range queries and not just the equality
+    ones: `toughness<1` answered 433 here against Scryfall's 434, and `?` was the whole of that
+    one row. The corpus prints `?` on three cards (Shellephant, `Loopy Lobster` cmb1,
+    `Catch of the Day` mb2) and only Shellephant is in a set api.scryfall.com answers for at all.
+
+    `\u221e` is deliberately NOT here: `Infinity Elemental` is `ulst`, which api.scryfall.com does
+    not answer for either, so there is no measurement to follow -- the same rule that keeps
+    loyalty's two starred cards on `maybe_int` below.
+
+    Loyalty deliberately keeps `maybe_int`: the two cards printing `*` there are funny-set cards
+    api.scryfall.com will not answer for at all, so there is no measurement to follow.
+    """
+    try:
+        return int(float(val))
+    except (ValueError, TypeError):
+        pass
+    text = str(val).strip()
+    if "*" not in text and "?" not in text:
+        raise ValueError(text)
+    total = 0.0
+    sign = 1
+    for index, piece in enumerate(re.split(r"(?<=.)([+-])", text)):
+        if index % 2:
+            sign = -1 if piece == "-" else 1
+            continue
+        term = piece.strip()
+        if term in {"*", "*\u00b2", "?"}:
+            continue  # `*`, `*` squared and `?` are all zero
+        total += sign * float(term)
+    return int(total)
+
+
 def rarity_text_to_int(rarity_text: str) -> int:
     """Convert rarity text to int."""
     rarity_map = {
@@ -94,6 +142,31 @@ def extract_collector_number_int(collector_number: str | int | float | None) -> 
     return None  # Field will be null by default
 
 
+def extract_frame_data_from_raw_card(raw_card: dict) -> dict[str, bool]:
+    """Extract frame data from a raw card dictionary.
+
+    Combines frame version and frame effects into a single JSONB object,
+    following the same pattern as _preprocess_card method.
+
+    Args:
+        raw_card: Raw card dictionary from Scryfall API.
+
+    Returns:
+        Dictionary mapping frame data keys to True.
+    """
+    frame_data = {}
+
+    # Add frame version if present (titlecased for consistency)
+    frame_version = raw_card.get("frame")
+    if frame_version:
+        frame_data[frame_version.title()] = True
+
+    # Add frame effects if present (titlecased for consistency)
+    frame_effects = raw_card.get("frame_effects", [])
+    for effect in frame_effects:
+        frame_data[effect.title()] = True
+
+    return frame_data
 # Face-merge policy for multi-face cards (#400, #873). Scryfall AND's search predicates at the
 # CARD level, each satisfiable by any face — measured against api.scryfall.com 2026-08-08:
 # `t:sorcery t:land` returns the MDFC lands (no single face is both), o: conjunctions match
@@ -103,7 +176,10 @@ def extract_collector_number_int(collector_number: str | int | float | None) -> 
 # on top of colliding on the scryfall_id primary key, which is how the back face silently won
 # until now. Front-face scalars (cmc, mana cost, illustration, image, prices) match Scryfall's
 # own top-level fields, verified on its card objects.
-_FACE_LIST_UNIONS = ("card_types", "card_subtypes")
+# `illustration_ids` is here and not among the front-face scalars because a printing SHOWS every
+# face's art, and the art tags attached to it are the union over all of them (api/tag_import.py).
+# `illustration_id` stays the front's, matching Scryfall's own top-level field.
+_FACE_LIST_UNIONS = ("card_types", "card_subtypes", "illustration_ids")
 _FACE_FLAG_UNIONS = ("card_colors", "card_keywords", "produced_mana")
 # The printed keyword list is a LIST, so its face merge is an order-preserving union rather than a
 # dict update.
@@ -587,8 +663,11 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
 
     card["planeswalker_loyalty"] = maybe_int(card.get("loyalty"))
     if "Creature" in card_types or {"Vehicle", "Spacecraft"} & set(card_subtypes):
-        card["creature_power"] = maybe_int(card.get("power"))
-        card["creature_toughness"] = maybe_int(card.get("toughness"))
+        # `maybe_stat_int`, not `maybe_int`: a printed `*` is ZERO on both sides of a
+        # power/toughness comparison -- see its docstring for the three cards that pin the
+        # arithmetic. The printed strings two lines down are untouched.
+        card["creature_power"] = maybe_stat_int(card.get("power"))
+        card["creature_toughness"] = maybe_stat_int(card.get("toughness"))
         card["creature_power_text"] = card.get("power")
         card["creature_toughness_text"] = card.get("toughness")
     else:
@@ -624,17 +703,7 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
 
     card["edhrec_rank"] = card.get("edhrec_rank")
 
-    # Extract frame data - combine frame version and frame effects into single JSONB object
-    frame_data = {}
-    # Add frame version if present (titlecased for consistency)
-    frame_version = card.get("frame")
-    if frame_version:
-        frame_data[frame_version.title()] = True
-    # Add frame effects if present (titlecased for consistency)
-    frame_effects = card.get("frame_effects", [])
-    for effect in frame_effects:
-        frame_data[effect.title()] = True
-    card["card_frame_data"] = frame_data
+    card["card_frame_data"] = extract_frame_data_from_raw_card(card)
 
     # Extract pricing data if available - ensure they are floats for jsonb_populate_record
     prices = card.get("prices", {})
@@ -706,6 +775,12 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
     card["collector_number"] = collector_number
     card["collector_number_int"] = extract_collector_number_int(collector_number)
     card["illustration_id"] = card.get("illustration_id")
+    # Every illustration this row SHOWS, front first. One entry here, and `_FACE_LIST_UNIONS`
+    # below appends the other faces' when the faces merge, so a merged row lists the front's
+    # (which is also `illustration_id`) followed by each later face's. A face carrying no art of
+    # its own -- split, adventure and flip cards put one `illustration_id` on the card and none on
+    # the faces -- inherits the card's here and dedupes back to one on merge.
+    card["illustration_ids"] = [card["illustration_id"]] if card["illustration_id"] else []
 
     # Handle legalities and produced_mana defaults
     card.setdefault("card_legalities", card.get("legalities", {}))

@@ -13,7 +13,6 @@ from api.parsing.db_info import (
     CARD_TYPES,
     COLOR_CODE_TO_NAME,
     COLOR_NAME_TO_CODE,
-    DB_NAME_TO_FIELD_TYPE,
     FORMAT_CODE_TO_NAME,
     FieldType,
     ParserClass,
@@ -60,18 +59,6 @@ color < query
 color @> query AND color <> query # as object
 query ?& color AND not(color ?& query) # as array
 """
-
-
-def get_field_type(attr: str) -> str:
-    """Get the field type for a given attribute name.
-
-    Args:
-        attr: The attribute name to look up.
-
-    Returns:
-        The field type for the attribute, or TEXT if not found.
-    """
-    return DB_NAME_TO_FIELD_TYPE.get(attr, FieldType.TEXT)
 
 
 # Rarity ordering for comparison operations
@@ -272,33 +259,6 @@ def get_frame_data_comparison_object(val: str) -> dict[str, bool]:
     return {normalized_val: True}
 
 
-def extract_frame_data_from_raw_card(raw_card: dict) -> dict[str, bool]:
-    """Extract frame data from a raw card dictionary.
-
-    Combines frame version and frame effects into a single JSONB object,
-    following the same pattern as _preprocess_card method.
-
-    Args:
-        raw_card: Raw card dictionary from Scryfall API.
-
-    Returns:
-        Dictionary mapping frame data keys to True.
-    """
-    frame_data = {}
-
-    # Add frame version if present (titlecased for consistency)
-    frame_version = raw_card.get("frame")
-    if frame_version:
-        frame_data[frame_version.title()] = True
-
-    # Add frame effects if present (titlecased for consistency)
-    frame_effects = raw_card.get("frame_effects", [])
-    for effect in frame_effects:
-        frame_data[effect.title()] = True
-
-    return frame_data
-
-
 def get_keywords_comparison_object(val: str) -> dict[str, bool]:
     """Convert keyword string to comparison object for database queries.
 
@@ -384,6 +344,17 @@ def get_legality_comparison_object(val: str, attr: str) -> dict[str, str]:
     return {format_name: status}
 
 
+# A braced symbol anywhere in a mana cost string, e.g. the '2' and 'W' of '{2}{W}'. Shared with
+# api.parsing.mana_symbols, which validates every symbol this finds.
+BRACED_MANA_SYMBOL = re.compile(r"{([^}]*)}")
+
+# Bare (unbraced) pip characters counted below: a colour, colourless, snow, or X, confirmed against
+# the real Scryfall API (mana:x behaves identically to mana:{x}, and mana:s to mana:{s}). Shared with
+# api.parsing.mana_symbols, which rejects any bare character outside this alphabet — see that
+# module's docstring for why.
+BARE_MANA_ATOMS = frozenset("WUBRGCXS")
+
+
 def mana_cost_str_to_dict(mana_cost_str: str) -> dict:
     """Convert a mana cost string to a dictionary of colored symbols and their counts.
 
@@ -395,7 +366,7 @@ def mana_cost_str_to_dict(mana_cost_str: str) -> dict:
     mana_cost_upper = mana_cost_str.upper()
 
     # First, extract all braced symbols
-    braced_symbols = re.findall(r"{([^}]*)}", mana_cost_upper)
+    braced_symbols = BRACED_MANA_SYMBOL.findall(mana_cost_upper)
     for mana_symbol in braced_symbols:
         try:
             int(mana_symbol)
@@ -406,12 +377,9 @@ def mana_cost_str_to_dict(mana_cost_str: str) -> dict:
 
     # Then, process unbraced characters (replace braced sections with space to prevent merging)
     # We don't care about digits here, only colored symbols
-    unbraced_part = re.sub(r"{[^}]*}", " ", mana_cost_upper)
+    unbraced_part = BRACED_MANA_SYMBOL.sub(" ", mana_cost_upper)
     for char in unbraced_part:
-        # Color characters (W, U, B, R, G, C) plus X, its own pip symbol —
-        # confirmed against the real Scryfall API: mana:x behaves identically
-        # to mana:{x}. calculate_cmc() already excludes X from cmc separately.
-        if char in "WUBRGCX":
+        if char in BARE_MANA_ATOMS:
             colored_symbol_counts[char] = colored_symbol_counts.get(char, 0) + 1
 
     as_dict = {}
@@ -430,7 +398,7 @@ def calculate_cmc(mana_cost_str: str) -> int:
     mana_cost_upper = mana_cost_str.upper()
 
     # First, process all braced symbols
-    braced_symbols = re.findall(r"{([^}]*)}", mana_cost_upper)
+    braced_symbols = BRACED_MANA_SYMBOL.findall(mana_cost_upper)
     for mana_symbol in braced_symbols:
         try:
             # Generic mana symbols add to CMC
@@ -447,14 +415,14 @@ def calculate_cmc(mana_cost_str: str) -> int:
 
     # Then, process unbraced part (after removing braced sections)
     # Replace braced sections with a space to prevent adjacent digits from merging
-    unbraced_part = re.sub(r"{[^}]*}", " ", mana_cost_upper)
-    # Match either: sequences of digits OR single color characters
-    for token in re.findall(r"\d+|[WUBRGC]", unbraced_part):
+    unbraced_part = BRACED_MANA_SYMBOL.sub(" ", mana_cost_upper)
+    # Match either: sequences of digits OR single color/colourless/snow characters
+    for token in re.findall(r"\d+|[WUBRGCS]", unbraced_part):
         if token.isdigit():
             # Multi-digit generic mana (e.g., "11" in "11R")
             cmc += int(token)
-        elif token in "WUBRGC":
-            # Color character counts as 1
+        elif token in "WUBRGCS":
+            # Color (or snow) character counts as 1, same as its braced form
             cmc += 1
 
     return cmc
@@ -634,13 +602,19 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
             # matched literally instead, so it keeps neither fold; see StringValueNode. Measured on
             # api.scryfall.com 2026-08-16: `name:ft` 1,628 against `name:"ft"` 362, `name:ofthe`
             # 1,109 against `name:"ofthe"` 0, `name:limdul` 8 against `name:"limdul"` 0.
-            # Comparison ops (name=, name!=) keep the literal value on both sides,
-            # accent-sensitive, exactly as before.
+            #
+            # `=` IS `:` HERE -- it is not a comparison on a string column, it carries no
+            # information of its own, and the bare/quoted split survives it INTACT. Measured on
+            # api.scryfall.com 2026-08-16: `name=ft` answers `name:ft`'s 1,628 (not `name:"ft"`'s
+            # 362), `name="ft"` answers `name:"ft"`'s 362, and `name=limdul` answers
+            # `name:limdul`'s 8. Gating on `:` alone sent `name=ft` down the literal path, where a
+            # whole-string equality then answered nothing at all. `!=` is NOT in this class -- it
+            # is the empty set on every string column.
             # `a:` gets the SAME split, on the same kind of evidence (api.scryfall.com, 2026-08-16):
             # `a:gawel` answers 10 exactly as `a:gaweł` does, `a:rebecca-guay` answers
             # `a:"rebecca guay"`'s 166, and `a:gu*ay` answers `a:guay`'s 197. An artist could only be
             # found under their own diacritics and punctuation before this.
-            if attr in ("card_name", "card_artist") and self.operator == ":" and not self.rhs.literal:
+            if attr in ("card_name", "card_artist") and self.operator in (":", "=") and not self.rhs.literal:
                 return {"node_type": "CollatedNameValueNode", "kwargs": {"value": collate_name(fold_accents(value))}}
             return {"node_type": "StringValueNode", "kwargs": {"value": value}}
 
@@ -663,8 +637,16 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
 
     def to_human_explanation(self) -> str:
         """Convert to human-readable explanation with card-specific formatting."""
-        # Handle empty string values
-        if isinstance(self.rhs, StringValueNode) and not self.rhs.value.strip():
+        # `:` (contains / JSONB containment) against an empty value is always vacuous --
+        # `LIKE '%'` matches every row, `{} <@ anything` is always true -- so it carries no
+        # real constraint and explains to "". `=` against an empty value is the opposite: a
+        # real, narrow constraint (the field is exactly empty, e.g. is:vanilla's `o=""`), so
+        # it must NOT collapse here -- `_format_card_attribute_explanation` renders that case
+        # below instead. Covers ManaValueNode too: a quoted empty mana/devotion value
+        # (mana:"") parses to one of these, not a StringValueNode, since parse_mana_value
+        # validates quoted values the same as bare ones (#909) — StringValueNode alone
+        # stopped catching it (#950).
+        if self.operator == ":" and isinstance(self.rhs, StringValueNode | ManaValueNode) and not self.rhs.value.strip():
             return ""
         # Handle plain string rhs (for empty queries)
         if isinstance(self.rhs, str) and not self.rhs.strip():
@@ -693,9 +675,15 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         # Default format
         return f"{lhs_str} {operator_str} {rhs_str}"
 
-    def _format_card_attribute_explanation(self, attr_node: CardAttributeNode, operator_str: str, rhs_str: str) -> str:  # noqa: PLR0911
+    def _format_card_attribute_explanation(self, attr_node: CardAttributeNode, operator_str: str, rhs_str: str) -> str:  # noqa: PLR0911, PLR0912
         """Format explanation for card attribute comparisons."""
         db_column_name = attr_node.attribute_name.lower()
+
+        # `=` against an empty value reaches here (see to_human_explanation) as a real
+        # constraint, not the vacuous `:` case -- state it plainly rather than falling into
+        # "the X contains " with nothing after it.
+        if self.operator == "=" and not rhs_str:
+            return f"the {attr_node.to_human_explanation()} is empty"
 
         # Special formatting for certain attributes
         if db_column_name == "card_color_identity" and self.operator in ("=", ":"):
@@ -710,16 +698,21 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
             return f"the toughness {operator_str} {rhs_str}"
         if db_column_name == "cmc":
             return f"the mana value {operator_str} {rhs_str}"
+        # `:` is substring containment on these; `=` is real equality against the whole
+        # field (verified against the actual SQL: `name=X` -> `card_name = X`, `name:X` ->
+        # `card_name_folded LIKE %X%`, same split for oracle_text/card_types/card_artist) --
+        # so `=` reads as "is", not "contains", to describe what it actually checks. Any
+        # other operator (e.g. `!=`) falls through to the generic default below.
         if db_column_name == "card_name" and self.operator in (":", "="):
-            return f"the name contains {rhs_str}"
+            return f"the name is {rhs_str}" if self.operator == "=" else f"the name contains {rhs_str}"
         if db_column_name == "oracle_text" and self.operator in (":", "="):
-            return f"the oracle text contains {rhs_str}"
+            return f"the oracle text is {rhs_str}" if self.operator == "=" else f"the oracle text contains {rhs_str}"
         if db_column_name == "card_types" and self.operator in (":", "="):
-            return f"the type contains {rhs_str}"
+            return f"the type is {rhs_str}" if self.operator == "=" else f"the type contains {rhs_str}"
         if db_column_name == "card_rarity_int":
             return f"the rarity {operator_str} {rhs_str}"
         if db_column_name == "card_artist" and self.operator in (":", "="):
-            return f"the artist contains {rhs_str}"
+            return f"the artist is {rhs_str}" if self.operator == "=" else f"the artist contains {rhs_str}"
         if db_column_name == "card_set_code" and self.operator in (":", "="):
             return f"the set contains {rhs_str}"
 
@@ -792,7 +785,18 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         if field_type == FieldType.JSONB_ARRAY:
             return self._handle_jsonb_array(context)
 
-        if self.operator == ":":
+        # `=` IS `:` ON A TEXT COLUMN -- a substring test, not an equality. It is the one operator
+        # on these columns that carries no information of its own. Measured on api.scryfall.com
+        # 2026-08-16 over the whole default corpus, `X=v` against `X:v`: `o=flying` 4,574 =
+        # `o:flying` 4,574 (this answered the cards whose oracle text IS the word), `ft=aether` 80
+        # = `ft:aether` 80, `name=ft` 1,628 = `name:ft` 1,628, `fo=lifelink` 713 = `fo:lifelink`
+        # 713. The columns stored exact rather than searched -- set code, layout, border,
+        # watermark, collector number -- are claimed inside `_handle_colon_operator` and keep a
+        # genuine equality, because equality IS the meaning there; routing `=` through the same
+        # door reaches them by the path that also lowercases the value, which `e=KHM` needed.
+        #
+        # `!=` and the ordered comparisons are NOT in this class and still fall through below.
+        if self.operator in (":", "="):
             return self._handle_colon_operator(context, field_type, lhs_sql, attr)
 
         if field_type == FieldType.TEXT:
@@ -831,7 +835,7 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         return super().to_sql(context)
 
     def _handle_colon_operator(self, context: QueryContext, field_type: str, lhs_sql: str, attr: str) -> str:
-        """Handle colon operator for different field types."""
+        """Handle the containment operators -- `:` and its synonym `=` -- for different field types."""
         if field_type == FieldType.TEXT:
             # Handle fields that need exact matching instead of pattern matching
             if attr in ("card_set_code", "card_layout", "card_border", "card_watermark", "collector_number"):
@@ -876,34 +880,55 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         mana_jsonb_sql = "card.mana_cost_jsonb"
         cmc_sql = "card.cmc"
 
+        # NO PRINTED COST IS NOT A COST OF ZERO, and this lane could not tell them apart either.
+        # A land and Ornithopter both store `mana_cost_jsonb = '{}'`, because `{0}` is a number and
+        # so is not a pip; the difference survives only in `mana_cost_text`, which is '' on the
+        # land and '{0}' on Ornithopter (card_processing copies Scryfall's `mana_cost` straight
+        # across, and Scryfall emits both). Without this clause `m:{0}` is `'{}' <@ mana_cost_jsonb
+        # AND cmc >= 0`, which is every card in the table.
+        #
+        # Measured on api.scryfall.com 2026-08-17 at unique=prints: `m:{0} t:land` is 195 — the
+        # cards that print a literal {0} — against the whole land corpus, and `m:{0}` is 93,355
+        # against 105,839. The engine lane gates the same way, on the interned string.
+        #
+        # `<> ''` also excludes NULL, which is what a row with no `mana_cost` key at all stores:
+        # `NULL <> ''` is NULL, and a NULL conjunct is not TRUE, so both spellings of "no cost"
+        # fall out together and neither needs its own branch.
+        #
+        # `!=` IS THE EXCEPTION on the engine lane — an absent cost differs from every queried
+        # cost, so `m!={w} t:land` is 12,249 there — but `!=` never reaches this method: the
+        # caller admits only `<= < >= > =` and asserts on anything else. There is nothing to carry
+        # until this lane grows a `!=`.
+        costed = "card.mana_cost_text <> ''"
+
         if self.operator == "=":
-            return f"({mana_jsonb_sql} = {mana} AND {cmc_sql} = {cmc})"
+            return f"({costed} AND {mana_jsonb_sql} = {mana} AND {cmc_sql} = {cmc})"
 
         if self.operator == "<=":
             # Card costs <= query if:
             # 1. Card doesn't have more colored pips (card mana <@ query mana)
             # 2. Card doesn't cost more total (card cmc <= query cmc)
-            return f"({mana_jsonb_sql} <@ {mana} AND {cmc_sql} <= {cmc})"
+            return f"({costed} AND {mana_jsonb_sql} <@ {mana} AND {cmc_sql} <= {cmc})"
 
         if self.operator == "<":
             # Card costs < query if:
             # 1. Card doesn't have more colored pips (card mana <@ query mana)
             # 2. Card doesn't cost more total (card cmc <= query cmc)
             # 3. Costs are not identical
-            return f"({mana_jsonb_sql} <@ {mana} AND {cmc_sql} <= {cmc} AND {mana_jsonb_sql} <> {mana})"
+            return f"({costed} AND {mana_jsonb_sql} <@ {mana} AND {cmc_sql} <= {cmc} AND {mana_jsonb_sql} <> {mana})"
 
         if self.operator == ">=":
             # Card costs >= query if:
             # 1. Card has at least the colored pips (card mana @> query mana)
             # 2. Card costs at least as much total (card cmc >= query cmc)
-            return f"({mana} <@ {mana_jsonb_sql} AND {cmc_sql} >= {cmc})"
+            return f"({costed} AND {mana} <@ {mana_jsonb_sql} AND {cmc_sql} >= {cmc})"
 
         if self.operator == ">":
             # Card costs > query if:
             # 1. Card has at least the colored pips (card mana @> query mana)
             # 2. Card costs at least as much total (card cmc >= query cmc)
             # 3. Costs are not identical
-            return f"({mana} <@ {mana_jsonb_sql} AND {cmc_sql} >= {cmc} AND {mana_jsonb_sql} <> {mana})"
+            return f"({costed} AND {mana} <@ {mana_jsonb_sql} AND {cmc_sql} >= {cmc} AND {mana_jsonb_sql} <> {mana})"
 
         msg = f"Unsupported mana cost operator: {self.operator}"
         raise ValueError(msg)
@@ -1017,7 +1042,12 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         # A QUOTED value is compared against the name AS WRITTEN: `name:"eowyn"` answers 0 on
         # api.scryfall.com while `name:"eowyn"` with the accent answers 3.
         #
-        # Exact-match paths (name=, name!=) are unchanged and keep using card_name/card_name_lower.
+        # `name=` REACHES THIS, and the bare/quoted split survives it intact rather than being
+        # flattened to one side: `name=ft` is 1,628 on api.scryfall.com (exactly `name:ft`, NOT
+        # `name:"ft"`'s 362) and `name="ft"` is 362 (exactly `name:"ft"`), measured 2026-08-16. The
+        # split is carried by `self.rhs.literal`, which the quotes set and the operator does not
+        # touch, so routing `=` here preserves it for free. `name!=` is not in this class and
+        # still takes the exact-match path on card_name.
         if attr == "card_name" and isinstance(self.rhs, StringValueNode) and self.rhs.literal:
             lhs_sql = "card.card_name"
         elif attr == "card_name":
@@ -1054,6 +1084,22 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         # Produce the query as a jsonb object
         lhs_sql = self.lhs.to_sql(context)
         attr = self.lhs.attribute_name
+        # `=` IS `:` ON A COLLECTION COLUMN -- set EQUALITY is not a meaning Scryfall gives it, and
+        # a card whose keyword list is exactly ["Flying"] is not what anyone asking `kw=flying`
+        # wants. Measured on api.scryfall.com 2026-08-16, `X=v` against `X:v` on the same corpus,
+        # identical on every row::
+        #
+        #     kw=flying e:khm             28 = kw:flying 28
+        #     otag=ramp e:khm             35 = otag:ramp 35
+        #     is=foil e:khm t:creature   129 = is:foil 129
+        #     f=modern e:khm             304 = f:modern 304
+        #
+        # The boundary is real and lies elsewhere: the COLOR columns in this same handler keep a
+        # genuine equality, because equality is the meaning there -- `c=rg e:khm t:creature` is 1
+        # against `c:rg`'s 2, and `id=rg` is 1 against `id:rg`'s 52. So does `devotion`, whose `=`
+        # is a count comparison rather than a set one (`devotion={r} e:khm t:creature` is 20
+        # against `devotion:{r}`'s 27). Probed in both directions before this changed.
+        is_containment_collection = attr not in ("card_colors", "card_color_identity", "produced_mana", "devotion")
         is_color_identity = False
         if attr in ("card_colors", "card_color_identity", "produced_mana"):
             rhs = get_colors_comparison_object(self.rhs.value.strip().lower(), attr)
@@ -1105,9 +1151,9 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
             msg = f"Unknown attribute: {attr}"
             raise ValueError(msg)
 
-        if self.operator == "=":
+        if self.operator == "=" and not is_containment_collection:
             return f"({lhs_sql} = {placeholder})"
-        if self.operator in (">=", ":"):
+        if self.operator in (">=", ":", "="):
             return f"({lhs_sql} @> {placeholder})"
         if self.operator == "<=":
             return f"({lhs_sql} <@ {placeholder})"
@@ -1131,17 +1177,19 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         col = self.lhs.to_sql(context)
 
         query = context.add([rhs_val])
-        if self.operator == "=":
-            return f"({col} <@ {query}) AND ({query} <@ {col})"
-        if self.operator in (">=", ":"):
+        # `=` IS `:` HERE TOO, for the same reason and on the same evidence: `t=creature e:khm` is
+        # 151 and `t:creature e:khm` is 151, `t=legendary e:khm` is 42 and `t:legendary e:khm` is
+        # 42 (api.scryfall.com, 2026-08-16). A set equality answered only the cards whose whole
+        # type list is the one word, which is never what a type query means.
+        if self.operator in (">=", ":", "="):
             return f"({query} <@ {col})"
         if self.operator == "<=":
             return f"({col} <@ {query})"
         if self.operator == ">":
             return f"({query} <@ {col}) AND NOT({col} <@ {query})"
-        # < and != use the same order-insensitive set semantics as = above
-        # (containment both ways), not jsonb literal equality, which is
-        # order-sensitive for arrays.
+        # < and != express set equality as containment BOTH WAYS, not as jsonb literal equality,
+        # which is order-sensitive for arrays. `=` used to be spelled this way as well and is now
+        # the containment above; these two are the only readers of the two-way form left.
         if self.operator == "<":
             return f"({col} <@ {query}) AND NOT({query} <@ {col})"
         if self.operator in ("!=", "<>"):

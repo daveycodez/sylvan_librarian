@@ -144,17 +144,67 @@ pub(crate) fn legality_bits_to_pydict<'a>(py: Python<'a>, bits: u64) -> PyResult
     Ok(dict)
 }
 
+/// True when the registry already holds every `(format, shift)` pair the archive names — the
+/// question `sync_format_shifts` asks before it takes a write lock.
+///
+/// It is CONTENT, not cardinality. This used to be `registry.len() < archive.len()`, which asks
+/// only "does the archive name MORE formats than I do", and on a name-keyed map that misses every
+/// change which keeps the count:
+///
+///   * a RENAME, which this corpus has actually had — Scryfall renamed `brawl` to `standardbrawl`
+///     and `historicbrawl` to `brawl` in one pass;
+///   * one format retired and another added in the same dump.
+///
+/// Shifts are handed out in first-seen order over a `legalities` object whose keys arrive sorted,
+/// so either shape re-slots every alphabetically-later format by one. A registry that declines to
+/// adopt the new map then reads every card's legality word at its NEIGHBOUR's two bits, and binds
+/// `legality:`/`banned:`/`restricted:` to the same wrong pair. Nothing errors: the words still
+/// decode, to the wrong statuses.
+///
+/// It cannot bite the store as built TODAY, because every Scryfall card carries the full
+/// `legalities` object — so the first row of any build assigns all 22 formats in the same sorted
+/// order, and two archives of the same vocabulary carry identical maps. That is a property of
+/// Scryfall's output, not of this function.
+fn shifts_agree<'a>(shifts: &HashMap<String, u8>, archive: impl IntoIterator<Item = (&'a str, u8)>) -> bool {
+    archive.into_iter().all(|(format, shift)| shifts.get(format) == Some(&shift))
+}
+
+/// Make `shifts` agree with `archive`, which is the authority for the words the archive holds.
+///
+/// Inserting the archive's pairs is not enough, which only shows up once same-count changes are
+/// visible at all: a retired name STILL HOLDS ITS SLOT. Insert `{a:0, b:2, d:4}` over
+/// `{a:0, b:2, c:4}` and `format_order` emits both `c` and `d` at bits 4-5, so a format that no
+/// longer exists reports the new one's status on every card. So drop exactly the entries this
+/// archive contradicts — a slot it hands to a DIFFERENT name — and leave every slot it never
+/// mentions alone, so a format assigned by an import running in this process and absent from this
+/// archive survives the sync.
+fn adopt_shifts(shifts: &mut HashMap<String, u8>, archive: &[(&str, u8)]) {
+    let owner_of: HashMap<u8, &str> = archive.iter().map(|(format, shift)| (*shift, *format)).collect();
+    shifts.retain(|name, shift| match owner_of.get(&*shift) {
+        Some(owner) => *owner == name.as_str(),
+        None => true,
+    });
+    for (format, shift) in archive {
+        shifts.insert((*format).to_string(), *shift);
+    }
+}
+
 /// Adopt the archive's format→shift assignments into this process's registry.
-/// Cheap no-op (one read lock) once the registry has caught up.
+///
+/// Cheap no-op (one read lock and ~22 lookups, no write and no generation bump) once the registry
+/// agrees — which matters because this runs on EVERY query: `bind_and_split_filter` syncs before
+/// `build_filter`, and a gratuitous `invalidate_format_order` would discard the cached order that
+/// `format_order` exists to protect on every request.
 pub(crate) fn sync_format_shifts(archived: &Archived<HashMap<String, u8>>) {
-    let behind = format_shifts().read().map(|m| m.len() < archived.len()).unwrap_or(false);
-    if !behind {
+    let pairs = || archived.iter().map(|(format, shift)| (format.as_str(), *shift));
+    // The common path borrows and allocates nothing. A poisoned lock reads as "agrees" and does
+    // nothing, exactly as the old `unwrap_or(false)` did.
+    if format_shifts().read().map(|m| shifts_agree(&m, pairs())).unwrap_or(true) {
         return;
     }
+    let archive: Vec<(&str, u8)> = pairs().collect();
     if let Ok(mut shifts) = format_shifts().write() {
-        for (format, shift) in archived.iter() {
-            shifts.insert(format.as_str().to_string(), *shift);
-        }
+        adopt_shifts(&mut shifts, &archive);
     }
     invalidate_format_order();
 }
@@ -200,5 +250,89 @@ mod tests {
         if FORMAT_GENERATION.load(AtomicOrdering::Acquire) == generation {
             assert!(Arc::ptr_eq(&first, &second), "second call must reuse the cached order");
         }
+    }
+
+    fn map_of(pairs: &[(&str, u8)]) -> HashMap<String, u8> {
+        pairs.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect()
+    }
+
+    /// Sorted pairs — `format_order`'s content, without needing a registry to hold it.
+    fn sorted_pairs(shifts: &HashMap<String, u8>) -> Vec<(String, u8)> {
+        let mut out: Vec<(String, u8)> = shifts.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        out.sort();
+        out
+    }
+
+    /// STALENESS IS CONTENT, NOT CARDINALITY. Two maps of the same SIZE can disagree about which
+    /// format owns which two bits, and the question `sync_format_shifts` used to ask —
+    /// `registry.len() < archive.len()` — says "nothing to do" to every one of them.
+    ///
+    /// The fixture is the shape this corpus has actually had: a RENAME. Scryfall renamed `brawl`
+    /// to `standardbrawl`; the count is identical before and after, and the slot the old name held
+    /// goes to the new one.
+    ///
+    /// Asserted against `shifts_agree`/`adopt_shifts` over an owned map rather than against the
+    /// global registry, so it is exact and unconditional. The test above documents what reading
+    /// `FORMAT_SHIFTS` costs: containment instead of equality, and an early return whenever the
+    /// shared registry happens to be full.
+    #[test]
+    fn a_same_count_archive_is_not_agreement() {
+        let mut shifts = map_of(&[("brawl", 0), ("commander", 2), ("modern", 4)]);
+        let archive = [("standardbrawl", 0u8), ("commander", 2), ("modern", 4)];
+        assert_eq!(shifts.len(), archive.len(), "the fixture is only interesting because the counts MATCH");
+
+        assert!(!shifts_agree(&shifts, archive), "a renamed format is a disagreement the count cannot see");
+        adopt_shifts(&mut shifts, &archive);
+
+        assert_eq!(shifts.get("standardbrawl"), Some(&0), "the archive's name must become bindable");
+        assert_eq!(
+            shifts.get("brawl"),
+            None,
+            "the retired name must not keep the slot — it would report standardbrawl's status on every card"
+        );
+        assert_eq!(
+            sorted_pairs(&shifts),
+            [("commander".to_owned(), 2), ("modern".to_owned(), 4), ("standardbrawl".to_owned(), 0)]
+        );
+        assert!(shifts_agree(&shifts, archive), "and the adoption must settle it");
+    }
+
+    /// A slot the archive never mentions belongs to whoever holds it: an import running in this
+    /// process assigns formats through `format_shift_or_assign` against the same registry, and
+    /// dropping those on every archive attach would un-assign a format mid-import.
+    ///
+    /// The growth case rides along — an archive that is a strict SUPERSET still extends, which is
+    /// the only thing the old count check could see and must keep working.
+    #[test]
+    fn adopting_keeps_slots_the_archive_does_not_claim_and_still_extends() {
+        let mut shifts = map_of(&[("commander", 0), ("modern", 2), ("import_only", 4)]);
+        let archive = [("commander", 0u8), ("modern", 2), ("alchemy", 6)];
+
+        assert!(!shifts_agree(&shifts, archive), "a format only the archive knows is news");
+        adopt_shifts(&mut shifts, &archive);
+
+        assert_eq!(shifts.get("import_only"), Some(&4), "a slot the archive is silent about is left alone");
+        assert_eq!(shifts.get("alchemy"), Some(&6), "and a format only the archive knows is adopted");
+        assert_eq!(
+            sorted_pairs(&shifts),
+            [
+                ("alchemy".to_owned(), 6),
+                ("commander".to_owned(), 0),
+                ("import_only".to_owned(), 4),
+                ("modern".to_owned(), 2)
+            ]
+        );
+    }
+
+    /// The fast path has to STAY fast: `bind_and_split_filter` syncs before `build_filter`, so
+    /// this question is asked on every query, and answering "no" takes a write lock and discards
+    /// the cached order. An archive that names a subset is not news either.
+    #[test]
+    fn an_archive_the_registry_already_holds_is_agreement() {
+        let shifts = map_of(&[("commander", 0), ("modern", 2)]);
+        assert!(shifts_agree(&shifts, [("commander", 0u8), ("modern", 2)]));
+        assert!(shifts_agree(&shifts, [("modern", 2u8)]), "a subset teaches the registry nothing");
+        assert!(shifts_agree(&shifts, [] as [(&str, u8); 0]), "and an empty archive least of all");
+        assert!(!shifts_agree(&shifts, [("modern", 4u8)]), "the same name at another slot IS news");
     }
 }

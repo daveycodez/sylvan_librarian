@@ -2142,9 +2142,10 @@ fn fuzz_build_filter(spec: &FuzzSpec) -> FilterExpr {
             core: *core,
             hybrids: hybrids.clone(),
             hybrid_ids: Vec::new(), // bind() fills this from `hybrids` when non-empty
+            hybrid_cmc: Vec::new(), // bind() fills this from the store's mana vocab, always
             cmc: *cmc,
         },
-        FuzzSpec::Leaf(FuzzLeaf::Devotion { op, pips }) => FilterExpr::Devotion { op: *op, pips: *pips },
+        FuzzSpec::Leaf(FuzzLeaf::Devotion { op, pips }) => FilterExpr::Devotion { op: *op, pips: *pips, hybrid_colors: Vec::new() },
         FuzzSpec::Leaf(FuzzLeaf::Border { value }) => FilterExpr::TextExact { field: TextField::Border, op: CmpOp::Eq, value: value.clone() },
         FuzzSpec::Leaf(FuzzLeaf::Legality { shift, expected }) => FilterExpr::Legality { shift: *shift, expected: *expected },
         FuzzSpec::And(v) => FilterExpr::And(v.iter().map(fuzz_build_filter).collect()),
@@ -8295,6 +8296,60 @@ fn broad_ranges_decline_to_narrow() {
     assert_eq!(range_candidates(archived, 100, 200).map(|v| v.len()), Some(100));
 }
 
+/// `usd` IS `COALESCE(usd, usd_foil, usd_etched)` ON api.scryfall.com, and the fallback has to
+/// reach BOTH the range index the planner narrows with and the verification that follows it — an
+/// index built on the raw column would narrow away the very printings the fallback exists to
+/// include, and the row would never reach `matches`.
+///
+/// `usd>=500` is 205 there against this port's 84 before the fix. Of the 175 rows of
+/// `usd>=500 unique=prints`, 99 carry `prices.usd` NULL beside a foil price over $500 and ZERO
+/// carry a LOW `usd` beside a high foil — which is the fourth printing here, and the reason this
+/// is a fallback rather than a maximum. Etched is measured too: Mox Opal (sld) is etched-priced
+/// and nothing else, and matches `usd>=300`.
+#[test]
+fn the_usd_search_key_falls_back_to_foil_then_etched_but_never_overrides() {
+    let mut vocab = VocabInterner::new();
+    let cards = vec![stub_card(1, TYPE_CREATURE, &[], &mut vocab)];
+    let mut data = store_of(cards, &[4], vocab);
+    data.printings[0].price_usd = Some(60_000); // $600 nonfoil
+    data.printings[1].compat.price_usd_foil = NonZeroU32::new(60_000); // foil only
+    data.printings[2].compat.price_usd_etched = NonZeroU32::new(60_000); // etched only
+    data.printings[3].price_usd = Some(100); // $1 nonfoil beside a $600 foil — NOT a maximum
+    data.printings[3].compat.price_usd_foil = NonZeroU32::new(60_000);
+    data.indexes.price_usd =
+        build_printing_value_index(&data.printings, &data.cards, &data.offsets, super::build_search_price_usd_cents);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let card = &archived.cards[0];
+
+    let ge = usd_cmp(CmpOp::Ge, 500.0);
+    // Verification: three match, the fourth is a dollar.
+    for pid in [0usize, 1, 2] {
+        assert!(ge.matches(card, &archived.printings[pid], &archived.strings), "printing {pid} must match usd>=500");
+    }
+    assert!(!ge.matches(card, &archived.printings[3], &archived.strings), "a low usd is not overridden by a high foil");
+    // Narrowing: the index has to carry the same three, or the planner drops them before
+    // verification ever runs. This is the half a query-time-only coalesce would get wrong.
+    match narrow_candidates(&ge, &archived.indexes, &archived.offsets, &archived.cards) {
+        Some(Candidates::Printings(v)) => {
+            for pid in [0u32, 1, 2] {
+                assert!(v.contains(&pid), "the range index must carry printing {pid}");
+            }
+            assert!(!v.contains(&3));
+        }
+        _ => panic!("usd must narrow in printing space"),
+    }
+    // And the two representations of the chain agree — the archived one the filter and the sort
+    // key read, and the unarchived one the index is built from.
+    for (pid, p) in archived.printings.iter().enumerate() {
+        assert_eq!(
+            super::search_price_usd_cents(p),
+            super::build_search_price_usd_cents(&data.printings[pid]),
+            "the search-price chain must not depend on which representation asks"
+        );
+    }
+}
+
 // Price is stored as integer cents (see Printing::price_usd's doc comment) specifically to make
 // both narrowing (via int_range_bounds, same as collector_number) and verification (field_num's
 // exact cents/100.0 division) genuinely exact at the boundary -- not "may include as a
@@ -10574,6 +10629,68 @@ fn packed_pips(pips: &[(&str, u8)]) -> u64 {
     p
 }
 
+/// Devotion counts DISTINCT PIPS, so a `{R/G}` symbol answers a `{r/g}` query ONCE.
+///
+/// The fixture's card 5 is `{R/G}` — lanes R=1 and G=1, because the loader expands a hybrid into
+/// both colours — and card 6 is `{R/G}{R/G}{R}`, lanes R=3 and G=2. Summing the queried lanes
+/// gives 2 and 5; counting pips gives 1 and 3, which is what Scryfall answers.
+///
+/// MEASURED against api.scryfall.com 2026-08-17, on the two cards that falsify the two obvious
+/// readings in opposite directions: Burning-Tree Emissary (`{R/G}{R/G}`) matches
+/// `devotion:{r/g}{r/g}` and NOT `devotion:{r/g}{r/g}{r/g}`, so its devotion is 2 and not the
+/// sum's 4; Svella, Ice Shaper (`{1}{R}{G}`) is the sixteenth card of `e:khm t:creature
+/// devotion:{r/g}{r/g}`'s 16, so its devotion is 2 and not the max's 1. Set-scoped confirmations,
+/// where corpus vintage cannot reach: `e:rna devotion:{r/g}{r/g}` 24, `e:gtc
+/// devotion:{w/u}{w/u}` 16, `e:sok devotion:{b/g}{b/g}` 21.
+///
+/// THE FILTER MUST BE BOUND. `hybrid_colors` is empty until bind() resolves it against the store's
+/// mana vocab, and an empty table corrects nothing — which is exactly the pre-fix behaviour, and
+/// why every other devotion test in this file still passes unbound.
+#[test]
+fn devotion_counts_distinct_pips_not_summed_lanes() {
+    let data = devotion_fixture_store();
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let bound = |op, pips: &[(&str, u8)]| {
+        let mut f = FilterExpr::Devotion { op, pips: packed_pips(pips), hybrid_colors: Vec::new() };
+        f.bind(
+            &archived.coll_vocab,
+            &archived.coll_vocab_sorted,
+            &archived.artist_vocab,
+            &archived.artist_vocab_collated,
+            &archived.mana_vocab,
+            &archived.indexes.flavor,
+            &archived.strings,
+        );
+        f
+    };
+    let matches = |f: &FilterExpr| -> Vec<usize> {
+        archived.cards.iter().enumerate()
+            .filter(|(_, c)| f.eval_card(c, &archived.strings) == Tri::True)
+            .map(|(i, _)| i)
+            .collect()
+    };
+
+    // One {R/G} pip is ONE pip of devotion to red-or-green, not two. Card 5 therefore answers a
+    // one-symbol query and not a two-symbol one; the sum said both.
+    assert!(matches(&bound(CmpOp::Ge, &[("R", 1), ("G", 1)])).contains(&5));
+    assert!(
+        !matches(&bound(CmpOp::Ge, &[("R", 2), ("G", 2)])).contains(&5),
+        "{{R/G}} is one pip: the summed lanes read 2 and matched, which is the Burning-Tree bug"
+    );
+    // Card 6 is {R/G}{R/G}{R} — three pips that are red or green, lanes 3 and 2 summing to 5.
+    assert!(matches(&bound(CmpOp::Ge, &[("R", 3), ("G", 3)])).contains(&6));
+    assert!(
+        !matches(&bound(CmpOp::Ge, &[("R", 4), ("G", 4)])).contains(&6),
+        "three distinct pips, not the five the summed lanes gave"
+    );
+    // A SINGLE-COLOUR query is untouched by the correction — one bit cannot match twice — so the
+    // hybrid still counts toward each colour on its own, and the exact plane stays valid.
+    assert!(matches(&bound(CmpOp::Ge, &[("R", 1)])).contains(&5));
+    assert!(matches(&bound(CmpOp::Ge, &[("G", 1)])).contains(&5));
+    assert_eq!(matches(&bound(CmpOp::Ge, &[("R", 3)])), vec![6]);
+}
+
 // Every devotion op agrees with tri() through the planes, at every saturation
 // depth — and past the boundary the compiler declines rather than guesses.
 #[test]
@@ -10581,7 +10698,7 @@ fn devotion_plane_parity_and_boundaries() {
     let data = devotion_fixture_store();
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
-    let dev = |op, pips: &[(&str, u8)]| FilterExpr::Devotion { op, pips: packed_pips(pips) };
+    let dev = |op, pips: &[(&str, u8)]| FilterExpr::Devotion { op, pips: packed_pips(pips), hybrid_colors: Vec::new() };
     let mut bitmap: Vec<u64> = Vec::new();
     let mut check_exact = |f: &FilterExpr| {
         let pe = compile_plane(f, &archived.indexes.planes, &archived.indexes.oracle_trigram.words).expect("must compile exactly");
@@ -10594,10 +10711,23 @@ fn devotion_plane_parity_and_boundaries() {
     for op in [CmpOp::Ge, CmpOp::Eq, CmpOp::Le, CmpOp::Ne, CmpOp::Gt, CmpOp::Lt] {
         for k in 1..=2u8 {
             check_exact(&dev(op, &[("U", k)]));
+            // MULTI-LANE (what a HYBRID value expands to) must DECLINE at every operator. tri()
+            // compares the SUM of the queried lanes, and the planes hold a saturating bucket per
+            // color that cannot be added — a card with one pip of each color satisfies
+            // `d[r]+d[g] >= 2` while sitting in no per-color bucket above 1. Declining is the
+            // whole point: `compile_plane` promises exactness, and nothing downstream re-checks a
+            // plane it claimed was exact, so "approximately right" here is a silent wrong answer.
+            for pips in [&[("W", k), ("U", k)], &[("R", k), ("G", k)]] {
+                assert!(
+                    compile_plane(&dev(op, pips), &archived.indexes.planes, &archived.indexes.oracle_trigram.words).is_none(),
+                    "multi-lane devotion must decline, not compile approximately"
+                );
+            }
         }
     }
     check_exact(&dev(CmpOp::Ge, &[("U", 3)])); // saturated value 3 means >= 3: exact
-    check_exact(&dev(CmpOp::Ge, &[("R", 1), ("G", 1)])); // multi-color, hybrid cards in play
+    // Multi-color (a hybrid value) declines — see the loop above and compile_devotion's note.
+    assert!(compile_plane(&dev(CmpOp::Ge, &[("R", 1), ("G", 1)]), &archived.indexes.planes, &archived.indexes.oracle_trigram.words).is_none());
     check_exact(&dev(CmpOp::Ge, &[("C", 2)])); // colorless devotion
     check_exact(&dev(CmpOp::Ge, &[("R", 3)])); // {R/G}{R/G}{R} card reaches R=3
 
@@ -10617,6 +10747,58 @@ fn devotion_plane_parity_and_boundaries() {
     }
 }
 
+// A HYBRID QUERY ADDS ITS TWO COLORS INTO ONE QUANTITY.
+//
+// Pinned against ABSOLUTE expectations, because the plane-parity test above proves only that the
+// compiler and tri() agree — and they agreed just as well when both read the query as a per-lane
+// AND, and again when both read it as a per-lane OR. All three disagree about the {W}{U} card,
+// which is the only card here with one pip in each queried color.
+//
+// Scryfall decides it. Over `e:khm t:creature`: `devotion:{r}{r}` is 7 and `devotion:{g}{g}` is 8,
+// so "d[r] >= 2 OR d[g] >= 2" cannot exceed 15 — and `devotion:{r/g}{r/g}` is **16**. The
+// sixteenth is the one KHM creature carrying a red pip and a green pip, whose lanes are 1 and 1
+// and whose combined devotion is 2. The AND reading answered 1 to `devotion:{r/g}`'s 62.
+#[test]
+fn a_hybrid_devotion_query_sums_its_two_colors() {
+    let data = devotion_fixture_store();
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    // Fixture cards, in order: 0 no cost, 1 {U}, 2 {U}{U}, 3 {U}{U}{U}, 4 {U}x5, 5 {R/G},
+    // 6 {R/G}{R/G}{R} (R=3,G=2), 7 {W}{U}, 8 {C}{C}, 9 {R} on an INSTANT (devotion 0).
+    // Queried W,U with one symbol: the measure is d[W]+d[U], the want is 1.
+    let wu = |op| FilterExpr::Devotion { op, pips: packed_pips(&[("W", 1), ("U", 1)]), hybrid_colors: Vec::new() };
+    let cases: &[(CmpOp, &[usize])] = &[
+        (CmpOp::Ge, &[1, 2, 3, 4, 7]),                // sum >= 1
+        (CmpOp::Gt, &[2, 3, 4, 7]),                   // sum >  1 — card 7 is 1+1, and belongs here
+        (CmpOp::Eq, &[1]),                            // sum == 1 — and card 7 does NOT
+        (CmpOp::Lt, &[0, 5, 6, 8, 9]),                // sum <  1
+        (CmpOp::Le, &[0, 1, 5, 6, 8, 9]),             // sum <= 1
+        (CmpOp::Ne, &[0, 2, 3, 4, 5, 6, 7, 8, 9]),    // sum != 1
+    ];
+    for &(op, want) in cases {
+        let f = wu(op);
+        let got: Vec<usize> = archived
+            .cards
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| f.eval_card(c, &archived.strings) == Tri::True)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(got, want, "devotion {op:?} over lanes W,U");
+    }
+    // The superset must still COVER a multi-lane match, which is the direction that matters once
+    // the exact compiler declines: card 7 sits in no per-color bucket above 1.
+    let f = wu(CmpOp::Ge);
+    let pe = super::planes::compile_devotion_superset(packed_pips(&[("W", 1), ("U", 1)])).expect("superset compiles");
+    let mut bitmap: Vec<u64> = Vec::new();
+    eval_planes(&pe, &archived.indexes.planes, &mut bitmap);
+    for (cid, card) in archived.cards.iter().enumerate() {
+        if f.eval_card(card, &archived.strings) == Tri::True {
+            assert!(bitmap_contains(&bitmap, cid as u32), "superset must cover card {cid}");
+        }
+    }
+}
+
 // The user-specified hybrid invariant, pinned: a card costing {R/G} has one
 // red devotion AND one green devotion.
 #[test]
@@ -10624,7 +10806,7 @@ fn hybrid_pip_counts_toward_both_colors() {
     let data = devotion_fixture_store();
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
-    let dev = |sym: &str, k: u8| FilterExpr::Devotion { op: CmpOp::Ge, pips: packed_pips(&[(sym, k)]) };
+    let dev = |sym: &str, k: u8| FilterExpr::Devotion { op: CmpOp::Ge, pips: packed_pips(&[(sym, k)]), hybrid_colors: Vec::new() };
     let mut bitmap: Vec<u64> = Vec::new();
     let rg_card = 5; // {R/G}
     for (f, want) in [(dev("R", 1), true), (dev("G", 1), true), (dev("R", 2), false), (dev("U", 1), false)] {
@@ -10644,8 +10826,8 @@ fn devotion_ignores_nonpermanent_pips() {
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
     let instant_card = &archived.cards[9]; // {R} on TYPE_INSTANT
     assert_eq!(u64::from(instant_card.mana_cost.devotion), 0, "an Instant's devotion must be zeroed at load, regardless of its pips");
-    let ge_r = FilterExpr::Devotion { op: CmpOp::Ge, pips: packed_pips(&[("R", 1)]) };
-    let le_r = FilterExpr::Devotion { op: CmpOp::Le, pips: packed_pips(&[("R", 1)]) };
+    let ge_r = FilterExpr::Devotion { op: CmpOp::Ge, pips: packed_pips(&[("R", 1)]), hybrid_colors: Vec::new() };
+    let le_r = FilterExpr::Devotion { op: CmpOp::Le, pips: packed_pips(&[("R", 1)]), hybrid_colors: Vec::new() };
     assert!(ge_r.eval_card(instant_card, &archived.strings) != Tri::True, "a nonpermanent's {{R}} must not satisfy devotion:{{R}}");
     assert!(le_r.eval_card(instant_card, &archived.strings) == Tri::True, "empty devotion is a subset of any query");
 }
@@ -11035,7 +11217,7 @@ fn verify_order_or_sorts_by_bucket_only() {
 // devotion:bbb` 1.2× when measured).
 #[test]
 fn verify_order_or_keeps_scan_cost_band_in_written_order() {
-    let devotion = || FilterExpr::Devotion { op: CmpOp::Ge, pips: packed_pips(&[("B", 3)]) };
+    let devotion = || FilterExpr::Devotion { op: CmpOp::Ge, pips: packed_pips(&[("B", 3)]), hybrid_colors: Vec::new() };
     let mut f = FilterExpr::Or(vec![contains_scan(), devotion()]);
     f.order_children_by_verify_cost(&mut 0);
     let FilterExpr::Or(children) = &f else { panic!("still an Or") };
@@ -11228,6 +11410,20 @@ fn mana_fixture_store() -> CardData {
     }).collect();
     let mut data = store_of(cards, &[1usize; 8], vocab);
     data.mana_vocab = mana_vocab;
+    // EVERY card in a real store carries a mana_cost STRING, and it is the only place "no cost"
+    // and "a cost of {0}" differ — both pack to {core: 0, hybrids: [], cmc: 0}, because `{0}`
+    // parses as a number and contributes neither pip nor cmc. Scryfall prints "" on a land and
+    // "{0}" on Ornithopter, so the filter reads the string to tell them apart.
+    //
+    // The fixture left this NONE_STR on every card, which no store ever produces — and a fixture
+    // that cannot express the distinction cannot test it. Card 7 (index 6) is the costless one.
+    let empty_id = u32::try_from(data.strings.len()).expect("fixture strings fit u32");
+    data.strings.push(String::new());
+    let printed_id = u32::try_from(data.strings.len()).expect("fixture strings fit u32");
+    data.strings.push("{W}".to_string());
+    for (i, c) in data.cards.iter_mut().enumerate() {
+        c.mana_cost_text_id = if i == 6 { empty_id } else { printed_id };
+    }
     data
 }
 
@@ -11256,7 +11452,7 @@ fn mana_cmp_of(op: CmpOp, pips: &[(&str, u8)], cmc: f32, mana_vocab: &[String]) 
     if unknown > 0 {
         hybrid_ids.push((super::MANA_SYM_UNKNOWN, unknown));
     }
-    FilterExpr::ManaCostCmp { op, core, hybrids, hybrid_ids, cmc }
+    FilterExpr::ManaCostCmp { op, core, hybrids, hybrid_ids, hybrid_cmc: Vec::new(), cmc }
 }
 
 // Containment, exactness, and their strict/negated variants over the packed
@@ -11281,11 +11477,15 @@ fn mana_cost_cmp_packed_semantics() {
     assert_eq!(matches(&mana_cmp_of(CmpOp::Ge, &[("W", 1)], 1.0, &mv)), [1, 2, 3]);
     // Eq: same symbols, same counts, same cmc — {W} only, not {W}{W} or {W}{U}.
     assert_eq!(matches(&mana_cmp_of(CmpOp::Eq, &[("W", 1)], 1.0, &mv)), [1]);
-    // Le = card ⊆ query: {W}, {W}{W}, and the empty cost.
-    assert_eq!(matches(&mana_cmp_of(CmpOp::Le, &[("W", 2)], 2.0, &mv)), [1, 2, 7]);
+    // Le = card ⊆ query: {W} and {W}{W}. Card 7 PRINTS NO COST and so answers no mana comparison
+    // at all — not even the zero-ish ones. Measured on api.scryfall.com 2026-08-17: `m:{0} t:land`
+    // is 195, the cards that print a literal {0}, against the 12,254 lands this file used to
+    // return; and `-m:{0}` is 12,442, which is those lands arriving through the NEGATION because
+    // the leaf is false for them.
+    assert_eq!(matches(&mana_cmp_of(CmpOp::Le, &[("W", 2)], 2.0, &mv)), [1, 2]);
     // Strict variants exclude the exact cost.
     assert_eq!(matches(&mana_cmp_of(CmpOp::Gt, &[("W", 1)], 1.0, &mv)), [2, 3]);
-    assert_eq!(matches(&mana_cmp_of(CmpOp::Lt, &[("W", 2)], 2.0, &mv)), [1, 7]);
+    assert_eq!(matches(&mana_cmp_of(CmpOp::Lt, &[("W", 2)], 2.0, &mv)), [1]);
     // Hybrid pips are distinct symbols: {R/G} matches only through the vocab.
     assert_eq!(matches(&mana_cmp_of(CmpOp::Ge, &[("R/G", 1)], 1.0, &mv)), [4]);
     assert_eq!(matches(&mana_cmp_of(CmpOp::Eq, &[("R/G", 1)], 1.0, &mv)), [4]);
@@ -11308,14 +11508,185 @@ fn mana_cost_cmp_packed_semantics() {
     // builds the FilterExpr from typed pips and bypasses string parsing.)
     assert_eq!(matches(&mana_cmp_of(CmpOp::Ge, &[("X", 1)], 0.0, &mv)), [5]);
     assert_eq!(matches(&mana_cmp_of(CmpOp::Eq, &[("X", 1), ("R", 1)], 1.0, &mv)), [5]);
-    // A symbol no card carries: containment and exactness fail everywhere;
-    // card ⊆ query still holds for the empty cost (query-only symbols never
-    // constrain the subset direction — same as the HashMap semantics).
+    // A symbol no card carries: containment and exactness fail everywhere, and so now does the
+    // subset direction — card 7 was the only card that satisfied it, and it prints no cost, so it
+    // answers no mana comparison at all.
     assert_eq!(matches(&mana_cmp_of(CmpOp::Ge, &[("Q/Z", 1)], 1.0, &mv)), Vec::<u128>::new());
     assert_eq!(matches(&mana_cmp_of(CmpOp::Eq, &[("Q/Z", 1)], 1.0, &mv)), Vec::<u128>::new());
-    assert_eq!(matches(&mana_cmp_of(CmpOp::Le, &[("Q/Z", 1)], 2.0, &mv)), [7]);
-    // Ne is not-exactly-equal.
+    assert_eq!(matches(&mana_cmp_of(CmpOp::Le, &[("Q/Z", 1)], 2.0, &mv)), Vec::<u128>::new());
+    // Ne is not-exactly-equal, and card 7 IS in it: an absent cost differs from every queried
+    // cost. This is the one operator a costless card answers, measured rather than reasoned —
+    // `m!={w} t:land` is 12,249 on api.scryfall.com (2026-08-17), against the 191 a blanket
+    // "costless matches nothing" would give.
     assert_eq!(matches(&mana_cmp_of(CmpOp::Ne, &[("W", 1)], 1.0, &mv)), [2, 3, 4, 5, 6, 7, 8]);
+}
+
+// GENERIC MANA IS A COUNTED PIP, AND THE FIXTURE ABOVE CANNOT SEE IT.
+//
+// Every cost in `mana_fixture_store` has generic 0 — its cmc is exactly its pip count — so the
+// comparison this replaced (card cmc against query cmc) and the one that replaced it (card generic
+// against query generic) agree on all eight cards, and every assertion above passes under either.
+// That is the whole bug: `m:{2}` compared cmc, so any two pips paid for it.
+//
+// The decisive case is a card whose cmc and generic disagree. Measured on api.scryfall.com
+// 2026-08-16 over the whole corpus, because KHM has no creature costing exactly {R}{R}:
+// `m={r}{r} t:creature` is 24, and `m={r}{r} m:{2} t:creature` is **0** — a {R}{R} cost has cmc 2
+// and generic 0, and Scryfall reads the pip. Over `e:khm t:creature` (151): `m:{2}` 102 where cmc
+// answered 142, `m:{1}` 140 where cmc answered 151, `m:{3}` 60 where cmc answered 113.
+#[test]
+fn generic_mana_is_a_counted_pip_not_a_cmc() {
+    let mut vocab = VocabInterner::new();
+    let mut mana_vocab: Vec<String> = Vec::new();
+    // (pips, cmc) — the pips are what `core` holds, and cmc - pips is the GENERIC:
+    let costs: &[(&[(&str, u8)], f32)] = &[
+        (&[("R", 1)], 3.0),  // 1: {2}{R} — generic 2
+        (&[("R", 2)], 2.0),  // 2: {R}{R} — generic 0, same cmc as {1}{R}
+        (&[("R", 1)], 2.0),  // 3: {1}{R} — generic 1
+        (&[("R", 1)], 1.0),  // 4: {R}     — generic 0
+        (&[], 2.0),          // 5: {2}     — generic 2, no pips at all
+    ];
+    let cards: Vec<OracleCard> = costs.iter().enumerate().map(|(i, &(pips, cmc))| {
+        let mut c = stub_card(i as u128 + 1, TYPE_CREATURE, &[], &mut vocab);
+        c.mana_cost = mana_cost_of(pips, &mut mana_vocab);
+        c.mana_cost.cmc = cmc;
+        for (lane, sym) in ["W", "U", "B", "R", "G"].iter().enumerate() {
+            if super::lane_get(c.mana_cost.devotion, lane) > 0 {
+                c.card_color_identity |= super::color_list_to_mask(&[sym]);
+            }
+        }
+        c
+    }).collect();
+    let mut data = store_of(cards, &[1usize; 5], vocab);
+    data.mana_vocab = mana_vocab;
+    // All five of these cards PRINT a cost, so all five need a non-empty mana_cost string: the
+    // filter reads it to tell a costless card from one costing {0}, and NONE_STR (which no store
+    // emits) reads as costless.
+    let printed_id = u32::try_from(data.strings.len()).expect("fixture strings fit u32");
+    data.strings.push("{R}".to_string());
+    for c in data.cards.iter_mut() {
+        c.mana_cost_text_id = printed_id;
+    }
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let matches = |f: &FilterExpr| -> Vec<u128> {
+        archived.cards.iter()
+            .filter(|c| f.eval_card(c, &archived.strings) == Tri::True)
+            .map(|c| u128::from(c.oracle_id))
+            .collect()
+    };
+    let mv: Vec<String> = archived.mana_vocab.iter().map(|s| s.to_string()).collect();
+
+    // `m:{2}` — no pips, cmc 2, so generic 2. The {R}{R} card has cmc 2 and must NOT match; the
+    // cmc comparison matched it, and that is the divergence this closes.
+    assert_eq!(matches(&mana_cmp_of(CmpOp::Ge, &[], 2.0, &mv)), [1, 5]);
+    // `m:{1}` — generic >= 1, so {2}{R}, {1}{R} and {2}, but not {R}{R} or {R}.
+    assert_eq!(matches(&mana_cmp_of(CmpOp::Ge, &[], 1.0, &mv)), [1, 3, 5]);
+    // `m:{2}{r}` — generic >= 2 AND an R pip: {2}{R} alone, not the bare {2}.
+    assert_eq!(matches(&mana_cmp_of(CmpOp::Ge, &[("R", 1)], 3.0, &mv)), [1]);
+    // `m={r}{r}` — generic 0 and exactly two R. The {R}{R} card, and never {2}{R}.
+    assert_eq!(matches(&mana_cmp_of(CmpOp::Eq, &[("R", 2)], 2.0, &mv)), [2]);
+    // `m={1}{r}` — generic 1 and one R, which distinguishes it from {R}{R} at the SAME cmc.
+    assert_eq!(matches(&mana_cmp_of(CmpOp::Eq, &[("R", 1)], 2.0, &mv)), [3]);
+    // `m<={1}{r}` — card ⊆ query on both the pips and the generic.
+    assert_eq!(matches(&mana_cmp_of(CmpOp::Le, &[("R", 1)], 2.0, &mv)), [3, 4]);
+}
+
+// A TWOBRID PAYS TWO, AND `generic_of` CREDITED IT WITH ONE.
+//
+// Generic is `cmc - (what the pips account for)`, and Scryfall's cmc counts `{2/B}` as two.
+// Beseech the Queen is `{2/B}{2/B}{2/B}` at cmc 6, so three pips crediting 1 each read as
+// 6 - 3 = 3 generic where the truth is 0 — and `!"Beseech the Queen" m>={3}` answered the card
+// where Scryfall (api.scryfall.com, 2026-08-17) answers nothing. Corpus-wide at unique=prints,
+// `m:{2/w} m:{2}` was 16 against Scryfall's 0, and `m:{6}` 2,573 against 2,554.
+//
+// THE WEIGHT TABLE ARRIVES THROUGH bind(), AND UNCONDITIONALLY — the twobrid whose weight matters
+// here is the CARD's, not the query's, so `m:{2}` needs it while naming no hybrid at all. That is
+// why this test binds and `mana_cmp_of` alone would not be enough: an unbound leaf falls back to
+// weight 1 and reproduces the bug exactly.
+#[test]
+fn a_twobrid_pip_weighs_two_against_generic() {
+    let mut vocab = VocabInterner::new();
+    let mut mana_vocab: Vec<String> = Vec::new();
+    // (pips, cmc) — every one of these has generic 0 except card 3:
+    let costs: &[(&[(&str, u8)], f32)] = &[
+        (&[("2/B", 3)], 6.0),  // 1: {2/B}{2/B}{2/B} — Beseech the Queen. generic 0, cmc 6.
+        (&[("B", 3)], 3.0),    // 2: {B}{B}{B}       — generic 0 under either weight
+        (&[("B", 1)], 3.0),    // 3: {2}{B}          — the only card here with real generic
+        (&[("W/U", 2)], 2.0),  // 4: {W/U}{W/U}      — a NON-twobrid hybrid still weighs 1
+    ];
+    let cards: Vec<OracleCard> = costs.iter().enumerate().map(|(i, &(pips, cmc))| {
+        let mut c = stub_card(i as u128 + 1, TYPE_CREATURE, &[], &mut vocab);
+        c.mana_cost = mana_cost_of(pips, &mut mana_vocab);
+        c.mana_cost.cmc = cmc;
+        for (lane, sym) in ["W", "U", "B", "R", "G"].iter().enumerate() {
+            if super::lane_get(c.mana_cost.devotion, lane) > 0 {
+                c.card_color_identity |= super::color_list_to_mask(&[sym]);
+            }
+        }
+        c
+    }).collect();
+    let mut data = store_of(cards, &[1usize; 4], vocab);
+    data.mana_vocab = mana_vocab;
+    // All four print a cost — see `mana_fixture_store` for why an absent string is not a {0} cost.
+    let printed_id = u32::try_from(data.strings.len()).expect("fixture strings fit u32");
+    data.strings.push("{B}".to_string());
+    for c in data.cards.iter_mut() {
+        c.mana_cost_text_id = printed_id;
+    }
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let mv: Vec<String> = archived.mana_vocab.iter().map(|s| s.to_string()).collect();
+    let bound = |op, pips: &[(&str, u8)], cmc: f32| {
+        let mut f = mana_cmp_of(op, pips, cmc, &mv);
+        f.bind(
+            &archived.coll_vocab,
+            &archived.coll_vocab_sorted,
+            &archived.artist_vocab,
+            &archived.artist_vocab_collated,
+            &archived.mana_vocab,
+            &archived.indexes.flavor,
+            &archived.strings,
+        );
+        f
+    };
+    let matches = |f: &FilterExpr| -> Vec<u128> {
+        archived.cards.iter()
+            .filter(|c| f.eval_card(c, &archived.strings) == Tri::True)
+            .map(|c| u128::from(c.oracle_id))
+            .collect()
+    };
+
+    // `m>={3}` — the Beseech row. Card 1's generic is 0, not the 6 - 3 = 3 an unweighted
+    // subtraction gives, so nothing here answers it.
+    assert_eq!(matches(&bound(CmpOp::Ge, &[], 3.0)), Vec::<u128>::new());
+    // `m:{2}` — only the card that really carries {2}. Card 1 answered this too, which is the
+    // `m:{2/w} m:{2}` 16-against-0 divergence in miniature.
+    assert_eq!(matches(&bound(CmpOp::Ge, &[], 2.0)), [3]);
+    // `m:{2/b}` — the twobrid is still its own symbol and still matches through the vocab, and
+    // the query side's generic saturates to 0 rather than wrapping.
+    assert_eq!(matches(&bound(CmpOp::Ge, &[("2/B", 1)], 1.0)), [1]);
+    // A NON-twobrid hybrid keeps weight 1: {W/U}{W/U} at cmc 2 has generic 0, so `m:{1}` misses
+    // it. Weighting every hybrid at 2 would have made this -2, and saturation would have hidden
+    // the error behind the same 0.
+    assert_eq!(matches(&bound(CmpOp::Ge, &[], 1.0)), [3]);
+    assert_eq!(matches(&bound(CmpOp::Eq, &[("W/U", 2)], 2.0)), [4]);
+}
+
+// The bare, unbraced generic the query grammar allows and `mana_cmc` does not see: `m:2` arrives
+// as the mana string "2", `m>=2WW` as "2WW", `m:1{r}1` as "1{R}1". Without this the first became
+// the EMPTY cost — a tautology, answering all 151 of `e:khm t:creature` where Scryfall answers
+// `m:{2}`'s 102.
+#[test]
+fn bare_generic_digits_are_counted_outside_braces() {
+    use super::mana_bare_generic;
+    assert_eq!(mana_bare_generic("2"), 2);
+    assert_eq!(mana_bare_generic("2WW"), 2);
+    assert_eq!(mana_bare_generic("1{R}1"), 2, "runs on both sides of a braced pip");
+    assert_eq!(mana_bare_generic("10WW"), 10, "a maximal RUN, not one digit then another");
+    assert_eq!(mana_bare_generic("{2}{R}"), 0, "braced generic belongs to mana_cmc, not here");
+    assert_eq!(mana_bare_generic("{10}"), 0);
+    assert_eq!(mana_bare_generic("WW"), 0);
+    assert_eq!(mana_bare_generic(""), 0);
 }
 
 // The SWAR lane comparison agrees with the scalar per-lane loop across the
@@ -12562,15 +12933,30 @@ fn the_colour_planes_answer_exactly_what_tri_answers() {
     }
 }
 
-/// `face_stat_nums` is `card_processing.py`'s `maybe_int` behind the same creature-like gate the
+/// `face_stat_nums` is the builder's `maybe_stat_int` behind the same creature-like gate the
 /// card-level column uses, so the FRONT face's parse must reproduce that column exactly. If it
-/// ever does not, `face_num_values` would add a phantom value beside the merged one.
+/// ever does not, `face_num_values` would add a phantom value beside the merged one — and the
+/// numeric PLANES are built from the face values, so the disagreement would narrow rather than
+/// merely differ.
 #[test]
 fn front_face_stats_match_card_columns() {
     // The printed forms the corpus actually holds, including the ones that are not numbers.
     let creature = Some("Creature — Human Wizard");
     assert_eq!(face_stat_nums(creature, Some("3"), Some("2"), None), (Some(3), Some(2), None));
-    assert_eq!(face_stat_nums(creature, Some("*"), Some("1+*"), None), (None, None, None));
+    // `*` IS ZERO and the arithmetic around it still runs — `tou<1` is 434 on api.scryfall.com
+    // against this port's 273 before the fix, 160 cards. The builder's `maybe_stat_int` carries
+    // the three cards that pin the arithmetic; this is the same rule on a face's own string.
+    assert_eq!(face_stat_nums(creature, Some("*"), Some("1+*"), None), (Some(0), Some(1), None));
+    assert_eq!(face_stat_nums(creature, Some("2+*"), Some("7-*"), None), (Some(2), Some(7), None));
+    // `?` IS ZERO TOO, on its own measurement rather than by analogy: `Shellephant` (ust/121)
+    // prints it on both sides and api.scryfall.com answers `tou=0` 1, `tou>=0` 1, `tou>0` 0.
+    // Read as absent it satisfied no comparison at all, which was the last row of `toughness<1`.
+    assert_eq!(face_stat_nums(creature, Some("*\u{b2}"), Some("?"), None), (Some(0), Some(0), None));
+    // `∞` stays absent — `Infinity Elemental` is `ulst`, unanswerable there, so nothing measured.
+    assert_eq!(face_stat_nums(creature, Some("\u{221e}"), None, None), (None, None, None));
+    // Loyalty keeps the old rule: the two cards printing `*` there are funny-set cards
+    // api.scryfall.com will not answer for at all, so there is nothing measured to follow.
+    assert_eq!(face_stat_nums(Some("Planeswalker — Duck"), None, None, Some("*")), (None, None, None));
     assert_eq!(face_stat_nums(creature, Some("-1"), Some("0"), None), (Some(-1), Some(0), None));
     // int(float(...)) truncates, exactly as maybe_int does.
     assert_eq!(face_stat_nums(creature, Some("1.5"), None, None), (Some(1), None, None));
@@ -12597,6 +12983,109 @@ fn a_face_mana_cost_uses_its_own_cmc() {
     assert_eq!(lane_get(agadeem.core, mana_lane("X").expect("X lane")), 1);
     // Devotion stays a card-level column and is deliberately not derived per face.
     assert_eq!(agadeem.devotion, 0);
+}
+
+/// `is:vanilla` reads the FRONT face, and two more rules besides — every row below is a live probe
+/// against api.scryfall.com on 2026-08-17, scoped with `!"Full // Name"` so the reference answer is
+/// 1 or 404, or a whole-corpus count where the note says so.
+///
+/// The rows that choose the shape:
+///
+/// * `is:vanilla` is 363 there and `t:creature -o:/./` — the expansion this predicate replaces — is
+///   352 on BOTH sides. The 11-card gap is not one class.
+/// * `is:vanilla o:/./` is 12, all adventures whose creature FRONT prints nothing while the other
+///   half does. The merged row joins the two texts, so no predicate over it can see the blank
+///   front. This is the +12.
+/// * The BACK is not enough: `Kaslem's Stonetree`, `Ecstatic Awakener`, `Chosen of Markov` and
+///   `Skin Invasion` each have a blank creature back behind a front that prints, and `is:vanilla`
+///   over the four is 0. `is:vanilla is:dfc` is 18 and settles it the other way — `Servo // Thopter`
+///   and `Goblin // Blood` are in it (blank front, printing back) and `Elemental // Centaur` and
+///   `Fish // Kraken` are not (printing front, blank back).
+/// * The CREATURE test is the card's, not the front's: `City's Blessing // Elemental` and
+///   `Copy // Horror` are both in that 18 and neither FRONT is a creature.
+/// * `t:creature -o:/./ -is:vanilla` is exactly 1 — `Dryad Arbor`, a LAND creature. `is:vanilla
+///   t:land` is 0 with and without `include_extras`, while `t:creature t:land -o:/./` is 2 (Dryad
+///   Arbor and the `Forest Dryad` token). This is the −1, and 352 + 12 − 1 = 363.
+/// * `Icehide Golem` and `Infinity Elemental` ARE vanilla there and print reminder text and nothing
+///   else, so the reminder text has to come off before the blankness test.
+#[test]
+fn is_vanilla_reads_the_front_face_and_the_card_types() {
+    let mut interner = Interner::new();
+    let mut intern = |s: &str| interner.intern(s.to_string());
+    let blank = intern("");
+    let adventure_text = intern("Return target creature you don't control with mana value 3 or less to its owner's hand.");
+    let transform_text = intern("{T}, Tap an untapped Vampire you control: Transform this creature.");
+    let reminder_only = intern("({S} can be paid with one mana from a snow source.)");
+    let flying = intern("Flying");
+
+    // `text` is the card's own printed oracle text; `faces` are the per-face printed strings, front
+    // first. A card with no faces IS its one face, which is why the two share a code path.
+    let card_of = |types: u16, text: u32, faces: &[u32]| {
+        let mut vocab = VocabInterner::new();
+        let mut card = stub_card(1, types, &[], &mut vocab);
+        card.oracle_text_id = text;
+        card.faces = faces
+            .iter()
+            .map(|&oracle_text_id| OracleFace {
+                card_name_id: NONE_STR,
+                mana_cost_text_id: NONE_STR,
+                type_line_id: NONE_STR,
+                oracle_text_id,
+                creature_power_text_id: NONE_STR,
+                creature_toughness_text_id: NONE_STR,
+                planeswalker_loyalty_text_id: NONE_STR,
+                defense_text_id: NONE_STR,
+                card_colors: None,
+                color_indicator: 0,
+                creature_power: None,
+                creature_toughness: None,
+                planeswalker_loyalty: None,
+                mana_cost: None,
+            })
+            .collect();
+        rkyv::to_bytes::<Error>(&card).expect("serialize").into_vec()
+    };
+
+    let strings_bytes = rkyv::to_bytes::<Error>(&interner.strings).expect("serialize strings");
+    let strings = rkyv::access::<AStrings, Error>(&strings_bytes).expect("access strings");
+    let vanilla = FilterExpr::VanillaFace;
+    let is_vanilla = |bytes: &[u8]| {
+        let card = rkyv::access::<Archived<OracleCard>, Error>(bytes).expect("access");
+        // Two-valued by construction: no arm of this predicate answers Null or PrintingDep.
+        vanilla.eval_card(card, strings) == Tri::True
+    };
+
+    // The 349 that were never in doubt: an unfaced creature with no text at all...
+    assert!(is_vanilla(&card_of(TYPE_CREATURE, blank, &[])));
+    // ...one with text, which is most of the corpus...
+    assert!(!is_vanilla(&card_of(TYPE_CREATURE, flying, &[])));
+    // ...and a textless NON-creature, since `is:vanilla -t:creature` is 0 there.
+    assert!(!is_vanilla(&card_of(TYPE_ARTIFACT, blank, &[])));
+
+    // THE +12. Beluna's Gatekeeper // Entry Denied: blank creature front, printing back. The merged
+    // text holds the join, which is why `-o:/./` answered 404 for it.
+    assert!(is_vanilla(&card_of(TYPE_CREATURE | TYPE_SORCERY, adventure_text, &[blank, adventure_text])));
+
+    // ...and its mirror, which is NOT vanilla: Chosen of Markov // Markov's Servant prints on the
+    // front and is blank on the back. An existential over faces would have matched this.
+    assert!(!is_vanilla(&card_of(TYPE_CREATURE, transform_text, &[transform_text, blank])));
+
+    // The creature test is the CARD's. City's Blessing // Elemental: the front is not a creature at
+    // all and the card is one, through the back — and it is vanilla there.
+    assert!(is_vanilla(&card_of(TYPE_CREATURE, blank, &[blank, flying])));
+
+    // THE −1. Dryad Arbor: unfaced, no printed rules text, and a LAND.
+    assert!(!is_vanilla(&card_of(TYPE_LAND | TYPE_CREATURE, blank, &[])));
+
+    // Icehide Golem: reminder text and nothing else, on the card and on a front face alike.
+    assert!(is_vanilla(&card_of(TYPE_ARTIFACT | TYPE_CREATURE, reminder_only, &[])));
+    assert!(is_vanilla(&card_of(TYPE_ARTIFACT | TYPE_CREATURE, blank, &[reminder_only, flying])));
+
+    // Negation is the plain complement — the predicate is total, so `-is:vanilla` has no third set.
+    let not_vanilla = FilterExpr::Not(Box::new(FilterExpr::VanillaFace));
+    let card = card_of(TYPE_CREATURE, blank, &[]);
+    let card = rkyv::access::<Archived<OracleCard>, Error>(&card).expect("access");
+    assert!(not_vanilla.eval_card(card, strings) == Tri::False);
 }
 
 #[test]
@@ -13091,55 +13580,113 @@ fn printings_of_one_card_do_not_look_ambiguous() {
     assert!(matches!(fuzzy_name_match(a, "lightning bolt", crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD), FuzzyOutcome::Hit { .. }));
 }
 
-#[test]
-fn autocomplete_matches_the_sql_routes_set_and_order() {
+/// A catalog fixture: one card per (printed name, is_extra), one printing each.
+///
+/// The printed name is pushed into `strings` AFTER `store_of` (which fills `card_name_collated_id`
+/// from the folded name and pushes to the same table), so the two never fight over an index.
+fn autocomplete_store(entries: &[(&str, bool)]) -> CardData {
     let mut vocab = VocabInterner::new();
-    let mut interner = Interner::new();
     let mut cards = Vec::new();
-    // Matched on the lowercased key, ANSWERED with the printed name -- the two differ, which is
-    // the point: a catalog entry is something a client hands back to /cards/named?exact=.
-    // "Aftershock" is the substring case: it contains "sho" without starting with it.
-    for (i, name) in ["Shock", "Shatter", "Shockwave", "Aftershock", "Counterspell"].iter().enumerate() {
+    for (i, (name, _)) in entries.iter().enumerate() {
         let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
+        c.card_name_folded = InlineStr::from_str(&name.to_lowercase());
         c.card_name_lower = InlineStr::from_str(&name.to_lowercase());
-        c.card_name_id = interner.intern((*name).to_string());
         cards.push(c);
     }
-    let bytes = rkyv::to_bytes::<Error>(&cards).expect("serialize");
-    let a = rkyv::access::<Archived<Vec<OracleCard>>, Error>(&bytes).expect("access");
-    let string_bytes = rkyv::to_bytes::<Error>(&interner.strings).expect("serialize strings");
-    let strings = rkyv::access::<Archived<Vec<String>>, Error>(&string_bytes).expect("access strings");
+    let counts = vec![1usize; entries.len()];
+    let mut data = store_of(cards, &counts, vocab);
+    for (i, (name, _)) in entries.iter().enumerate() {
+        data.strings.push((*name).to_string());
+        data.cards[i].card_name_id = (data.strings.len() - 1) as u32;
+    }
+    // The `is:extra` tag, on the printings of the cards Scryfall hides.
+    let extra_vid = data.coll_vocab.len() as u16;
+    data.coll_vocab.push(crate::EXTRA_IS_TAG.to_string());
+    data.coll_vocab_sorted = sorted_vocab_ids(&data.coll_vocab);
+    for (i, (_, extra)) in entries.iter().enumerate() {
+        if *extra {
+            data.printings[i].card_is_tags.push(extra_vid);
+        }
+    }
+    data
+}
 
-    // The SQL this route falls back to is
-    //   WHERE lower(card_name) LIKE '%needle%' ORDER BY rank, length(card_name), card_name
-    // with rank 0 for a prefix match and 1 for a bare substring. The route asks the ENGINE first,
-    // so a disagreement is not a fallback -- it is two different answers to one request, and this
-    // one is what ships. Every assertion below is that query's behaviour.
+/// The catalog's SET and ORDER, both measured against api.scryfall.com (2026-08-17) rather than
+/// against the SQL this route falls back to.
+#[test]
+fn autocomplete_orders_by_trigram_similarity_and_hides_extras() {
+    let data = autocomplete_store(&[
+        ("Light Up the Night", false),
+        ("Lightning Angel", false),
+        ("Lightning Bolt", false),
+        ("Serra Avenger", false),
+        ("Serenity", false),
+        // A token: in this corpus, and in none of Scryfall's answers.
+        ("Shark", true),
+        ("Shatter", false),
+        ("Shockwave", false),
+        ("Shock", false),
+        // The substring case: it contains "sho" without starting with it.
+        ("Aftershock", false),
+        // Collates to "goblin", so "gob" is a PREFIX of it.
+        ("_____ Goblin", false),
+        ("Goblin Welder", false),
+    ]);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
-    // Substring matches are IN the set, and rank behind every prefix match. Verified against
+    // THE ORDER IS SIMILARITY, NOT LENGTH, and these are the two shapes where the two disagree.
+    // `Light Up the Night` is 15 collated characters against `Lightning Angel`'s 14 and leads it,
+    // because `igh` and `ght` each occur twice and a trigram SET holds one of each. `Lightning
+    // Bolt` (13) sits between them, which is the ordering length would also give -- the point is
+    // that the 15 and the 13 TIE.
+    assert_eq!(
+        autocomplete_names(a, "lig", 20),
+        vec!["Light Up the Night", "Lightning Bolt", "Lightning Angel"],
+        "a repeated window shrinks the trigram set, so the longer name leads"
+    );
+    // `Serra Avenger` (12) leads `Serenity` (8) because it ends in "er" and so carries the "er "
+    // window "  ser " closes with. Nothing about length can express this.
+    assert_eq!(
+        autocomplete_names(a, "ser", 20),
+        vec!["Serra Avenger", "Serenity"],
+        "sharing the needle's closing window outranks being four characters shorter"
+    );
+
+    // Substring matches are IN the set and rank behind every prefix match. Verified against
     // api.scryfall.com, where q=bolt answers Bolt Bend .. Boltwing Marauder THEN Firebolt,
     // Rift Bolt -- a prefix-only catalog would never offer the client "Aftershock" at all.
     assert_eq!(
-        autocomplete_names(a, strings, "sho", 20),
+        autocomplete_names(a, "sho", 20),
         vec!["Shock", "Shockwave", "Aftershock"],
         "prefix matches rank 0, substring matches rank 1"
     );
+    assert_eq!(autocomplete_names(a, "SHO", 20), vec!["Shock", "Shockwave", "Aftershock"], "case-insensitive");
+    // "Shark" is a token and never reaches a client, so it is absent here and does not consume
+    // the cap below either.
     assert_eq!(
-        autocomplete_names(a, strings, "SHO", 20),
-        vec!["Shock", "Shockwave", "Aftershock"],
-        "case-insensitive"
-    );
-    // Within a rank the order is by LENGTH then name, not alphabetical: Shock(5), Shatter(7),
-    // Shockwave(9). Alphabetical would put Shatter first, which is what this returned before.
-    assert_eq!(
-        autocomplete_names(a, strings, "sh", 20),
+        autocomplete_names(a, "sh", 20),
         vec!["Shock", "Shatter", "Shockwave", "Aftershock"],
-        "length then name within a rank, and PRINTED -- a lowercase entry is not a name Scryfall prints"
+        "the catalog excludes extras, and answers with the PRINTED name"
     );
-    // The cap applies to the ORDERED list, so it keeps the shortest prefix match rather than
+    // The cap applies to the ORDERED list, so it keeps the best prefix match rather than
     // whichever name the corpus happened to reach first.
-    assert_eq!(autocomplete_names(a, strings, "sh", 1), vec!["Shock"], "capped, after ordering");
-    assert!(autocomplete_names(a, strings, "zzz", 20).is_empty());
+    assert_eq!(autocomplete_names(a, "sh", 1), vec!["Shock"], "capped, after ordering");
+
+    // The rank split and the predicate are asked of the COLLATED name: api.scryfall.com answers
+    // q=gob with `_____ Goblin` FIRST, and answers q=ningbolt with `Lightning Bolt` -- "ningbolt"
+    // is a substring of "lightningbolt" and of no spelling that keeps the space.
+    assert_eq!(
+        autocomplete_names(a, "gob", 20),
+        vec!["_____ Goblin", "Goblin Welder"],
+        "underscores are not part of the name the prefix rank is asked about"
+    );
+    assert_eq!(autocomplete_names(a, "ningbolt", 20), vec!["Lightning Bolt"], "the predicate is collated too");
+
+    assert!(autocomplete_names(a, "zzz", 20).is_empty());
+    // The route's own two-character floor, re-asked of the COLLATED needle: `q=a` is an empty
+    // catalog on api.scryfall.com, and a needle that collates to one letter is that query.
+    assert!(autocomplete_names(a, "s", 20).is_empty(), "under two collated characters is an empty catalog");
 }
 
 #[test]
@@ -13598,4 +14145,201 @@ fn order_released_breaks_a_date_tie_by_set_then_collector_number() {
     let mut reversed = asc.clone();
     reversed.reverse();
     assert_eq!(order(true), reversed, "dir=desc reverses the set with the date, and the number with the set");
+// `=` IS `:` ON A TEXT OR COLLECTION COLUMN — the one operator on those columns that carries no
+// information of its own.
+//
+// Measured on api.scryfall.com 2026-08-16, `X=v` against `X:v` on the same corpus, identical on
+// every row: `o=flying` 4,574 = `o:flying` 4,574 (this answered the cards whose oracle text IS the
+// word "flying"), `ft=aether` 80 = `ft:aether` 80, `name=ft` 1,628 = `name:ft` 1,628,
+// `kw=flying e:khm` 28 = `kw:flying` 28 (this answered 9 — the cards whose ONLY keyword is
+// Flying, a set equality nothing asks for), `otag=ramp e:khm` 35 = `otag:ramp` 35,
+// `t=creature e:khm` 151 = `t:creature` 151.
+//
+// The bare/quoted split survives it intact rather than being flattened to one side: `name="ft"` is
+// 362 on Scryfall, exactly `name:"ft"`, against `name=ft`'s 1,628. That distinction rides on the
+// rhs NODE SHAPE, which the operator does not touch, so routing `=` through the same branch keeps
+// it for free — pinned below on both spellings.
+#[test]
+fn equals_is_a_synonym_for_colon_on_text_and_collection_columns() {
+    let leaf = |attr: &str, op: &str, rhs: serde_json::Value| -> FilterExpr {
+        super::build_filter(&serde_json::json!({
+            "node_type": "CardBinaryOperatorNode",
+            "kwargs": {
+                "op": op,
+                "lhs": {"node_type": "CardAttributeNode", "kwargs": {"attribute_name": attr, "original_attribute": attr}},
+                "rhs": rhs,
+            }
+        }))
+        .unwrap_or_else(|e| panic!("{attr}{op} must build: {e}"))
+    };
+    let string_node = |v: &str| serde_json::json!({"node_type": "StringValueNode", "kwargs": {"value": v}});
+    let collated_node = |v: &str| serde_json::json!({"node_type": "CollatedNameValueNode", "kwargs": {"value": v}});
+
+    // A TEXT column: same field, same needle, under both spellings of the operator.
+    for (attr, rhs) in [
+        ("oracle_text", string_node("flying")),
+        ("flavor_text", string_node("aether")),
+        ("card_name", collated_node("ft")),
+        // ...and the QUOTED form, which is a different search and stays a different search.
+        ("card_name", string_node("ft")),
+        ("card_artist", collated_node("moeller")),
+    ] {
+        match (leaf(attr, ":", rhs.clone()), leaf(attr, "=", rhs.clone())) {
+            (
+                FilterExpr::TextContains { field: colon_field, word: colon_word },
+                FilterExpr::TextContains { field: equals_field, word: equals_word },
+            ) => {
+                assert!(colon_field == equals_field, "{attr}= must search the same field as {attr}:");
+                assert_eq!(colon_word, equals_word, "{attr}= must carry the same needle as {attr}:");
+            }
+            _ => panic!("{attr} must build a TextContains under both `:` and `=`"),
+        }
+    }
+
+    // The two card_name spellings must still land on DIFFERENT fields under `=`, or the split has
+    // been flattened rather than preserved.
+    let bare = leaf("card_name", "=", collated_node("ft"));
+    let quoted = leaf("card_name", "=", string_node("ft"));
+    match (bare, quoted) {
+        (FilterExpr::TextContains { field: bare_field, .. }, FilterExpr::TextContains { field: quoted_field, .. }) => {
+            assert!(bare_field == TextSearchField::NameCollated);
+            assert!(quoted_field == TextSearchField::NameLower);
+        }
+        _ => panic!("both card_name spellings must build a TextContains"),
+    }
+
+    // A COLLECTION column: `=` is containment, not set equality.
+    for attr in ["card_keywords", "card_oracle_tags", "card_art_tags", "card_is_tags", "card_frame_data", "card_subtypes"] {
+        let rhs = serde_json::json!(["flying"]);
+        match (leaf(attr, ":", rhs.clone()), leaf(attr, "=", rhs.clone())) {
+            (
+                FilterExpr::CollectionCmp { op: colon_op, value: colon_value, .. },
+                FilterExpr::CollectionCmp { op: equals_op, value: equals_value, .. },
+            ) => {
+                assert_eq!(colon_op, CmpOp::Ge, "{attr}: is containment");
+                assert_eq!(equals_op, CmpOp::Ge, "{attr}= must be containment too, not Eq");
+                assert_eq!(colon_value, equals_value);
+            }
+            _ => panic!("{attr} must build a CollectionCmp under both `:` and `=`"),
+        }
+    }
+
+    // THE BOUNDARY, probed in the other direction rather than assumed. `=` stays a real equality
+    // on the set-valued COLOR columns and on mana, because equality IS the meaning there. Over
+    // `e:khm t:creature` on api.scryfall.com 2026-08-16: `c=rg` 1 against `c:rg`'s 2, `id=rg` 1
+    // against `id:rg`'s 52, `produces=rg` 0 against 5, `m={2}` 0 against `m:{2}`'s 102.
+    for attr in ["card_colors", "card_color_identity", "produced_mana"] {
+        match leaf(attr, "=", string_node("rg")) {
+            FilterExpr::ColorCmp { op, .. } => assert_eq!(op, CmpOp::Eq, "{attr}= keeps its equality"),
+            _ => panic!("{attr}= must build a ColorCmp"),
+        }
+    }
+    match leaf("mana_cost_jsonb", "=", serde_json::json!({"node_type": "ManaValueNode", "kwargs": {"value": "{2}"}})) {
+        FilterExpr::ManaCostCmp { op, .. } => assert_eq!(op, CmpOp::Eq, "m= keeps its equality"),
+        _ => panic!("m= must build a ManaCostCmp"),
+    }
+}
+
+// THE TWO CARDS THAT SETTLE THE MEASURE, AND THE RESIDUAL THEY USED TO PIN — NOW CLOSED.
+//
+// Both have a Scryfall combined R/G devotion of exactly 2 — each matches `devotion:{r/g}{r/g}`
+// and neither matches `devotion:{r/g}{r/g}{r/g}` (api.scryfall.com, 2026-08-16) — and they pull
+// the model in opposite directions:
+//
+//                                cost         lanes      distinct pips   sum   max
+//   Svella, Ice Shaper           {1}{R}{G}    r=1 g=1          2          2     1
+//   Burning-Tree Emissary        {R/G}{R/G}   r=2 g=2          2          4     2
+//
+// So NEITHER a summed measure nor a per-lane max is Scryfall's rule; the quantity is the number
+// of DISTINCT pips matching either queried color, and that is what the leaf now computes: the
+// sum of the queried lanes, less the double count each hybrid pip of the queried pair
+// contributes. The store needed no new field for it — the per-hybrid-symbol counts were already
+// in `ManaCost.hybrids`, and the colours each symbol claims come from `hybrid_colors`, which
+// bind() resolves against the store's mana vocab.
+//
+// This test was written while the correction was still pending and asserted the divergence; it
+// now asserts the agreement, and it is still the row that keeps a future change from breaking the
+// Svella direction while satisfying the Burning-Tree one. The four rows at three and four symbols
+// are where the two used to part company: Scryfall answers NOTHING there, and now so does this.
+//
+// THE FILTER MUST BE BOUND for any of that to happen — an unbound `hybrid_colors` is empty and
+// corrects nothing, which is exactly the pre-fix reading. That is deliberate and is why the older
+// devotion tests in this file, which build leaves by hand and never bind, still pass unchanged:
+// every one of them queries a single colour, where the correction is provably zero anyway.
+#[test]
+fn a_hybrid_pip_of_the_queried_pair_counts_once() {
+    let mut vocab = VocabInterner::new();
+    let mut mana_vocab: Vec<String> = Vec::new();
+    let costs: &[&[(&str, u8)]] = &[&[("R", 1), ("G", 1)], &[("R/G", 2)]];
+    let cards: Vec<OracleCard> = costs
+        .iter()
+        .enumerate()
+        .map(|(i, &pips)| {
+            let mut c = stub_card(i as u128 + 1, TYPE_CREATURE, &[], &mut vocab);
+            c.mana_cost = mana_cost_of(pips, &mut mana_vocab);
+            let mut ident = 0u8;
+            for (lane, sym) in ["W", "U", "B", "R", "G"].iter().enumerate() {
+                if super::lane_get(c.mana_cost.devotion, lane) > 0 {
+                    ident |= super::color_list_to_mask(&[sym]);
+                }
+            }
+            c.card_color_identity = ident;
+            c
+        })
+        .collect();
+    let mut data = store_of(cards, &[1usize; 2], vocab);
+    data.mana_vocab = mana_vocab;
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+
+    // A hybrid query value reaches the engine as BOTH lanes raised — that expansion is the
+    // parser's, and it is what makes the query side's max a symbol count.
+    let bound = |pips: &[(&str, u8)]| {
+        let mut f = FilterExpr::Devotion { op: CmpOp::Ge, pips: packed_pips(pips), hybrid_colors: Vec::new() };
+        f.bind(
+            &archived.coll_vocab,
+            &archived.coll_vocab_sorted,
+            &archived.artist_vocab,
+            &archived.artist_vocab_collated,
+            &archived.mana_vocab,
+            &archived.indexes.flavor,
+            &archived.strings,
+        );
+        f
+    };
+    let hybrid_rg = |n: u8| bound(&[("R", n), ("G", n)]);
+    let hits = |f: &FilterExpr| -> Vec<usize> {
+        archived
+            .cards
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| f.eval_card(c, &archived.strings) == Tri::True)
+            .map(|(i, _)| i)
+            .collect()
+    };
+    const SVELLA: usize = 0;
+    const BURNING_TREE: usize = 1;
+
+    // AGREES WITH SCRYFALL: both cards at one and two symbols, neither above their real devotion
+    // in the single-color lanes.
+    assert_eq!(hits(&hybrid_rg(1)), [SVELLA, BURNING_TREE], "devotion:{{r/g}} — both, and Scryfall answers both");
+    assert_eq!(hits(&hybrid_rg(2)), [SVELLA, BURNING_TREE], "devotion:{{r/g}}{{r/g}} — both, and Scryfall answers both");
+    // The per-color lanes are exact and were never what was approximate: Burning-Tree answers
+    // `devotion:{r}{r}` and `devotion:{g}{g}` on Scryfall, and Svella answers neither. A
+    // single-colour query is one bit, which one pip cannot match twice, so the correction is zero
+    // here by construction — and that is what keeps `compile_plane`'s exactness claim honest.
+    for sym in ["R", "G"] {
+        assert_eq!(hits(&bound(&[(sym, 2)])), [BURNING_TREE], "devotion:{{{sym}}}{{{sym}}} is a single-lane query and stays exact");
+    }
+
+    // WHERE THE RESIDUAL WAS. Scryfall answers NEITHER card at three symbols or more; the summed
+    // measure counted each {R/G} symbol twice and reached 4, so Burning-Tree matched both rows.
+    // With the double count backed out its measure is 2, and both cards drop out with Scryfall.
+    for n in 3..=4u8 {
+        assert_eq!(
+            hits(&hybrid_rg(n)),
+            Vec::<usize>::new(),
+            "devotion:{{r/g}}x{n}: Scryfall answers nothing, and neither card is a distinct-pip match"
+        );
+    }
 }
