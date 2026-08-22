@@ -406,7 +406,7 @@ class APIResource(ScryfallCardsRoutes, ScryfallReferenceRoutes):
         params["request_host"] = req.get_header("X-Proxy-Host") or req.host
         return params
 
-    def _handle(self, req: falcon.Request, resp: falcon.Response) -> None:
+    def _handle(self, req: falcon.Request, resp: falcon.Response) -> None:  # noqa: PLR0912
         """Handle a Falcon request and set the response.
 
         Args:
@@ -430,7 +430,7 @@ class APIResource(ScryfallCardsRoutes, ScryfallReferenceRoutes):
 
         entry, action_args = self._resolve_action(path)
         action = self._raise_not_found
-        if entry is None:
+        if entry is None and not req.context.get("admin_authenticated", False):
             # AN UNKNOWN PATH ANSWERS IN SCRYFALL'S SHAPE, not with the route listing.
             #
             # The listing is a convenience for a human poking at the origin. A client is not a human:
@@ -441,15 +441,21 @@ class APIResource(ScryfallCardsRoutes, ScryfallReferenceRoutes):
             # REST method was not found.", `no-cache`).
             #
             # A human still has the listing: every route is documented, and the route table is the
-            # source both this and `_build_routes_listing` read.
+            # source both this and `build_routes_listing` read -- and a caller who has proven they
+            # hold the admin secret (#966) still gets the full listing below, exactly as upstream
+            # answers them: the Scryfall shape is for the client that cannot present one.
             self._respond_scryfall_error(resp, code="not_found", status=404, details=_SCRYFALL_NOT_FOUND_DETAILS)
             return
-        # A route answers only the methods it declares. Checked after the path resolves, so a
-        # path that identifies nothing stays a 404 rather than reporting what it would accept.
-        if req.method not in entry.spec.methods:
+        if entry is None:
+            # Admin-authenticated unknown path: upstream's listing, the full one.
+            pass
+        elif req.method not in entry.spec.methods:
+            # A route answers only the methods it declares. Checked after the path resolves, so a
+            # path that identifies nothing stays a 404 rather than reporting what it would accept.
             self._reject_method(resp, path=path, allowed=sorted(entry.spec.methods))
             return
-        action = entry.action
+        else:
+            action = entry.action
 
         res = None
         before = time.monotonic()
