@@ -53,6 +53,7 @@ from api.scryfall_compat.objects import (
     to_scryfall_card,
 )
 from api.settings import settings
+from api.utils import db_utils
 from api.utils.routing import route
 
 if TYPE_CHECKING:
@@ -555,7 +556,7 @@ class ScryfallCardsRoutes:
             The result rows.
         """
         with self.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
-            self._set_statement_timeout(cursor, 10_000)
+            db_utils.set_statement_timeout(cursor, 10_000)
             cursor.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
 

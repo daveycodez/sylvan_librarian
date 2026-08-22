@@ -138,7 +138,7 @@ def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
         conn.commit()
     # /cards/search runs through _search, which prefers the in-process engine when its store is
     # loaded -- a store built before this insert would answer every query here with zero rows.
-    api_resource._reload_engine(force=True)
+    api_resource.app_context.reload_engine(force=True)
     api_resource._clear_caches()
     return api_resource
 
