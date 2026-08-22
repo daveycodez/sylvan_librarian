@@ -67,7 +67,7 @@ CREATURE_TYPES = ["Compat Beast", "Compat Wizard"]
 @pytest.fixture(name="reference_corpus", scope="module")
 def reference_corpus_fixture(api_resource: APIResource) -> APIResource:
     """Seed the three reference tables once, then hand back the resource."""
-    with api_resource._conn_pool.connection() as conn, conn.cursor() as cursor:
+    with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
         cursor.execute("DELETE FROM magic.sets")
         cursor.executemany(
             "INSERT INTO magic.sets (id, code, tcgplayer_id, position, set_object) VALUES (%s, %s, %s, %s, %s)",
@@ -87,7 +87,7 @@ def reference_corpus_fixture(api_resource: APIResource) -> APIResource:
             ("creature-types", Jsonb(CREATURE_TYPES)),
         )
         conn.commit()
-    api_resource._clear_caches()
+    api_resource.admin._clear_caches()
     return api_resource
 
 

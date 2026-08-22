@@ -53,6 +53,7 @@ from api.scryfall_compat.objects import (
 )
 from api.scryfall_compat.responder import ScryfallResponder
 from api.settings import settings
+from api.utils import db_utils
 from api.utils.routing import route
 
 if TYPE_CHECKING:
@@ -481,8 +482,8 @@ class ScryfallCardsRoutes(ScryfallResponder):
         Returns:
             The result rows.
         """
-        with self._conn_pool.connection() as conn, conn.cursor() as cursor:
-            self._set_statement_timeout(cursor, 10_000)
+        with self.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
+            db_utils.set_statement_timeout(cursor, 10_000)
             cursor.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
 
@@ -496,13 +497,13 @@ class ScryfallCardsRoutes(ScryfallResponder):
         if not settings.enable_engine:
             return None
         try:
-            if self._engine.size() == 0:
+            if self.app_context.engine.size() == 0:
                 self._trigger_background_reload_if_needed()
                 return None
         # An engine that cannot report its size cannot serve, whatever the reason.
         except Exception:  # noqa: BLE001
             return None
-        return self._engine
+        return self.app_context.engine
 
     def _engine_card(self, fetch: Callable[[Any], dict[str, Any] | None]) -> dict[str, Any] | _EngineMiss | None:
         """Run one engine lookup, or report that the engine could not serve it.
@@ -584,6 +585,60 @@ class ScryfallCardsRoutes(ScryfallResponder):
             explain=False,
         )["result"]
         return to_scryfall_card(sql_row_to_engine_row(rows[0])) if rows else None
+
+    def _engine_exact_name(self, folded: str, set_code: str | None) -> dict[str, Any] | None:
+        """The exact-name match from the engine, or None when it cannot answer.
+
+        Args:
+            folded: The accent-folded, lowercased name.
+            set_code: Restrict to this set, or None for any.
+
+        Returns:
+            `{"scryfall_id", "card_name"}` for the best match, or None to fall back to SQL.
+        """
+        engine = self._engine_for_lookup()
+        if engine is None:
+            return None
+        try:
+            row = engine.exact_card_by_name(folded, set_code, list(CARD_OBJECT_FIELDS))
+        # Any engine failure falls back to SQL; it never 500s.
+        except Exception:
+            logger.exception("Engine exact name match failed, falling back to SQL")
+            return None
+        if row is None:
+            return None
+        # Outside the except ON PURPOSE: a missing key is a SHAPE mismatch between this call and
+        # CARD_OBJECT_FIELDS, not an engine that cannot answer, and swallowing it would turn the
+        # fast path into a permanent silent fallback. See _fuzzy_similarity_candidate, where
+        # exactly that happened.
+        return {"scryfall_id": row["scryfall_id"], "card_name": row["name"]}
+
+    def _card_by_illustration_id(self, illustration_id: str) -> dict[str, Any] | None:
+        """Return the best printing carrying an illustration id.
+
+        The ENGINE first, like every other identifier `/cards/collection` accepts. This was the one
+        left on SQL, and it is a scan there too — `illustration_id` has no index on the table, where
+        the engine answers it from a sorted permutation in O(log n).
+
+        Args:
+            illustration_id: The illustration UUID.
+
+        Returns:
+            The matching printing, or None.
+        """
+        engine = self._engine_for_lookup()
+        if engine is not None:
+            try:
+                row = engine.card_by_illustration_id(illustration_id, list(CARD_OBJECT_FIELDS))
+            # Any engine failure falls back to SQL; it never 500s.
+            except Exception:
+                logger.exception("Engine illustration lookup failed, falling back to SQL")
+            else:
+                if row is None:
+                    return None
+                return self._fetch_one_card("scryfall_id = %(value)s", {"value": str(row["scryfall_id"])})
+
+        return self._fetch_one_card("illustration_id = %(value)s", {"value": illustration_id})
 
     def _cards_by_ids(self, scryfall_ids: Sequence[str]) -> list[dict[str, Any]]:
         """Fetch cards by scryfall id, preserving the order of the ids given.
@@ -816,11 +871,20 @@ class ScryfallCardsRoutes(ScryfallResponder):
             # `exact=Delver of Secrets` to the two-faced card -- but it is a fallback, not a peer:
             # on the current corpus `exact=Lightning Bolt` otherwise answers
             # "Emeritus of Conflict // Lightning Bolt", whose prefer_score is the higher of the two.
-            card = self._fetch_one_card(
-                " AND ".join(clauses),
-                params,
-                rank_first="(lower(card_name_folded) = %(folded)s) DESC, ",
-            )
+            # The ENGINE first, same as the fuzzy stages below and `_cards_by_ids`. This was the
+            # last by-name lookup still answering from SQL, and it is the one a scan hurts most:
+            # `named?exact=` is a single-card fetch that walked all ~31,700 folded names.
+            card = None
+            chosen = self._engine_exact_name(params["folded"], params.get("set_code"))
+            if chosen is not None:
+                found = self._cards_by_ids([str(chosen["scryfall_id"])])
+                card = found[0] if found else None
+            if card is None:
+                card = self._fetch_one_card(
+                    " AND ".join(clauses),
+                    params,
+                    rank_first="(lower(card_name_folded) = %(folded)s) DESC, ",
+                )
             if card is None:
                 return self._scryfall_respond(
                     falcon_response,
@@ -980,6 +1044,12 @@ class ScryfallCardsRoutes(ScryfallResponder):
         Returns:
             The matching printing, or None.
         """
+        # The ENGINE first, like every other lookup on this surface. Unlike `fuzzy_card_by_name`,
+        # `exact_card_by_name` takes the set code, so a set filter no longer forces SQL.
+        row = self._engine_exact_name(needle, base_params.get("set_code"))
+        if row is not None:
+            return row
+
         params = {**base_params, "needle": needle}
         clauses = [*base_clauses, "lower(card_name_folded) = %(needle)s"]
         return self._best_printing(" AND ".join(clauses), params)
@@ -1000,6 +1070,25 @@ class ScryfallCardsRoutes(ScryfallResponder):
         Returns:
             Up to two rows -- enough to tell "one match" from "ambiguous" without fetching more.
         """
+        # The ENGINE first. A LIKE per word is a sequential scan of every folded name; the engine
+        # narrows the same predicate through `name_trigram` -- measured 1,303 us against 11 us.
+        engine = self._engine_for_lookup()
+        if engine is not None and words:
+            try:
+                rows = engine.cards_containing_all_words(
+                    list(words),
+                    base_params.get("set_code"),
+                    2,
+                    list(CARD_OBJECT_FIELDS),
+                )
+            # Any engine failure falls back to SQL; it never 500s.
+            except Exception:
+                logger.exception("Engine containment match failed, falling back to SQL")
+            else:
+                # `else`, not the `try` body: a key error here is a shape mismatch, not an engine
+                # failure, and must not be swallowed into a silent fallback.
+                return [{"scryfall_id": row["scryfall_id"], "card_name": row["name"]} for row in rows]
+
         params = dict(base_params)
         clauses = list(base_clauses)
         for index, word in enumerate(words):
@@ -1053,15 +1142,21 @@ class ScryfallCardsRoutes(ScryfallResponder):
                         FUZZY_SIMILARITY_LEAD,
                         list(CARD_OBJECT_FIELDS),
                     )
+                # Any engine failure falls back to SQL; it never 500s.
+                except Exception:
+                    logger.exception("Engine fuzzy match failed, falling back to SQL")
+                else:
+                    # The key is `scryfall_id`, which is what CARD_OBJECT_FIELDS asks for. It read
+                    # `id` before, so every hit raised KeyError INSIDE the try above, was logged as
+                    # an engine failure and fell through to SQL -- this fast path had never once
+                    # returned. Reading the row in `else` is what makes the next such mismatch a
+                    # test failure rather than a silent permanent fallback.
                     if status == "ambiguous":
                         return _AMBIGUOUS
                     if status == "miss":
                         return None
                     if row:
-                        return {"scryfall_id": row["id"], "card_name": row["name"]}
-                # Any engine failure falls back to SQL; it never 500s.
-                except Exception:
-                    logger.exception("Engine fuzzy match failed, falling back to SQL")
+                        return {"scryfall_id": row["scryfall_id"], "card_name": row["name"]}
 
         params = {**base_params, "needle": needle, "floor": FUZZY_SIMILARITY_FLOOR}
         # `%%` escapes psycopg's placeholder marker: the bare `%` operator would be read as the
@@ -1116,6 +1211,11 @@ class ScryfallCardsRoutes(ScryfallResponder):
         min_query_length = 2
         if len(needle) < min_query_length:
             return self._scryfall_respond(falcon_response, catalog_object([]), pretty=is_pretty)
+        # FOLDED, like `named?exact=` and the fuzzy stages above. Unfolded, an ASCII query could not
+        # reach a name with diacritics -- `q=eowyn` answered an empty catalog where Scryfall answers
+        # three Éowyn cards -- and nobody types the accent. Both paths below compare the folded name,
+        # so the engine and the SQL fallback keep answering alike.
+        needle = fold_accents(needle.lower())
 
         # The ENGINE first, for the same reason the fuzzy match above now does: `autocomplete` was
         # added by "Fuzzy Name Match and Autocomplete, Computed Not Stored" and nothing called it.
@@ -1130,11 +1230,12 @@ class ScryfallCardsRoutes(ScryfallResponder):
 
         rows = self._run_query(
             query=(
-                "SELECT card_name, min(CASE WHEN lower(card_name) LIKE %(prefix)s THEN 0 ELSE 1 END) AS rank "
-                "FROM magic.cards AS card WHERE lower(card_name) LIKE %(needle)s "
+                "SELECT card_name, "
+                "min(CASE WHEN lower(card_name_folded) LIKE %(prefix)s THEN 0 ELSE 1 END) AS rank "
+                "FROM magic.cards AS card WHERE lower(card_name_folded) LIKE %(needle)s "
                 "GROUP BY card_name ORDER BY rank, length(card_name), card_name LIMIT %(limit)s"
             ),
-            params={"prefix": f"{needle.lower()}%", "needle": f"%{needle.lower()}%", "limit": MAX_AUTOCOMPLETE_VALUES},
+            params={"prefix": f"{needle}%", "needle": f"%{needle}%", "limit": MAX_AUTOCOMPLETE_VALUES},
             explain=False,
         )["result"]
         return self._scryfall_respond(falcon_response, catalog_object([row["card_name"] for row in rows]), pretty=is_pretty)
@@ -1300,7 +1401,7 @@ class ScryfallCardsRoutes(ScryfallResponder):
         if "oracle_id" in identifier and _is_uuid(str(identifier["oracle_id"])):
             return self._card_by_oracle_id(str(identifier["oracle_id"]))
         if "illustration_id" in identifier and _is_uuid(str(identifier["illustration_id"])):
-            return self._fetch_one_card("illustration_id = %(value)s", {"value": str(identifier["illustration_id"])})
+            return self._card_by_illustration_id(str(identifier["illustration_id"]))
         if "mtgo_id" in identifier:
             return self._card_by_external_id("mtgo", _as_int(str(identifier["mtgo_id"])))
         if "multiverse_id" in identifier:

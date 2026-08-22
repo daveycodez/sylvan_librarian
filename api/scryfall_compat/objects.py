@@ -27,7 +27,14 @@ from typing import Any
 # `card_name`; a single-face one carries all three.
 _IMPORTER_ADDED_KEYS = ("card_name", "face_name", "face_idx")
 
-# Sizes Scryfall serves under `image_uris`, and the `version` vocabulary of the image format.
+# The `version` vocabulary of the image format -- SIX names, not the eleven `image_uris` carries.
+#
+# The two lists used to be the same list, and are not any more: Scryfall's `image_uris` gained five
+# webp sizes (see _IMAGE_EXTENSIONS) that `version=` does not accept. Measured against
+# api.scryfall.com on 2026-08-16 -- `?format=image&version=thumb` redirects to the LARGE jpg, byte
+# for byte the same fallback `version=bogus` gets, and the same for grid/display/art/crop. So these
+# five are emitted as URLs and refused as parameters, and widening this tuple to match the other
+# would silently change five 302 targets.
 IMAGE_VERSIONS = ("small", "normal", "large", "png", "art_crop", "border_crop")
 DEFAULT_IMAGE_VERSION = "large"
 
@@ -61,8 +68,35 @@ CARD_OBJECT_FIELDS = (
 # Scryfall's card back, one image for every normal card.
 CARD_BACK_ID = "0aeebaf5-8c7d-4636-9e82-8c27447861f7"
 
-# The file extension each image size is served as.
-_IMAGE_EXTENSIONS = {"small": "jpg", "normal": "jpg", "large": "jpg", "png": "png", "art_crop": "jpg", "border_crop": "jpg"}
+# The file extension each `image_uris` size is served as, in Scryfall's own key order.
+#
+# ELEVEN, not the six this module shipped with. Scryfall added five webp sizes -- `thumb`, `grid`,
+# `display`, `art`, `crop` -- and every card object it serves carries all eleven; a six-key
+# `image_uris` differed from Scryfall on every card object emitted.
+#
+# Unconditional, and measured that way: across all 540,484 printings in the 2026-08-16 all_cards
+# bulk, `image_uris` is either wholly ABSENT (8,444 cards, 7,641 faces -- the layouts whose picture
+# lives on the other level) or carries exactly these eleven keys in exactly this order. No card,
+# face, layout or `image_status` carries a partial set, so there is no per-key conditionality to
+# round-trip the way `printed_*` has.
+#
+# Derived, not stored: the same scan confirms all eleven URLs are the same pure function of the id
+# and the face on every one of the 548,604 objects that has them -- `art_crop` and `art` are
+# different sizes of one path, not a stored pair. These five cost zero storage, which is why they
+# are a table and not a column.
+_IMAGE_EXTENSIONS = {
+    "small": "jpg",
+    "normal": "jpg",
+    "large": "jpg",
+    "png": "png",
+    "art_crop": "jpg",
+    "border_crop": "jpg",
+    "thumb": "webp",
+    "grid": "webp",
+    "display": "webp",
+    "art": "webp",
+    "crop": "webp",
+}
 
 # magic.cards column -> the engine's name for the same value. The columns predate the engine, and
 # `to_scryfall_card` reads engine names.
@@ -215,6 +249,32 @@ def _faces(row: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _decimal(value: float | int | None) -> float | None:
+    """Carry a mana value as the DECIMAL Scryfall types it as.
+
+    api.scryfall.com answers `"cmc":1.0`, not `"cmc":1` — check
+    https://api.scryfall.com/cards/named?exact=Lightning+Bolt. The field is decimal because
+    fractional mana values are real: Little Girl costs {HW} and answers `"cmc":0.5`
+    (https://api.scryfall.com/cards/named?exact=Little+Girl). A whole-numbered mana value therefore
+    still serializes with its decimal point, and `magic.cards.cmc` being an `integer` column is what
+    made this service answer `1` instead.
+
+    That column is also why the underlying 0.5 cannot be stored at all today; changing its type is a
+    migration and belongs on its own, and nothing that half-mana exists in is imported. This keeps
+    the SERIALIZATION honest in the meantime, which is what a client comparing against Scryfall
+    sees.
+
+    Args:
+        value: The stored mana value, or None. Typed narrowly rather than `Any` because this is the
+            one place the column's type matters: an `integer` column is exactly what produced the
+            wrong output.
+
+    Returns:
+        The value as a float, or None when the card has none.
+    """
+    return None if value is None else float(value)
+
+
 def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfall.com") -> dict[str, Any]:
     """Build the Scryfall card object for one engine row.
 
@@ -258,7 +318,7 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
         "layout": row.get("card_layout") or row.get("layout"),
         "highres_image": bool(row.get("highres_image")),
         "image_status": row.get("image_status"),
-        "cmc": row.get("cmc"),
+        "cmc": _decimal(row.get("cmc")),
         "type_line": row.get("type_line"),
         "colors": row.get("colors") or [],
         "color_identity": row.get("color_identity") or [],

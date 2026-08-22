@@ -72,6 +72,7 @@ ENGINE_COLUMNS: list[str] = [
     "mana_cost_text",
     "oracle_text",
     "planeswalker_loyalty",
+    "planeswalker_loyalty_text",
     "price_eur",
     "price_tix",
     "price_usd",

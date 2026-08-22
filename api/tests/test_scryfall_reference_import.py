@@ -284,19 +284,19 @@ class TestImportReferenceQuietly:
         """
         with _all_steps_stubbed() as steps:
             steps[failing].side_effect = RuntimeError("upstream is down")
-            stub_api_resource._import_reference_quietly()
+            stub_api_resource.admin._import_reference_quietly()
 
     def test_a_failure_in_one_step_still_runs_the_others(self, stub_api_resource) -> None:
         with _all_steps_stubbed() as steps:
             steps["_import_sets"].side_effect = RuntimeError("down")
-            stub_api_resource._import_reference_quietly()
+            stub_api_resource.admin._import_reference_quietly()
 
         steps["_import_catalogs"].assert_called_once()
         steps["_import_symbology"].assert_called_once()
 
     def test_all_three_run_on_the_happy_path(self, stub_api_resource) -> None:
         with _all_steps_stubbed() as steps:
-            stub_api_resource._import_reference_quietly()
+            stub_api_resource.admin._import_reference_quietly()
 
         for step in steps.values():
             step.assert_called_once()

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 
 import pytest
 
@@ -70,6 +71,18 @@ class TestToScryfallCard:
         assert card["rarity"] == "common"
         assert card["legalities"] == {"modern": "legal"}
 
+    def test_cmc_is_a_decimal_even_when_the_column_holds_an_integer(self):
+        """`"cmc":1.0` is what api.scryfall.com answers, and `magic.cards.cmc` is an integer column.
+
+        The field is decimal because fractional mana values are real -- Little Girl costs {HW} and
+        Scryfall answers `"cmc":0.5` for it. A whole-numbered mana value therefore still carries its
+        decimal point, and a client comparing bodies against Scryfall can see the difference.
+        """
+        card = to_scryfall_card(row(cmc=1))
+        assert isinstance(card["cmc"], float)
+        assert '"cmc": 1.0' in json.dumps(card)
+        assert to_scryfall_card(row(cmc=None))["cmc"] is None
+
     def test_uris_are_derived_not_stored(self):
         """Every *_uri is a pure function of the id, set, collector number or oracle id."""
         card = to_scryfall_card(row(), base_url="https://example.test")
@@ -86,6 +99,43 @@ class TestToScryfallCard:
             "https://cards.scryfall.io/large/front/a/a/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jpg?1783903008"
         )
         assert card["image_uris"]["png"].endswith(".png?1783903008")
+
+    def test_image_uris_carries_scryfalls_eleven_sizes_in_scryfalls_order(self):
+        """Scryfall's key set, not ours.
+
+        This module served SIX keys for as long as it existed, missing `thumb`, `grid`, `display`,
+        `art` and `crop`, so every card object differed from Scryfall's. The list below is read off
+        api.scryfall.com and confirmed against all 540,484 printings in the 2026-08-16 all_cards
+        bulk, where `image_uris` is either wholly absent or exactly these eleven keys in this order
+        -- no layout, `image_status` or face position produces a partial set.
+        """
+        expected = [
+            "small",
+            "normal",
+            "large",
+            "png",
+            "art_crop",
+            "border_crop",
+            "thumb",
+            "grid",
+            "display",
+            "art",
+            "crop",
+        ]
+        card = to_scryfall_card(row())
+        assert list(card["image_uris"]) == expected
+        # The five new sizes are webp; the original six keep their own extensions.
+        for size in ("thumb", "grid", "display", "art", "crop"):
+            assert card["image_uris"][size].endswith(".webp?1783903008")
+
+        # Per-face too: the gap was on both placements, and a face builds its own dict.
+        two_faced = row()
+        two_faced["layout"] = "transform"
+        two_faced["card_faces"] = [{"name": "Delver of Secrets"}, {"name": "Insectile Aberration"}]
+        faces = to_scryfall_card(two_faced)["card_faces"]
+        assert [list(face["image_uris"]) for face in faces] == [expected, expected]
+        assert "/front/" in faces[0]["image_uris"]["thumb"]
+        assert "/back/" in faces[1]["image_uris"]["crop"]
 
     def test_purchase_uris_drop_scryfalls_affiliate_wrapper(self):
         """Same destination, without routing another service's affiliate revenue to Scryfall."""

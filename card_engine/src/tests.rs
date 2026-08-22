@@ -2,10 +2,10 @@ use super::{
     and_child_rank, assign_name_ranks,
     build_numeric_index, build_oracle_text_index, build_tag_index, build_trigram_index,
     build_rarity_index, build_flavor_index, build_hybrid_tag_index, bitmap_beats_postings, HybridTagIndex, build_sort_permutations,
-    assign_artwork_groups, build_artwork_base_from, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
+    assign_artwork_groups, assign_artist_ranks, build_artwork_base_from, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
     cards_of_printings, count_common_keywords, count_common_types,
     build_artist_index, build_printing_value_index, build_arith_tuple_index, is_arith_tuple_route, range_candidates, narrow_candidates, narrow_candidates_exact, rarity_candidates,
-    range_too_broad_to_narrow, run_query, run_query_routed, run_query_with_plan, explain, explain_analyze, AcquireFacts, PlanEstimate, PlanTrial,
+    perm_primary_key, range_too_broad_to_narrow, run_query, run_query_routed, run_query_with_plan, explain, explain_analyze, AcquireFacts, PlanEstimate, PlanTrial,
     acquire_plan_features, take_phase_stats, PagingTaken, CountSource, NarrowedRepr,
     EXACT_VALUE_TOTALS, RangeCardCounts, narrow_rec, ValueTotals, PairTotals, build_all_value_totals, build_pair_totals, build_range_card_counts, exact_result_total,
     PhysicalPlan, PlanScope, CandidatePlan, ComposePaging, trigram_candidates, finalize_trigram_index, PrintingValueIndex, NARROW_FLOOR,
@@ -20,6 +20,7 @@ use super::{
     build_printing_by_scryfall_id, build_oracle_by_oracle_id, find_printing_by_scryfall_id, find_oracle_by_oracle_id,
     build_external_id_index, find_printing_by_external_id, EXT_MULTIVERSE, EXT_MTGO, EXT_ARENA, EXT_TCGPLAYER,
     trigram_similarity, fuzzy_name_match, autocomplete_names, FuzzyOutcome,
+    exact_name_match, names_containing_all_words,
     VOCAB_NONE, COMPAT_PROMO, COMPAT_REPRINT, COMPAT_TEXTLESS, GAME_PAPER, GAME_ARENA, FINISH_FOIL, FINISH_NONFOIL,
     TextField, TextSearchField, Tri, SortedTrigramIndex, VocabInterner, ARTIST_NONE, NONE_STR, TYPE_ARTIFACT, TYPE_CREATURE,
     TYPE_ENCHANTMENT, TYPE_INSTANT, TYPE_LAND, TYPE_LEGENDARY, TYPE_PLANESWALKER, TYPE_SNOW, TYPE_SORCERY,
@@ -195,7 +196,7 @@ fn test_tag_index_str_lookup() {
 fn stub_card(oracle_id: u128, card_types: u16, subtypes: &[&str], vocab: &mut VocabInterner) -> OracleCard {
     OracleCard {
         card_name_lower: InlineStr::from_str(""),
-        card_name_folded: InlineStr::from_str(""),
+        card_name_folded_id: NONE_STR,
         card_colors: 0,
         card_color_identity: 0,
         produced_mana: 0,
@@ -304,8 +305,8 @@ fn store_of(cards: Vec<OracleCard>, printing_counts: &[usize], vocab: VocabInter
         // border_planes_fixture_store already does), so an empty string table is
         // safe here -- the border-scatter loop skips every printing regardless.
         planes: build_bit_planes(&cards, &printings, &offsets, &[]),
-        name_bigrams: build_name_bigram_index(&cards),
-        name_unigrams: build_name_unigram_index(&cards),
+        name_bigrams: build_name_bigram_index(&cards, &[]),
+        name_unigrams: build_name_unigram_index(&cards, &[]),
         legal_divergent: build_divergent_ids(&cards),
         sort_perms: build_sort_permutations(&cards),
         max_artwork_groups: artwork_groups.iter().copied().max().unwrap_or(0),
@@ -2294,7 +2295,6 @@ fn fuzz_store_n(rng: &mut rand::rngs::SmallRng, ncards: usize) -> CardData {
         // tests indexing/algebra parity, not fold_accents() semantics (#649 covers that directly).
         let name = corpus[rng.random_range(0..corpus.len())].0;
         card.card_name_lower = InlineStr::from_str(name);
-        card.card_name_folded = card.card_name_lower;
         card.card_name_id = interner.intern(name.to_string());
         let vanilla = card.card_types & TYPE_CREATURE != 0 && rng.random_bool(VANILLA_CREATURE_FRAC);
         let oracle = if vanilla {
@@ -2465,9 +2465,9 @@ fn fuzz_store_n(rng: &mut rand::rngs::SmallRng, ncards: usize) -> CardData {
     data.indexes.artists = build_artist_index(&data.printings, data.artist_vocab.len());
     // Text narrowing indexes — same load-bearing property. name/oracle drive trigram + bigram
     // narrowing and the full-scan memoization; flavor is the printing-space CSR bind() resolves against.
-    data.indexes.name_trigram = build_trigram_index(&data.cards, |c| c.card_name_folded.as_str());
-    data.indexes.name_bigrams = build_name_bigram_index(&data.cards);
-    data.indexes.name_unigrams = build_name_unigram_index(&data.cards);
+    data.indexes.name_trigram = build_trigram_index(&data.cards, |c| crate::folded_name_of(c, &data.strings));
+    data.indexes.name_bigrams = build_name_bigram_index(&data.cards, &data.strings);
+    data.indexes.name_unigrams = build_name_unigram_index(&data.cards, &data.strings);
     data.indexes.oracle_trigram = build_oracle_text_index(&data.cards, &data.strings);
     data.indexes.flavor = build_flavor_index(&data.printings, &data.strings);
     data.indexes.planes = build_bit_planes(&data.cards, &data.printings, &data.offsets, &data.strings);
@@ -6375,7 +6375,6 @@ fn bench_checked_vs_unchecked_access() {
         );
         let mut card = stub_card((i + 1) as u128, TYPE_CREATURE, &["Benchmark", words[i % 10]], &mut vocab);
         card.card_name_lower = InlineStr::from_str(&name.to_lowercase());
-        card.card_name_folded = card.card_name_lower;
         card.card_name_id = interner.intern(name.clone());
         card.oracle_text_id = interner.intern(oracle.clone());
         card.oracle_text_lower_id = interner.intern(oracle.to_lowercase());
@@ -6400,8 +6399,8 @@ fn bench_checked_vs_unchecked_access() {
 
     let indexes = CardIndexes {
         artwork_base,
-        name_trigram:   build_trigram_index(&cards, |c| c.card_name_folded.as_str()),
-        name_unigrams:  build_name_unigram_index(&cards),
+        name_trigram:   build_trigram_index(&cards, |c| crate::folded_name_of(c, &[])),
+        name_unigrams:  build_name_unigram_index(&cards, &[]),
         oracle_trigram: build_oracle_text_index(&cards, &strings),
         cmc:            build_numeric_index(&cards, |c| c.cmc.map(|v| v as i16)),
         power:          build_numeric_index(&cards, |c| c.creature_power.map(|v| v as i16)),
@@ -6440,10 +6439,11 @@ fn bench_checked_vs_unchecked_access() {
         border_printing: build_border_printing_planes(&printings, &strings),
         rarity_printing: build_rarity_printing_planes(&printings),
         rarity_printing_ordered: build_printing_value_index(&printings, &cards, &offsets, |p| p.card_rarity_int.map(u32::from)),
-        name_bigrams:   build_name_bigram_index(&cards),
+        name_bigrams:   build_name_bigram_index(&cards, &[]),
         legal_divergent: build_divergent_ids(&cards),
         arith_tuple:    build_arith_tuple_index(&cards),
         printing_by_scryfall_id: build_printing_by_scryfall_id(&printings),
+        printing_by_illustration_id: crate::build_printing_by_illustration_id(&printings),
         oracle_by_oracle_id:     build_oracle_by_oracle_id(&cards),
         external_id_index:       build_external_id_index(&printings),
     };
@@ -8767,7 +8767,6 @@ fn text_fixture_store() -> CardData {
         .map(|(i, &(name, text))| {
             let mut c = stub_card(i as u128 + 1, TYPE_CREATURE, &[], &mut vocab);
             c.card_name_lower = InlineStr::from_str(name);
-            c.card_name_folded = c.card_name_lower;
             c.card_name_id = interner.intern(name.to_string());
             c.oracle_text_lower_id = interner.intern(text.unwrap_or_default().to_string());
             c
@@ -8775,7 +8774,7 @@ fn text_fixture_store() -> CardData {
         .collect();
     let mut data = store_of(cards, &[1usize; 6], vocab);
     data.strings = interner.strings;
-    data.indexes.name_trigram = build_trigram_index(&data.cards, |c| c.card_name_folded.as_str());
+    data.indexes.name_trigram = build_trigram_index(&data.cards, |c| crate::folded_name_of(c, &data.strings));
     data.indexes.oracle_trigram = build_oracle_text_index(&data.cards, &data.strings);
     data
 }
@@ -9665,7 +9664,6 @@ fn name_bigrams_tiers_and_exactness() {
         let mut c = stub_card(u128::from(i) + 1, TYPE_CREATURE, &[], &mut vocab);
         let name = if i % 64 == 0 { format!("azz qx{i}") } else { format!("azz b{i}") };
         c.card_name_lower = InlineStr::from_str(&name);
-        c.card_name_folded = c.card_name_lower;
         c
     }).collect();
     let data = store_of(cards, &vec![1usize; 4096], vocab);
@@ -9690,7 +9688,7 @@ fn name_bigrams_tiers_and_exactness() {
     assert!(n.tight);
     let cand = n.set.into_cards(&archived.offsets, &archived.indexes.printing_to_card);
     let brute: Vec<u32> = archived.cards.iter().enumerate()
-        .filter(|(_, c)| c.card_name_folded.as_str().contains("qx"))
+        .filter(|(_, c)| crate::folded_name(c, &archived.strings).contains("qx"))
         .map(|(i, _)| i as u32)
         .collect();
     assert_eq!(cand, brute, "bigram membership IS containment for 2-byte needles");
@@ -9716,7 +9714,6 @@ fn not_over_unigram_is_tight_but_oracle_stays_loose() {
             let mut c = stub_card(u128::from(i) + 1, TYPE_CREATURE, &[], &mut vocab);
             let name = if i % 8 == 0 { format!("aq b{i}") } else { format!("ab c{i}") };
             c.card_name_lower = InlineStr::from_str(&name);
-            c.card_name_folded = c.card_name_lower;
             c
         })
         .collect();
@@ -9733,7 +9730,7 @@ fn not_over_unigram_is_tight_but_oracle_stays_loose() {
         .cards
         .iter()
         .enumerate()
-        .filter(|(_, c)| !c.card_name_folded.as_str().contains('q'))
+        .filter(|(_, c)| !crate::folded_name(c, &archived.strings).contains('q'))
         .map(|(i, _)| i as u32)
         .collect();
     assert_eq!(cand, brute, "-name:q must be exactly the cards whose name lacks 'q'");
@@ -9763,7 +9760,6 @@ fn name_unigrams_tiers_and_exactness() {
         let mut c = stub_card(u128::from(i) + 1, TYPE_CREATURE, &[], &mut vocab);
         let name = if i % 64 == 0 { format!("az q{i}") } else { format!("az b{i}") };
         c.card_name_lower = InlineStr::from_str(&name);
-        c.card_name_folded = c.card_name_lower;
         c
     }).collect();
     let data = store_of(cards, &vec![1usize; 4096], vocab);
@@ -9788,7 +9784,7 @@ fn name_unigrams_tiers_and_exactness() {
     assert!(n.tight);
     let cand = n.set.into_cards(&archived.offsets, &archived.indexes.printing_to_card);
     let brute: Vec<u32> = archived.cards.iter().enumerate()
-        .filter(|(_, c)| c.card_name_folded.as_str().contains('q'))
+        .filter(|(_, c)| crate::folded_name(c, &archived.strings).contains('q'))
         .map(|(i, _)| i as u32)
         .collect();
     assert_eq!(cand, brute, "byte membership IS containment for 1-byte needles");
@@ -9809,7 +9805,6 @@ fn name_bigrams_compose_and_memoize() {
     let cards: Vec<OracleCard> = names.iter().enumerate().map(|(i, name)| {
         let mut c = stub_card(i as u128 + 1, TYPE_CREATURE, &[], &mut vocab);
         c.card_name_lower = InlineStr::from_str(name);
-        c.card_name_folded = c.card_name_lower;
         c.card_name_id = interner.intern(name.to_string());
         c
     }).collect();
@@ -9847,7 +9842,7 @@ fn name_bigrams_compose_and_memoize() {
         _ => panic!("2-byte needle must memoize via bigrams"),
     }
     for (cid, card) in archived.cards.iter().enumerate() {
-        let want = card.card_name_folded.as_str().contains("fi");
+        let want = crate::folded_name(card, &archived.strings).contains("fi");
         assert!((f.eval_card(card, &archived.strings) == Tri::True) == want, "NameMatch parity at card {cid}");
     }
 }
@@ -10068,7 +10063,6 @@ fn named_store() -> CardData {
         .map(|(i, name)| {
             let mut c = stub_card((i + 1) as u128, TYPE_CREATURE, &[], &mut vocab);
             c.card_name_lower = InlineStr::from_str(name);
-            c.card_name_folded = c.card_name_lower;
             // Distinct, deliberately store-order-scrambled edhrec ranks: the
             // second "sol ring" (card 3) outranks the first (card 1).
             c.edhrec_rank = Some([40, 60, 10, 20, 30, 50][i]);
@@ -10156,13 +10150,21 @@ fn accent_folded_name_search_matches_unaccented_query() {
         ("éowyn, fearless knight", "eowyn, fearless knight"),
         ("ferocious knight", "ferocious knight"),
     ];
-    let cards: Vec<OracleCard> = rows.iter().enumerate().map(|(i, (lower, folded))| {
+    let cards: Vec<OracleCard> = rows.iter().enumerate().map(|(i, (lower, _))| {
         let mut c = stub_card(i as u128 + 1, TYPE_CREATURE, &[], &mut vocab);
         c.card_name_lower = InlineStr::from_str(lower);
-        c.card_name_folded = InlineStr::from_str(folded);
         c
     }).collect();
-    let data = store_of(cards, &[1usize; 2], vocab);
+    let mut data = store_of(cards, &[1usize; 2], vocab);
+    // Interned the way the builder does: a folded name that DIFFERS from the lower one is the only
+    // case that reaches the strings table, and this fixture exists precisely for that case.
+    for (i, (lower, folded)) in rows.iter().enumerate() {
+        if lower != folded {
+            data.strings.push((*folded).to_owned());
+            data.cards[i].card_name_folded_id = (data.strings.len() - 1) as u32;
+        }
+    }
+    let data = data;
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
@@ -11587,6 +11589,36 @@ fn absent_compat_values_stay_absent() {
     assert!(a.promo_types.is_empty());
 }
 
+/// An illustration id is NOT unique -- reprints sharing art carry the same one -- so the binary
+/// search lands anywhere inside a run. The SQL this replaces ordered by `prefer_score` and took the
+/// first, which is the first printing in CORPUS order, so the index must return the run's MINIMUM
+/// pid rather than whichever member the search happened to hit.
+#[test]
+fn an_illustration_id_resolves_to_its_first_printing() {
+    let mut vocab = VocabInterner::new();
+    let mut cards = Vec::new();
+    for i in 0..4u128 {
+        cards.push(stub_card(i + 1, 0, &[], &mut vocab));
+    }
+    let mut data = store_of(cards, &[1, 1, 1, 1], vocab);
+    // Shared art on three printings, deliberately NOT in pid order once sorted: 7 on pids 3, 1, 2.
+    data.printings[0].illustration_id = 9;
+    data.printings[1].illustration_id = 7;
+    data.printings[2].illustration_id = 7;
+    data.printings[3].illustration_id = 7;
+    data.indexes.printing_by_illustration_id = crate::build_printing_by_illustration_id(&data.printings);
+
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let perm = &a.indexes.printing_by_illustration_id;
+
+    assert_eq!(crate::find_printing_by_illustration_id(perm, &a.printings, 7), Some(1), "the FIRST, not any");
+    assert_eq!(crate::find_printing_by_illustration_id(perm, &a.printings, 9), Some(0));
+    assert_eq!(crate::find_printing_by_illustration_id(perm, &a.printings, 8), None, "a miss is None, not a neighbour");
+    // 0 is parse_uuid_or_hash's null and must never match a stored row.
+    assert_eq!(crate::find_printing_by_illustration_id(perm, &a.printings, 0), None);
+}
+
 #[test]
 fn external_ids_resolve_to_their_printing() {
     let mut a = stub_printing(1, 1, Some(1.0));
@@ -11672,6 +11704,41 @@ fn cards_without_relations_carry_none() {
 
 // ─── Fuzzy name matching ──────────────────────────────────────────────────────
 
+/// `trigrams_into` is a hand-rolled restatement of `trigrams`'s padded-window definition that
+/// avoids materialising the `"  word "` buffer, so the two must agree EXACTLY — a single dropped
+/// or extra window would shift every fuzzy score without failing anything else.
+///
+/// The word lengths are the interesting axis: 1 and 2 bytes are the cases where the padded form is
+/// shorter than a full 3-window and the leading/trailing windows overlap, which is precisely where
+/// an off-by-one would hide.
+#[test]
+fn trigrams_into_matches_the_padded_definition() {
+    let mut buf = Vec::new();
+    for s in [
+        "",
+        "a",
+        "ab",
+        "abc",
+        "abcd",
+        "a b",
+        "a bc def",
+        "jace beleren",
+        "urza's bauble",
+        "  leading and trailing  ",
+        "!!! ??? ---",
+        "eowyn",
+        "\u{e9}owyn",
+        "fire // ice",
+        "x",
+        "aaaa aaaa",
+        "\u{c6}therling",
+    ] {
+        crate::trigrams_into(s, &mut buf);
+        let want: Vec<[u8; 3]> = crate::trigrams(s).into_iter().collect();
+        assert_eq!(buf, want, "trigrams_into disagrees with trigrams for {s:?}");
+    }
+}
+
 #[test]
 fn trigram_similarity_matches_pg_trgm() {
     // pg_trgm pads each word "  word " and windows over it, so "abc" yields exactly
@@ -11694,25 +11761,95 @@ fn trigram_similarity_matches_pg_trgm() {
     assert_eq!(trigram_similarity("lightning", "lightnin"), trigram_similarity("lightnin", "lightning"));
 }
 
+/// The by-name lookups narrow through `name_trigram`, and narrowing must not change the answer.
+///
+/// Asserted DIFFERENTIALLY, over the same store built twice: once with the index (the narrowed
+/// path) and once without it (the full scan, which `store_of` produces because it does not build
+/// `name_trigram`). Every probe must agree. A test that only exercised the fast path would pass
+/// just as happily if the narrowing were fast and wrong.
+#[test]
+fn name_lookups_agree_with_and_without_the_trigram_index() {
+    // Built twice rather than cloned: neither OracleCard nor VocabInterner is Clone.
+    let fixture = || {
+        let mut vocab = VocabInterner::new();
+        let names = [
+            "lightning bolt",
+            "emeritus of conflict // lightning bolt",
+            "delver of secrets // insectile aberration",
+            "shock",
+            "counterspell",
+        ];
+        let mut cards = Vec::new();
+        for (i, name) in names.iter().enumerate() {
+            let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
+            c.card_name_lower = InlineStr::from_str(name);
+            cards.push(c);
+        }
+        store_of(cards, &[1, 1, 1, 1, 1], vocab)
+    };
+    // `store_of` does not build `name_trigram`, so this one takes the full-scan path.
+    let scan_data = fixture();
+    let mut idx_data = fixture();
+    idx_data.indexes.name_trigram = build_trigram_index(&idx_data.cards, |c| crate::folded_name_of(c, &[]));
+
+    let scan_bytes = rkyv::to_bytes::<Error>(&scan_data).expect("serialize");
+    let scan = rkyv::access::<Archived<CardData>, Error>(&scan_bytes).expect("access");
+    let idx_bytes = rkyv::to_bytes::<Error>(&idx_data).expect("serialize");
+    let idx = rkyv::access::<Archived<CardData>, Error>(&idx_bytes).expect("access");
+
+    for needle in [
+        "lightning bolt",
+        "delver of secrets",
+        "insectile aberration",
+        "emeritus of conflict",
+        "shock",
+        "no such card",
+        "li", // under 3 bytes: the index has nothing to say and both sides scan
+    ] {
+        assert_eq!(
+            exact_name_match(scan, needle, None),
+            exact_name_match(idx, needle, None),
+            "exact_name_match disagrees for {needle:?}"
+        );
+    }
+    for words in [vec!["lightning".to_owned()], vec!["of".to_owned(), "secrets".to_owned()], vec!["zzz".to_owned()]] {
+        assert_eq!(
+            names_containing_all_words(scan, &words, None, 2),
+            names_containing_all_words(idx, &words, None, 2),
+            "names_containing_all_words disagrees for {words:?}"
+        );
+    }
+
+    // And the ranking rule the SQL carried in its ORDER BY: a WHOLE-name match beats a face match,
+    // even when the face's card scores higher. `lightning bolt` is card 0 and also the BACK face of
+    // card 1, whose printing has the better prefer_score.
+    assert_eq!(exact_name_match(idx, "lightning bolt", None).map(|(cid, _)| cid), Some(0));
+    // A face match is still found when nothing carries the whole name.
+    assert_eq!(exact_name_match(idx, "insectile aberration", None).map(|(cid, _)| cid), Some(2));
+}
+
 #[test]
 fn a_typo_resolves_to_the_intended_card() {
     let mut vocab = VocabInterner::new();
     let mut cards = Vec::new();
     for (i, name) in ["lightning bolt", "shock", "counterspell"].iter().enumerate() {
         let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
-        c.card_name_folded = InlineStr::from_str(name);
         c.card_name_lower = InlineStr::from_str(name);
         cards.push(c);
     }
     let bytes = rkyv::to_bytes::<Error>(&cards).expect("serialize");
     let a = rkyv::access::<Archived<Vec<OracleCard>>, Error>(&bytes).expect("access");
+    // Every card here carries NONE_STR (folded == lower), so an EMPTY table is the right one:
+    // `folded_name` never reaches it, and a populated one would prove nothing extra.
+    let sbytes = rkyv::to_bytes::<Error>(&Vec::<String>::new()).expect("serialize strings");
+    let strs = rkyv::access::<Archived<Vec<String>>, Error>(&sbytes).expect("access strings");
 
-    match fuzzy_name_match(a, "lightnig bolt", 0.4, 0.05) {
+    match fuzzy_name_match(a, strs, "lightnig bolt", 0.4, 0.05) {
         FuzzyOutcome::Hit(cid) => assert_eq!(cid, 0, "a one-letter typo still finds Lightning Bolt"),
         _ => panic!("expected a hit"),
     }
     // Nothing close enough clears the floor.
-    assert!(matches!(fuzzy_name_match(a, "zzzzzzzz", 0.4, 0.05), FuzzyOutcome::Miss));
+    assert!(matches!(fuzzy_name_match(a, strs, "zzzzzzzz", 0.4, 0.05), FuzzyOutcome::Miss));
 }
 
 #[test]
@@ -11723,12 +11860,16 @@ fn two_close_names_are_ambiguous_not_a_guess() {
     let mut cards = Vec::new();
     for (i, name) in ["fire dragon", "fire dragoon"].iter().enumerate() {
         let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
-        c.card_name_folded = InlineStr::from_str(name);
+        c.card_name_lower = InlineStr::from_str(name);
         cards.push(c);
     }
     let bytes = rkyv::to_bytes::<Error>(&cards).expect("serialize");
     let a = rkyv::access::<Archived<Vec<OracleCard>>, Error>(&bytes).expect("access");
-    assert!(matches!(fuzzy_name_match(a, "fire dragen", 0.4, 0.05), FuzzyOutcome::Ambiguous));
+    // Every card here carries NONE_STR (folded == lower), so an EMPTY table is the right one:
+    // `folded_name` never reaches it, and a populated one would prove nothing extra.
+    let sbytes = rkyv::to_bytes::<Error>(&Vec::<String>::new()).expect("serialize strings");
+    let strs = rkyv::access::<Archived<Vec<String>>, Error>(&sbytes).expect("access strings");
+    assert!(matches!(fuzzy_name_match(a, strs, "fire dragen", 0.4, 0.05), FuzzyOutcome::Ambiguous));
 }
 
 #[test]
@@ -11739,12 +11880,17 @@ fn printings_of_one_card_do_not_look_ambiguous() {
     let mut cards = Vec::new();
     for i in 0..3u128 {
         let mut c = stub_card(i + 1, 0, &[], &mut vocab);
-        c.card_name_folded = InlineStr::from_str("lightning bolt");
+        // `card_name_folded_id` defaults to NONE_STR, i.e. "same as card_name_lower".
+        c.card_name_lower = InlineStr::from_str("lightning bolt");
         cards.push(c);
     }
     let bytes = rkyv::to_bytes::<Error>(&cards).expect("serialize");
     let a = rkyv::access::<Archived<Vec<OracleCard>>, Error>(&bytes).expect("access");
-    assert!(matches!(fuzzy_name_match(a, "lightning bolt", 0.4, 0.05), FuzzyOutcome::Hit(_)));
+    // Every card here carries NONE_STR (folded == lower), so an EMPTY table is the right one:
+    // `folded_name` never reaches it, and a populated one would prove nothing extra.
+    let sbytes = rkyv::to_bytes::<Error>(&Vec::<String>::new()).expect("serialize strings");
+    let strs = rkyv::access::<Archived<Vec<String>>, Error>(&sbytes).expect("access strings");
+    assert!(matches!(fuzzy_name_match(a, strs, "lightning bolt", 0.4, 0.05), FuzzyOutcome::Hit(_)));
 }
 
 #[test]
@@ -11758,13 +11904,16 @@ fn autocomplete_matches_the_sql_routes_set_and_order() {
     for (i, name) in ["Shock", "Shatter", "Shockwave", "Aftershock", "Counterspell"].iter().enumerate() {
         let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
         c.card_name_lower = InlineStr::from_str(&name.to_lowercase());
+        // FOLDED is what the catalog now matches, so the fixture carries it. These names are ASCII,
+        // where folding is the identity -- the accented case is asserted separately below.
         c.card_name_id = interner.intern((*name).to_string());
         cards.push(c);
     }
-    let bytes = rkyv::to_bytes::<Error>(&cards).expect("serialize");
-    let a = rkyv::access::<Archived<Vec<OracleCard>>, Error>(&bytes).expect("access");
-    let string_bytes = rkyv::to_bytes::<Error>(&interner.strings).expect("serialize strings");
-    let strings = rkyv::access::<Archived<Vec<String>>, Error>(&string_bytes).expect("access strings");
+    let n = cards.len();
+    let mut data = store_of(cards, &vec![1usize; n], vocab);
+    data.strings = interner.strings;
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
     // The SQL this route falls back to is
     //   WHERE lower(card_name) LIKE '%needle%' ORDER BY rank, length(card_name), card_name
@@ -11776,24 +11925,231 @@ fn autocomplete_matches_the_sql_routes_set_and_order() {
     // api.scryfall.com, where q=bolt answers Bolt Bend .. Boltwing Marauder THEN Firebolt,
     // Rift Bolt -- a prefix-only catalog would never offer the client "Aftershock" at all.
     assert_eq!(
-        autocomplete_names(a, strings, "sho", 20),
+        autocomplete_names(a, "sho", 20),
         vec!["Shock", "Shockwave", "Aftershock"],
         "prefix matches rank 0, substring matches rank 1"
     );
     assert_eq!(
-        autocomplete_names(a, strings, "SHO", 20),
+        autocomplete_names(a, "SHO", 20),
         vec!["Shock", "Shockwave", "Aftershock"],
         "case-insensitive"
     );
     // Within a rank the order is by LENGTH then name, not alphabetical: Shock(5), Shatter(7),
     // Shockwave(9). Alphabetical would put Shatter first, which is what this returned before.
     assert_eq!(
-        autocomplete_names(a, strings, "sh", 20),
+        autocomplete_names(a, "sh", 20),
         vec!["Shock", "Shatter", "Shockwave", "Aftershock"],
         "length then name within a rank, and PRINTED -- a lowercase entry is not a name Scryfall prints"
     );
+    // THE ACCENT CASE, which is why this matches the folded name at all. `q=eowyn` answered an
+    // EMPTY catalog before: the needle is ASCII, the stored lowercase name is not, and nobody types
+    // the accent. api.scryfall.com answers q=eowyn with three Éowyn cards, q=jotun with three Jötun
+    // ones and q=lim-dul with eight. The PRINTED name still comes back accented -- folding decides
+    // what MATCHES, not what is shown.
+    {
+        let mut vocab2 = VocabInterner::new();
+        let mut interner2 = Interner::new();
+        let mut accented = Vec::new();
+        for (i, (printed, folded)) in
+            [("Éowyn, Lady of Rohan", "eowyn, lady of rohan"), ("Jötun Grunt", "jotun grunt")].iter().enumerate()
+        {
+            let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab2);
+            c.card_name_lower = InlineStr::from_str(&printed.to_lowercase());
+            // A folded name that DIFFERS is the only case that reaches the strings table, which is
+            // exactly what these two names are here to exercise.
+            c.card_name_folded_id = interner2.intern((*folded).to_string());
+            c.card_name_id = interner2.intern((*printed).to_string());
+            accented.push(c);
+        }
+        let n2 = accented.len();
+        let mut d2 = store_of(accented, &vec![1usize; n2], vocab2);
+        d2.strings = interner2.strings;
+        let b2 = rkyv::to_bytes::<Error>(&d2).expect("serialize");
+        let a2 = rkyv::access::<Archived<CardData>, Error>(&b2).expect("access");
+        assert_eq!(autocomplete_names(a2, "eowyn", 20), vec!["Éowyn, Lady of Rohan"], "an ASCII needle reaches É");
+        assert_eq!(autocomplete_names(a2, "jotun", 20), vec!["Jötun Grunt"], "an ASCII needle reaches ö");
+        // Ordered by CHARACTERS, as Postgres `length()` counts, not bytes as `str::len()` does.
+        // Both names are prefix matches for "e", so rank cannot separate them: "Éxx" is 3
+        // characters and 4 bytes, "Exxx" is 4 of each. By characters "Éxx" wins outright, which is
+        // what the SQL answers; by bytes they TIE at 4 and fall to alphabetical, where 'E' precedes
+        // 'É' and the answer flips.
+        {
+            let mut v3 = VocabInterner::new();
+            let mut i3 = Interner::new();
+            let mut tie = Vec::new();
+            for (n, (printed, folded)) in [("Exxx", "exxx"), ("Éxx", "exx")].iter().enumerate() {
+                let mut c = stub_card(n as u128 + 1, 0, &[], &mut v3);
+                c.card_name_lower = InlineStr::from_str(&printed.to_lowercase());
+                c.card_name_folded_id = i3.intern((*folded).to_string());
+                c.card_name_id = i3.intern((*printed).to_string());
+                tie.push(c);
+            }
+            let n3 = tie.len();
+            let mut d3 = store_of(tie, &vec![1usize; n3], v3);
+            d3.strings = i3.strings;
+            let b3 = rkyv::to_bytes::<Error>(&d3).expect("serialize");
+            let a3 = rkyv::access::<Archived<CardData>, Error>(&b3).expect("access");
+            assert_eq!(autocomplete_names(a3, "e", 20), vec!["Éxx", "Exxx"], "shorter in CHARACTERS first");
+        }
+
+        // And the accented spelling still works, which is what it did before.
+        assert_eq!(autocomplete_names(a2, "jötun", 20), Vec::<&str>::new(), "the needle is folded by the caller");
+    }
+
     // The cap applies to the ORDERED list, so it keeps the shortest prefix match rather than
     // whichever name the corpus happened to reach first.
-    assert_eq!(autocomplete_names(a, strings, "sh", 1), vec!["Shock"], "capped, after ordering");
-    assert!(autocomplete_names(a, strings, "zzz", 20).is_empty());
+    assert_eq!(autocomplete_names(a, "sh", 1), vec!["Shock"], "capped, after ordering");
+    assert!(autocomplete_names(a, "zzz", 20).is_empty());
+}
+
+// ─── Price orderings pick the group's cheapest printing ───────────────────────
+//
+// See `prefer_for_sort`. Scryfall ranks a card by its CHEAPEST printing in the ordered
+// currency and returns that printing, so under `unique=card`/`unique=artwork` the
+// representative has to be chosen by the ordered price rather than by `prefer_score`.
+
+/// One card whose three printings disagree about which is cheapest in each currency,
+/// plus a `prefer_score` order that agrees with none of them. `store_of` stores printings
+/// prefer-descending, so scryfall_id 1 is the default-preferred one.
+fn priced_store(prices: &[(Option<u32>, Option<u32>, Option<u32>)]) -> CardData {
+    let mut vocab = VocabInterner::new();
+    let card = stub_card(1, TYPE_CREATURE, &[], &mut vocab);
+    let mut data = store_of(vec![card], &[prices.len()], vocab);
+    for (p, &(usd, eur, tix)) in data.printings.iter_mut().zip(prices) {
+        p.price_usd = usd;
+        p.price_eur = eur;
+        p.price_tix = tix;
+    }
+    // Built, not left at their empty defaults: an empty index makes `walk_value_orderby_page`
+    // decline and fall back to the gather, which would leave the walk's `rep == pid` emission
+    // test — the one place the representative choice and the page order have to agree —
+    // silently uncovered.
+    data.indexes.price_usd = build_printing_value_index(&data.printings, &data.cards, &data.offsets, |p| p.price_usd);
+    data.indexes.price_eur = build_printing_value_index(&data.printings, &data.cards, &data.offsets, |p| p.price_eur);
+    data.indexes.price_tix = build_printing_value_index(&data.printings, &data.cards, &data.offsets, |p| p.price_tix);
+    data
+}
+
+/// The representative `unique=card` returns for `orderby`/`direction`, as a scryfall_id.
+fn representative(data: &CardData, prefer: &str, orderby: &str, direction: &str) -> u128 {
+    let bytes = rkyv::to_bytes::<Error>(data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let mut filter = FilterExpr::True;
+    let (total, page) = run_query(&QueryCtx::from(archived), &mut filter, None, "card", prefer, orderby, direction, 100, 0);
+    assert_eq!(total, 1, "unique=card collapses the fixture to one row");
+    u128::from(page[0].1.scryfall_id)
+}
+
+#[test]
+// Prices are integer CENTS, written `dollars_cents` so `1827_00` reads as $1827.00 at a
+// glance. clippy wants `182_700` and `50`; both are what the column holds and neither says
+// what the money is. The grouping is the documentation here, so the lints are allowed on
+// these three rather than the literals being flattened.
+#[allow(clippy::inconsistent_digit_grouping, clippy::zero_prefixed_literal)]
+fn price_orderby_represents_the_card_by_its_cheapest_printing() {
+    // id 1 is prefer-best; the cheapest is a different printing in each currency.
+    let data = priced_store(&[
+        (Some(9_00), Some(1_00), Some(9_00)), // id 1 — cheapest in EUR
+        (Some(5_00), Some(5_00), Some(0_50)), // id 2 — cheapest in TIX
+        (Some(1_00), Some(3_00), Some(3_00)), // id 3 — cheapest in USD
+    ]);
+    // The non-price ordering is untouched: it still gets the prefer_score pick.
+    assert_eq!(representative(&data, "default", "edhrec", "asc"), 1);
+    assert_eq!(representative(&data, "default", "name", "desc"), 1);
+    // Each price ordering gets that currency's cheapest printing...
+    assert_eq!(representative(&data, "default", "usd", "desc"), 3);
+    assert_eq!(representative(&data, "default", "eur", "desc"), 1);
+    assert_eq!(representative(&data, "default", "tix", "desc"), 2);
+    // ...in BOTH directions. Direction reverses the page; it does not re-pick the printing.
+    assert_eq!(representative(&data, "default", "usd", "asc"), 3);
+    assert_eq!(representative(&data, "default", "eur", "asc"), 1);
+    assert_eq!(representative(&data, "default", "tix", "asc"), 2);
+}
+
+/// The Juzám Djinn shape: the prefer-best printing is an unpriced oversized promo, so
+/// leaving the pick to `prefer_score` gave the card no USD price at all and dropped it out
+/// of a price sort entirely. A missing price must lose to any real one.
+#[test]
+// Prices are integer CENTS, written `dollars_cents` so `1827_00` reads as $1827.00 at a
+// glance. clippy wants `182_700` and `50`; both are what the column holds and neither says
+// what the money is. The grouping is the documentation here, so the lints are allowed on
+// these three rather than the literals being flattened.
+#[allow(clippy::inconsistent_digit_grouping, clippy::zero_prefixed_literal)]
+fn price_orderby_skips_a_printing_with_no_price_in_that_currency() {
+    let data = priced_store(&[
+        (None, None, Some(1_00)),          // id 1 — prefer-best, but unpriced in USD and EUR
+        (Some(1827_00), Some(1775_40), None), // id 2 — the only printing with a USD/EUR price
+    ]);
+    assert_eq!(representative(&data, "default", "edhrec", "asc"), 1);
+    assert_eq!(representative(&data, "default", "usd", "desc"), 2);
+    assert_eq!(representative(&data, "default", "eur", "desc"), 2);
+    // TIX is the mirror image: only the prefer-best printing has one.
+    assert_eq!(representative(&data, "default", "tix", "desc"), 1);
+}
+
+/// When NOTHING is priced there is no cheaper printing to prefer, so the card keeps its
+/// ordinary representative rather than silently changing which printing it shows.
+#[test]
+fn price_orderby_keeps_the_default_representative_when_no_printing_is_priced() {
+    let data = priced_store(&[(None, None, None), (None, None, None)]);
+    assert_eq!(representative(&data, "default", "usd", "desc"), 1);
+    assert_eq!(representative(&data, "default", "eur", "asc"), 1);
+    assert_eq!(representative(&data, "default", "tix", "desc"), 1);
+}
+
+/// An explicit `prefer=` is the caller naming the printing they want, and it still wins —
+/// `prefer_for_sort` only fills in a pick for callers that did not make one.
+#[test]
+// Prices are integer CENTS, written `dollars_cents` so `1827_00` reads as $1827.00 at a
+// glance. clippy wants `182_700` and `50`; both are what the column holds and neither says
+// what the money is. The grouping is the documentation here, so the lints are allowed on
+// these three rather than the literals being flattened.
+#[allow(clippy::inconsistent_digit_grouping, clippy::zero_prefixed_literal)]
+fn an_explicit_prefer_still_beats_the_price_orderby() {
+    let data = priced_store(&[
+        (Some(9_00), Some(1_00), Some(9_00)), // id 1 — prefer-best, dearest in USD
+        (Some(5_00), Some(5_00), Some(0_50)),
+        (Some(1_00), Some(3_00), Some(3_00)), // id 3 — cheapest in USD
+    ]);
+    assert_eq!(representative(&data, "usd_high", "usd", "desc"), 1);
+    assert_eq!(representative(&data, "usd_low", "usd", "desc"), 3);
+    // `oldest`/`newest` are price-blind: store_of makes the LAST printing the oldest.
+    assert_eq!(representative(&data, "oldest", "usd", "desc"), 3);
+    assert_eq!(representative(&data, "newest", "usd", "desc"), 1);
+}
+
+/// `order=artist` treats an artistless printing the way every other ordering treats an absent
+/// value, rather than as a real rank at the far end.
+///
+/// `assign_artist_ranks` parks the artistless printings in a trailing rank block, and reporting
+/// that block as a VALUE made this the one ordering whose absent side moved with the direction in
+/// the wrong sense: last ascending (correct) but FIRST descending (not), because a real rank
+/// reflects under `desc` and an absent sentinel does not.
+#[test]
+fn an_artistless_printing_sorts_like_an_absent_value() {
+    let mut vocab = VocabInterner::new();
+    let cards = vec![stub_card(1, TYPE_CREATURE, &[], &mut vocab), stub_card(2, TYPE_CREATURE, &[], &mut vocab)];
+    let mut data = store_of(cards, &[1, 1], vocab);
+    let artist_vocab = vec!["aaa".to_string()];
+    data.printings[0].card_artist_vid = 0;
+    data.printings[1].card_artist_vid = ARTIST_NONE;
+    assign_artist_ranks(&mut data.printings, &artist_vocab);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+
+    // Asserted RELATIVE to a column that is already nullable, not against a fixed direction, so
+    // this pins the property that matters -- artist's absent side behaves like everybody else's --
+    // without also pinning WHICH side that is. It therefore holds both before and after the
+    // nulls-sort-lowest change, and would fail if only one of the two were ever flipped.
+    for descending in [false, true] {
+        let artist_named = sort_key_bits(&archived.cards[0], &archived.printings[0], SortCol::Artist, descending);
+        let artist_absent = sort_key_bits(&archived.cards[1], &archived.printings[1], SortCol::Artist, descending);
+        let cmc_present = perm_primary_key(Some(1.0), descending);
+        let cmc_absent = perm_primary_key(None, descending);
+        assert_eq!(
+            artist_absent > artist_named,
+            cmc_absent > cmc_present,
+            "artist's absent side disagrees with cmc's (descending={descending})",
+        );
+    }
 }

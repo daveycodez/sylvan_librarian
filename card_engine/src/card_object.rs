@@ -33,13 +33,37 @@ use serde_json::{Map, Value};
 const CARD_BACK_ID: &str = "0aeebaf5-8c7d-4636-9e82-8c27447861f7";
 
 /// Image size -> file extension, in Scryfall's own order.
-const IMAGE_EXTENSIONS: [(&str, &str); 6] = [
+///
+/// ELEVEN, not the six this file shipped with. Scryfall added five webp sizes — `thumb`, `grid`,
+/// `display`, `art`, `crop` — and every card object it serves carries all eleven; a six-key
+/// `image_uris` differed from Scryfall on every card object emitted.
+///
+/// Unconditional, and measured that way: across all 540,484 printings in the 2026-08-16 all_cards
+/// bulk, `image_uris` is either wholly ABSENT (8,444 cards, 7,641 faces — the layouts whose picture
+/// lives on the other level) or carries exactly these eleven keys in exactly this order. No card,
+/// face, layout or `image_status` carries a partial set, so there is no per-key conditionality to
+/// round-trip the way `printed_*` has.
+///
+/// Derived, not stored: the same scan confirms all eleven URLs are the same pure function of the id
+/// and the face on every one of the 548,604 objects that has them — `art_crop` and `art` are
+/// different sizes of one path, not a stored pair. These five cost zero archive bytes, which is why
+/// they are a table and not a column.
+///
+/// NOT the `version=` vocabulary of `format=image`, which stays six: measured against
+/// api.scryfall.com, `version=thumb` redirects to the LARGE jpg, the same fallback `version=bogus`
+/// gets, and the same for grid/display/art/crop.
+const IMAGE_EXTENSIONS: [(&str, &str); 11] = [
     ("small", "jpg"),
     ("normal", "jpg"),
     ("large", "jpg"),
     ("png", "png"),
     ("art_crop", "jpg"),
     ("border_crop", "jpg"),
+    ("thumb", "webp"),
+    ("grid", "webp"),
+    ("display", "webp"),
+    ("art", "webp"),
+    ("crop", "webp"),
 ];
 
 // ─── row accessors, mirroring the port's str/num/bool/list ───────────────────
@@ -332,8 +356,14 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     write_bool(out, &mut first, "highres_image", bool_of(row, "highres_image"));
     write_str_or_null(out, &mut first, "image_status", str_of(row, "image_status"));
     write_key(out, &mut first, "cmc");
-    match num_of(row, "cmc") {
-        Some(v) => serde_json::to_writer(&mut *out, v).expect("number"),
+    // As a DECIMAL, which is what api.scryfall.com answers with: `"cmc":1.0`, not `"cmc":1` (see
+    // https://api.scryfall.com/cards/named?exact=Lightning+Bolt). Writing the stored number
+    // directly emits `1`, because `magic.cards.cmc` is an integer column -- and that would also
+    // put the engine at odds with `to_scryfall_card`, which now carries the same value as a float.
+    // The two must agree byte for byte: the engine answers a card when it can and the SQL path
+    // answers it when the engine cannot, and a client must not be able to tell which one did.
+    match num_of(row, "cmc").and_then(serde_json::Value::as_f64) {
+        Some(v) => serde_json::to_writer(&mut *out, &v).expect("number"),
         None => out.extend_from_slice(b"null"),
     }
     write_str_or_null(out, &mut first, "type_line", str_of(row, "type_line"));
@@ -555,6 +585,50 @@ mod tests {
 
     /// Prices format to two decimals; a missing price is null rather than "0.00", and zero is a
     /// price like any other.
+    /// All ELEVEN sizes, in Scryfall's order, with the webp five spelled out.
+    ///
+    /// A key-SET test, not a URL-shape one: the six-key version of this table was wrong on every
+    /// card object for as long as it shipped, and neither parity harness could see it because both
+    /// reduce `image_uris` before comparing. Pinned to the bytes, so a size added in the middle of
+    /// the table fails here rather than reordering every card object silently.
+    #[test]
+    fn image_uris_carries_scryfalls_eleven_sizes_in_scryfalls_order() {
+        const EXPECTED: [(&str, &str); 11] = [
+            ("small", "jpg"),
+            ("normal", "jpg"),
+            ("large", "jpg"),
+            ("png", "png"),
+            ("art_crop", "jpg"),
+            ("border_crop", "jpg"),
+            ("thumb", "webp"),
+            ("grid", "webp"),
+            ("display", "webp"),
+            ("art", "webp"),
+            ("crop", "webp"),
+        ];
+        let id = "cd000000-0000-0000-0000-000000000002";
+        let expected = |face: &str, suffix: &str| {
+            let body = EXPECTED
+                .iter()
+                .map(|(size, ext)| {
+                    format!(r#""{size}":"https://cards.scryfall.io/{size}/{face}/c/d/{id}.{ext}{suffix}""#)
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{body}}}")
+        };
+
+        // Single-faced, with the cache-buster the row's image_updated_at supplies.
+        let mut out = Vec::new();
+        write_image_uris(&mut out, id, Some(1_783_903_008), "front");
+        assert_eq!(String::from_utf8(out).expect("utf-8"), expected("front", "?1783903008"));
+
+        // Per-face, back half, no cache-buster — the same eleven keys either way.
+        let mut out = Vec::new();
+        write_image_uris(&mut out, id, None, "back");
+        assert_eq!(String::from_utf8(out).expect("utf-8"), expected("back", ""));
+    }
+
     #[test]
     fn prices_are_two_decimals_or_null() {
         let card = build(json!({"name": "x", "scryfall_id": "ef000000-0000-0000-0000-000000000003",
@@ -633,5 +707,32 @@ mod tests {
         assert!(at(r#""prices":"#) < at(r#""watermark":"#));
         assert!(at(r#""watermark":"#) < at(r#""cardmarket_id":"#));
         assert!(at(r#""cardmarket_id":"#) < at(r#""security_stamp":"#));
+    }
+
+    #[test]
+    fn cmc_is_written_as_a_decimal() {
+        // api.scryfall.com answers `"cmc":1.0`, not `"cmc":1` -- the field is decimal because
+        // fractional mana values are real (Little Girl costs {HW} and answers `"cmc":0.5`). The
+        // stored value arrives as an INTEGER, because `magic.cards.cmc` is an integer column, and
+        // writing it straight through is what produced `1`.
+        let serde_json::Value::Object(map) = json!({
+            "name": "Lightning Bolt", "scryfall_id": "01000000-0000-0000-0000-000000000007", "cmc": 1,
+        }) else {
+            panic!()
+        };
+        let mut out = Vec::new();
+        write_scryfall_card(&mut out, &map, "https://api.example/v1");
+        let text = String::from_utf8(out).expect("utf-8");
+        assert!(text.contains(r#""cmc":1.0"#), "cmc must be decimal: {text}");
+
+        // And a card with no mana value at all still says so.
+        let serde_json::Value::Object(none) = json!({
+            "name": "Ancestral Vision", "scryfall_id": "01000000-0000-0000-0000-000000000008",
+        }) else {
+            panic!()
+        };
+        let mut out = Vec::new();
+        write_scryfall_card(&mut out, &none, "https://api.example/v1");
+        assert!(String::from_utf8(out).expect("utf-8").contains(r#""cmc":null"#));
     }
 }
