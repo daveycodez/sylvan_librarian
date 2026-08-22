@@ -153,8 +153,8 @@ def _extra() -> dict:
 @pytest.fixture(name="compat_corpus", scope="module")
 def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
     """Load this module's cards and their rulings once, then hand back the resource."""
-    api_resource._upsert_cards([copy.deepcopy(card) for card in (_bolt(), _bear(), _delver(), _extra())])
-    with api_resource._conn_pool.connection() as conn, conn.cursor() as cursor:
+    api_resource.admin._upsert_cards([copy.deepcopy(card) for card in (_bolt(), _bear(), _delver())])
+    with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
         cursor.execute("DELETE FROM magic.rulings WHERE oracle_id = %(oracle_id)s", {"oracle_id": BOLT_ORACLE_ID})
         # Three rulings across two dates, two of them same-day: a single ruling cannot tell one
         # ordering from another, which is how the ascending sort went unnoticed. Inserted oldest
@@ -170,8 +170,8 @@ def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
         conn.commit()
     # /cards/search runs through _search, which prefers the in-process engine when its store is
     # loaded -- a store built before this insert would answer every query here with zero rows.
-    api_resource._reload_engine(force=True)
-    api_resource._clear_caches()
+    api_resource.app_context.reload_engine(force=True)
+    api_resource.admin._clear_caches()
     return api_resource
 
 

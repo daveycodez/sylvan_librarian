@@ -10,8 +10,7 @@ from typing import Any, ClassVar
 
 import pytest
 
-from api.card_processing import preprocess_card
-from api.parsing.card_query_nodes import extract_frame_data_from_raw_card
+from api.card_processing import extract_frame_data_from_raw_card, preprocess_card
 
 # Project root directory for accessing sample data
 _PROJECT_ROOT = pathlib.Path(__file__).parent.parent.parent
@@ -128,13 +127,25 @@ class TestCardProcessing:
 
         # ORDINARY — served by a bare `/cards/search`.
         assert "extra" not in tags(legalities={"vintage": "not_legal"}), "cn2/6 is 200 bare"
-        assert "extra" not in tags(set_type="funny"), "e:ust answers 249 with and without the flag"
+        assert "extra" not in tags(set_type="funny", set_code="ust"), "e:ust answers 249 either way"
         assert "extra" not in tags(layout="reversible_card", name="Echo // Echo"), "tdm/380 is 200 bare"
         assert "extra" not in tags(promo_types=["sldbonus", "playtest"]), "sld/SCTLR is legal and served"
         # Unstable's Hosts and Augments: `is:extra e:ust` answers 0, and both layouts were in
         # _EXTRA_LAYOUTS until 2026-08-16. Asserted as a pair so re-adding either fails here.
-        assert "extra" not in tags(layout="host", set_type="funny"), "is:extra e:ust is 0"
-        assert "extra" not in tags(layout="augment", set_type="funny"), "is:extra e:ust is 0"
+        assert "extra" not in tags(layout="host", set_type="funny", set_code="ust"), "is:extra e:ust is 0"
+        assert "extra" not in tags(layout="augment", set_type="funny", set_code="ust"), "is:extra e:ust is 0"
+        # A funny set _FUNNY_EXTRA_SETS has never heard of is SERVED, not hidden — the stale-list
+        # failure mode that direction was chosen for.
+        assert "extra" not in tags(set_type="funny", set_code="un99"), "an unlisted funny set defaults to served"
+        assert "extra" not in tags(set_type="funny", set_code="sunf", type_line="Stickers"), "sunf's sheets are served"
+        # ...and the playtest promo inside a served un-set: `und`/`unh`'s "Look at Me, I'm R&D" is a
+        # real Un-card that merely depicts a playtest card, and `is:extra e:und` answers 0.
+        assert "extra" not in tags(
+            set_type="funny", set_code="und", promo_types=["playtest"], legalities={"vintage": "not_legal"}
+        ), "is:extra e:und is 0"
+        # Digital and never-legal are each ordinary alone; only the conjunction is the class.
+        assert "extra" not in tags(digital=True, set_type="alchemy"), "a playable Alchemy card is served"
+        assert "extra" not in tags(border_color="silver", set_type="expansion"), "567 silver printings are served"
 
         # EXTRA — 404 bare, 200 with include_extras=true.
         assert "extra" in tags(set_type="memorabilia"), "ced/78 appears only with extras"
@@ -146,6 +157,20 @@ class TestCardProcessing:
         # `content_warning`, the flag with no other signal behind it: layout `normal`, an ordinary
         # type line, legal somewhere. `is:extra e:lea` answers 1 and that one card is Crusade.
         assert "extra" in tags(content_warning=True), "lea/61 Crusade"
+        # A funny ODDITY set: `is:extra e:ulst` is 62 of 62, and its rows are field-for-field
+        # indistinguishable from the ust twins above — the set code is the whole signal.
+        assert "extra" in tags(set_type="funny", set_code="ulst", border_color="silver"), "is:extra e:ulst is 62"
+        # ...and a TOKEN in an unlisted funny set is still one: the funny rule adds and never
+        # subtracts, so a stale list cannot make a future un-set's tokens vanish from search.
+        assert "extra" in tags(set_type="funny", set_code="un99", layout="token"), "tokens survive a stale list"
+        # A digital printing legal in NO format: `is:extra e:hbg` is 122, 104 of them this class.
+        assert "extra" in tags(digital=True, set_type="alchemy", legalities={"alchemy": "not_legal", "historic": "not_legal"}), (
+            "hbg's Arena-only duplicates"
+        )
+        # A silver-bordered promo: pal04's Arena League un-cards, j17's Rules Lawyer, pust/punh.
+        assert "extra" in tags(border_color="silver", set_type="promo"), "pal04/10 Mise"
+        # A Secret Lair sticker sheet (sld/335-339), whose only tell is the type line.
+        assert "extra" in tags(type_line="Stickers", set_type="box"), "sld/336"
 
     def test_preprocess_card_keeps_non_paper_cards(self) -> None:
         """A digital-only printing is IMPORTED: Scryfall serves it with default parameters.
@@ -297,6 +322,15 @@ class TestCardProcessing:
         assert result["price_tix"] == 0.01
         assert result["card_set_code"] == "m15"
 
+    def test_preprocess_card_lists_its_one_illustration(self) -> None:
+        """A single-faced card shows one piece of art, and a card with none shows an empty list."""
+        with_art = preprocess_card(create_test_card(illustration_id="44444444-4444-4444-4444-444444444444"))[0]
+        assert with_art["illustration_ids"] == ["44444444-4444-4444-4444-444444444444"]
+
+        without_art = preprocess_card(create_test_card())[0]
+        assert without_art["illustration_id"] is None
+        assert without_art["illustration_ids"] == []
+
     def test_preprocess_card_processes_frame_data(self) -> None:
         """Test preprocess_card processes frame data correctly."""
         card_with_frame = create_test_card(
@@ -423,11 +457,16 @@ class TestCardProcessing:
         assert result[0]["flavor_text"] == "A flavor line."
 
     def test_preprocess_card_handles_non_numeric_power_toughness(self) -> None:
-        """Test preprocess_card handles non-numeric power/toughness values."""
+        """A printed `*` is ZERO; anything else non-numeric is still absent.
+
+        `tou<1` is 434 on api.scryfall.com against this engine's 273 and `tou=0` 432 against 272 --
+        160 cards, every one of them `*`-statted -- because absent compares false against
+        everything. Scryfall's own `tou:*` answers the same 432 as `tou=0`.
+        """
         card = create_test_card(
             keywords=[],
-            power="*",  # Non-numeric
-            toughness="X",  # Non-numeric
+            power="*",
+            toughness="X",  # Not a star and not a number: still absent.
             prices={},
         )
 
@@ -435,8 +474,41 @@ class TestCardProcessing:
 
         assert len(result) == 1
         result = result[0]
-        assert result["creature_power"] is None
+        assert result["creature_power"] == 0
         assert result["creature_toughness"] is None
+        # The printed strings are untouched -- they are what the card object serves.
+        assert result["creature_power_text"] == "*"
+
+    @pytest.mark.parametrize(
+        ("printed", "expected"),
+        [
+            ("*", 0),
+            ("1+*", 1),  # Allosaurus Rider, and api.scryfall.com answers pow=1 for it
+            ("*+1", 1),  # Souls of the Lost, tou=1
+            ("2+*", 2),  # Aysen Crusader, pow=2 and NOT pow=0
+            ("7-*", 7),
+            ("*\u00b2", 0),
+            ("3", 3),
+            ("-1", -1),
+            ("1.5", 1),  # int(float(...)) truncates, as maybe_int has always done
+            # `?` IS ZERO TOO, measured rather than reasoned from the star: Shellephant (ust/121)
+            # prints it on both sides and api.scryfall.com answers `tou=0` 1, `tou>=0` 1,
+            # `tou>0` 0. Read as absent it satisfied no comparison at all -- the whole of
+            # `toughness<1` answering 433 against 434.
+            ("?", 0),
+            ("X", None),
+            # `∞` stays absent: Infinity Elemental is `ulst`, which api.scryfall.com does not
+            # answer for, so there is no measurement to follow.
+            ("∞", None),
+        ],
+    )
+    def test_preprocess_card_substitutes_zero_for_a_printed_star(self, printed: str, expected: int | None) -> None:
+        """Every starred form the corpus prints, `?`, and the non-numbers that stay absent."""
+        card = create_test_card(keywords=[], power=printed, prices={})
+
+        result = preprocess_card(card)[0]
+
+        assert result["creature_power"] == expected
 
     def test_preprocess_hound_tamer_dfc(self) -> None:
         """A real transform card merges to one row: front stats, both faces searchable."""
@@ -543,6 +615,43 @@ class TestFaceMerging:
         assert merged["mana_cost_text"] == "{2}{U}"
         assert merged["illustration_id"] == "11111111-1111-1111-1111-111111111111"
 
+    def test_illustration_ids_list_every_face_front_first(self) -> None:
+        """The art a printing SHOWS is all of it, which is what art tags attach to.
+
+        `illustration_id` stays the front's for display, so the back's art exists nowhere else on
+        the row -- and `arttag:snow e:khm` is 75 on Scryfall against 73 for the front-only reading.
+        """
+        merged = preprocess_card(self._battle_card())[0]
+        assert merged["illustration_ids"] == [
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+        ]
+
+    def test_faces_sharing_the_cards_art_collapse_to_one_illustration(self) -> None:
+        """A split card (Fire // Ice) has one illustration on the CARD and none on its faces.
+
+        Both face rows therefore inherit the same id, and the merge must dedupe rather than list
+        it twice -- there is one piece of art to attach tags to.
+        """
+        card = create_test_card(
+            name="Flame // Frost",
+            layout="split",
+            illustration_id="33333333-3333-3333-3333-333333333333",
+            card_faces=[
+                {"name": "Flame", "type_line": "Instant", "mana_cost": "{R}", "oracle_text": "Deal 2 damage."},
+                {"name": "Frost", "type_line": "Instant", "mana_cost": "{U}", "oracle_text": "Tap target creature."},
+            ],
+        )
+        merged = preprocess_card(card)[0]
+        assert merged["illustration_ids"] == ["33333333-3333-3333-3333-333333333333"]
+
+    def test_a_face_with_no_art_at_all_contributes_nothing(self) -> None:
+        """A missing illustration is absent from the list, not a null entry in it."""
+        card = self._battle_card()
+        del card["card_faces"][1]["illustration_id"]
+        merged = preprocess_card(card)[0]
+        assert merged["illustration_ids"] == ["11111111-1111-1111-1111-111111111111"]
+
     def test_oracle_text_joins_faces_with_separator(self) -> None:
         """Each face's text is substring-searchable in the one joined column.
 
@@ -607,7 +716,10 @@ class TestFaceMerging:
             ],
         )
         merged = preprocess_card(card)[0]
-        assert merged["creature_power"] is None  # "*" is non-numeric
+        # `*` is ZERO, and `1+*` is 1 -- see maybe_stat_int. The point of this test is that the
+        # numeric and _text columns come from the SAME face, which they still do.
+        assert merged["creature_power"] == 0
+        assert merged["creature_toughness"] == 1
         assert merged["creature_power_text"] == "*"
         assert merged["creature_toughness_text"] == "1+*"
 
@@ -789,10 +901,18 @@ class TestEngineCardObjects:
     """
 
     @staticmethod
-    def _two_faced() -> dict:
-        """A transform card whose two faces disagree on every per-face field that matters."""
+    def _two_faced(
+        artist: str | None = None,
+        face_artists: tuple[str, str] = ("Front Artist", "Back Artist"),
+    ) -> dict:
+        """A transform card whose two faces disagree on every per-face field that matters.
+
+        `artist` is the CARD-level credit Scryfall sends beside the faces — joined with " & " when
+        the two faces have different artists, and the single name when they share one.
+        """
         return create_test_card(
             name="Front Test // Back Test",
+            artist=artist,
             layout="transform",
             lang="en",
             set_type="expansion",
@@ -809,7 +929,7 @@ class TestEngineCardObjects:
                     "toughness": "2",
                     "oracle_text": "Front text.",
                     "flavor_text": "Front flavor.",
-                    "artist": "Front Artist",
+                    "artist": face_artists[0],
                     "illustration_id": "11111111-1111-1111-1111-111111111111",
                 },
                 {
@@ -820,7 +940,7 @@ class TestEngineCardObjects:
                     "power": "3",
                     "toughness": "3",
                     "oracle_text": "Back text.",
-                    "artist": "Back Artist",
+                    "artist": face_artists[1],
                     "illustration_id": "22222222-2222-2222-2222-222222222222",
                 },
             ],
@@ -834,6 +954,23 @@ class TestEngineCardObjects:
         assert faces[1]["illustration_id"] == "22222222-2222-2222-2222-222222222222"
         assert faces[0]["artist"] == "Front Artist"
         assert faces[1]["artist"] == "Back Artist"
+
+    def test_a_cards_artist_is_scryfalls_and_never_a_faces(self) -> None:
+        """The card's joined credit survives the face overlay, and a shared one is not doubled.
+
+        `card_artist` is read off the merged dict, and the face overlay had already put face 0's
+        `artist` there — so a card drawn by two people was credited to the front one alone. Taking
+        Scryfall's own card-level string rather than joining the faces is what makes the shared
+        case right for free: two faces by one artist keep the single name.
+        """
+        two = preprocess_card(self._two_faced(artist="Front Artist & Back Artist"))[0]
+        assert two["card_artist"] == "Front Artist & Back Artist"
+        assert [face["artist"] for face in two["card_faces"]] == ["Front Artist", "Back Artist"]
+
+        shared = preprocess_card(
+            self._two_faced(artist="Solo Artist", face_artists=("Solo Artist", "Solo Artist")),
+        )[0]
+        assert shared["card_artist"] == "Solo Artist"
 
     def test_back_face_stats_survive_the_merge(self) -> None:
         """Both faces' stats stay reachable, retiring the merge's documented residual.

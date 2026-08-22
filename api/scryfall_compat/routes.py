@@ -1214,8 +1214,8 @@ class ScryfallCardsRoutes:
             The result rows.
         """
         params = {k: db_utils.maybe_json(v) for k, v in params.items()}
-        with self._conn_pool.connection() as conn, conn.cursor() as cursor:
-            self._set_statement_timeout(cursor, 10_000)
+        with self.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
+            db_utils.set_statement_timeout(cursor, 10_000)
             cursor.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
 
@@ -1229,13 +1229,13 @@ class ScryfallCardsRoutes:
         if not settings.enable_engine:
             return None
         try:
-            if self._engine.size() == 0:
+            if self.app_context.engine.size() == 0:
                 self._trigger_background_reload_if_needed()
                 return None
         # An engine that cannot report its size cannot serve, whatever the reason.
         except Exception:  # noqa: BLE001
             return None
-        return self._engine
+        return self.app_context.engine
 
     def _sets_with_extras(self) -> frozenset[str]:
         """The set codes holding at least one `is:extra` printing, lowercased.
@@ -2143,8 +2143,8 @@ class ScryfallCardsRoutes:
             falcon_response: The Falcon response to write to.
             q: The partial name.
             pretty: Whether to indent JSON output.
-            include_extras: Accepted, ignored -- the autocomplete catalog is names, and this
-                surface has never scoped it by the extras class.
+            include_extras: Accepted, ignored -- Scryfall's own catalog excludes extras
+                unconditionally, and so does the engine (`autocomplete_names`).
 
         Returns:
             A Catalog object of card names.
@@ -2164,6 +2164,13 @@ class ScryfallCardsRoutes:
 
         # The ENGINE first, for the same reason the fuzzy match above now does: `autocomplete` was
         # added by "Fuzzy Name Match and Autocomplete, Computed Not Stored" and nothing called it.
+        #
+        # AND IT DELIBERATELY DISAGREES WITH THE SQL BELOW NOW. That query orders by
+        # `length(card_name)`; api.scryfall.com orders by `pg_trgm` similarity over the COLLATED
+        # name and hides extras, which is measured in `autocomplete_names`' own comment (30
+        # prefixes, 546 adjacent pairs, zero inversions). The SQL cannot express either half --
+        # neither the collation nor the extras class exists as a column -- so it stays what it has
+        # always been, the degraded answer for a request the engine could not serve at all.
         engine = self._engine_for_lookup()
         if engine is not None:
             try:

@@ -121,6 +121,8 @@ pub(crate) fn has_printing_varying_leaf(f: &FilterExpr) -> bool {
         | FilterExpr::OracleIdMatch { .. }
         // ...and so is its set count: `single_set` is decided once, at build, over every printing.
         | FilterExpr::SingleSet
+        // ...and so are its faces and their texts, which is all `is:vanilla` reads.
+        | FilterExpr::VanillaFace
         | FilterExpr::ColorCmp { .. }
         | FilterExpr::TypeCmp { .. }
         | FilterExpr::ManaCostCmp { .. }
@@ -416,7 +418,7 @@ fn estimate_leaf(f: &FilterExpr, indexes: &Archived<CardIndexes>, n_cards: u32, 
         // "3+" can't be split — the saturated superset (count clamped to 3, the
         // 3+ bucket ⊇ ≥k for k≥3) is a sound upper bound. Superset is Ge-based,
         // so it's sound only for Ge/Gt; Le/Lt/Eq/Ne that decline stay unknown.
-        FilterExpr::Devotion { op, pips } => match plane_popcount(f, indexes, n_cards) {
+        FilterExpr::Devotion { op, pips, .. } => match plane_popcount(f, indexes, n_cards) {
             Some((c, _)) => exact(c),
             None if matches!(op, CmpOp::Ge | CmpOp::Gt) => compile_devotion_superset(*pips)
                 .and_then(|pe| plane_expr_popcount(&pe, indexes, n_cards))
@@ -473,7 +475,12 @@ fn estimate_leaf(f: &FilterExpr, indexes: &Archived<CardIndexes>, n_cards: u32, 
         // Neither has an index to count through: `is:localizedname` reads a field on the printing
         // (and widens, so it is unreachable here for the same reason LangMatch is), and `is:unique`
         // a bool on the card. Both are a full-scan verify, and "unknown" says exactly that.
-        FilterExpr::PrintedNamePresent | FilterExpr::SingleSet | FilterExpr::FlavorNameIn { .. } => unknown(n),
+        // `is:vanilla` joins them: a per-face text walk with no index behind it, so a full-scan
+        // verify and nothing to count through.
+        FilterExpr::PrintedNamePresent
+        | FilterExpr::SingleSet
+        | FilterExpr::VanillaFace
+        | FilterExpr::FlavorNameIn { .. } => unknown(n),
 
         // Printing-space CSR width sums → project (varying).
         FilterExpr::ArtistMatch { ids } => {

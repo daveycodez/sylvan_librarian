@@ -13,15 +13,6 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 
-def extract_image_location_uuid(card: dict[str, Any]) -> str:
-    """Extract the image location UUID from a card."""
-    for image_location in card.get("image_uris", {}).values():
-        if ".jpg" in image_location:
-            return image_location.rpartition("/")[-1].partition(".")[0]
-    msg = f"No image location found for card: {card}"
-    raise AssertionError(msg)
-
-
 # Card types that can exist as a permanent on the battlefield. Devotion (MTG
 # comprehensive rules) is defined only over permanents' mana costs, confirmed
 # against the real Scryfall API (devotion: never matches a pure Instant/Sorcery,
@@ -63,6 +54,63 @@ def maybe_int(val: str | int | float | None) -> int | None:
     return int(float(val))
 
 
+@maybeify
+def maybe_stat_int(val: str | int | float | None) -> int | None:
+    """Convert a printed POWER or TOUGHNESS to int, where `*` AND `?` ARE NUMBERS AND BOTH ARE ZERO.
+
+    `maybe_int` reads `*` as absent, and absent compares false against everything, so the whole
+    `*`-statted population fell out of every power/toughness comparison: `tou<1` is 434 on
+    api.scryfall.com against this engine's 273, `tou=0` 432 against 272 -- 160 cards. Scryfall's
+    own `tou:*` answers the same 432 as `tou=0`; the star is not a third state there.
+
+    The star is SUBSTITUTED, not the value replaced -- the printed arithmetic still runs. Measured
+    2026-08-17, one card per form:
+
+        Allosaurus Rider   power     1+*   matches pow=1, not pow=0
+        Souls of the Lost  toughness *+1   matches tou=1
+        Aysen Crusader     power     2+*   matches pow=2, and NOT pow=0
+
+    The corpus prints six starred forms -- `*`, `1+*`, `*+1`, `2+*`, `7-*` and one `*\u00b2` --
+    and this grammar covers exactly those: a term is a signed number or a star, and the terms are
+    summed. A form it does not recognise raises and `maybeify` returns None, which is the
+    pre-existing behaviour and the safe direction to be wrong in.
+
+    A PRINTED `?` IS ZERO ON ITS OWN MEASUREMENT, not by analogy with the star. `Shellephant`
+    (ust/121) prints `?` on both sides, and on api.scryfall.com 2026-08-17
+    `!"Shellephant" tou=0` is 1, `tou>=0` is 1 and `tou>0` is 0 -- so Scryfall holds exactly 0
+    for it, the same value it holds for a star. Read as ABSENT it satisfied no comparison against
+    its own column at all, which is why it fell out of the range queries and not just the equality
+    ones: `toughness<1` answered 433 here against Scryfall's 434, and `?` was the whole of that
+    one row. The corpus prints `?` on three cards (Shellephant, `Loopy Lobster` cmb1,
+    `Catch of the Day` mb2) and only Shellephant is in a set api.scryfall.com answers for at all.
+
+    `\u221e` is deliberately NOT here: `Infinity Elemental` is `ulst`, which api.scryfall.com does
+    not answer for either, so there is no measurement to follow -- the same rule that keeps
+    loyalty's two starred cards on `maybe_int` below.
+
+    Loyalty deliberately keeps `maybe_int`: the two cards printing `*` there are funny-set cards
+    api.scryfall.com will not answer for at all, so there is no measurement to follow.
+    """
+    try:
+        return int(float(val))
+    except (ValueError, TypeError):
+        pass
+    text = str(val).strip()
+    if "*" not in text and "?" not in text:
+        raise ValueError(text)
+    total = 0.0
+    sign = 1
+    for index, piece in enumerate(re.split(r"(?<=.)([+-])", text)):
+        if index % 2:
+            sign = -1 if piece == "-" else 1
+            continue
+        term = piece.strip()
+        if term in {"*", "*\u00b2", "?"}:
+            continue  # `*`, `*` squared and `?` are all zero
+        total += sign * float(term)
+    return int(total)
+
+
 def rarity_text_to_int(rarity_text: str) -> int:
     """Convert rarity text to int."""
     rarity_map = {
@@ -94,6 +142,31 @@ def extract_collector_number_int(collector_number: str | int | float | None) -> 
     return None  # Field will be null by default
 
 
+def extract_frame_data_from_raw_card(raw_card: dict) -> dict[str, bool]:
+    """Extract frame data from a raw card dictionary.
+
+    Combines frame version and frame effects into a single JSONB object,
+    following the same pattern as _preprocess_card method.
+
+    Args:
+        raw_card: Raw card dictionary from Scryfall API.
+
+    Returns:
+        Dictionary mapping frame data keys to True.
+    """
+    frame_data = {}
+
+    # Add frame version if present (titlecased for consistency)
+    frame_version = raw_card.get("frame")
+    if frame_version:
+        frame_data[frame_version.title()] = True
+
+    # Add frame effects if present (titlecased for consistency)
+    frame_effects = raw_card.get("frame_effects", [])
+    for effect in frame_effects:
+        frame_data[effect.title()] = True
+
+    return frame_data
 # Face-merge policy for multi-face cards (#400, #873). Scryfall AND's search predicates at the
 # CARD level, each satisfiable by any face — measured against api.scryfall.com 2026-08-08:
 # `t:sorcery t:land` returns the MDFC lands (no single face is both), o: conjunctions match
@@ -103,7 +176,10 @@ def extract_collector_number_int(collector_number: str | int | float | None) -> 
 # on top of colliding on the scryfall_id primary key, which is how the back face silently won
 # until now. Front-face scalars (cmc, mana cost, illustration, image, prices) match Scryfall's
 # own top-level fields, verified on its card objects.
-_FACE_LIST_UNIONS = ("card_types", "card_subtypes")
+# `illustration_ids` is here and not among the front-face scalars because a printing SHOWS every
+# face's art, and the art tags attached to it are the union over all of them (api/tag_import.py).
+# `illustration_id` stays the front's, matching Scryfall's own top-level field.
+_FACE_LIST_UNIONS = ("card_types", "card_subtypes", "illustration_ids")
 _FACE_FLAG_UNIONS = ("card_colors", "card_keywords", "produced_mana")
 # The printed keyword list is a LIST, so its face merge is an order-preserving union rather than a
 # dict update.
@@ -303,6 +379,38 @@ def _merge_processed_faces(faces: list[dict[str, Any]]) -> dict[str, Any]:
 # 2026-08-16; 46 printings across ust/und/ulst stop carrying `is:extra`.
 _EXTRA_LAYOUTS = frozenset({"token", "double_faced_token", "emblem", "planar", "scheme", "vanguard", "art_series", "front_card"})
 
+# The `funny` sets Scryfall hides behind `include_extras`. Every OTHER funny set is served
+# ordinarily, and both halves are total: measured on api.scryfall.com 2026-08-16, all 22 funny sets
+# in the corpus answer `is:extra e:<code>` with either their whole card count or zero — never
+# anything in between.
+#
+#   whole set extra   cmb1 121  cmb2 121  h17 4  hho 21  ph17 3  ph18 4  ph19 7  ph20 3  ph21 4
+#                     ph22 5  ph23 2  phtr 3  punk 52  ulst 62  unk 512
+#   whole set served  ptg 0  sunf 0  ugl 0  und 0  unf 0  unh 0  ust 0
+#
+# NOTHING ON THE PRINTING PREDICTS THE SPLIT, and that is a measurement rather than a shrug. The
+# ulst rows (The List's Unstable reprints) were diffed field by field against their own ust twins
+# over the whole 2026-08-16 bulk: of the 40-odd keys, the only values ulst holds that no
+# ust/und/unh/unf/ugl row holds are `highres_image: false` and `image_status: "lowres"` — scan
+# quality, and not even uniform across ulst. `set_type`, `border_color` (silver both), `layout`,
+# `security_stamp`, `promo_types`, `frame_effects`, `games`, `finishes`, `booster`, `reprint`,
+# `content_warning`, `legalities` (never legal both) all overlap. Widening the comparison to the
+# two GROUPS — 927 printings across the 15 extra sets against 1,310 across the 7 served ones —
+# found no field whose value set separates them either.
+#
+# The SET objects do not predict it: `foil_only` is true for both h17 (extra) and ptg (served),
+# `parent_set_code` is set on both punk (extra) and sunf (served), `tcgplayer_id` is set on both
+# unk (extra) and ptg (served), and `card_count`/`printed_size`/`digital`/`block` split neither
+# way. So it is editorial data in Scryfall's own database, and a list is the only faithful port.
+#
+# SPELLED AS THE EXTRA SIDE ON PURPOSE. A funny set this list has never heard of is served
+# ORDINARILY, so the failure mode of a stale list is a handful of employee-award or convention
+# cards leaking into search — not a 639-card retail Un-set vanishing from it, which is what
+# defaulting the other way would risk the first time Wizards prints another one.
+_FUNNY_EXTRA_SETS = frozenset(
+    {"cmb1", "cmb2", "h17", "hho", "ph17", "ph18", "ph19", "ph20", "ph21", "ph22", "ph23", "phtr", "punk", "ulst", "unk"}
+)
+
 
 # The `is:` value the extras class is stored under. Read by `api_resource`'s default
 # `include_extras=false` conjunct and by the compat route's auto-enable walk; spelled once more in
@@ -316,12 +424,53 @@ def _is_extra(card: dict[str, Any]) -> bool:
 
     See `preprocess_card` for the per-class probe that decided each half of this.
 
+    MEASURED COVERAGE (2026-08-16, the 114,068 English printings of the all_cards bulk against
+    api.scryfall.com's own `is:extra`, 10,818 printings): this class reaches 10,732 — 45 short and
+    none over. The 45 are Arena-only duplicate printings with no signal on them at all (hbg 18,
+    j21 16, ydmu 9, ybro 1) plus one Secret Lair poster; the same field-by-field diff that cleared
+    `_FUNNY_EXTRA_SETS` finds nothing separating them from their own set-mates either, so they are
+    left rather than enumerated one id at a time. Before the funny/digital/silver-promo/Stickers
+    clauses it reached 10,482 with 308 misses and 2 false positives.
+
     Args:
         card: The bulk card object.
 
     Returns:
         True when the printing should carry `is:extra`.
     """
+    never_legal = not set(card["legalities"].values()) & {"legal", "restricted"}
+    # A FUNNY SET DECIDES FOR ITS PRINTINGS — see `_FUNNY_EXTRA_SETS` for the measurement and for
+    # why no printing field can stand in for the list.
+    #
+    # A funny set the list names is extra outright. A funny set it does NOT name still falls
+    # through to the layout, memorabilia, content-warning and "Card"/"Token" clauses below, and
+    # skips only the two that measurably misfire inside the un-sets: `und`/`unh` carry a `playtest`
+    # promo each ("Look at Me, I'm R&D", a real Un-card that merely DEPICTS a playtest card) and
+    # `sunf` ships 48 sticker sheets, and all three sets answer `is:extra` 0 on api.scryfall.com.
+    #
+    # FALLING THROUGH RATHER THAN RETURNING FALSE IS THE POINT. An early False would let a future
+    # funny set's tokens, planes or vanguards vanish from search the moment the list went stale --
+    # the silent-vanishing failure this list's polarity was chosen to avoid, reintroduced one level
+    # down. It costs nothing today: of the 57 funny printings another clause would call extra
+    # (punk 52 planar, cmb1/cmb2 1 vanguard each, hho/h17 1 token each) every one is already in a
+    # listed set, so the two rules agree wherever they overlap.
+    funny = card.get("set_type") == "funny"
+    if funny and card.get("set") in _FUNNY_EXTRA_SETS:
+        return True
+    # A DIGITAL PRINTING NO FORMAT ALLOWS. Arena's Alchemy duplicates and the Astral cards from the
+    # 1997 MicroProse game are legal nowhere and served nowhere: 117 printings across hbg (104),
+    # past (12) and prm (1), every one of them inside Scryfall's `is:extra` and not one outside it,
+    # over the whole English corpus. Digital and never-legal are each ordinary on their own —
+    # Alchemy's playable cards are legal in alchemy/historic, and paper's never-legal conspiracies
+    # are ordinary results — so it is the conjunction that carries the class.
+    if card.get("digital") is True and never_legal:
+        return True
+    # A SILVER-BORDERED PROMO: an Un-card handed out outside its own set (Arena League, judge
+    # gifts, prerelease stamps). 10 printings across pal04/j17/p30m/punh/pust, all extras, no false
+    # positive — silver alone is not the class (567 silver printings are ordinary), and neither is
+    # `promo`.
+    if card.get("border_color") == "silver" and card.get("set_type") == "promo":
+        return True
     if card.get("layout") in _EXTRA_LAYOUTS:
         return True
     if card.get("set_type") == "memorabilia":
@@ -334,18 +483,20 @@ def _is_extra(card: dict[str, Any]) -> bool:
     # are the same story. Measured 2026-08-16: `is:extra e:lea` answers 1.
     if card.get("content_warning") is True:
         return True
-    # A "Card"/"Token" TYPE LINE, for the printings whose layout does not already say so: the
-    # checklist and substitute-card family ships as layout `normal` in some sets.
+    # A "Card"/"Token"/"Stickers" TYPE LINE, for the printings whose layout does not already say
+    # so: the checklist and substitute-card family ships as layout `normal` in some sets, and the
+    # Secret Lair sticker sheets (sld/335-339) ship as an ordinary `normal` box-set printing whose
+    # only tell is the type. `Stickers` is guarded on `funny` because `sunf` ships 48 sticker
+    # sheets that Scryfall serves; `Card`/`Token` need no guard, and deliberately do not have one.
     type_line = card.get("type_line")
     if type_line:
         card_types, _ = parse_type_line(type_line)
-        if any(t in {"Card", "Token"} for t in card_types):
+        if any(t == "Card" or t == "Token" or (t == "Stickers" and not funny) for t in card_types):  # noqa: PLR1714
             return True
     # A playtest promo, EXCEPT where the printing is otherwise playable: sld/SCTLR Counterspell
     # carries `playtest`, is legal in modern, and is returned by a bare
     # `!"Counterspell"&unique=prints` — so the flag alone hides nothing.
-    never_legal = not set(card["legalities"].values()) & {"legal", "restricted"}
-    return "playtest" in card.get("promo_types", []) and never_legal
+    return "playtest" in card.get("promo_types", []) and never_legal and not funny
 
 
 def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0915,C901,PLR0912
@@ -442,6 +593,28 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
         # The printed-language COLUMNS are the card-level triple. The per-face recursion above
         # merged each face's own printed keys into its row, so without this the front face's
         # printed_name would masquerade as the card's — the per-face halves ride card_faces.
+        # ...and so is the ARTIST. A card drawn by two people carries the JOINED credit at card
+        # level ("David Martin & Franz Vohwinkel" on Fire // Ice, dmr/215) and the per-face credit
+        # inside card_faces, so the same face overlay put face 0's artist on the merged row and
+        # `card_artist` came out "David Martin". 1,158 printings in the 2026-08-16 default_cards
+        # bulk carry a two-artist credit, and three surfaces read this one column: the card
+        # object's `artist`, `order=artist` (api.scryfall.com sorts Fire // Ice AFTER all six
+        # plain "David Martin" dmr cards, i.e. on the joined string), and `a:` (`a:"franz
+        # vohwinkel"` returns it there — artist search covers non-front faces).
+        #
+        # Scryfall's own string, never a join recomputed over the faces: that is what keeps the
+        # 4,951 multi-faced cards whose faces share one artist on a single name rather than
+        # "X & X", and the string is not re-splittable afterwards either — "Hari & Deepti" is ONE
+        # artist of ten printings.
+        merged_row["card_artist"] = card.get("artist")
+        # ...and so is the LAYOUT, which is the one other key a FACE can genuinely carry. Scryfall
+        # puts `layout` on the faces of reversible cards and on nothing else: over the whole
+        # 2026-08-15 all_cards bulk exactly 81 cards have a face-level `layout`, and all 81 are
+        # `reversible_card`. The overlay above put the face's value on every face row, so
+        # `card_layout` came out of the FRONT face -- 77 of the 81 stored as `normal`, 3 as
+        # `adventure`, 1 as `token` -- and `layout:reversible_card` answered nothing at all.
+        if "layout" in card:
+            merged_row["card_layout"] = card["layout"].lower()
         merged_row["printed_name"] = card.get("printed_name")
         merged_row["flavor_name"] = card.get("flavor_name")
         merged_row["printed_type_line"] = card.get("printed_type_line")
@@ -473,8 +646,11 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
 
     card["planeswalker_loyalty"] = maybe_int(card.get("loyalty"))
     if "Creature" in card_types or {"Vehicle", "Spacecraft"} & set(card_subtypes):
-        card["creature_power"] = maybe_int(card.get("power"))
-        card["creature_toughness"] = maybe_int(card.get("toughness"))
+        # `maybe_stat_int`, not `maybe_int`: a printed `*` is ZERO on both sides of a
+        # power/toughness comparison -- see its docstring for the three cards that pin the
+        # arithmetic. The printed strings two lines down are untouched.
+        card["creature_power"] = maybe_stat_int(card.get("power"))
+        card["creature_toughness"] = maybe_stat_int(card.get("toughness"))
         card["creature_power_text"] = card.get("power")
         card["creature_toughness_text"] = card.get("toughness")
     else:
@@ -510,17 +686,7 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
 
     card["edhrec_rank"] = card.get("edhrec_rank")
 
-    # Extract frame data - combine frame version and frame effects into single JSONB object
-    frame_data = {}
-    # Add frame version if present (titlecased for consistency)
-    frame_version = card.get("frame")
-    if frame_version:
-        frame_data[frame_version.title()] = True
-    # Add frame effects if present (titlecased for consistency)
-    frame_effects = card.get("frame_effects", [])
-    for effect in frame_effects:
-        frame_data[effect.title()] = True
-    card["card_frame_data"] = frame_data
+    card["card_frame_data"] = extract_frame_data_from_raw_card(card)
 
     # Extract pricing data if available - ensure they are floats for jsonb_populate_record
     prices = card.get("prices", {})
@@ -592,6 +758,12 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
     card["collector_number"] = collector_number
     card["collector_number_int"] = extract_collector_number_int(collector_number)
     card["illustration_id"] = card.get("illustration_id")
+    # Every illustration this row SHOWS, front first. One entry here, and `_FACE_LIST_UNIONS`
+    # below appends the other faces' when the faces merge, so a merged row lists the front's
+    # (which is also `illustration_id`) followed by each later face's. A face carrying no art of
+    # its own -- split, adventure and flip cards put one `illustration_id` on the card and none on
+    # the faces -- inherits the card's here and dedupes back to one on merge.
+    card["illustration_ids"] = [card["illustration_id"]] if card["illustration_id"] else []
 
     # Handle legalities and produced_mana defaults
     card.setdefault("card_legalities", card.get("legalities", {}))
