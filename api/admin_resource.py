@@ -49,7 +49,7 @@ from api.db.bulk_upsert import bulk_upsert as _bulk_upsert
 
 # BOOLEAN_IS_TAGS lives in db_info because the parser reads it too (rewrite.SUPPORTED_IS_VALUES)
 # and cannot import this module.
-from api.parsing.db_info import ARRAY_IS_TAGS, BOOLEAN_IS_TAGS
+from api.parsing.db_info import BOOLEAN_IS_TAGS
 from api.scryfall_bulk_data_fetcher import BulkDataKey, ScryfallBulkDataFetcher
 from api.settings import settings
 from api.tag_import import import_art_tags as _import_art_tags
@@ -736,7 +736,7 @@ class AdminResource:
         }
 
     def _sync_boolean_is_tags(self, conn: Connection) -> int:
-        """Sync the blob-backed is: tags (BOOLEAN_IS_TAGS + ARRAY_IS_TAGS) from raw_card_blob.
+        """Sync the row-derived is: tags (BOOLEAN_IS_TAGS) from each card's own columns.
 
         Rebuilds each card's managed keys as (existing minus managed) plus the keys whose
         blob-derived expression is true, touching only rows whose result actually differs

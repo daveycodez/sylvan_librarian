@@ -17,7 +17,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from api.parsing.card_query_nodes import CardAttributeNode
-from api.parsing.db_info import ARRAY_IS_TAGS, BOOLEAN_IS_TAGS
+from api.parsing.db_info import BOOLEAN_IS_TAGS
 from api.parsing.hand_parser import parse_query as _parse_query
 from api.parsing.nodes import (
     AndNode,
@@ -301,7 +301,7 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
         'o:"{w/u/p}" or o:"{w/b/p}" or o:"{u/b/p}" or o:"{u/r/p}" or o:"{b/r/p}" or o:"{b/g/p}" or '
         'o:"{r/g/p}" or o:"{r/w/p}" or o:"{g/w/p}" or o:"{g/u/p}"'
     ),
-    # Spelling aliases of tags the importer stores (db_info.BOOLEAN_IS_TAGS / ARRAY_IS_TAGS).
+    # Spelling aliases of tags the importer stores (db_info.BOOLEAN_IS_TAGS).
     # Aliased rather than stored twice: a second copy of a 3,228-card tag is bytes for nothing.
     ("is", "full"): "is:fullart",
     ("is", "promostamped"): "is:stamped",
@@ -381,7 +381,6 @@ ENGINE_IS_VALUES: frozenset[str] = frozenset({"localizedname", "unique", "vanill
 # tag added to the importer from being reported unsupported by the parser.
 SUPPORTED_IS_VALUES: frozenset[str] = (
     frozenset(BOOLEAN_IS_TAGS)
-    | frozenset(ARRAY_IS_TAGS)
     | ENGINE_IS_VALUES
     | frozenset(value for alias, value in _DERIVED_EXPANSIONS if alias == "is")
 )
