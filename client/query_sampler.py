@@ -209,6 +209,7 @@ STATIC_VALUES: dict[str, list[str]] = {
         "is:historic",
         "is:hybrid",
         "is:host",
+        "is:judge",
         "is:karoo",
         "is:leveler",
         "is:manland",

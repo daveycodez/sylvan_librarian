@@ -121,12 +121,8 @@ EQUIVALENCES = [
     # Scryfall's second names for land cycles we already carry, and the ones we did not.
     ("is:karoo", "otag:bounceland"),
     ("is:canland", "otag:cycle-horizon-land"),
-    ("is:bikeland", "otag:cycle-bicycle-land"),
-    ("is:cycleland", "otag:cycle-bicycle-land"),
-    ("is:bicycleland", "otag:cycle-bicycle-land"),
-    ("is:surveilland", "otag:cycle-mkm-surveil-land"),
-    ("is:tricycleland", "otag:cycle-iko-triome or otag:cycle-snc-triland"),
-    ("is:pathway", "t:land name:pathway"),
+    ("is:cycleland", "otag:cycle-dual-cycling-land"),
+    ("is:bicycleland", "otag:cycle-dual-cycling-land"),
     # Frame effects and layouts that were already expressible and simply had no entry.
     ("is:showcase", "frame:showcase"),
     ("is:extendedart", "frame:extendedart"),
