@@ -204,11 +204,12 @@ class TestToScryfallCard:
         assert card["oracle_text"] == "Lightning Bolt deals 3 damage to any target."
         assert card["image_uris"]
 
-    def test_a_multi_faced_card_moves_its_text_into_the_faces(self):
+    def test_a_two_image_card_moves_its_text_and_its_pictures_into_the_faces(self):
         """Which keys sit at top level varies by LAYOUT, so this is a branch, not a fixed shape."""
         card = to_scryfall_card(
             row(
                 name="Delver of Secrets // Insectile Aberration",
+                layout="transform",
                 card_faces=[
                     {"name": "Delver of Secrets", "oracle_text": "Front.", "mana_cost": "{U}"},
                     {"name": "Insectile Aberration", "oracle_text": "Back.", "power": "3"},
@@ -222,6 +223,55 @@ class TestToScryfallCard:
         # Each face gets its own side of the CDN path.
         assert "/front/" in card["card_faces"][0]["image_uris"]["large"]
         assert "/back/" in card["card_faces"][1]["image_uris"]["large"]
+        # ...and the keys that belong to a face on a two-image layout leave the top level.
+        for key in ("colors", "card_back_id", "illustration_id"):
+            assert key not in card
+
+    def test_a_one_image_multi_face_card_keeps_its_picture_and_cost_at_top_level(self):
+        """A split card is ONE piece of cardboard, so its faces get no `image_uris` of their own.
+
+        Gating on the face COUNT rather than the layout invents a `.../back/...` URL with no image
+        behind it on every split, flip, adventure and prepare printing. The top-level cost is the
+        faces' joined " // " -- skipping the faces that have none, so flipped Erayo is `{1}{U}` and
+        not `{1}{U} // `.
+        """
+        card = to_scryfall_card(
+            row(
+                name="Fire // Ice",
+                layout="split",
+                card_faces=[
+                    {"name": "Fire", "oracle_text": "Two damage.", "mana_cost": "{1}{R}"},
+                    {"name": "Ice", "oracle_text": "Tap target.", "mana_cost": "{1}{U}"},
+                ],
+            )
+        )
+        assert "image_uris" not in card["card_faces"][0]
+        assert "image_uris" not in card["card_faces"][1]
+        assert card["image_uris"]
+        assert card["mana_cost"] == "{1}{R} // {1}{U}"
+        # ...and a two-image layout's face-owned keys stay at top level here.
+        assert card["card_back_id"]
+
+    def test_a_reversible_printing_drops_the_three_keys_its_faces_carry(self):
+        """A reversible printing keeps nothing of the card at top level.
+
+        All 81 omit `oracle_id`, `cmc` and `type_line` there, and carry the card's `oracle_id` and
+        `cmc` on both faces instead.
+        """
+        card = to_scryfall_card(
+            row(
+                name="Propaganda // Propaganda",
+                layout="reversible_card",
+                card_faces=[
+                    {"name": "Propaganda", "oracle_text": "Front.", "mana_cost": "{2}{U}"},
+                    {"name": "Propaganda", "oracle_text": "Back.", "mana_cost": "{2}{U}"},
+                ],
+            )
+        )
+        for key in ("oracle_id", "cmc", "type_line"):
+            assert key not in card
+        assert all(f["oracle_id"] == "11111111-2222-3333-4444-555555555555" for f in card["card_faces"])
+        assert all(f["cmc"] == 1.0 for f in card["card_faces"])
 
     def test_related_cards_pass_through_when_present(self):
         parts = [{"object": "related_card", "id": "x", "component": "token", "name": "Goblin", "type_line": "Token"}]

@@ -18,6 +18,8 @@ import closes.
 from __future__ import annotations
 
 import datetime
+import re
+import string
 import urllib.parse
 import uuid
 from typing import Any
@@ -177,39 +179,142 @@ def _image_uris(scryfall_id: str, updated_at: int | None, face: str = "front") -
     }
 
 
+# Characters Scryfall DELETES from a slug rather than hyphenating. Live-derived: "Erayo's Essence"
+# slugs to `erayos-essence` (not `erayo-s-essence`), "S.H.I.E.L.D." to `shield`, `Henzie "Toolbox"
+# Torre` to `henzie-toolbox-torre`, and the zhs printings of Kongming/Pang Tong pin the curly
+# quotes. U+201E ("bottom quote") is NOT deleted -- `Henzie ,,Der Beschaffer" Torre` (de) keeps it.
+_SLUG_DELETED = frozenset("'\",./\u201c\u201d")
+
+# Slug bytes served literally; every other byte is UTF-8 percent-encoded, uppercase hex. The literal
+# set is exactly what appears un-encoded across the bulk corpus; `?` is the one ASCII special
+# observed encoded. Unobserved characters encode, which can never break a URL.
+_SLUG_LITERAL = frozenset(string.ascii_letters + string.digits + "!&()+-:;=_")
+
+# The languages Scryfall writes into the scryfall_uri path -- its ten print localizations, exactly.
+# The glyph and novelty languages (ph, qya, he, la, grc, ar, sa, dw) get NO path segment: a ph Elesh
+# Norn lives at `/card/one/414/elesh-norn-mother-of-machines`, English form.
+_SLUG_LANG_SEGMENTS = frozenset({"de", "es", "fr", "it", "ja", "ko", "pt", "ru", "zhs", "zht"})
+
+
 def _slug(name: str) -> str:
-    """Scryfall's URL slug for a card name: lowercase, non-alphanumerics collapsed to hyphens."""
-    out = "".join(c if c.isalnum() else "-" for c in name.lower())
-    while "--" in out:
-        out = out.replace("--", "-")
-    return out.strip("-")
+    """Scryfall's URL slug for a card name.
+
+    NOT the folklore "non-alphanumerics collapse to hyphens" rule this used to carry -- that
+    hyphenates apostrophes (`erayo-s-essence`) and serves raw UTF-8 (`jötun-grunt`) where production
+    Scryfall deletes the apostrophe and percent-encodes the bytes. The real rule, verified against
+    the `scryfall_uri` of all 540,484 printings in the 2026-08-16 all_cards bulk (zero mismatches):
+
+      1. lowercase;
+      2. DELETE `' " , . /` and the curly quotes U+201C/U+201D;
+      3. each run of ASCII spaces becomes one hyphen -- literal hyphens pass through and may stack
+         (ru "Пламенник - военный разведчик" keeps `---`), and nothing is trimmed ("Humming-" and
+         "With Great Power . . ." both keep their trailing hyphen);
+      4. everything else survives verbatim (`:`, `!`, `&`, and CJK punctuation) and is then UTF-8
+         percent-encoded per _SLUG_LITERAL.
+    """
+    cleaned = "".join(c for c in name.lower() if c not in _SLUG_DELETED)
+    hyphenated = re.sub(" +", "-", cleaned)
+    return "".join(
+        chr(b) if chr(b) in _SLUG_LITERAL else f"%{b:02X}" for b in hyphenated.encode("utf-8")
+    )
 
 
-def _related_uris(name: str) -> dict[str, str]:
+def _scryfall_uri(name: str, set_code: str, number: str, lang: str) -> str:
+    """`https://scryfall.com/card/{set}/{number}[/{lang}]/{slug}?utm_source=api`.
+
+    A foreign printing keeps the language segment and takes the plain English slug (ody/243/zhs ->
+    `/zhs/holistic-wisdom`, verified live). Scryfall also writes a
+    `slug(printed name)-(slug(english name))` path where it HAS a printed name (grn/212/pt is
+    `ego-%C3%A0-deriva-(unmoored-ego)`); reproducing that needs the printed name, which the card
+    row does not carry yet, and the English fallback is what it serves until then.
+    """
+    segment = f"{lang}/" if lang in _SLUG_LANG_SEGMENTS else ""
+    return f"https://scryfall.com/card/{set_code}/{number}/{segment}{_slug(name)}?utm_source=api"
+
+
+# The layouts Scryfall gives TWO images to -- the ones that are two pieces of cardboard, or a
+# front and a back. Everything else with `card_faces` (split, flip, adventure, prepare) is ONE
+# image, and its faces must NOT get per-face image_uris: doing so invents a `.../back/...` URL with
+# no image behind it. Verified exhaustively against the 2026-08-16 all_cards bulk, zero exceptions
+# in either direction. These layouts also keep `colors`, `card_back_id` and `illustration_id` on
+# their faces alone.
+_TWO_IMAGE_LAYOUTS = frozenset({"art_series", "double_faced_token", "modal_dfc", "reversible_card", "transform"})
+
+# A REVERSIBLE printing keeps NOTHING of the card at top level -- not even the three keys every
+# other multi-face layout keeps. Measured across the whole 2026-08-16 all_cards bulk: all 81 omit
+# `oracle_id`, `cmc` and `type_line`, where a `transform` printing sends all three. Its FACES carry
+# the card's `oracle_id` and `cmc` instead, 0 of 81 disagreeing, so omitting them loses nothing.
+_REVERSIBLE_LAYOUT = "reversible_card"
+
+# The layouts whose `edhrec` link keeps the JOINED name. Every other multi-face layout links the
+# FRONT face -- verified card for card against api.scryfall.com. The two tcgplayer_infinite_*
+# searches take the joined name on every layout, so the two are deliberately not one string.
+_EDHREC_JOINED_LAYOUTS = frozenset({"double_faced_token", "reversible_card", "split"})
+
+
+def _related_uris(name: str, edhrec_name: str, multiverse_ids: list[Any], lang: str) -> dict[str, str]:
     """Scryfall's `related_uris`, pointing at the destinations directly.
 
     Scryfall wraps the TCGplayer entries in `partner.tcgplayer.com/...?u=<encoded real URL>` with
     its own affiliate code. The destination is the same page, and emitting the wrapper from this
     host would route another service's affiliate revenue to Scryfall.
+
+    `gatherer` LEADS the object when the printing has multiverse ids, built from the FIRST id, with
+    `printed=true` for every non-English printing and `printed=false` for English -- verified
+    against the bulk corpus at 540,430 of 540,484 printings. The 54 exceptions are foreign-only
+    promos (dd2-ja, snc launch, one-ph, ltc-qya) whose Gatherer entries carry no translation; that
+    fact lives on Scryfall's side of the wire and is not derivable from the row.
     """
-    quoted = urllib.parse.quote_plus(name)
-    return {
-        "tcgplayer_infinite_articles": f"https://www.tcgplayer.com/search/articles?productLineName=magic&q={quoted}",
-        "tcgplayer_infinite_decks": f"https://www.tcgplayer.com/search/decks?productLineName=magic&q={quoted}",
-        "edhrec": f"https://edhrec.com/route/?cc={quoted}",
-    }
-
-
-def _purchase_uris(row: dict[str, Any]) -> dict[str, str]:
-    """Scryfall's `purchase_uris`, rebuilt from the marketplace ids. Same affiliate reasoning."""
     out: dict[str, str] = {}
-    if row.get("tcgplayer_id"):
-        out["tcgplayer"] = f"https://www.tcgplayer.com/product/{row['tcgplayer_id']}?page=1"
-    if row.get("cardmarket_id"):
-        out["cardmarket"] = f"https://www.cardmarket.com/en/Magic/Products?idProduct={row['cardmarket_id']}"
-    if row.get("mtgo_id"):
-        out["cardhoarder"] = f"https://www.cardhoarder.com/cards/{row['mtgo_id']}"
+    first_id = multiverse_ids[0] if multiverse_ids else None
+    if isinstance(first_id, int):
+        printed = "false" if lang == "en" else "true"
+        out["gatherer"] = (
+            f"https://gatherer.wizards.com/Pages/Card/Details.aspx?multiverseid={first_id}&printed={printed}"
+        )
+    quoted = urllib.parse.quote_plus(name)
+    out["tcgplayer_infinite_articles"] = (
+        f"https://www.tcgplayer.com/search/articles?productLineName=magic&q={quoted}"
+    )
+    out["tcgplayer_infinite_decks"] = f"https://www.tcgplayer.com/search/decks?productLineName=magic&q={quoted}"
+    out["edhrec"] = f"https://edhrec.com/route/?cc={urllib.parse.quote_plus(edhrec_name)}"
     return out
+
+
+def _purchase_uris(row: dict[str, Any], name: str) -> dict[str, str]:
+    """Scryfall's `purchase_uris`, product links where the ids exist and name searches where not.
+
+    Rebuilt from the marketplace ids -- or, for a key whose id this printing does not have, from a
+    NAME SEARCH on that marketplace. Same affiliate reasoning as `_related_uris`.
+
+    All three keys are always present. The fallback is per KEY, not per card: an English printing
+    with TCGplayer and Cardmarket ids but no MTGO id gets two product links and a cardhoarder
+    search (verified live across khm). Every foreign printing takes the search form on all three --
+    marketplace product ids belong to the English printing. Emitting nothing was the alternative,
+    and it made `purchase_uris` an empty object on 426,416 printings.
+
+    The search text is the FRONT FACE name (`Invasion of Alara`, not `Invasion of Alara // Awaken
+    the Maelstrom`): the joined string matches no product.
+    """
+    q = urllib.parse.quote_plus(name.split(" // ", 1)[0])
+    tcg, cm, mtgo = row.get("tcgplayer_id"), row.get("cardmarket_id"), row.get("mtgo_id")
+    return {
+        "tcgplayer": (
+            f"https://www.tcgplayer.com/product/{tcg}?page=1"
+            if tcg
+            else f"https://www.tcgplayer.com/search/magic/product?productLineName=magic&q={q}&view=grid"
+        ),
+        "cardmarket": (
+            f"https://www.cardmarket.com/en/Magic/Products?idProduct={cm}"
+            if cm
+            else f"https://www.cardmarket.com/en/Magic/Products/Search?searchString={q}"
+        ),
+        "cardhoarder": (
+            f"https://www.cardhoarder.com/cards/{mtgo}"
+            if mtgo
+            else f"https://www.cardhoarder.com/cards?data%5Bsearch%5D={q}"
+        ),
+    }
 
 
 def _prices(row: dict[str, Any]) -> dict[str, Any]:
@@ -228,18 +333,34 @@ def _prices(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _faces(row: dict[str, Any]) -> list[dict[str, Any]]:
-    """The card's faces, with the two keys the engine deliberately does not store re-added.
+def _faces(row: dict[str, Any], *, two_image: bool, reversible: bool) -> list[dict[str, Any]]:
+    """The card's faces, with the keys the engine deliberately does not store re-added.
 
     `object` is the constant "card_face", and a face's `image_uris` is the card's CDN function with
     front/back swapped, so neither is worth archive space.
+
+    `image_uris` is gated on the LAYOUT rather than on the face count: only a two-image layout has
+    a second picture, and giving one to a split or adventure face invents a URL with nothing behind
+    it. An empty `mana_cost` or `oracle_text` on a face is a VALUE, not an omission -- every face
+    of every multi-face printing in the corpus carries both keys (8,620 of 8,620 transform faces,
+    4,356 of them with an empty cost), so an empty string there is a costless back face.
     """
     faces = row.get("card_faces") or []
     out = []
     for index, face in enumerate(faces):
         built: dict[str, Any] = {"object": "card_face"}
-        built.update({key: value for key, value in face.items() if value not in (None, "", [])})
-        if len(faces) > 1:
+        built.update(
+            {
+                key: value
+                for key, value in face.items()
+                if value is not None and (value not in ("", []) or key in ("mana_cost", "oracle_text"))
+            }
+        )
+        if reversible:
+            # Both faces of a reversible printing carry the CARD's oracle_id and cmc.
+            built.setdefault("oracle_id", str(row.get("oracle_id") or ""))
+            built.setdefault("cmc", _decimal(row.get("cmc")))
+        if two_image:
             built["image_uris"] = _image_uris(
                 row.get("scryfall_id", ""),
                 row.get("image_updated_at"),
@@ -303,7 +424,15 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
     name = row.get("name") or ""
     set_code = row.get("set_code") or ""
     number = row.get("collector_number") or ""
-    faces = _faces(row)
+    lang = row.get("lang") or "en"
+    layout = row.get("card_layout") or row.get("layout")
+    has_faces = bool(row.get("card_faces"))
+    # Only ever true for a card that HAS faces: the two-image layouts are all multi-face.
+    two_image = has_faces and layout in _TWO_IMAGE_LAYOUTS
+    reversible = layout == _REVERSIBLE_LAYOUT
+    faces = _faces(row, two_image=two_image, reversible=reversible)
+    # `edhrec` links the FRONT face on every multi-face layout but the split-likes.
+    edhrec_name = name.split(" // ", 1)[0] if faces and layout not in _EDHREC_JOINED_LAYOUTS else name
 
     card: dict[str, Any] = {
         "object": "card",
@@ -311,10 +440,10 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
         "oracle_id": oracle_id,
         "multiverse_ids": row.get("multiverse_ids") or [],
         "name": name,
-        "lang": row.get("lang") or "en",
+        "lang": lang,
         "released_at": row.get("released_at"),
         "uri": f"{base_url}/cards/{scryfall_id}",
-        "scryfall_uri": f"https://scryfall.com/card/{set_code}/{number}/{_slug(name)}?utm_source=api",
+        "scryfall_uri": _scryfall_uri(name, set_code, number, lang),
         "layout": row.get("card_layout") or row.get("layout"),
         "highres_image": bool(row.get("highres_image")),
         "image_status": row.get("image_status"),
@@ -351,15 +480,42 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
         "booster": bool(row.get("booster")),
         "story_spotlight": bool(row.get("story_spotlight")),
         "prices": _prices(row),
-        "related_uris": _related_uris(name),
-        "purchase_uris": _purchase_uris(row),
+        "related_uris": _related_uris(name, edhrec_name, row.get("multiverse_ids") or [], lang),
     }
+    # A printing NO MARKETPLACE SELLS omits the key rather than carrying three dead links. The
+    # rule is the marketplaces, not `digital` -- measured 2026-08-16: prm/80925 (games ["mtgo"],
+    # digital true) HAS purchase_uris and ymid/59 and khm/A-198 (games ["arena"], digital true) do
+    # not, so it is "paper or mtgo". An ABSENT `games` list emits: the omission is a positive claim
+    # about the printing rather than a gap.
+    games = row.get("games")
+    if games is None or not games or any(g in ("paper", "mtgo") for g in games):
+        card["purchase_uris"] = _purchase_uris(row, name)
+
+    # A two-image layout keeps `colors`, `card_back_id` and `illustration_id` on its FACES alone --
+    # there is no shared back and no card-level illustration when the card is two pictures --
+    # and Scryfall omits the top-level keys entirely rather than nulling them.
+    if two_image:
+        for key in ("colors", "card_back_id", "illustration_id"):
+            card.pop(key, None)
+    # ...and a reversible printing drops the three the other two-image layouts keep.
+    if reversible:
+        for key in ("oracle_id", "cmc", "type_line"):
+            card.pop(key, None)
 
     # A multi-face card carries its faces and NOT the top-level text they replace; a single-faced
     # one carries the text and no `card_faces`. Which keys sit at top level varies by LAYOUT, which
     # is why this is a branch rather than a fixed key set.
     if faces:
         card["card_faces"] = faces
+        if not two_image:
+            # ONE image and one cost: a split/flip/adventure/prepare printing keeps both at top
+            # level, the cost joined " // " between the faces that HAVE one, skipping the ones
+            # that do not -- flipped Erayo, whose back face carries an empty cost, is `{1}{U}` and
+            # not `{1}{U} // `. Checked against all 3,654 such printings with zero misses.
+            card["mana_cost"] = " // ".join(
+                f["mana_cost"] for f in (row.get("card_faces") or []) if f.get("mana_cost")
+            )
+            card["image_uris"] = _image_uris(scryfall_id, row.get("image_updated_at"))
     else:
         card["mana_cost"] = row.get("mana_cost")
         card["oracle_text"] = row.get("oracle_text")
