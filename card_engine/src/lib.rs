@@ -3138,8 +3138,8 @@ struct ArtistIndex {
 /// against the 240 KB stored before, so this is smaller AND faster, not a trade.
 #[derive(Archive, Serialize, Deserialize, Default)]
 struct HybridTagIndex {
-    /// Values above the density crossover: one printing-space bitmap each, ready to use with no scatter.
-    dense: HashMap<String, Vec<u64>>,
+    /// Values above the density crossover: one bitmap each, ready to use with no scatter.
+    dense: HashMap<String, DenseBits>,
     /// Everything below it: sorted printing ids, exactly as `TagIndex`.
     ///
     /// A sparse value can never be "broad" downstream: the crossover is 1/32 (3.1%) and
@@ -3153,6 +3153,22 @@ fn bitmap_beats_postings(k: usize, n_rows: usize) -> bool {
     k.saturating_mul(32) > n_rows
 }
 
+/// One dense value's rows, as a bitmap that remembers its own popcount.
+///
+/// The count is stored rather than derived because `len_of` sits on the QUERY PLANNING path
+/// (`probe_collection_k` asks it for every collection child of every `And`), where a posting list
+/// answered in O(1) from its length. Deriving it instead costs a popcount over the whole plane —
+/// 1,487 words at corpus scale in printing space — turning a free question into a per-query scan.
+/// Measured: with the count derived, `o:draw` plus a tag ran 1-6% slower than the postings it
+/// replaced; with it stored, the same queries come back at or under that baseline.
+///
+/// 4 bytes per dense value, ~175 of them across all six indexes, so this costs under a kilobyte.
+#[derive(Archive, Serialize, Deserialize, Default)]
+struct DenseBits {
+    count: u32,
+    words: Vec<u64>,
+}
+
 fn build_hybrid_tag_index<T>(rows: &[T], vocab: &[String], get_ids: impl Fn(&T) -> &Vec<u16>) -> HybridTagIndex {
     hybrid_from_tag_index(build_tag_index(rows, vocab, get_ids), rows.len())
 }
@@ -3164,7 +3180,13 @@ fn hybrid_from_tag_index(map: TagIndex, n_rows: usize) -> HybridTagIndex {
     let mut out = HybridTagIndex::default();
     for (value, postings) in map {
         if bitmap_beats_postings(postings.len(), n_rows) {
-            out.dense.insert(value, scatter_bits(postings, n_rows));
+            // Popcounted from the scattered bitmap, not `postings.len()`: a duplicate row id in
+            // `postings` sets the same bit twice, which `postings.len()` would over-count and the
+            // popcount does not, so `count` stays exactly the bitmap's true popcount by construction.
+            // A one-time cost at archive-build time, not the query-time cost this field exists to avoid.
+            let words = scatter_bits(postings, n_rows);
+            let count = words.iter().map(|w| w.count_ones()).sum();
+            out.dense.insert(value, DenseBits { count, words });
         } else {
             out.sparse.insert(value, postings);
         }
@@ -3196,12 +3218,18 @@ impl ArchivedHybridTagIndex {
         self.dense.get(value).is_some()
     }
 
+    /// The value's `DenseBits` entry, for a caller that needs both the presence check and the data —
+    /// one lookup instead of `is_dense` followed by `bits`/`len_of` each redoing it.
+    fn dense(&self, value: &str) -> Option<&Archived<DenseBits>> {
+        self.dense.get(value)
+    }
+
     /// The value's printing-space bitmap, materialized from postings if that is how it is stored.
     /// `None` only when the value is absent from the store entirely — nothing is dropped, so that is a
     /// proof rather than a gap.
     fn bits(&self, value: &str, n_printings: usize) -> Option<Vec<u64>> {
         if let Some(b) = self.dense.get(value) {
-            return Some(b.iter().map(|w| u64::from(*w)).collect());
+            return Some(b.words.iter().map(|w| u64::from(*w)).collect());
         }
         self.sparse.get(value).map(|v| scatter_bits(v.iter().map(|x| u32::from(*x)), n_printings))
     }
@@ -3210,28 +3238,74 @@ impl ArchivedHybridTagIndex {
     /// without materializing when the value is a bitmap.
     fn len_of(&self, value: &str) -> Option<usize> {
         if let Some(b) = self.dense.get(value) {
-            return Some(b.iter().map(|w| u64::from(*w).count_ones() as usize).sum());
+            // O(1) from the stored popcount — see DenseBits. This is planner-path.
+            return Some(u32::from(b.count) as usize);
         }
         self.sparse.get(value).map(|v| v.len())
     }
 
-    /// The value's ids as a materialized posting list, whichever tier stores it. `None` only when
-    /// the value is absent from the store entirely (same proof as `bits`). The widened driver's
-    /// card-space narrowing wants ids to project through `printing_to_card`/`foreign_to_card`,
-    /// not a bitmap over a space it is about to leave.
+    /// The value's rows as ascending ids, whichever way it is stored.
+    ///
+    /// The inverse of `bits`, and the reason hybrid storage can be adopted by the other five
+    /// collection indexes WITHOUT moving any value across a narrowing gate: a caller that produced a
+    /// sorted id vec before can still produce one, so the representation a value reaches the
+    /// candidate machinery in is decided by the same rules as before rather than by how it happens
+    /// to be stored. `frame_data` chose the opposite (dense values take a bitmap path with their own
+    /// gate), which is right for a field whose gate was tuned around it and wrong as a default —
+    /// doing that to `oracle_tags` would hand card-space values a selectivity guard card space
+    /// deliberately does not have.
+    ///
+    /// Decode is a popcount walk, `w & (w - 1)` clearing one bit at a time, so it costs one
+    /// iteration per SET bit plus one per word rather than one per row. Shares its loop with
+    /// `bitmap_card_ids` via `decode_bitmap_ids`, driven here by the stored count (no fresh popcount
+    /// pass) over archived words (no copy into a plain `&[u64]` first).
     fn ids_of(&self, value: &str) -> Option<Vec<u32>> {
         if let Some(b) = self.dense.get(value) {
-            let mut out = Vec::new();
-            for (wi, word) in b.iter().enumerate() {
-                let mut w = u64::from(*word);
-                while w != 0 {
-                    out.push((wi * 64) as u32 + w.trailing_zeros());
-                    w &= w - 1;
-                }
-            }
-            return Some(out);
+            return Some(decode_bitmap_ids(b.words.iter().map(|w| u64::from(*w)), u32::from(b.count) as usize));
         }
         self.sparse.get(value).map(|v| v.iter().map(|x| u32::from(*x)).collect())
+    }
+
+    /// The value's rows as ascending ids, like `ids_of`, but without materializing a `Vec` — for a
+    /// caller that only folds over the ids once (sum a range per id, set a range of bits per id) and
+    /// would otherwise pay for an allocation whose contents get read back exactly once. Absent from
+    /// both tiers yields nothing, matching `ids_of`'s `None`.
+    fn iter_ids(&self, value: &str) -> HybridIdsIter<'_> {
+        if let Some(b) = self.dense.get(value) {
+            let words = &b.words[..];
+            return HybridIdsIter::Dense { words, word: 0, bits: words.first().map_or(0, |w| u64::from(*w)) };
+        }
+        if let Some(v) = self.sparse.get(value) {
+            return HybridIdsIter::Sparse(v.iter());
+        }
+        HybridIdsIter::Empty
+    }
+}
+
+/// Ascending row ids from a `HybridTagIndex` value, produced lazily. See `iter_ids`.
+enum HybridIdsIter<'a> {
+    Dense { words: &'a [Archived<u64>], word: usize, bits: u64 },
+    Sparse(std::slice::Iter<'a, Archived<u32>>),
+    Empty,
+}
+
+impl Iterator for HybridIdsIter<'_> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<u32> {
+        match self {
+            HybridIdsIter::Dense { words, word, bits } => {
+                while *bits == 0 {
+                    *word += 1;
+                    *bits = u64::from(*words.get(*word)?);
+                }
+                let id = (*word as u32) * 64 + bits.trailing_zeros();
+                *bits &= *bits - 1;
+                Some(id)
+            }
+            HybridIdsIter::Sparse(it) => it.next().map(|x| u32::from(*x)),
+            HybridIdsIter::Empty => None,
+        }
     }
 }
 
@@ -5983,11 +6057,23 @@ struct CardIndexes {
     power:          NumericIndex,    // card space
     toughness:      NumericIndex,    // card space
     rarity:         RarityIndex,     // card space (any-printing-at-rarity)
-    subtypes:       TagIndex,        // card space
-    keywords:       TagIndex,        // card space
-    oracle_tags:    TagIndex,        // card space
-    art_tags:       TagIndex,        // printing space
-    is_tags:        TagIndex,        // printing space
+    // All five are HYBRID, joining `frame_data` below: a value above the 1/32 density crossover is
+    // stored as a bitmap instead of a posting list, which is smaller for exactly the values that
+    // cost the most as postings. Measured on a ~95k-printing corpus, art_tags 6.82 -> 4.45 MB and
+    // oracle_tags 1.44 -> 1.00 MB, with the other three ~0.03 MB between them.
+    //
+    // STORAGE ONLY. Unlike `frame_data`, every read goes through `ids_of`/`len_of`/`bits`, which
+    // answer identically whichever way a value is stored -- so no value changes which narrowing path
+    // it takes, which representation it reaches the candidate machinery in, or which selectivity
+    // gate applies to it. That distinction is the safety argument: `frame_data` routes dense values
+    // to a bitmap path with its own gate, and doing the same here would put the corpus's three
+    // densest oracle tags (47%, 30%, 25% of cards) behind MAX_NARROW_FRACTION, a guard card-space
+    // narrowing deliberately does not have.
+    subtypes:       HybridTagIndex,  // card space
+    keywords:       HybridTagIndex,  // card space
+    oracle_tags:    HybridTagIndex,  // card space
+    art_tags:       HybridTagIndex,  // printing space
+    is_tags:        HybridTagIndex,  // printing space
     frame_data:     HybridTagIndex,  // printing space (bitmap for dense values, postings for the sparse tail)
     artists:        ArtistIndex,     // printing space (CSR by artist vocab id)
     flavor:         FlavorIndex,     // printing space (CSR by dense flavor text id)
@@ -6805,19 +6891,17 @@ fn probe_collection_k(filter: &FilterExpr, indexes: &Archived<CardIndexes>) -> O
     if !matches!(op, CmpOp::Ge | CmpOp::Eq | CmpOp::Gt) {
         return None;
     }
-    // frame_data is the hybrid index, so its count is a popcount or a postings length, never a `get`.
-    if matches!(field, CollField::FrameData) {
-        return indexes.frame_data.len_of(value.as_str());
-    }
+    // Every collection index is hybrid now, so a count is a popcount or a postings length and
+    // never a `get` — same answer either way, which is what lets the caller stay unaware of storage.
     let idx = match field {
         CollField::Subtypes => &indexes.subtypes,
         CollField::Keywords => &indexes.keywords,
         CollField::OracleTags => &indexes.oracle_tags,
         CollField::ArtTags => &indexes.art_tags,
         CollField::IsTags => &indexes.is_tags,
-        CollField::FrameData => unreachable!("handled above"),
+        CollField::FrameData => &indexes.frame_data,
     };
-    idx.get(value.as_str()).map(|v| v.len())
+    idx.len_of(value.as_str())
 }
 
 /// One entry in the And arm's work list: a child exactly as written, or a half-open interval fused
@@ -7543,7 +7627,11 @@ fn narrow_rec(
                 CollField::IsTags     => (&indexes.is_tags,     false),
                 CollField::FrameData  => unreachable!("frame_data is the hybrid index, handled above"),
             };
-            match idx.get(value.as_str()) {
+            // `len_of` rather than a postings length: identical answer for a sparse value, a popcount
+            // for a dense one, and crucially the SAME question as before, asked before any decision
+            // is taken. Every branch below is the pre-hybrid logic — the gate, the representation,
+            // and which side of it a value falls on all depend only on the count, never on storage.
+            match idx.len_of(value.as_str()) {
                 // A value with no postings in a complete index proves
                 // `contains(value)` false for every row, which makes Ge, Eq,
                 // and Gt all provably empty alike — no row can satisfy any of
@@ -7553,7 +7641,7 @@ fn narrow_rec(
                 None => {
                     Narrowed::tight(if card_space { Candidates::Cards(Vec::new()) } else { Candidates::Printings(Vec::new()) })
                 }
-                Some(v) => {
+                Some(k) => {
                     // Broad printing-space postings pay the same gather cost
                     // the range indexes guard against (is:spell is ~60k ids);
                     // past the fraction they scatter to a bitmap when
@@ -7562,14 +7650,39 @@ fn narrow_rec(
                     // the length check downstream (loose either way).
                     // Card-space lists need no guard — same argument as
                     // numeric_candidates.
-                    if !card_space && range_too_broad_to_narrow(v.len(), n_printings) {
+                    if !card_space && range_too_broad_to_narrow(k, n_printings) {
                         if !broad_ok {
                             return None;
                         }
-                        let bits = scatter_bits(v.iter().map(|x| u32::from(*x)), n_printings);
-                        return mk(Candidates::PrintingBits(bits));
+                        // `bits` hands back a STORED bitmap for a dense value, so the scatter this
+                        // line used to pay is gone for exactly the broad values that paid most for
+                        // it. The sparse tail still scatters, as before.
+                        return mk(Candidates::PrintingBits(idx.bits(value.as_str(), n_printings)?));
                     }
-                    let ids: Vec<u32> = v.iter().map(|x| u32::from(*x)).collect();
+                    // A value STORED as a bitmap and broad enough that composition would promote it
+                    // to one anyway is handed over as bits, rather than decoded to ids for the
+                    // machinery to scatter straight back. `BITS_PROMOTE` is the crossover already
+                    // calibrated for exactly this question (#636), so this defers to it rather than
+                    // inventing a second threshold.
+                    //
+                    // This is the one place hybrid storage changes which REPRESENTATION a value
+                    // arrives in, and it is measured, not assumed: decoding instead cost 5-9% on
+                    // `o:draw` plus a dense tag, because ids_of walks the plane to rebuild a list
+                    // the next step scatters again. Tightness is unchanged — `mk` decides that from
+                    // the op, not from the representation.
+                    //
+                    // CARD SPACE ONLY, and that restriction is measured too. Printing space already
+                    // has a bitmap branch above (the broadness gate), so this would only catch the
+                    // 1/32-to-1/4 band — where handing bits measured no better than decoding and
+                    // sometimes worse, while card space measured a clean win. Promoting there as
+                    // well would be a change made on symmetry rather than evidence.
+                    if card_space
+                        && k > *BITS_PROMOTE
+                        && let Some(b) = idx.dense(value.as_str())
+                    {
+                        return mk(Candidates::CardBits(b.words.iter().map(|w| u64::from(*w)).collect()));
+                    }
+                    let ids = idx.ids_of(value.as_str())?;
                     mk(if card_space { Candidates::Cards(ids) } else { Candidates::Printings(ids) })
                 }
             }
@@ -9500,27 +9613,28 @@ fn broadcast_card_ids_to_printings(card_ids: impl Iterator<Item = u32>, offsets:
 /// truth `is_printing_composable`/`compose_printing_bits`/`compose_printing_estimate` share so their
 /// field tables can't drift apart.
 /// Which structure backs a `CollectionCmp` field on the compose path.
-enum CollComposeSource<'i> {
-    /// Postings. `true` = card-space ids (project each card's printing range up with
-    /// `broadcast_card_ids_to_printings`), `false` = printing ids (scatter directly).
-    Postings(&'i Archived<TagIndex>, bool),
-    /// The hybrid printing-space index: a stored bitmap for dense values, postings for the tail.
-    Hybrid(&'i Archived<HybridTagIndex>),
+struct CollComposeSource<'i> {
+    /// Every collection index is hybrid: a stored bitmap for values above the 1/32 crossover,
+    /// postings for the tail. Read through `ids_of`/`bits`/`len_of`, which answer the same for both.
+    idx: &'i Archived<HybridTagIndex>,
+    /// `true` = card-space ids (project each card's printing range up with
+    /// `broadcast_card_ids_to_printings`), `false` = printing ids (usable directly).
+    card_space: bool,
 }
 
 fn collection_compose_index(indexes: &Archived<CardIndexes>, field: CollField) -> Option<CollComposeSource<'_>> {
     Some(match field {
-        CollField::Subtypes   => CollComposeSource::Postings(&indexes.subtypes,    true),
-        CollField::Keywords   => CollComposeSource::Postings(&indexes.keywords,    true),
-        CollField::OracleTags => CollComposeSource::Postings(&indexes.oracle_tags, true),
-        CollField::ArtTags    => CollComposeSource::Postings(&indexes.art_tags,    false),
-        CollField::IsTags     => CollComposeSource::Postings(&indexes.is_tags,     false),
+        CollField::Subtypes   => CollComposeSource { idx: &indexes.subtypes,    card_space: true },
+        CollField::Keywords   => CollComposeSource { idx: &indexes.keywords,    card_space: true },
+        CollField::OracleTags => CollComposeSource { idx: &indexes.oracle_tags, card_space: true },
+        CollField::ArtTags    => CollComposeSource { idx: &indexes.art_tags,    card_space: false },
+        CollField::IsTags     => CollComposeSource { idx: &indexes.is_tags,     card_space: false },
         // `frame_data` used to return `None` here, and that exclusion was never about frames as such:
         // it was the one index that was not `complete`, because its dense values were dropped at build,
         // so absence could not prove emptiness and it could not be an exact compose leaf. Storing every
         // value makes it complete, which makes it composable — and that chain is most of this change's
         // win: `frame:2015` under `unique=printing` went 1,375 -> 41 us.
-        CollField::FrameData => CollComposeSource::Hybrid(&indexes.frame_data),
+        CollField::FrameData => CollComposeSource { idx: &indexes.frame_data, card_space: false },
     })
 }
 
@@ -9535,17 +9649,16 @@ fn collection_compose_index(indexes: &Archived<CardIndexes>, field: CollField) -
 /// collection-length condition, ~lib.rs:3441), and the compose path has no residual re-check, so
 /// `Eq`/`Gt` stay on the general path.
 fn collection_leaf_bits(src: &CollComposeSource, value: &str, offsets: &AOffsets, n_printings: usize) -> Vec<u64> {
-    match src {
-        // A dense value is already a printing bitmap, so this is a copy rather than a scatter.
-        CollComposeSource::Hybrid(idx) => {
-            idx.bits(value, n_printings).unwrap_or_else(|| vec![0u64; words_per_plane(n_printings)])
-        }
-        CollComposeSource::Postings(idx, card_space) => match idx.get(value) {
-            None => vec![0u64; words_per_plane(n_printings)],
-            Some(v) if *card_space => broadcast_card_ids_to_printings(v.iter().map(|x| u32::from(*x)), offsets, n_printings),
-            Some(v) => scatter_bits(v.iter().map(|x| u32::from(*x)), n_printings),
-        },
+    if src.card_space {
+        // Card ids have to be projected up whichever way they were stored. `iter_ids` walks them
+        // (dense: bit by bit off the stored words; sparse: the stored ids directly) without
+        // collecting a `Vec` first -- broadcast is the only consumer, so nothing needs it built.
+        // Absent yields nothing, which broadcasts to all-zero, matching the old `None => empty()`.
+        return broadcast_card_ids_to_printings(src.idx.iter_ids(value), offsets, n_printings);
     }
+    // Printing space lands in the target space already: a dense value IS a printing bitmap, so this
+    // is a copy rather than a scatter, and the sparse tail scatters as it always did.
+    src.idx.bits(value, n_printings).unwrap_or_else(|| vec![0u64; words_per_plane(n_printings)])
 }
 
 /// The number of printings a containment collection leaf matches (its exact `unique=printing` total),
@@ -9554,21 +9667,22 @@ fn collection_leaf_bits(src: &CollComposeSource, value: &str, offsets: &AOffsets
 /// so the estimate for a bare collection leaf is exact, matching set/watermark. O(card postings) — the
 /// same order as the eventual scatter, cheap for the sparse subtype/keyword/oracle-tag posting lists.
 fn collection_leaf_printing_count(src: &CollComposeSource, value: &str, offsets: &AOffsets) -> usize {
-    match src {
-        // A popcount when the value is a bitmap; a postings length otherwise.
-        CollComposeSource::Hybrid(idx) => idx.len_of(value).unwrap_or(0),
-        CollComposeSource::Postings(idx, card_space) => match idx.get(value) {
-            None => 0,
-            Some(v) if *card_space => v
-                .iter()
-                .map(|c| {
-                    let c = u32::from(*c) as usize;
-                    (u32::from(offsets[c + 1]) - u32::from(offsets[c])) as usize
-                })
-                .sum(),
-            Some(v) => v.len(),
-        },
+    if src.card_space {
+        // One posting = one CARD here, so the printing total is the sum of their ranges. `iter_ids`
+        // folds directly over the ids (dense or sparse) with no intermediate `Vec` -- this consumes
+        // each id exactly once, so there was never a reason to collect them first.
+        return src
+            .idx
+            .iter_ids(value)
+            .map(|c| {
+                let c = c as usize;
+                (u32::from(offsets[c + 1]) - u32::from(offsets[c])) as usize
+            })
+            .sum();
     }
+    // Printing space: one posting = one printing, so a popcount when the value is a bitmap and a
+    // postings length otherwise — `len_of` is both.
+    src.idx.len_of(value).unwrap_or(0)
 }
 
 /// The exact printing-space bitmap for a **negated** containment collection leaf (`-type:`/`-kw:`/
@@ -10464,7 +10578,9 @@ fn exact_result_total(composed: &FilterExpr, indexes: &Archived<CardIndexes>, mo
             CollField::ArtTags | CollField::IsTags | CollField::FrameData => None,
         };
         // Absent from a complete index is an exact ZERO, not "no answer".
-        return card_space_idx.map(|idx| idx.get(value.as_str()).map_or(0, |v| v.len()));
+        // `len_of` counts a dense value by popcount and a sparse one by postings length — the same
+        // card count either way, so the exactness argument above is untouched by storage.
+        return card_space_idx.map(|idx| idx.len_of(value.as_str()).unwrap_or(0));
     }
     None
 }
@@ -11185,6 +11301,34 @@ fn plane_leaves_nothing_to_verify(
         && plane.is_none_or(|expr| {
             matches!(mode, Mode::Card) || !plane_expr_is_existential(expr, u64::from(indexes.planes.divergent_formats))
         })
+}
+
+/// The compose-side counterpart to `plane_leaves_nothing_to_verify`: whether a bare `Ge` (containment)
+/// `CollectionCmp` on a CARD-space field leaves the match kernels nothing to verify.
+///
+/// `subtypes`/`keywords`/`oracle_tags` are pure card properties — every printing of a card agrees —
+/// unlike `art_tags`/`is_tags`/`frame_data`, which vary printing to printing (see `collection`,
+/// filter.rs). So when the WHOLE filter is one of these leaves, `card_pass`/`card_match_count` resolve
+/// it at the card level for every candidate, exactly like a card-invariant legality format: nothing is
+/// left to check per printing, or even per candidate beyond the narrowing that already happened.
+///
+/// `Ge` only: `Eq`/`Gt` need the collection-length check a containment leaf does not prove, so
+/// `is_printing_composable` never hands compose a bare `Eq`/`Gt` collection leaf in the first place
+/// (see `collection_leaf_bits`'s doc) — this mirrors that gate rather than re-deriving it.
+///
+/// Bare leaf only, deliberately: `otag:X t:human` loses the guarantee the moment a printing-varying
+/// predicate joins it as a partner — `card_pass` then returns `PrintingDep` and the kernels must walk
+/// every printing regardless, the same caveat `plane_leaves_nothing_to_verify`'s legality callers
+/// already live with for a divergent format.
+///
+/// #1005: `otag:triggered-ability` (47% dense) measured `StreamedSelect` predicted at 1026us against
+/// 45.7us real — a 22x over-charge from this gap — which routed the query to `PrintingCompose`
+/// (176.5us measured) despite it being ~4x slower.
+fn compose_leaf_nothing_to_verify(filter: &FilterExpr) -> bool {
+    matches!(
+        filter,
+        FilterExpr::CollectionCmp { field: CollField::Subtypes | CollField::Keywords | CollField::OracleTags, op: CmpOp::Ge, .. }
+    )
 }
 
 /// The candidate materialization + filter rewriting shared by `StreamedSelect`
@@ -13048,11 +13192,19 @@ fn acquire_plan_features(
         // accuracy, beating every threshold on the two alternative signals tried. Its 26% false positives
         // over-cost both materializing plans by the same factor, which an argmin largely absorbs; the false
         // negatives are what were losing `GatheredScan vs StreamedSelect`, so recall is the side to favour.
-        let (eval_domain, scan_units) = if range_too_broad_to_narrow(printing_matches, n_printings as usize) {
-            (n_cards as usize, n_printings as usize)
-        } else {
-            (eval_domain, scan_units)
-        };
+        // The broadness guard this asks about is `MAX_NARROW_FRACTION`, which card-space collection
+        // narrowing does not have ("Card-space lists need no guard" — narrow_rec's CollectionCmp Ge
+        // arm). So a bare card-space collection leaf never actually falls back to visiting every card
+        // the way a broad range or legality predicate can; charging it as if it did is the same gap
+        // `compose_leaf_nothing_to_verify` closes for the tier, applied to this feature instead (#1005).
+        // Scoped to that check alone, not the wider `nothing_to_verify` OR: legality's own broadness
+        // behavior here is untouched, and unverified by this fix.
+        let (eval_domain, scan_units) =
+            if !compose_leaf_nothing_to_verify(filter) && range_too_broad_to_narrow(printing_matches, n_printings as usize) {
+                (n_cards as usize, n_printings as usize)
+            } else {
+                (eval_domain, scan_units)
+            };
         // The tier is what the MATERIALIZING alternatives pay per candidate, so it must be asked about
         // the predicate THEY see (`filter` + `plane`), not about `composed` — and gated exactly as
         // `prepare_candidates` gates it, or the router charges a `card_pass` the kernels will skip. On a
@@ -13061,7 +13213,15 @@ fn acquire_plan_features(
         // terms; charging them anyway was 92-94% of P3's predicted cost on `f:modern`, `f:gladiator`,
         // `f:commander` and `f:predh`. `residual_exact` is unavailable here (this branch never narrows),
         // so this is the conservative half of the executor's disjunction: it can over-charge, never under.
-        let nothing_to_verify = plane_leaves_nothing_to_verify(filter, mode, plane, indexes);
+        //
+        // `compose_leaf_nothing_to_verify` closes the analogous gap for a bare compose-exact collection
+        // leaf: `otag:triggered-ability` (47% dense) measured StreamedSelect predicted at 1026us against
+        // 45.7us real, a 22x over-charge from exactly this branch's `False` default, which routed the
+        // query to `PrintingCompose` (176.5us) despite it being ~4x slower (#1005). `plane_leaves_
+        // nothing_to_verify` cannot see this — it only recognizes the legality plane's rewrite to `True`,
+        // and a compose-exact leaf is never rewritten that way.
+        let nothing_to_verify =
+            plane_leaves_nothing_to_verify(filter, mode, plane, indexes) || compose_leaf_nothing_to_verify(filter);
         let tier = if nothing_to_verify { 0 } else { verify_cost_tier(composed) };
         // `GatheredScan` walks every printing of every candidate card, so its scan feature is the candidate
         // SPAN. `scan_all` estimates that span as `est_cards x` the corpus-average printings-per-card `x 2.1`,
@@ -15082,7 +15242,16 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 //                does on 0 of its 12,098 faced printings. `PrintingFace`'s size moves, so the
 //                header catches a stale archive — but it cannot see the other half: a stale
 //                `watermarks` index would silently answer the front face only.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026081613;
+//   2026082301 — the five remaining collection indexes (`subtypes`, `keywords`, `oracle_tags`,
+//                `art_tags`, `is_tags`) go `TagIndex` -> `HybridTagIndex`, joining `frame_data`,
+//                and dense values carry their popcount (`DenseBits`) — upstream #1003, merged in
+//                at main's 2026081301. THE HEADER CANNOT CATCH THIS ONE: the two sizes it records
+//                are `AOracleCard` and `APrinting`, and neither moves, because the change is
+//                entirely inside `CardIndexes`. So this constant is the only thing stopping a
+//                reader from accessing an older store's `HashMap<String, Vec<u32>>` as a
+//                `HybridTagIndex` through `access_unchecked`. Renumbered off main's value because
+//                it has to lead this branch's own history too.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026082302;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -15959,11 +16128,11 @@ impl QueryEngine {
                 for v in face_stat_values(c, |c| c.creature_toughness, |f| f.creature_toughness) { push(i16::from(v)); }
             }),
             rarity:         build_rarity_index(&printings, &offsets),
-            subtypes:       build_tag_index(&cards, &coll_vocab, |c| &c.card_subtypes),
-            keywords:       build_tag_index(&cards, &coll_vocab, |c| &c.card_keywords),
-            oracle_tags:    build_tag_index(&cards, &coll_vocab, |c| &c.card_oracle_tags),
-            art_tags:       build_tag_index(&printings, &coll_vocab, |p| &p.card_art_tags),
-            is_tags:        build_tag_index(&printings, &coll_vocab, |p| &p.card_is_tags),
+            subtypes:       build_hybrid_tag_index(&cards, &coll_vocab, |c| &c.card_subtypes),
+            keywords:       build_hybrid_tag_index(&cards, &coll_vocab, |c| &c.card_keywords),
+            oracle_tags:    build_hybrid_tag_index(&cards, &coll_vocab, |c| &c.card_oracle_tags),
+            art_tags:       build_hybrid_tag_index(&printings, &coll_vocab, |p| &p.card_art_tags),
+            is_tags:        build_hybrid_tag_index(&printings, &coll_vocab, |p| &p.card_is_tags),
             frame_data:     build_hybrid_tag_index(&printings, &coll_vocab, |p| &p.card_frame_data),
             artists:        build_artist_index(&printings, artist_vocab.len()),
             flavor:         build_flavor_index(&printings, &strings),

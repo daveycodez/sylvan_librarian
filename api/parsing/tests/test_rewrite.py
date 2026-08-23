@@ -18,7 +18,7 @@ EQUIVALENCES = [
     ("frame:old", "frame:1993 or frame:1997"),
     ("frame:new", "frame:2003 or frame:2015 or frame:future"),
     ("is:old", "frame:1993 or frame:1997"),
-    ("is:new", "frame:2015"),
+    ("is:new", "frame:2003 or frame:2015 or frame:future"),
     # type / subtype based
     ("is:historic", "t:legendary or t:artifact or t:saga"),
     ("is:permanent", "t:creature or t:artifact or t:enchantment or t:land or t:planeswalker or t:battle"),
@@ -66,6 +66,10 @@ EQUIVALENCES = [
     ("is:shadowland", "t:land o:/reveal an? (Plains|Island|Swamp|Mountain|Forest)/"),
     ("is:snarl", "t:land o:/reveal an? (Plains|Island|Swamp|Mountain|Forest)/"),
     ("is:modal", "otag:modal"),
+    ("is:bikeland", "otag:cycle-dual-cycling-land"),
+    ("is:surveilland", "otag:cycle-dual-surveil-land"),
+    ("is:tricycleland", "otag:tricycle-land"),
+    ("is:pathway", "otag:cycle-pathway"),
     # composes under negation and inside compounds
     ("-frame:old", "-(frame:1993 or frame:1997)"),
     ("t:goblin frame:modern", "t:goblin frame:2003"),
