@@ -1237,4 +1237,35 @@ mod tests {
         assert!(String::from_utf8(out).expect("utf-8").contains(r#""cmc":null"#));
     }
 
+    /// The SAME cases `api/scryfall_compat/objects.py` asserts, from the same file.
+    ///
+    /// Two implementations build this object — this one for the engine path, `objects.py` for the
+    /// SQL path — and both answer `/cards/*`, so a difference between them is one a client can
+    /// see. Nothing else compares them: the Rust suite and the Python suite are separate CI jobs
+    /// that never meet. A shared fixture is what makes each job fail on its own drift.
+    ///
+    /// Values and key PRESENCE, not key order: both sides are compared as parsed objects. The wire
+    /// order is pinned by the position assertions elsewhere in this module.
+    #[test]
+    fn the_card_object_matches_the_python_builder_case_for_case() {
+        const FIXTURE: &str =
+            include_str!("../../api/scryfall_compat/fixtures/card_object_parity.json");
+        let doc: serde_json::Value = serde_json::from_str(FIXTURE).expect("fixture must be JSON");
+        let base_url = doc["base_url"].as_str().expect("base_url");
+        let cases = doc["cases"].as_array().expect("cases must be an array");
+        assert!(!cases.is_empty(), "fixture must carry cases");
+
+        for case in cases {
+            let name = case["case"].as_str().unwrap_or("<unnamed>");
+            let serde_json::Value::Object(row) = case["row"].clone() else {
+                panic!("{name}: row must be an object")
+            };
+            let mut out = Vec::new();
+            write_scryfall_card(&mut out, &row, base_url);
+            let got: serde_json::Value =
+                serde_json::from_slice(&out).expect("the writer must emit valid JSON");
+            assert_eq!(got, case["expected"], "{name}: diverged from the Python builder");
+        }
+    }
+
 }

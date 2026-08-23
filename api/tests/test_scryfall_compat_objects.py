@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import pathlib
 
 import pytest
 
@@ -425,3 +426,32 @@ class TestCardToText:
         }
         del card[missing]
         assert "\n\n" not in card_to_text(card)
+
+
+_PARITY_FIXTURE = pathlib.Path(__file__).resolve().parents[1] / "scryfall_compat" / "fixtures" / "card_object_parity.json"
+
+
+def _parity_cases() -> list[tuple[str, dict, dict]]:
+    doc = json.loads(_PARITY_FIXTURE.read_text(encoding="utf-8"))
+    return [(c["case"], c["row"], c["expected"]) for c in doc["cases"]]
+
+
+class TestCardObjectParityWithTheRustBuilder:
+    """The SAME cases `card_engine/src/card_object.rs` asserts, from the same file.
+
+    Two implementations build this object -- `objects.py` for the SQL path, `card_object.rs` for
+    the engine path -- and both answer `/cards/*`, so a difference between them is one a client can
+    see. Nothing else compares them: the Python suite and the Rust suite are separate CI jobs that
+    never meet. A shared fixture is what makes each job fail on its own drift.
+
+    Values and key PRESENCE, not key order: both sides compare parsed objects. The wire order is
+    pinned by the position assertions in card_object.rs.
+    """
+
+    def test_the_fixture_carries_cases(self):
+        assert _parity_cases(), "the parity fixture must not be empty"
+
+    @pytest.mark.parametrize(("case", "row", "expected"), _parity_cases(), ids=lambda v: v if isinstance(v, str) else "")
+    def test_the_card_object_matches_the_rust_builder(self, case: str, row: dict, expected: dict):
+        doc = json.loads(_PARITY_FIXTURE.read_text(encoding="utf-8"))
+        assert to_scryfall_card(dict(row), base_url=doc["base_url"]) == expected, case
