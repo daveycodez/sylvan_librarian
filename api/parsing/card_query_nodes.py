@@ -7,12 +7,11 @@ import unicodedata
 
 from titlecase import titlecase
 
+from api.parsing.colors import COLOR_ALIAS_TO_CODES, COLOR_CODE_TO_NAME
 from api.parsing.db_info import (
     ALIAS_TO_FIELD_INFOS,
     CARD_SUPERTYPES,
     CARD_TYPES,
-    COLOR_CODE_TO_NAME,
-    COLOR_NAME_TO_CODE,
     FORMAT_CODE_TO_NAME,
     FieldType,
     ParserClass,
@@ -187,6 +186,10 @@ class CardAttributeNode(AttributeNode):
 
 _COLOR_BITS: dict[str, int] = {"W": 16, "U": 8, "B": 4, "R": 2, "G": 1}
 
+# Canonical WUBRG(C) ordering for rendering a set of color codes back to a human, e.g. so
+# "brgb" explains as "Black/Red/Green" rather than echoing input order.
+_CANONICAL_COLOR_ORDER = "wubrgc"
+
 
 def _color_dict_to_mask(color_dict: dict[str, bool]) -> int:
     return sum(bit for color, bit in _COLOR_BITS.items() if color_dict.get(color))
@@ -204,7 +207,9 @@ def get_colors_comparison_object(val: str, attr: str = "card_colors") -> dict[st
     """Convert color string to comparison object for database queries.
 
     Args:
-        val: Color string (either color codes like 'WUBRG' or color name like 'red').
+        val: Color string (either color codes like 'WUBRG' or a color name like 'red' or
+            'azorius' — every name in COLOR_ALIAS_TO_CODES, which is the vocabulary Scryfall
+            itself accepts).
         attr: The DB column this value is being compared against. Colorless means two
             different things depending on the field: for card_colors/card_color_identity
             it's the *absence* of any color (Scryfall stores both as `[]`, verified
@@ -220,23 +225,20 @@ def get_colors_comparison_object(val: str, attr: str = "card_colors") -> dict[st
         ValueError: If the color string is invalid.
     """
     colorless_is_value = attr == "produced_mana"
-    # If all chars are color codes
+    # A color NAME spells a set of letters ('azorius' -> 'wu', 'brown' -> 'c', 'colorless' -> 'c');
+    # a letter string already is one. Expanding the name FIRST leaves a single code path, so
+    # `c:azorius` and `c:wu` serialize to the identical rhs and cannot drift apart, and the
+    # colorless-is-a-value distinction below is stated once instead of once per spelling.
+    codes = COLOR_ALIAS_TO_CODES.get(val, val)
     color_code_set = set(COLOR_CODE_TO_NAME)
-    if val and set(val) <= color_code_set:
+    if codes and set(codes) <= color_code_set:
         if colorless_is_value:
-            return {c.upper(): True for c in val}
+            return {c.upper(): True for c in codes}
         # Colorless-only queries use an empty dict, matching how colorless cards
         # are stored (card_color_identity = {}) rather than {"C": True}.
-        return {c.upper(): True for c in val if c != "c"}
-    # If it's a color name (e.g. 'red', 'blue', etc.)
-    try:
-        letter_code = COLOR_NAME_TO_CODE[val]
-        if letter_code == "c":
-            return {"C": True} if colorless_is_value else {}
-        return {letter_code.upper(): True}
-    except KeyError as e:
-        msg = f"Invalid color string: {val}"
-        raise ValueError(msg) from e
+        return {c.upper(): True for c in codes if c != "c"}
+    msg = f"Invalid color string: {val}"
+    raise ValueError(msg)
 
 
 def get_frame_data_comparison_object(val: str) -> dict[str, bool]:
@@ -690,13 +692,32 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         if isinstance(context_node, CardAttributeNode):
             db_column_name = context_node.attribute_name.lower()
             if db_column_name in ("card_colors", "card_color_identity"):
+                # A color NAME ('temur', 'azorius', 'blue', 'colorless') spells a letter set
+                # via COLOR_ALIAS_TO_CODES. Single-letter spellings expand the same as bare
+                # letter codes below ('blue' -> 'Blue'); multi-letter names show the letters
+                # alongside the name as {G}{U}{R}-style bracket tokens so the reader isn't left
+                # to memorize which colors a guild/shard/wedge name means (#990). The frontend's
+                # showResults() runs the whole message through convertManaSymbols() after
+                # escaping, which turns exactly these tokens into real mana-font icons -- so
+                # this is the one spot in the string a server response is allowed to steer
+                # frontend HTML, and only ever with this fixed A-Z/digit token vocabulary.
+                alias_codes = COLOR_ALIAS_TO_CODES.get(value.lower())
+                if alias_codes is not None:
+                    if len(alias_codes) == 1:
+                        return COLOR_CODE_TO_NAME[alias_codes].capitalize()
+                    tokens = "".join(f"{{{c.upper()}}}" for c in alias_codes)
+                    return f"{value.capitalize()} ({tokens})"
                 # Try to expand single-letter color codes
                 if len(value) == 1 and value.lower() in COLOR_CODE_TO_NAME:
                     return COLOR_CODE_TO_NAME[value.lower()].capitalize()
-                # Try to expand multi-letter color codes (e.g., "ug" -> "Blue/Green")
+                # Try to expand multi-letter color codes (e.g., "ug" -> "Blue/Green"), deduped
+                # and in canonical WUBRG(C) order so a repeated/scrambled letter string like
+                # "brgb" reads as "Black/Red/Green" rather than echoing every input letter in
+                # input order ("Black/Red/Green/Black").
                 max_colors = 5
                 if len(value) <= max_colors and all(c.lower() in COLOR_CODE_TO_NAME for c in value):
-                    color_names = [COLOR_CODE_TO_NAME[c.lower()].capitalize() for c in value.lower()]
+                    present = {c.lower() for c in value}
+                    color_names = [COLOR_CODE_TO_NAME[c].capitalize() for c in _CANONICAL_COLOR_ORDER if c in present]
                     return "/".join(color_names)
 
             # If context is a format-related attribute, try to expand format codes
