@@ -6761,7 +6761,7 @@ fn flavor_match_bind_eval_and_narrow() {
     }
     let mut rx = FilterExpr::TextRegex {
         field: super::TextField::FlavorTextLower,
-        regex: regex::Regex::new("qu.et").unwrap(),
+        regex: crate::filter::compile_search_regex_for_test("qu.et"),
     };
     bound(&mut rx);
     assert!(rx.matches(card0, &archived.printings[1], &archived.strings));
@@ -10333,7 +10333,7 @@ fn contains_scan() -> FilterExpr {
 }
 
 fn machinery_regex() -> FilterExpr {
-    FilterExpr::TextRegex { field: TextField::OracleTextLower, regex: regex::Regex::new("draw .* cards?").unwrap() }
+    FilterExpr::TextRegex { field: TextField::OracleTextLower, regex: crate::filter::compile_search_regex_for_test("draw .* cards?") }
 }
 
 // Pattern-shape cost classification: anchored literals are memcmp-cheap
@@ -10342,7 +10342,7 @@ fn machinery_regex() -> FilterExpr {
 // shares REGEX_MACHINERY_NS100.
 #[test]
 fn regex_tier_classifies_pattern_shapes() {
-    use super::{regex_tier, REGEX_MACHINERY_NS100, SET_LOOKUP_NS100};
+    use super::{regex_tier, REGEX_BACKTRACK_NS100, REGEX_MACHINERY_NS100, SET_LOOKUP_NS100};
     assert_eq!(regex_tier("(?i)^flying$"), SET_LOOKUP_NS100);
     assert_eq!(regex_tier("dragon$"), SET_LOOKUP_NS100);
     assert_eq!(regex_tier("(?i)^\\{t\\}: add"), SET_LOOKUP_NS100, "escaped punctuation is literal");
@@ -10353,6 +10353,27 @@ fn regex_tier_classifies_pattern_shapes() {
     assert_eq!(regex_tier("(?i)^\\d+$"), REGEX_MACHINERY_NS100, "class escapes are machinery");
     assert_eq!(regex_tier("a|b"), REGEX_MACHINERY_NS100);
     assert_eq!(regex_tier("ends with backslash\\"), REGEX_MACHINERY_NS100, "dangling escape: not literal");
+    assert_eq!(regex_tier("(?i)draw (?!two)"), REGEX_BACKTRACK_NS100);
+    assert_eq!(regex_tier("(?=.*sacrifice)draw"), REGEX_BACKTRACK_NS100);
+    assert_eq!(regex_tier("(?<=draw )a card"), REGEX_BACKTRACK_NS100);
+}
+
+#[test]
+fn regex_backtrack_exhaustion_surfaces_as_match_failure() {
+    use crate::filter::{
+        clear_regex_match_failed, regex_is_match_for_test, take_regex_match_failed, REGEX_MATCH_ERR_PREFIX,
+    };
+    use fancy_regex::RegexBuilder;
+
+    clear_regex_match_failed();
+    let re = RegexBuilder::new("(?i)(?=a)(a+)+b")
+        .backtrack_limit(8)
+        .build()
+        .expect("pattern compiles");
+    let hay = format!("{}c", "a".repeat(40));
+    assert!(!regex_is_match_for_test(&re, &hay));
+    let msg = take_regex_match_failed().expect("backtrack exhaustion must set failure flag");
+    assert!(msg.starts_with(REGEX_MATCH_ERR_PREFIX));
 }
 
 // And children reorder cheapest-tier-first regardless of written order, and
@@ -10372,6 +10393,20 @@ fn verify_order_sorts_and_children_cheap_first() {
     assert!(matches!(children[2], FilterExpr::TypeCmp { .. }));
     assert!(matches!(children[3], FilterExpr::TextContains { .. }));
     assert!(matches!(children[4], FilterExpr::TextRegex { .. }));
+}
+
+#[test]
+fn verify_order_puts_lookaround_regex_last() {
+    let lookaround = FilterExpr::TextRegex {
+        field: TextField::OracleTextLower,
+        regex: crate::filter::compile_search_regex_for_test("draw (?!two)"),
+    };
+    let mut f = FilterExpr::And(vec![lookaround, contains_scan(), type_mask()]);
+    f.order_children_by_verify_cost(&mut 0);
+    let FilterExpr::And(children) = &f else { panic!("still an And") };
+    assert!(matches!(children[0], FilterExpr::TypeCmp { .. }));
+    assert!(matches!(children[1], FilterExpr::TextContains { .. }));
+    assert!(matches!(children[2], FilterExpr::TextRegex { .. }));
 }
 
 // Within the memoized-set tier, And children refine to ascending set size

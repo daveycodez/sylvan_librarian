@@ -13,15 +13,13 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 
-// Raised for malformed query input (bad filter JSON, unbuildable filter expression). Subclasses
-// ValueError so existing `except ValueError` call sites keep working; new call sites can catch
-// this specifically to distinguish "the query was bad" from unrelated ValueErrors.
+// Query engine errors. `RetryableQueryError` declines to the SQL path; `FatalQueryError`
+// (and subclasses) return HTTP 400 without SQL retry. `except QueryError` catches both.
 create_exception!(card_engine, QueryError, PyValueError, "Raised when a query cannot be parsed or built.");
-
-// Subclass of QueryError (not a sibling) so `except QueryError` already catches it; callers that
-// need to distinguish "requested a field that doesn't exist" from other query errors can catch
-// this specifically instead.
-create_exception!(card_engine, UnknownFieldError, QueryError, "Raised when `fields` names an unknown field.");
+create_exception!(card_engine, RetryableQueryError, QueryError, "Raised when the engine declines a query the SQL path may still serve.");
+create_exception!(card_engine, FatalQueryError, QueryError, "Raised when a query is invalid for both engine and public search.");
+create_exception!(card_engine, UnsupportedRegexError, FatalQueryError, "Raised when a query regex is unsupported or cannot be compiled.");
+create_exception!(card_engine, UnknownFieldError, FatalQueryError, "Raised when `fields` names an unknown field.");
 
 // ─── Feature-gated counting allocator (memory measurement only) ──────────────
 // Counts live bytes / live allocations of this extension's Rust heap and records
@@ -11980,6 +11978,26 @@ pub(crate) fn count_common_keywords(data: &Archived<CardData>) -> HashMap<String
 /// `FilterExpr::True` behind, so by the time a plan runs there is nothing left to read the bound from.
 /// Every caller that does not want it can ignore it and get `UNBOUNDED` behaviour — a longer walk, never
 /// a different page.
+fn map_build_filter_err(err: String) -> PyErr {
+    if let Some(msg) = err.strip_prefix(REGEX_COMPILE_ERR_PREFIX) {
+        UnsupportedRegexError::new_err(msg.to_string())
+    } else {
+        RetryableQueryError::new_err(format!("build_filter: {err}"))
+    }
+}
+
+fn map_regex_match_err(msg: String) -> PyErr {
+    let detail = msg.strip_prefix(REGEX_MATCH_ERR_PREFIX).unwrap_or(&msg);
+    UnsupportedRegexError::new_err(detail.to_string())
+}
+
+fn check_regex_match_failed() -> PyResult<()> {
+    if let Some(msg) = take_regex_match_failed() {
+        return Err(map_regex_match_err(msg));
+    }
+    Ok(())
+}
+
 fn bind_and_split_filter(
     py: Python<'_>,
     filters: &Bound<PyAny>,
@@ -11993,16 +12011,17 @@ fn bind_and_split_filter(
         .call_method1("dumps", (to_json,))?
         .extract()?;
     let json_str = std::str::from_utf8(&json_bytes)
-        .map_err(|e| QueryError::new_err(format!("bad UTF-8 from orjson: {e}")))?;
+        .map_err(|e| RetryableQueryError::new_err(format!("bad UTF-8 from orjson: {e}")))?;
     let json_val: Value = serde_json::from_str(json_str)
-        .map_err(|e| QueryError::new_err(format!("bad query JSON: {e}")))?;
+        .map_err(|e| RetryableQueryError::new_err(format!("bad query JSON: {e}")))?;
 
     // Must run before build_filter so legality shifts resolve in workers that
     // never executed the load path themselves.
     sync_format_shifts(&data.format_shifts);
-    let mut filter_expr = build_filter(&json_val)
-        .map_err(|e| QueryError::new_err(format!("build_filter: {e}")))?;
+    clear_regex_match_failed();
+    let mut filter_expr = build_filter(&json_val).map_err(map_build_filter_err)?;
     filter_expr.bind(&data.coll_vocab, &data.coll_vocab_sorted, &data.artist_vocab, &data.mana_vocab, &data.indexes.flavor, &data.strings);
+    check_regex_match_failed()?;
 
     // Read before the split consumes the tree.
     let sort_bound = sort_col_bound(&filter_expr, sort_col);
@@ -12634,6 +12653,7 @@ impl QueryEngine {
         // the params: `from_strs` is still the single interpretation of the four strings.
         let (total, page) =
             run_query_routed(&ctx, &params.with_sort_bound(sort_bound), &mut filter_expr, Some(&unsplit), plane_expr.as_ref());
+        check_regex_match_failed()?;
 
         let matches: Vec<Bound<PyDict>> = page
             .iter()
@@ -12729,6 +12749,7 @@ impl QueryEngine {
         let ctx = QueryCtx::from(data);
         let params = params.with_sort_bound(sort_bound);
         let (facts, trials) = py.detach(|| explain_analyze(&ctx, &params, &filter_expr, Some(&unsplit), plane_expr.as_ref(), num_warmups, num_trials));
+        check_regex_match_failed()?;
 
         let rows: Vec<Bound<PyDict>> = trials.iter().map(|t| plan_trial_to_pydict(py, t)).collect::<PyResult<Vec<_>>>()?;
         let out = PyDict::new(py);
@@ -12865,6 +12886,9 @@ mod card_engine {
     #[pymodule_init]
     fn init(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add("QueryError", m.py().get_type::<super::QueryError>())?;
+        m.add("RetryableQueryError", m.py().get_type::<super::RetryableQueryError>())?;
+        m.add("FatalQueryError", m.py().get_type::<super::FatalQueryError>())?;
+        m.add("UnsupportedRegexError", m.py().get_type::<super::UnsupportedRegexError>())?;
         m.add("UnknownFieldError", m.py().get_type::<super::UnknownFieldError>())
     }
 }
