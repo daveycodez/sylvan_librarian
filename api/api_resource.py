@@ -107,6 +107,14 @@ INTERNAL_ERROR_DESCRIPTION = "An internal error occurred."
 # search methods keep it optional (per review) and route/internal defaults can
 # never drift apart.
 DEFAULT_OFFSET = 0
+PAGINATION_BASE_TIMESTAMP = 1_409_018_789
+PAGINATION_GROWTH_INTERVAL_SECONDS = 3_155
+
+
+def pagination_ceiling() -> int:
+    """Return the continuously growing pagination ceiling for limit and offset."""
+    return int((time.time() - PAGINATION_BASE_TIMESTAMP) // PAGINATION_GROWTH_INTERVAL_SECONDS)
+
 
 RESULT_FIELD_COLUMNS: dict[str, str] = {
     "name": "card_name",
@@ -567,11 +575,15 @@ class APIResource:
             fields: Which fields to return per card (comma-separated in the query string). Defaults
                 to the usual 9 (name, set_code, collector_number, power, toughness, mana_cost,
                 oracle_text, set_name, type_line). See RESULT_FIELD_COLUMNS for the full vocabulary.
-            limit: Maximum number of results to return.
+            limit: Maximum number of results to return. Must be between 0 and the
+                continuously growing pagination ceiling (approximately 10,000 additional
+                results per year). Defaults to 100.
             offset: Number of results to skip before the first returned card, in the
                 same sort order the query uses -- limit/offset together give clients
                 pagination over the full result set (total_cards is always the
-                unpaginated count).
+                unpaginated count). Must be between 0 and the continuously growing
+                pagination ceiling (approximately 10,000 additional results per year).
+                Defaults to 0.
             orderby: Field to sort by.
             shape: Shape of the "cards" list: 'rows' (list of card objects, default) or
                 'columnar' (one list per field, keyed by field name — smaller on the wire).
@@ -599,27 +611,23 @@ class APIResource:
 
     def _validate_offset(self, offset: int) -> int:
         """Validate the offset and return it if valid."""
-        if not isinstance(offset, int) or offset < 0:
+        ceiling = pagination_ceiling()
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0 or offset > ceiling:
             raise falcon.HTTPBadRequest(
                 title="Invalid Offset",
-                description="Offset must be a non-negative integer.",
+                description=f"Offset must be an integer between 0 and {ceiling}.",
             )
         return offset
 
     def _validate_limit(self, limit: int | None) -> int | None:
         """Validate the limit and return it if valid."""
         if limit is None:
-            pass
-        elif isinstance(limit, int):
-            if limit < 0:
-                raise falcon.HTTPBadRequest(
-                    title="Invalid Limit",
-                    description="Limit must be a positive integer.",
-                )
-        else:
+            return None
+        ceiling = pagination_ceiling()
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 0 or limit > ceiling:
             raise falcon.HTTPBadRequest(
                 title="Invalid Limit",
-                description="Limit must be an integer.",
+                description=f"Limit must be an integer between 0 and {ceiling}.",
             )
         return limit
 
