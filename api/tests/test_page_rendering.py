@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -10,6 +11,7 @@ import falcon
 from api.api_resource import APIResource
 from api.tests.support import mock_app_context
 from api.utils import page_rendering
+from api.utils.page_rendering import serialize_embedded_json
 
 
 class TestServeStaticFile(unittest.TestCase):
@@ -18,14 +20,10 @@ class TestServeStaticFile(unittest.TestCase):
     def test_reads_file_content(self) -> None:
         mock_response = MagicMock()
 
-        with patch("api.utils.page_rendering.pathlib.Path") as mock_path:
-            mock_file = MagicMock()
-            mock_file.open.return_value.__enter__.return_value.read.return_value = "file content"
-            mock_path.return_value = mock_file
-
+        with patch("api.utils.page_rendering._read_static_text", return_value="file content"):
             page_rendering.serve_static_file(filename="test.html", falcon_response=mock_response)
 
-            assert mock_response.text == "file content"
+        assert mock_response.text == "file content"
 
     def test_missing_file_serves_404(self) -> None:
         mock_response = MagicMock()
@@ -34,6 +32,32 @@ class TestServeStaticFile(unittest.TestCase):
 
         assert mock_response.status == falcon.HTTP_404
         assert "does-not-exist.html" in mock_response.text
+
+    def test_content_is_read_from_disk_only_once(self) -> None:
+        """_read_static_text is process-lifetime cached: a second call skips the disk read."""
+        mock_response_1 = MagicMock()
+        mock_response_2 = MagicMock()
+
+        with patch("pathlib.Path.read_text", return_value="cached content") as mock_read_text:
+            page_rendering.serve_static_file(filename="__test_cache_marker__.html", falcon_response=mock_response_1)
+            page_rendering.serve_static_file(filename="__test_cache_marker__.html", falcon_response=mock_response_2)
+
+        assert mock_response_1.text == "cached content"
+        assert mock_response_2.text == "cached content"
+        mock_read_text.assert_called_once()
+
+
+class TestReadStaticBytes(unittest.TestCase):
+    """read_static_bytes is process-lifetime cached, like _read_static_text."""
+
+    def test_content_is_read_from_disk_only_once(self) -> None:
+        with patch("pathlib.Path.read_bytes", return_value=b"cached bytes") as mock_read_bytes:
+            first = page_rendering.read_static_bytes("__test_bytes_cache_marker__.ico")
+            second = page_rendering.read_static_bytes("__test_bytes_cache_marker__.ico")
+
+        assert first == b"cached bytes"
+        assert second == b"cached bytes"
+        mock_read_bytes.assert_called_once()
 
 
 class TestHtmlMinification(unittest.TestCase):
@@ -79,3 +103,68 @@ class TestHtmlMinification(unittest.TestCase):
             self.api_resource._root(falcon_response=mock_response, q="elf")
         assert "window.EMBEDDED_SEARCH_RESULTS = {" in mock_response.text
         assert "Elvish Mystic" in mock_response.text
+
+    def test_hostile_query_in_search_results_escapes_script_breakout(self) -> None:
+        mock_response = MagicMock()
+        hostile_query = "</script><script>alert('xss')</script>"
+        mock_search_results = {
+            "cards": [{"name": "<img src=x onerror=alert(1)>", "set_code": "m14", "collector_number": "1"}],
+            "total_cards": 1,
+            "query": hostile_query,
+        }
+        with patch.object(self.api_resource, "_search", return_value=mock_search_results):
+            self.api_resource._root(falcon_response=mock_response, q=hostile_query)
+
+        # The embedded script assignment must not contain literal closing script tags or < characters
+        assert "window.EMBEDDED_SEARCH_RESULTS = " in mock_response.text
+        # Extract the script content containing the embedded data
+        script_marker = "window.EMBEDDED_SEARCH_RESULTS = "
+        script_start = mock_response.text.index(script_marker) + len(script_marker)
+        script_end = mock_response.text.index(";", script_start)
+        embedded_json = mock_response.text[script_start:script_end]
+
+        assert "<" not in embedded_json
+        assert "</script>" not in embedded_json
+
+        # Hydration parity: parsing the escaped JSON yields the exact original payload
+        hydrated = json.loads(embedded_json)
+        assert hydrated == mock_search_results
+
+
+class TestSerializeEmbeddedJson(unittest.TestCase):
+    """serialize_embedded_json produces HTML-script-safe JSON by escaping literal `<`."""
+
+    def test_escapes_literal_less_than(self) -> None:
+        payload = {"tag": "<script>", "arrow": "a < b", "nested": [{"key": "<value>"}]}
+        serialized = serialize_embedded_json(payload)
+
+        assert "<" not in serialized
+        assert r"\u003c" in serialized
+        assert json.loads(serialized) == payload
+
+    def test_hostile_script_closing_payload(self) -> None:
+        payload = {
+            "query": "</script><script>alert('breakout')</script>",
+            "comment": "<!-- comment -->",
+        }
+        serialized = serialize_embedded_json(payload)
+
+        assert "<" not in serialized
+        assert "</script>" not in serialized
+        assert "<!--" not in serialized
+        assert json.loads(serialized) == payload
+
+    def test_preserves_complex_datatypes_and_unicode(self) -> None:
+        payload = {
+            "string": "Lim-Dûl's Vault",
+            "escapes": 'quote: ", backslash: \\, newline: \n, tab: \t',
+            "numbers": [0, 42, -3.14, 1e-5],
+            "booleans": [True, False],
+            "null": None,
+            "html_entities": "&amp; &lt; &gt; &quot;",
+            "script_tags": '</script><script src="evil.js"></script>',
+        }
+        serialized = serialize_embedded_json(payload)
+
+        assert "<" not in serialized
+        assert json.loads(serialized) == payload

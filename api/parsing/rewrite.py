@@ -1,9 +1,9 @@
 """Post-parse query rewriting: expand derived predicates into subtrees of primitives.
 
-Applied once at the shared parse seam (`parse_scryfall_query`), so both the production
-hand parser and the legacy pyparsing parser get identical treatment: the transform
-operates on the common AST, after parsing and before SQL / Rust-engine serialization
-(`parse => transform => rest`). Nothing parser-specific lives here.
+Applied once at the shared post-parse seam (`post_parse.finalize_query`), so both the
+production hand parser and the legacy pyparsing parser get identical treatment: the
+transform operates on the common AST, after parsing and before SQL / Rust-engine
+serialization (`parse => finalize_query => rest`). Nothing parser-specific lives here.
 
 Each expansion is written as a DSL string and re-parsed with the production parser, so a
 definition is expressed in the same language it targets and stays correct by construction
@@ -16,8 +16,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import cachebox
+
 from api.parsing.card_query_nodes import CardAttributeNode
-from api.parsing.hand_parser import parse_query as _parse_query
+from api.parsing.hand_parser import parse_str_to_query as _parse_str_to_query
 from api.parsing.nodes import (
     AndNode,
     BinaryOperatorNode,
@@ -37,15 +39,14 @@ if TYPE_CHECKING:
 #
 # `frame:modern/old/new` are undocumented-but-live Scryfall aliases (the syntax docs list
 # only the numeric frames + frame-effects); mirrored because they see real use. `is:old`
-# and `is:new` ARE documented. Note `is:new` is the 2015 frame *only* -- deliberately
-# narrower than `frame:new` (every post-"classic" frame) -- and both are mirrored as-is
-# rather than reconciled, since diverging from Scryfall would be the real bug.
+# and `is:new` ARE documented, and match their `frame:` counterparts exactly (live count
+# 2026-08-22: `is:new` = `frame:new` = 90058, vs `frame:2015` alone at 72564 -- issue #974).
 _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     ("frame", "modern"): "frame:2003",
     ("frame", "old"): "frame:1993 or frame:1997",
     ("frame", "new"): "frame:2003 or frame:2015 or frame:future",
     ("is", "old"): "frame:1993 or frame:1997",
-    ("is", "new"): "frame:2015",
+    ("is", "new"): "frame:2003 or frame:2015 or frame:future",
     # Type / subtype based. `kw:changeling` (an ability keyword, subtype is Shapeshifter) picks up
     # the all-creature-type cards Scryfall counts. Note party IS creature-restricted while outlaw is
     # NOT (it also matches Kindred non-creature cards carrying an outlaw subtype).
@@ -86,6 +87,7 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     # enters-tapped-gain-life cycles Scryfall's list lacks -- with counts
     # last validated against api.scryfall.com on 2026-08-07.
     ("is", "battleland"): "otag:cycle-tangoland",  # 10
+    ("is", "bikeland"): "otag:cycle-dual-cycling-land",  # 10, exact
     ("is", "bondland"): "otag:cycle-bondland",  # 10
     ("is", "bounceland"): "otag:bounceland",  # 17, exact
     ("is", "canopyland"): "otag:cycle-horizon-land",  # 6, exact
@@ -98,6 +100,7 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     ("is", "gainland"): "otag:gainland",  # 42, self-updating superset of Scryfall's 15
     ("is", "manland"): "t:land o:become o:creature o:/still a.* land/",
     ("is", "painland"): "otag:cycle-painland",  # 10, exact
+    ("is", "pathway"): "otag:cycle-pathway",  # 10, exact
     ("is", "scryland"): "otag:cycle-block-ths-scry-land",  # 10, exact
     # shadowland/snarl: the reveal-or-tapped lands that reveal a BASIC LAND
     # TYPE card -- the basic-type regex is what separates them from the
@@ -112,7 +115,11 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
         "is",
         "storageland",
     ): "otag:cycle-fem-storage-land or otag:cycle-mmq-storage-land or otag:cycle-tsp-storage-land",  # 15 vs 12
+    ("is", "surveilland"): "otag:cycle-dual-surveil-land",  # 10, exact
     ("is", "tangoland"): "otag:cycle-tangoland",  # 10; Scryfall accepts both names
+    # Same 10 cards as is:triome below (verified by name) -- another case of Scryfall
+    # accepting two names for one cycle, like tangoland/battleland above.
+    ("is", "tricycleland"): "otag:tricycle-land",  # 10, exact
     ("is", "triland"): "otag:cycle-ala-shardland or otag:cycle-ktk-wedgeland",  # 10, name-verified
     ("is", "triome"): "otag:cycle-iko-triome or otag:cycle-snc-triland",  # 10, name-verified
     # ── Non-land derivables ──────────────────────────────────────────────
@@ -161,14 +168,43 @@ def _leaf_key(node: QueryNode) -> tuple[str, str] | None:
     return (alias, value.lower())
 
 
-def _parse_expansion(dsl: str) -> QueryNode:
-    """Parse an expansion DSL string into a subtree (the production parser's output root).
+@cachebox.cached(cache={})
+def _expanded_template(key: tuple[str, str]) -> QueryNode:
+    """Fully-expanded AST for one derived-predicate key, computed once per process.
 
-    Uses the production hand parser directly (not `parse_scryfall_query`) so expansion of
-    a synonym does not recurse back through this transform; nesting is handled explicitly
-    by `_expand` re-walking the result.
+    Parses the expansion with the hand parser only (not ``parse_scryfall_query``), so synonym
+    expansion does not recurse through this transform; seeding ``in_progress`` with ``key``
+    breaks any cycle. Callers MUST ``_clone_expansion`` the result before splicing it into a
+    query tree -- see that function for why a plain ``copy.deepcopy`` is both unsafe and, on
+    these small subtrees, measured slower than re-parsing the DSL string outright.
     """
-    return _parse_query(dsl).root
+    subtree, _ = _expand(_parse_str_to_query(_DERIVED_EXPANSIONS[key]).root, frozenset({key}))
+    return subtree
+
+
+def _clone_expansion(node: QueryNode) -> QueryNode:
+    """Structural copy of a cached expansion subtree, cheap enough to be worth caching at all.
+
+    A later per-request pass mutates leaf nodes in place (case-normalization in
+    ``card_query_nodes.to_sql``, e.g. ``self.rhs.value = ...``, ``self.operator = ...``), which
+    would otherwise corrupt ``_expanded_template``'s cached result for every future query that
+    reuses the same synonym -- so each leaf needs its own node and its own ``rhs`` object.
+    ``lhs`` and each value node's own ``.value`` are never reassigned in place downstream, so
+    those are shared, not copied.
+
+    Deliberately not ``copy.deepcopy``: measured ~20x slower than this on these subtrees (a
+    6-leaf expansion: 32us vs 1.5us) because deepcopy's generic per-object reduce/memo machinery
+    dominates on custom classes -- slower, in fact, than just re-parsing the DSL string (17us),
+    which is what made caching the parse pointless until this clone replaced the copy step.
+    """
+    cls = node.__class__
+    if cls is AndNode or cls is OrNode:
+        return cls([_clone_expansion(op) for op in node.operands])
+    if cls is NotNode:
+        return NotNode(_clone_expansion(node.operand))
+    if isinstance(node, BinaryOperatorNode):
+        return type(node)(node.lhs, node.operator, type(node.rhs)(node.rhs.value))
+    return node
 
 
 def _expand(node: QueryNode, in_progress: frozenset[tuple[str, str]]) -> tuple[QueryNode, bool]:
@@ -192,10 +228,7 @@ def _expand(node: QueryNode, in_progress: frozenset[tuple[str, str]]) -> tuple[Q
         return (NotNode(new_op), True) if changed else (node, False)
     key = _leaf_key(node)
     if key is not None and key in _DERIVED_EXPANSIONS and key not in in_progress:
-        # Recurse into the expansion so a definition may itself reference another derived
-        # predicate; `in_progress` breaks any (mis)configured cycle (a -> ... -> a).
-        subtree, _ = _expand(_parse_expansion(_DERIVED_EXPANSIONS[key]), in_progress | {key})
-        return subtree, True
+        return _clone_expansion(_expanded_template(key)), True
     return node, False
 
 
@@ -311,6 +344,73 @@ def expand_derived_predicates(query: Query) -> Query:
     return flatten_nested_operations(Query(root))
 
 
+def _operand_dedup_key(node: QueryNode) -> tuple:
+    """Hashable key for order-insensitive dedup within one AND/OR operand list."""
+    cls = node.__class__
+    if cls is AndNode or cls is OrNode:
+        return (cls.__name__, frozenset(_operand_dedup_key(op) for op in node.operands))
+    if cls is NotNode:
+        return ("NotNode", _operand_dedup_key(node.operand))
+    return ("leaf", hash(node))
+
+
+def _deduplicate_operand_list(operands: list[QueryNode]) -> list[QueryNode]:
+    """Drop duplicate operands, keeping the first (order-insensitive within one compound)."""
+    seen: set[tuple] = set()
+    unique: list[QueryNode] = []
+    for operand in operands:
+        key = _operand_dedup_key(operand)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(operand)
+    return unique
+
+
+def _normalize_compound_operands(node: QueryNode) -> tuple[QueryNode, bool]:
+    """Bottom-up flatten, dedupe, and unwrap singleton And/Or nodes."""
+    cls = node.__class__
+    if cls is AndNode or cls is OrNode:
+        changed = False
+        operands: list[QueryNode] = []
+        for operand in node.operands:
+            normalized, operand_changed = _normalize_compound_operands(operand)
+            changed |= operand_changed
+            if isinstance(normalized, cls):
+                operands.extend(normalized.operands)
+                changed = True
+            else:
+                operands.append(normalized)
+        deduped = _deduplicate_operand_list(operands)
+        if len(deduped) != len(operands):
+            changed = True
+        if len(deduped) <= 1:
+            return (deduped[0], True) if deduped else (node, changed)
+        if not changed:
+            return node, False
+        return cls(deduped), True
+    if cls is NotNode:
+        normalized, changed = _normalize_compound_operands(node.operand)
+        return (NotNode(normalized), True) if changed else (node, False)
+    return node, False
+
+
+def flatten_and_deduplicate_compounds(query: Query) -> Query:
+    """Flatten nested AND/OR chains, drop duplicate operands, unwrap singleton compounds.
+
+    A single bottom-up pass merges same-type children, dedupes with order-insensitive keys
+    (``AND(cmc<2, c=w)`` equals ``AND(c=w, cmc<2)`` under a shared OR), then unwraps. No separate
+    pre-flatten is needed: ``_normalize_compound_operands`` already merges a same-type child into
+    its parent's operand list as part of its own bottom-up walk (the ``isinstance(normalized, cls)``
+    branch below), which is exactly what ``flatten_nested_operations`` does -- so calling it first
+    would just flatten the same chains twice, rebuilding every node with nothing left to change.
+    """
+    root, changed = _normalize_compound_operands(query.root)
+    if not changed:
+        return query
+    return Query(root)
+
+
 # The post-parse rewrite pipeline, applied in order at the shared parse seam. Add future AST
 # rewrites to this tuple — both parsers call `rewrite_query`, so a new pass lands in exactly one
 # place and is guaranteed identical treatment across parsers (enforced by test_parser_parity).
@@ -325,6 +425,10 @@ def rewrite_query(query: Query) -> Query:
     `expand_derived_predicates` (a synonym may expand into a subtree that itself contains a
     regex or other rewritable leaf), then `lower_literal_regexes`, then any future pass
     appended to `_REWRITE_PASSES`.
+
+    ``flatten_and_deduplicate_compounds`` runs later in ``post_parse.finalize_query`` — after
+    regex-budget validation — so duplicate identical regex leaves still count toward the public
+    leaf limit.
     """
     for rewrite_pass in _REWRITE_PASSES:
         query = rewrite_pass(query)

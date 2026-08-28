@@ -134,17 +134,27 @@ const MANA_SYMBOLS = new Map([
 ]);
 const MANA_RE = /\{[^}]{1,5}\}/g;
 
-function convertManaSymbols(text) {
+function formatCardText(text, isModal = true, convertNewlines = false) {
+  if (typeof isModal === 'object' && isModal !== null) {
+    convertNewlines = isModal.convertNewlines || false;
+    isModal = isModal.isModal ?? true;
+  }
   if (!text) return '';
-  return text.replace(MANA_RE, match => {
+  const symbolClass = isModal ? 'modal-mana-symbol' : 'mana-symbol';
+  const escaped = escapeHtml(text);
+  const formatted = escaped.replace(MANA_RE, match => {
     const cls = MANA_SYMBOLS.get(match);
-    return cls ? `<span class="modal-mana-symbol ${cls}"></span>` : escapeHtml(match);
+    return cls ? `<span class="${symbolClass} ${cls}"></span>` : match;
   });
+  return convertNewlines ? formatted.replace(/\n/g, '<br>') : formatted;
 }
 
-function formatOracleText(text) {
-  if (!text) return '';
-  return convertManaSymbols(escapeHtml(text)).replace(/\n/g, '<br>');
+function convertManaSymbols(text, isModal = true) {
+  return formatCardText(text, isModal, false);
+}
+
+function formatOracleText(text, isModal = true) {
+  return formatCardText(text, isModal, true);
 }
 
 function renderCardFace(card) {
@@ -242,7 +252,9 @@ async function main() {
   try {
     const resp = await fetch(`/search?q=${encodeURIComponent(`set:${setCode} cn:${collectorNumber}`)}&unique=printing`);
     const data = await resp.json();
-    card = data.cards?.[0];
+    // cn: matches on collector_number_int, which collapses numbers differing only by
+    // letters/symbols (e.g. "2018" vs "2018A") — pick the exact printing, not data.cards[0].
+    card = data.cards?.find(c => c.collector_number === collectorNumber) ?? data.cards?.[0];
   } catch (_) {
     document.getElementById('card-loading').textContent = 'Failed to load card.';
     return;
