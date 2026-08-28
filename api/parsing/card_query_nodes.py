@@ -556,12 +556,14 @@ _COLOR_COUNT_BY_OPERATOR: typing.Final = {
     "<=": (">=", 0),  # a tautology, spelled as a count so it stays one leaf
 }
 
-# produced_mana is NOT here, and the reason is measured rather than conservative: Scryfall counts
-# SIX values on that column, colorless among them. `produces=1 produces:c` is 481 -- exactly the
-# cards that produce colorless and nothing else -- so a C-only producer counts ONE there, where
-# `magic.color_identity_mask` and the engine's popcount both read the five WUBRG keys and would
-# call it zero. `produces:m` is therefore a count this column cannot answer yet, and it stays the
-# error it already was rather than becoming a silently different one.
+# produced_mana gets its OWN table rather than sharing the one above, and the reason is measured
+# rather than stylistic: Scryfall counts SIX values on that column, colorless among them.
+# `produces=1 produces:c` is 481 -- exactly the cards that produce colorless and nothing else -- so
+# a C-only producer counts ONE there, where `magic.color_identity_mask` and the engine's popcount
+# both read the five WUBRG keys and would call it zero. That is why this column carries its own
+# six-bit mask (`magic.produced_mana_mask`) and why sharing a table with the colour columns would
+# be wrong on exactly the cards the mask exists for.
+#
 # The same table for produced_mana, intersected with "produces at least one value". A card that
 # makes no mana at all is not a producer of anything, and Scryfall keeps it out of every one of
 # these: `produces<m` = `produces!=m` = 1,143 = `produces=1`, NOT `produces<2` (32,139) or

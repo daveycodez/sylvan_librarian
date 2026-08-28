@@ -1910,14 +1910,12 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
         // against the live Scryfall API: id:2 and id=2 return identical sets),
         // which is exactly what str_op_to_cmp yields.
         //
-        // produced_mana is refused, and it is a MEASUREMENT rather than caution:
-        // Scryfall counts six values on that column, colorless among them, so
-        // `produces=1 produces:c` is 481 -- the cards that produce colorless and
-        // nothing else -- where the popcount below masks C off and would call
-        // those zero. That is also why `produces:m`, which IS a count on
-        // Scryfall, is not lowered into this node by the parser.
-        // produced_mana counts here too, over SIX values rather than five — see
-        // the ColorCountCmp eval arm.
+        // produced_mana counts here too, over SIX values rather than five, and
+        // the asymmetry is a MEASUREMENT rather than an oversight: Scryfall
+        // counts colorless among them, so `produces=1 produces:c` is 481 -- the
+        // cards that produce colorless and nothing else -- where a five-key
+        // WUBRG popcount would call those zero. See the ColorCountCmp eval arm,
+        // which reads the six-bit mask for this field and five for the others.
         if rhs["node_type"].as_str() == Some("NumericValueNode") {
             let count = rhs["kwargs"]["value"].as_f64().ok_or("NumericValueNode missing value")? as u8;
             return Ok(FilterExpr::ColorCountCmp { field: color_field, op: str_op_to_cmp(op)?, count });
