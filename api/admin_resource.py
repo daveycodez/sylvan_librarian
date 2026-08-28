@@ -118,20 +118,8 @@ BOOLEAN_IS_TAGS: dict[str, str] = {
     "gameday": "cards.raw_card_blob->'promo_types' @> '\"gameday\"'",
     "giftbox": "cards.raw_card_blob->'promo_types' @> '\"giftbox\"'",
     "glossy": "cards.raw_card_blob->'promo_types' @> '\"glossy\"'",
-    # EVERY hybrid symbol, not just the ten two-colour ones. Scryfall counts four families and
-    # measuring it settles the width rather than reasoning about it (api.scryfall.com, 2026-08-23,
-    # unique=cards): `is:hybrid` is 603, and the ten `{W/U}`-style symbols reach 579 of them. The
-    # other 24 are the twobrid `{2/W}` cycle (19 cards), colourless-hybrid `{C/W}` (1) and
-    # Phyrexian-hybrid `{W/U/P}` (4).
-    #
-    # All four are one SHAPE -- an optional generic-or-colourless left side, and an optional `/P`
-    # tail -- which is the argument for a regex over the enumerated rewrite 00713 rejected: the
-    # alternation covers a family Wizards has not printed yet without another entry here.
-    #
-    # `{C/P}` is deliberately NOT in it. Colourless Phyrexian is not a hybrid symbol and Scryfall
-    # agrees: `is:hybrid o:"{c/p}"` is empty. The `[WUBRGC]` on the RIGHT of the slash is what
-    # excludes it, since `P` is not in that class.
-    "hybrid": r"cards.mana_cost_text ~ '\{([0-9]+|[WUBRGC])/[WUBRGC](/P)?\}'",
+    # Matches color/color, 2/color, colorless/color, and color/color/phyrexian.
+    "hybrid": r"cards.mana_cost_text ~ '\{[2CWUBRG]/[WUBRG]'",
     "instore": "cards.raw_card_blob->'promo_types' @> '\"instore\"'",
     "intro_pack": "cards.raw_card_blob->'promo_types' @> '\"intropack\"'",
     "judge_gift": "cards.raw_card_blob->'promo_types' @> '\"judgegift\"'",
@@ -141,29 +129,8 @@ BOOLEAN_IS_TAGS: dict[str, str] = {
     # "Partner with <name>" cards carry a plain "Partner" keyword alongside it (verified
     # against the corpus), so checking for "Partner" alone already covers both.
     "partner": "cards.raw_card_blob->'keywords' @> '\"Partner\"'",
-    # Phyrexian is ANYWHERE ON THE CARD, and the cost is the SMALLER half: `is:phyrexian` is 73
-    # and the cost -- even counting the Phyrexian-hybrid `{W/U/P}` symbols this also widens to --
-    # reaches only 37. The other 36 carry the symbol in rules text and nowhere else: Spellskite,
-    # the Souleaters, every `{2}{B/P}: transform` back face. Reading `mana_cost_text` alone answers
-    # 33 of the 73.
-    #
-    # Case-insensitive on the text side only: costs are stored upper-case, rules text quotes the
-    # symbol lower-case.
-    #
-    # `card_faces` is not walked, and could not be: preprocess_card explodes a multi-face printing
-    # into one row per face and strips the key from `raw_card_blob`, then the unique index on
-    # `scryfall_id` keeps ONE of those rows -- the last face. So a symbol that appears only on the
-    # FRONT face of a two-sided card is not in this table at all, under either column. That is a
-    # pre-existing limit of the row model rather than of this expression, it is unchanged by this
-    # commit, and merging the faces is what would lift it.
-    #
-    # `{C/P}` IS in this class, unlike in `hybrid`: it exists on cards even though #909's
-    # mana-symbol validator rejects it as a QUERY term, which is exactly the case a stored tag can
-    # answer and an enumerated `m:` rewrite structurally cannot.
-    "phyrexian": (
-        r"cards.mana_cost_text ~ '\{([WUBRGC]/)?[WUBRGC]/P\}' "
-        r"OR cards.oracle_text ~* '\{([wubrgc]/)?[wubrgc]/p\}'"
-    ),
+    # Search for `/P}` in mana costs and oracle texts.
+    "phyrexian": r"(cards.mana_cost_text ~ '/P\}' OR cards.oracle_text ~ '/P\}')",
     "planeswalker_deck": "cards.raw_card_blob->'promo_types' @> '\"planeswalkerdeck\"'",
     "player_rewards": "cards.raw_card_blob->'promo_types' @> '\"playerrewards\"'",
     "release": "cards.raw_card_blob->'promo_types' @> '\"release\"'",
