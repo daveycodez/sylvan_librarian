@@ -45,15 +45,27 @@ the linear engine, so the #734 trigram narrowing — which reads the pattern wit
 backtracking pattern yields no literal factors and scans, which is correct and
 already the behavior for any regex without a usable factor.
 
-`fancy_regex` runs with a `backtrack_limit`; exceeding it reads as "no match".
-That diverges from PostgreSQL, which raises. The alternative is threading a
-fallible result through per-card `Tri` evaluation, and these patterns already
-scan the corpus, so the ceiling is what keeps a pathological pattern from
-turning one request into a CPU sink.
+`fancy_regex` runs under the execution budget the security work already
+calibrated (`REGEX_BACKTRACK_LIMIT`, `docs/issues/security-regex-execution-budget.md`),
+and exhausting it surfaces as `UnsupportedRegexError` through that work's
+thread-local failure latch rather than as a silent non-match. Only the
+backtracking arm can reach it: the linear engine has no step budget to exhaust,
+which is most of why the two-tier split is worth having — the patterns that were
+already cheap never come near the ceiling, and the ones that can are the ones the
+#734 trigram narrow cannot narrow.
 
 **ARE escape translation** rewrites `\y`→`\b`, `\Y`→`\B`, `\Z`→`\z` (exact
 equivalents, so those stay linear) and `\m`/`\M` to lookaround (no equivalent,
 so those go backtracking). Bracket expressions are copied through untouched.
+
+The parse-time budget (`api/parsing/regex_budget.py`) measures patterns with
+Python's `re._parser`, which rejects all four word-boundary escapes outright, so
+it applies the same rewrite before measuring — otherwise a documented operator
+would be turned into a user-visible error by its own security check. It measures
+a translated copy and leaves the stored pattern alone, because the SQL path hands
+that pattern to PostgreSQL, which speaks ARE natively. `\m`/`\M` therefore spend
+lookaround budget, which is the honest accounting: they are exactly what puts a
+pattern on the backtracking engine that the cap exists to bound.
 
 **`TextField::TypeLine`** reads the interned `type_line_id` already on
 `AOracleCard`, card-level like `Layout` — Scryfall's type line is oracle data.
