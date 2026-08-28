@@ -33,6 +33,11 @@ import falcon
 from api.enums import CardOrdering, PreferOrder, SortDirection, UniqueOn
 from api.parsing import generate_sql_query, parse_scryfall_query
 from api.parsing.card_query_nodes import fold_accents
+from api.parsing.query_budget import (
+    InvalidRegexPatternError,
+    QueryBudgetExceeded,
+    bounded_query_log_context,
+)
 from api.scryfall_compat import objects
 from api.scryfall_compat.objects import (
     CARD_OBJECT_FIELDS,
@@ -1273,6 +1278,27 @@ class ScryfallCardsRoutes(ScryfallResponder):
         if q and q.strip():
             try:
                 where, params = generate_sql_query(parse_scryfall_query(q))
+            except QueryBudgetExceeded as err:
+                # Same treatment `_search` gives the budget: the stable non-disclosing message,
+                # and a bounded preview in the log rather than the full query in the body.
+                log_ctx = bounded_query_log_context(q)
+                logger.info(
+                    "Query budget exceeded (%s) preview=%r digest=%s",
+                    err.kind,
+                    log_ctx["query_preview"],
+                    log_ctx["query_digest"],
+                )
+                return self._scryfall_respond(
+                    falcon_response,
+                    bad_request_error(err.user_message),
+                    pretty=is_pretty,
+                )
+            except InvalidRegexPatternError as err:
+                return self._scryfall_respond(
+                    falcon_response,
+                    bad_request_error(err.user_message_for_query(q)),
+                    pretty=is_pretty,
+                )
             except ValueError:
                 return self._scryfall_respond(
                     falcon_response,

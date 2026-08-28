@@ -1,8 +1,71 @@
 use memchr::memmem;
-use regex::Regex;
+use fancy_regex::{Error as FancyError, Regex};
 use serde_json::Value;
 use super::{AOracleCard, APrinting, AStrings, str_at, mana_lane, lane_add, lanes_ge, LANES6_HI, LANES8_HI, mana_pip_counts, mana_cmc, color_list_to_mask, card_type_str_to_bit, trigram_candidates, trigram_min_posting, ARTIST_NONE, NONE_STR, FlavorIndex, NameBigramIndex, OracleTextIndex, SortedTrigramIndex, flavor_fingerprint, flavor_match_sets};
 use super::legality::{LEGALITY_LEGAL, LEGALITY_BANNED, LEGALITY_RESTRICTED, format_shift};
+
+/// Public search TextRegex backtrack cap — calibrated in docs/issues/security-regex-execution-budget.md.
+pub(crate) const REGEX_BACKTRACK_LIMIT: usize = 8192;
+
+/// Prefix on `build_filter` errors that must surface as `UnsupportedRegexError`, not `RetryableQueryError`.
+pub(crate) const REGEX_COMPILE_ERR_PREFIX: &str = "regex_compile:";
+
+/// Prefix on runtime regex match failures (`is_match` backtrack exhaustion, etc.).
+pub(crate) const REGEX_MATCH_ERR_PREFIX: &str = "regex_match:";
+
+pub(crate) fn compile_search_regex(pattern: &str) -> Result<Regex, String> {
+    fancy_regex::RegexBuilder::new(&format!("(?i){pattern}"))
+        .backtrack_limit(REGEX_BACKTRACK_LIMIT)
+        .build()
+        .map_err(|e| format!("{REGEX_COMPILE_ERR_PREFIX}{e}"))
+}
+
+use std::cell::Cell;
+
+thread_local! {
+    static REGEX_MATCH_FAILED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Reset before bind/evaluate so a prior query on this thread cannot poison the next.
+pub(crate) fn clear_regex_match_failed() {
+    REGEX_MATCH_FAILED.with(|c| c.set(false));
+}
+
+/// Take and clear the failure flag; `Some(message)` when a match aborted at runtime.
+pub(crate) fn take_regex_match_failed() -> Option<String> {
+    REGEX_MATCH_FAILED.with(|c| {
+        if c.get() {
+            c.set(false);
+            Some(format!("{REGEX_MATCH_ERR_PREFIX}regex execution limit exceeded"))
+        } else {
+            None
+        }
+    })
+}
+
+fn regex_is_match(re: &Regex, hay: &str) -> bool {
+    if REGEX_MATCH_FAILED.with(|c| c.get()) {
+        return false;
+    }
+    match re.is_match(hay) {
+        Ok(m) => m,
+        Err(FancyError::RuntimeError(_)) => {
+            REGEX_MATCH_FAILED.with(|c| c.set(true));
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn regex_is_match_for_test(re: &Regex, hay: &str) -> bool {
+    regex_is_match(re, hay)
+}
+
+#[cfg(test)]
+pub(crate) fn compile_search_regex_for_test(pattern: &str) -> Regex {
+    compile_search_regex(pattern).expect("test regex should compile")
+}
 
 // ─── Comparison / arithmetic operators ───────────────────────────────────────
 
@@ -301,6 +364,25 @@ fn card_colors(card: &AOracleCard, f: ColorField) -> u8 {
     }
 }
 
+/// The `ColorCmp` predicate against one card's (or, for an exact-total lookup, one stored
+/// combination's) bits. Shared by `matches()` and `exact_result_total`'s color arm so the two answers
+/// cannot drift apart -- a query bare enough to reach the totals table still has to agree with the
+/// residual path a compound query would fall back to.
+pub(crate) fn color_cmp_matches(op: CmpOp, mask: u8, bits: u8) -> bool {
+    match op {
+        // mask == 0 means the query was literally "c"/"colorless" (see
+        // get_colors_comparison_object on the Python side), not "at
+        // least zero colors" -- bits & 0 == 0 is vacuously true for
+        // every card, so Ge must fall back to exact equality here.
+        CmpOp::Ge => if mask == 0 { bits == 0 } else { bits & mask == mask },
+        CmpOp::Eq => bits == mask,
+        CmpOp::Le => bits & !mask == 0,
+        CmpOp::Lt => bits & !mask == 0 && bits != mask,
+        CmpOp::Gt => bits & mask == mask && bits != mask,
+        CmpOp::Ne => bits != mask,
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum CollField {
     Subtypes,
@@ -586,6 +668,13 @@ pub(crate) const TEXT_SCAN_NS100: u32 = 2_300;
 ///   left as a known conservative overestimate, not fixed here (would need a
 ///   regex_tier() classification change, not just a constant recalibration).
 pub(crate) const REGEX_MACHINERY_NS100: u32 = 5_000;
+/// - fancy-regex lookarounds / backrefs / conditionals: measured 89–430×
+///   REGEX_MACHINERY on the text corpus for PR-907-shaped patterns
+///   (`bench_regex_backtrack_tier`, 2026-08; e.g. `draw (?!two)` ~2.1 µs/card vs
+///   `draw .* cards?` ~24 ns/card). Deliberately dwarfs machinery so And reordering
+///   runs cheap predicates first; `(?=.*…)` shapes can cost more still — the tier
+///   prices ordering, not worst-case plan latency.
+pub(crate) const REGEX_BACKTRACK_NS100: u32 = 380_000;
 
 /// Per-candidate verification cost of a node in the tri walk. Composites take
 /// the max of their children: their short-circuit may have to evaluate every
@@ -650,8 +739,14 @@ pub(crate) fn verify_cost_tier(f: &FilterExpr) -> u32 {
 ///   REGEX_MACHINERY_NS100 — everything else: bare literal (measured the
 ///                         same cost as live metacharacters, not the same as
 ///                         TextContains — see REGEX_MACHINERY_NS100's doc)
+///   REGEX_BACKTRACK_NS100 — lookarounds and other fancy-regex backtracking
+///                         features (see bench_regex_backtrack_tier)
 pub(crate) fn regex_tier(pattern: &str) -> u32 {
-    let mut p = pattern.strip_prefix("(?i)").unwrap_or(pattern);
+    let p = pattern.strip_prefix("(?i)").unwrap_or(pattern);
+    if pattern_requires_backtrack(p) {
+        return REGEX_BACKTRACK_NS100;
+    }
+    let mut p = p;
     let anchored_start = p.starts_with('^');
     if anchored_start {
         p = &p[1..];
@@ -676,6 +771,40 @@ pub(crate) fn regex_tier(pattern: &str) -> u32 {
         }
     }
     if anchored_start || anchored_end { SET_LOOKUP_NS100 } else { REGEX_MACHINERY_NS100 }
+}
+
+/// True when *pattern* needs fancy-regex's backtracking VM (lookarounds, etc.).
+pub(crate) fn pattern_requires_backtrack(pattern: &str) -> bool {
+    const LOOKAROUNDS: &[&str] = &["(?=", "(?!", "(?<=", "(?<!"];
+    let bytes = pattern.as_bytes();
+    let mut in_class = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'[' => in_class = true,
+            b']' if in_class => in_class = false,
+            b'(' if !in_class && i + 1 < bytes.len() && bytes[i + 1] == b'?' => {
+                let rest = &pattern[i..];
+                if LOOKAROUNDS.iter().any(|tok| rest.starts_with(tok)) {
+                    return true;
+                }
+                if rest.starts_with("(?>") || rest.starts_with("(?(") {
+                    return true;
+                }
+            }
+            b'\\' if !in_class && i + 1 < bytes.len() => {
+                let nxt = bytes[i + 1];
+                if (b'1'..=b'9').contains(&nxt) || matches!(nxt, b'g' | b'G' | b'k' | b'K') {
+                    return true;
+                }
+                i += 1;
+            }
+            _ if !in_class && pattern[i..].starts_with("(?P=") => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Whether a node can NEVER settle the card-level pass — it compares only
@@ -945,7 +1074,7 @@ impl FilterExpr {
                 *self = FilterExpr::ArtistMatch { ids };
             }
             FilterExpr::TextRegex { field: TextField::ArtistLower, regex } => {
-                let ids = artist_match_ids(artist_vocab, |s| regex.is_match(s));
+                let ids = artist_match_ids(artist_vocab, |s| regex_is_match(regex, s));
                 *self = FilterExpr::ArtistMatch { ids };
             }
             FilterExpr::TextContains { field: TextSearchField::FlavorTextLower, word } => {
@@ -970,7 +1099,7 @@ impl FilterExpr {
                 *self = FilterExpr::FlavorMatch { gids, dense_ids };
             }
             FilterExpr::TextRegex { field: TextField::FlavorTextLower, regex } => {
-                let (gids, dense_ids) = flavor_match_sets(flavor, strings, 0, |s| regex.is_match(s));
+                let (gids, dense_ids) = flavor_match_sets(flavor, strings, 0, |s| regex_is_match(regex, s));
                 *self = FilterExpr::FlavorMatch { gids, dense_ids };
             }
             _ => {}
@@ -1268,6 +1397,9 @@ impl FilterExpr {
         residual: &[&FilterExpr],
         residual_is_or: bool,
     ) -> bool {
+        if REGEX_MATCH_FAILED.with(|c| c.get()) {
+            return false;
+        }
         if residual_is_or {
             residual.iter().any(|c| c.tri(card, Some(printing), strings) == Tri::True)
         } else {
@@ -1395,27 +1527,13 @@ impl FilterExpr {
 
             FilterExpr::TextRegex { field, regex } => {
                 match text_field_value(card, printing, strings, *field) {
-                    StrVal::Known(s) => tri_bool(regex.is_match(s)),
+                    StrVal::Known(s) => tri_bool(regex_is_match(regex, s)),
                     StrVal::Null => Tri::Null,
                     StrVal::PDep => Tri::PrintingDep,
                 }
             }
 
-            FilterExpr::ColorCmp { field, op, mask } => {
-                let bits = card_colors(card, *field);
-                tri_bool(match op {
-                    // mask == 0 means the query was literally "c"/"colorless" (see
-                    // get_colors_comparison_object on the Python side), not "at
-                    // least zero colors" -- bits & 0 == 0 is vacuously true for
-                    // every card, so Ge must fall back to exact equality here.
-                    CmpOp::Ge => if *mask == 0 { bits == 0 } else { bits & mask == *mask },
-                    CmpOp::Eq => bits == *mask,
-                    CmpOp::Le => bits & !mask == 0,
-                    CmpOp::Lt => bits & !mask == 0 && bits != *mask,
-                    CmpOp::Gt => bits & mask == *mask && bits != *mask,
-                    CmpOp::Ne => bits != *mask,
-                })
-            }
+            FilterExpr::ColorCmp { field, op, mask } => tri_bool(color_cmp_matches(*op, *mask, card_colors(card, *field))),
 
             FilterExpr::TypeCmp { mask, op } => {
                 let bits = u16::from(card.card_types);
@@ -1829,8 +1947,7 @@ fn build_text_filter(attr: &str, op: &str, rhs: &Value) -> Result<FilterExpr, St
 
     if rhs_node_type == "RegexValueNode" {
         let pattern  = rhs["kwargs"]["value"].as_str().unwrap_or("");
-        let re = Regex::new(&format!("(?i){pattern}"))
-            .map_err(|e| format!("invalid regex '{pattern}': {e}"))?;
+        let re = compile_search_regex(pattern)?;
         let field = match attr {
             "card_name"   => TextField::NameLower,
             "oracle_text" => TextField::OracleTextLower,
