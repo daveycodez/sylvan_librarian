@@ -13,10 +13,15 @@ measured rules (api.scryfall.com, 2026-08-08):
   apostrophe still opens a quoted string (name:'power').
 """
 
+from functools import partial
+
 import pytest
 
 from api.parsing import generate_sql_query, parse_scryfall_query
-from api.parsing.pyparsing_based import parse_search_query
+from api.parsing.post_parse import parse_query as parse_with_pipeline
+from api.parsing.pyparsing_based import parse_str_to_query as pyparsing_parse_str_to_query
+
+parse_search_query = partial(parse_with_pipeline, parser_fn=pyparsing_parse_str_to_query)
 
 # (query with punctuation, equivalent query without it)
 EQUIVALENT_CASES = [
