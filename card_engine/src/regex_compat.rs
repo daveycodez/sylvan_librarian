@@ -25,16 +25,7 @@ use std::sync::Arc;
 
 use regex::Regex;
 
-/// Backtracking steps allowed for one `is_match` before `fancy_regex` gives up.
-///
-/// Only reachable from a pattern that already declined the linear engine, and
-/// only per candidate string. The ceiling matters because a lookaround pattern
-/// has no literal factor for the trigram narrow to read, so it is evaluated
-/// against the whole corpus: the bound is what keeps a pathological pattern
-/// from turning one request into a CPU sink. PostgreSQL's own regex engine
-/// backtracks under a comparable (memory-shaped) ceiling, so this is the same
-/// class of limit the SQL path already imposed, not a new one.
-const BACKTRACK_LIMIT: usize = 1_000_000;
+use super::filter::REGEX_BACKTRACK_LIMIT;
 
 /// A compiled query regex, on whichever engine can express it.
 ///
@@ -79,7 +70,7 @@ impl CompiledRegex {
         match Regex::new(&cased) {
             Ok(re) => Ok(CompiledRegex::Fast(re)),
             Err(linear_err) => match fancy_regex::RegexBuilder::new(&cased)
-                .backtrack_limit(BACKTRACK_LIMIT)
+                .backtrack_limit(REGEX_BACKTRACK_LIMIT)
                 .build()
             {
                 Ok(re) => Ok(CompiledRegex::Backtrack(Arc::new(re))),
@@ -88,19 +79,29 @@ impl CompiledRegex {
         }
     }
 
-    /// Does this pattern match anywhere in `haystack`?
+    /// Does this pattern match anywhere in `haystack`, budget permitting?
     ///
-    /// Exceeding `BACKTRACK_LIMIT` reads as "no match". That is a real
-    /// divergence from PostgreSQL, which raises instead — but the alternative
-    /// is threading a fallible result through per-card `Tri` evaluation, and
-    /// the limit is high enough that a pattern reaching it is pathological
-    /// rather than merely complex.
+    /// The linear arm cannot fail — it has no step budget to exhaust — so the
+    /// `Err` case is reachable only from a lookaround or backreference pattern
+    /// that ran past [`REGEX_BACKTRACK_LIMIT`]. `filter::regex_is_match` is the
+    /// caller that turns that into the query-level `UnsupportedRegexError`
+    /// rather than a silent non-match; see its note.
+    #[inline]
+    pub(crate) fn try_is_match(&self, haystack: &str) -> Result<bool, fancy_regex::Error> {
+        match self {
+            CompiledRegex::Fast(re) => Ok(re.is_match(haystack)),
+            CompiledRegex::Backtrack(re) => re.is_match(haystack),
+        }
+    }
+
+    /// [`try_is_match`](Self::try_is_match) with an exhausted budget read as
+    /// "no match".
+    ///
+    /// For callers outside a query's execution — tests, and anywhere the
+    /// failure latch is not being read afterwards.
     #[inline]
     pub(crate) fn is_match(&self, haystack: &str) -> bool {
-        match self {
-            CompiledRegex::Fast(re) => re.is_match(haystack),
-            CompiledRegex::Backtrack(re) => re.is_match(haystack).unwrap_or(false),
-        }
+        self.try_is_match(haystack).unwrap_or(false)
     }
 
     /// The compiled pattern source, [`QUERY_REGEX_FLAGS`] prefix included.
