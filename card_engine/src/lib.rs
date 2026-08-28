@@ -13267,15 +13267,18 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 // `is:split`/`is:dfc`/`is:meld`/... -- real candidate narrowing for the first time). Same blind spot
 // again: entirely inside `CardIndexes`.
 //
-// 2026082701 — the scryfall-cards-api merge. This branch's layout changes land here: `Printing`
+// 2026082703 — the scryfall-cards-api merge. This branch's layout changes land here: `Printing`
 // gains `set_rank` and `artist_rank`, the dense ranks the six new `order=` values sort by (#913),
 // and `OracleCard.card_name_folded` becomes an interned `card_name_folded_id` (304 -> 240 bytes;
 // it held a string identical to `card_name_lower` on every card whose name carries no diacritic —
 // 31,636 of 31,724 on the current corpus, so 61 bytes a card bought 88 exceptions). The struct
 // sizes move, so the header would catch these on its own — but both sides of the merge had spent
 // 2026082301/2026082302 on DIFFERENT layouts, and the check is equality with a never-reuse
-// invariant, so the merged layout takes a value strictly newer than either parent's.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026082701;
+// invariant, so the merged layout takes a value strictly newer than either parent's. 01 and 02
+// are already spent the same way by two sibling branches (#920's `scryfall_prefer_score`, #913's
+// own re-pin of the rank fields) — three open branches, three distinct values, so no pair can
+// merge textually clean into one value meaning two layouts.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026082703;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
