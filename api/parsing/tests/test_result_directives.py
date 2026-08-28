@@ -13,10 +13,17 @@ still just a directive.
 `ci` mirrors Scryfall's alias for color identity (`ci<=bg` == `id<=bg`).
 """
 
+from functools import partial
+
 import pytest
 
 from api.parsing import generate_sql_query, parse_scryfall_query
-from api.parsing.pyparsing_based import parse_search_query
+from api.parsing.post_parse import parse_query as parse_with_pipeline
+from api.parsing.pyparsing_based import parse_str_to_query as pyparsing_parse_str_to_query
+
+# The pyparsing front end plus the shared post-parse pipeline -- directive extraction runs there,
+# so the raw `parse_str_to_query` alone would leave `Query.directives` empty.
+parse_with_pyparsing = partial(parse_with_pipeline, parser_fn=pyparsing_parse_str_to_query)
 
 # (query with directive, equivalent query without it)
 DIRECTIVE_CASES = [
@@ -55,7 +62,7 @@ def test_directive_filters_like_equivalent(query: str, equivalent: str) -> None:
 def test_directive_parser_parity(query: str, equivalent: str) -> None:
     """Both parsers agree on every directive-bearing query."""
     del equivalent
-    assert generate_sql_query(parse_scryfall_query(query)) == generate_sql_query(parse_search_query(query))
+    assert generate_sql_query(parse_scryfall_query(query)) == generate_sql_query(parse_with_pyparsing(query))
 
 
 def test_directive_needs_a_value() -> None:
@@ -69,11 +76,11 @@ def test_directive_needs_a_value() -> None:
 def test_directive_prefix_of_longer_word_is_a_name() -> None:
     """Words that merely START with a directive keep their name reading."""
     # "sorting" must not be consumed as "sort" + garbage, nor "uniquely" as "unique" + garbage.
-    assert generate_sql_query(parse_scryfall_query("sorting")) == generate_sql_query(parse_search_query("sorting"))
-    assert generate_sql_query(parse_scryfall_query("uniquely")) == generate_sql_query(parse_search_query("uniquely"))
+    assert generate_sql_query(parse_scryfall_query("sorting")) == generate_sql_query(parse_with_pyparsing("sorting"))
+    assert generate_sql_query(parse_scryfall_query("uniquely")) == generate_sql_query(parse_with_pyparsing("uniquely"))
     # "dir" is the riskiest of these: it is a prefix of "direction" AND of ordinary words.
-    assert generate_sql_query(parse_scryfall_query("direct")) == generate_sql_query(parse_search_query("direct"))
-    assert generate_sql_query(parse_scryfall_query("dire")) == generate_sql_query(parse_search_query("dire"))
+    assert generate_sql_query(parse_scryfall_query("direct")) == generate_sql_query(parse_with_pyparsing("direct"))
+    assert generate_sql_query(parse_scryfall_query("dire")) == generate_sql_query(parse_with_pyparsing("dire"))
 
 
 def test_dir_is_recorded_as_the_short_spelling_of_direction() -> None:
@@ -83,13 +90,13 @@ def test_dir_is_recorded_as_the_short_spelling_of_direction() -> None:
     repeated directive can quote back what the client actually wrote.
     """
     assert parse_scryfall_query("t:goblin dir:desc").directives == (("dir", "desc", False),)
-    assert parse_search_query("t:goblin dir:desc").directives == (("dir", "desc", False),)
+    assert parse_with_pyparsing("t:goblin dir:desc").directives == (("dir", "desc", False),)
 
 
 def test_direction_is_not_swallowed_by_the_dir_alternative() -> None:
     """The longer spelling has to win outright, or `direction:desc` parses as `dir` + garbage."""
     assert parse_scryfall_query("t:goblin direction:desc").directives == (("direction", "desc", False),)
-    assert parse_search_query("t:goblin direction:desc").directives == (("direction", "desc", False),)
+    assert parse_with_pyparsing("t:goblin direction:desc").directives == (("direction", "desc", False),)
 
 
 def test_directive_values_are_captured_in_source_order() -> None:
@@ -137,12 +144,12 @@ def test_directive_in_a_parenthesized_and_group_is_not_nested() -> None:
 )
 def test_directive_capture_parity(query: str) -> None:
     """Both parsers record identical directives for the same query."""
-    assert parse_scryfall_query(query).directives == parse_search_query(query).directives
+    assert parse_scryfall_query(query).directives == parse_with_pyparsing(query).directives
 
 
 def test_directive_only_query_filters_like_empty() -> None:
     """A query that is nothing but a directive matches everything, in both parsers."""
-    assert generate_sql_query(parse_scryfall_query("unique:art")) == generate_sql_query(parse_search_query("unique:art"))
+    assert generate_sql_query(parse_scryfall_query("unique:art")) == generate_sql_query(parse_with_pyparsing("unique:art"))
     assert parse_scryfall_query("unique:art").directives == (("unique", "art", False),)
 
 
@@ -162,7 +169,7 @@ CI_CASES = [
 def test_ci_is_an_identity_alias(ci_query: str, id_query: str) -> None:
     """`ci` produces identical SQL to the established identity aliases, in both parsers."""
     assert generate_sql_query(parse_scryfall_query(ci_query)) == generate_sql_query(parse_scryfall_query(id_query))
-    assert generate_sql_query(parse_search_query(ci_query)) == generate_sql_query(parse_search_query(id_query))
+    assert generate_sql_query(parse_with_pyparsing(ci_query)) == generate_sql_query(parse_with_pyparsing(id_query))
 
 
 # `-` is not a word character to the hand tokenizer, so `usd-low` lexes as WORD MINUS WORD.
@@ -185,6 +192,6 @@ HYPHENATED_DIRECTIVES = [
 )
 def test_hyphenated_directive_values_survive_both_parsers(query: str, name: str, value: str) -> None:
     """A hyphenated directive value reaches the directive whole, in both parsers."""
-    for parse in (parse_scryfall_query, parse_search_query):
+    for parse in (parse_scryfall_query, parse_with_pyparsing):
         directives = parse(query).directives
         assert directives == ((name, value, False),), f"{parse.__name__} lost the hyphen in {query!r}"
