@@ -152,6 +152,14 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
     # sets -- so it changes which printing represents a card, never whether the card is findable.
     if card.get("set_type") == MEMORABILIA_SET_TYPE:
         return []
+    # Oversized printings, same reasoning. Every card that exists ONLY oversized -- all 207
+    # planes, all 102 schemes, all 32 paper Vanguard avatars, Garruk the Slayer -- is not_legal
+    # in every format, so the legality gate above already refuses it before this line runs.
+    # Measured 2026-08-27: after the gates above, exactly 240 oversized printings survive, 230 of
+    # them memorabilia; this line removes the last 10, the p09/p10/p11 oversized box-topper
+    # promos, each of which has normal-sized printings. So no card is lost here either.
+    if card.get("oversized"):
+        return []
 
     # Filter out unplayable cards: Cards and Tokens
     type_line = card.get("type_line")

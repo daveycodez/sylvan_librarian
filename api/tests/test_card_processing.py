@@ -230,6 +230,20 @@ class TestCardProcessing:
         """
         assert len(preprocess_card(create_test_card(set_type="expansion"))) == 1
 
+    def test_preprocess_card_filters_oversized_printings(self) -> None:
+        """Oversized printings are not imported.
+
+        Every card that exists ONLY oversized (planes, schemes, Vanguard avatars) is not_legal in
+        every format and already refused by the legality gate, so this test card carries legal
+        legalities to reach the oversized check itself. Measured 2026-08-27: past the earlier gates
+        this drops exactly 10 printings, the p09/p10/p11 oversized box-topper promos, each of which
+        has normal-sized printings.
+
+        `test_preprocess_card_keeps_ordinary_sets` above is the paired keep-side: its card carries
+        no `oversized` field at all, matching the bulk objects where the flag is false.
+        """
+        assert preprocess_card(create_test_card(set_type="expansion", oversized=True)) == []
+
     def test_preprocess_card_filters_card_type(self) -> None:
         """Test preprocess_card filters out cards with Card type."""
         invalid_card = create_test_card(
