@@ -12,7 +12,8 @@ from dataclasses import dataclass
 from enum import Enum, auto
 
 from api.parsing.card_query_nodes import CardAttributeNode, CardBinaryOperatorNode, ExactNameNode
-from api.parsing.db_info import ALIAS_TO_FIELD_INFOS, COLOR_NAME_TO_CODE, ParserClass
+from api.parsing.colors import COLOR_ALIAS_TO_CODES
+from api.parsing.db_info import ALIAS_TO_FIELD_INFOS, ParserClass
 from api.parsing.mana_symbols import first_invalid_mana_symbol
 from api.parsing.nodes import (
     DIRECTIVE_NAMES,
@@ -30,6 +31,7 @@ from api.parsing.nodes import (
     TrueNode,
     flatten_nested_operations,
 )
+from api.parsing.query_budget import MAX_GROUP_DEPTH, QueryBudgetExceeded
 from api.parsing.spans import QUOTE_CHARS, brace_close_index, find_close_index, unescape
 
 # ── Alias → parser-class lookup ──────────────────────────────────────────────
@@ -58,7 +60,7 @@ _BANG_ALIAS_CLASSES: frozenset[ParserClass] = frozenset(
     {ParserClass.COLOR, ParserClass.MANA, ParserClass.RARITY, ParserClass.YEAR, ParserClass.DATE}
 )
 
-_VALID_COLOR_NAMES: frozenset[str] = frozenset(COLOR_NAME_TO_CODE)
+_VALID_COLOR_NAMES: frozenset[str] = frozenset(COLOR_ALIAS_TO_CODES)
 _COLOR_LETTERS: frozenset[str] = frozenset("wubrgcWUBRGC")
 _MIN_MTG_YEAR: int = 1992
 _MAX_YEAR: int = 2040
@@ -340,12 +342,13 @@ def _name_node(value: str) -> CardBinaryOperatorNode:
 class Parser:
     """Recursive descent parser for Scryfall query syntax."""
 
-    __slots__ = ("pos", "tokens")
+    __slots__ = ("group_depth", "pos", "tokens")
 
     def __init__(self, tokens: list[Token]) -> None:
         """Initialise the parser with the token list produced by tokenize()."""
         self.tokens = tokens
         self.pos = 0
+        self.group_depth = 0
 
     # ── token access ─────────────────────────────────────────────────────────
 
@@ -457,13 +460,19 @@ class Parser:
 
     def parse_group(self) -> QueryNode:
         """Parse a parenthesised sub-expression."""
-        self.consume()  # LPAREN
-        if self.peek().type == TT.RPAREN:
-            msg = "Empty parentheses are not allowed"
-            raise ParseError(msg)
-        inner = self.parse_expr()
-        self.expect(TT.RPAREN)
-        return inner
+        if self.group_depth >= MAX_GROUP_DEPTH:
+            raise QueryBudgetExceeded(kind="depth")
+        self.group_depth += 1
+        try:
+            self.consume()  # LPAREN
+            if self.peek().type == TT.RPAREN:
+                msg = "Empty parentheses are not allowed"
+                raise ParseError(msg)
+            inner = self.parse_expr()
+            self.expect(TT.RPAREN)
+            return inner
+        finally:
+            self.group_depth -= 1
 
     def parse_exact_name(self) -> QueryNode:
         """Parse an exact-name expression: !word or !"quoted string"."""
@@ -778,11 +787,25 @@ class Parser:
             self.consume()
             return StringValueNode(str(tok.value))
         if tok.type == TT.WORD:
+            self.consume()
             val = str(tok.value)
+            # The four-colour names are HYPHENATED (`yore-tiller`, `witch-maw`), and `-` is not a
+            # word-continuation character, so the lexer hands this WORD MINUS WORD. Same greedy
+            # hyphen-continuation rule parse_text_value uses (no space on either side) -- glue
+            # first, validate once at the end, rather than checking membership before consuming.
+            # WORD-only (not NUMBER, unlike parse_text_value's continuation): a color value is
+            # never numeric, so `c:w-1` still stops at `w` and leaves `-1` for whatever comes next.
+            while (
+                self.peek().type == TT.MINUS
+                and not self.peek().space_before
+                and self.peek(1).type == TT.WORD
+                and not self.peek(1).space_before
+            ):
+                self.consume()
+                val += "-" + str(self.consume().value)
             if val.lower() not in _VALID_COLOR_NAMES and not all(c in _COLOR_LETTERS for c in val):
                 msg = f"Invalid color value {val!r} at position {tok.pos}"
                 raise ParseError(msg)
-            self.consume()
             return StringValueNode(val)
         msg = f"Expected color value, got {tok.value!r} at position {tok.pos}"
         raise ParseError(msg)
@@ -836,12 +859,8 @@ class Parser:
 # ── entry point ───────────────────────────────────────────────────────────────
 
 
-def parse_query(src: str | None) -> Query:
-    """Parse a Scryfall query string into a Query AST.
-
-    Drop-in replacement for parse_search_query; handles implicit AND natively
-    without a separate preprocessing pass.
-    """
+def parse_str_to_query(src: str | None) -> Query:
+    """Parse a query string into a Query AST (lex + parse + flatten only)."""
     if not src or not src.strip():
         return Query(TrueNode())
     try:
@@ -849,8 +868,12 @@ def parse_query(src: str | None) -> Query:
     except LexError as exc:
         msg = f'Failed to lex query: "{src}"'
         raise ValueError(msg) from exc
+    except QueryBudgetExceeded:
+        raise
     try:
         result = Parser(tokens).parse()
+    except QueryBudgetExceeded:
+        raise
     except ParseError as exc:
         msg = f'Failed to parse query: "{src}"'
         raise ValueError(msg) from exc

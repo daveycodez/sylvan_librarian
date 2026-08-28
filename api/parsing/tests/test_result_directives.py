@@ -16,7 +16,15 @@ still just a directive.
 import pytest
 
 from api.parsing import generate_sql_query, parse_scryfall_query
-from api.parsing.pyparsing_based import parse_search_query
+from api.parsing.nodes import Query
+from api.parsing.post_parse import parse_query as _parse_with_pipeline
+from api.parsing.pyparsing_based import parse_str_to_query as _pyparsing_parse_str_to_query
+
+
+def parse_search_query(query: str | None) -> Query:
+    """Full-pipeline parse through the pyparsing front-end (the seam parse_scryfall_query uses)."""
+    return _parse_with_pipeline(query, parser_fn=_pyparsing_parse_str_to_query)
+
 
 # (query with directive, equivalent query without it)
 DIRECTIVE_CASES = [
