@@ -17,7 +17,7 @@ import pytest
 
 from api.parsing import generate_sql_query, parse_scryfall_query
 from api.parsing.card_query_nodes import slugify_tag
-from api.parsing.pyparsing_based import parse_search_query
+from api.parsing.pyparsing_based import parse_str_to_query as pyparsing_parse_str_to_query
 
 # (spelling as written, the hyphenated spelling it must match)
 TAG_VALUE_CASES = [
@@ -38,7 +38,7 @@ TAG_VALUE_CASES = [
 def test_written_tag_values_match_the_slug_spelling(written_query: str, slug_query: str) -> None:
     """A tag value written with spaces or capitals produces identical SQL to its slug, in both parsers."""
     assert generate_sql_query(parse_scryfall_query(written_query)) == generate_sql_query(parse_scryfall_query(slug_query))
-    assert generate_sql_query(parse_search_query(written_query)) == generate_sql_query(parse_search_query(slug_query))
+    assert generate_sql_query(pyparsing_parse_str_to_query(written_query)) == generate_sql_query(pyparsing_parse_str_to_query(slug_query))
 
 
 SLUGIFY_CASES = [
