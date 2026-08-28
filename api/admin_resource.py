@@ -94,37 +94,45 @@ IMPORT_LOCK_TIMEOUT = 2
 # total, and it halves the logged parameter too (see log_parameter_max_length in the pg config).
 _UPSERT_PAGE_SIZE = 3_000
 
+# BOOLEAN_IS_TAGS sync runs once per import over the whole corpus, evaluating every
+# managed expression per row. Chunk by scryfall_id hash so each statement stays within
+# the import's statement_timeout as the tag list grows. The tag table itself lives in
+# api.parsing.db_info (imported above) because the parser reads it too.
+_BOOLEAN_IS_TAGS_SYNC_CHUNK_COUNT = 4
 
 
 def _build_boolean_is_tags_sql(tags: dict[str, str]) -> str:
-    """Build the one-shot BOOLEAN_IS_TAGS sync statement from `tags`.
+    """Build a BOOLEAN_IS_TAGS sync statement from `tags`.
 
-    Each `(tag, expr)` pair becomes one row of a VALUES list correlated against the outer
-    `cards` row (`expr` reads `cards.raw_card_blob`), so `expr` may be any boolean SQL
-    expression -- not just "this top-level key is literally true" -- letting one mechanism
-    cover both plain booleans and promo_types/keywords/finishes array membership or
-    nested-object lookups. `tags` is a static, developer-authored module constant, never
-    user input, so embedding its keys and expressions as literal SQL text here (rather than
-    binding them as query parameters, which can't carry per-tag SQL syntax anyway) is safe.
+    Each `(tag, expr)` pair becomes one ``jsonb_build_object`` entry: ``expr`` reads the
+    outer `cards` row (`cards.raw_card_blob`, `cards.mana_cost_text`, etc.), so it may be
+    any boolean SQL expression -- not just "this top-level key is literally true" -- letting
+    one mechanism cover plain booleans, promo_types/keywords/finishes membership, and nested
+    lookups. ``jsonb_strip_nulls`` drops keys whose ``CASE WHEN`` did not fire. `tags` is a
+    static, developer-authored module constant, never user input, so embedding its keys and
+    expressions as literal SQL text here (rather than binding them as query parameters, which
+    can't carry per-tag SQL syntax anyway) is safe.
+
+    Callers pass ``num_chunks`` and ``chunk_index`` as query parameters. Use
+    ``num_chunks=1, chunk_index=0`` to scan the whole corpus; otherwise only cards whose
+    ``hashtext(scryfall_id)`` falls in that slice are touched.
     """
     managed = ", ".join(f"'{tag}'" for tag in tags)
-    values = ",\n                        ".join(f"('{tag}', ({expr}))" for tag, expr in tags.items())
+    object_entries = ",\n            ".join(
+        f"'{tag}', CASE WHEN ({expr}) THEN true END" for tag, expr in tags.items()
+    )
     return f"""
 WITH proposed AS (
     SELECT
         cards.scryfall_id,
         (cards.card_is_tags - ARRAY[{managed}]::text[])
-            || COALESCE(
-                   (
-                       SELECT jsonb_object_agg(t.tag, true)
-                       FROM (VALUES
-                        {values}
-                       ) AS t(tag, is_true)
-                       WHERE t.is_true
-                   ),
-                   '{{}}'::jsonb
-               ) AS proposed_is_tags
+            || jsonb_strip_nulls(
+                jsonb_build_object(
+            {object_entries}
+                )
+            ) AS proposed_is_tags
     FROM magic.cards cards
+    WHERE (abs(hashtext(cards.scryfall_id::text)) %% %(num_chunks)s) = %(chunk_index)s
 )
 UPDATE magic.cards
 SET card_is_tags = proposed.proposed_is_tags
@@ -134,23 +142,13 @@ WHERE
     cards.card_is_tags IS DISTINCT FROM proposed.proposed_is_tags
 """
 
-
-_SYNC_BOOLEAN_IS_TAGS_SQL = _build_boolean_is_tags_sql(BOOLEAN_IS_TAGS)
-
 CUSTOM_IS_TAGS = [
     "historic",  # artifact, legendary, saga
     "permanent",  # ...
-    "reprint",
     "spell",  # ...
     "unique",  # has exactly one printing
     "old",  # 93/97 frame
     "new",  # newer frames
-    "foil",  # foil version of a card
-    "nonfoil",  # non-foil version of a card
-    "datestamped",  # can get from the json promo_types array
-    "universesbeyond",  # can get from the json promo_types array
-    # I don't know how to do this, I just don't want to make the normal requests
-    "booster",
     "default",
 ]
 
@@ -661,6 +659,13 @@ class AdminResource:
             msg = "is_tag parameter is required"
             raise ValueError(msg)
 
+        if is_tag in BOOLEAN_IS_TAGS:
+            return {
+                "cards_updated": 0,
+                "is_tag": is_tag,
+                "message": f"is:{is_tag} is synced automatically from BOOLEAN_IS_TAGS on every import, no manual action needed",
+                "total_cards_found": 0,
+            }
         if is_tag in CUSTOM_IS_TAGS:
             return self._add_is_tag_to_custom(is_tag=is_tag)
         if is_tag in CARD_IS_TAGS:
@@ -743,19 +748,31 @@ class AdminResource:
         -- so list churn (a card entering or leaving the game-changer roster) converges on
         every import, and unrelated card_is_tags entries are never disturbed.
 
+        The sync is split into hash-scoped chunks so each statement stays within the
+        import's statement_timeout even as the corpus grows.
+
         Args:
         ----
-            conn (Connection): open connection; committed here.
+            conn (Connection): open connection; committed here once per chunk.
 
         Returns:
         -------
             int: rows whose card_is_tags changed.
 
         """
+        updated_count = 0
+        sync_sql = _build_boolean_is_tags_sql(BOOLEAN_IS_TAGS)
         with conn.cursor() as cursor:
-            cursor.execute(_SYNC_BOOLEAN_IS_TAGS_SQL)
-            updated_count = cursor.rowcount
-        conn.commit()
+            for chunk_index in range(_BOOLEAN_IS_TAGS_SYNC_CHUNK_COUNT):
+                cursor.execute(
+                    sync_sql,
+                    {
+                        "num_chunks": _BOOLEAN_IS_TAGS_SYNC_CHUNK_COUNT,
+                        "chunk_index": chunk_index,
+                    },
+                )
+                updated_count += cursor.rowcount
+                conn.commit()
         if updated_count:
             logger.info("Synced blob-backed is: tags on %d printings", updated_count)
         return updated_count

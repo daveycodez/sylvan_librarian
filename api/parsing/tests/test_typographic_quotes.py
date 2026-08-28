@@ -11,12 +11,16 @@ asking whether the phrase searched as ONE term. U+2018/U+2019 fold to `'` and U+
 fullwidth forms, CJK brackets, ornate quotes, backtick, acute, U+02BC.
 """
 
+from functools import partial
+
 import pytest
 
-from api.parsing import generate_sql_query, parse_scryfall_query
+from api.parsing import generate_sql_query, parse_query, parse_scryfall_query
 from api.parsing.hand_parser import fold_typographic_quotes
 from api.parsing.parsing_f import balance_partial_query
-from api.parsing.pyparsing_based import parse_search_query
+from api.parsing.pyparsing_based import parse_str_to_query as pyparsing_parse_str_to_query
+
+parse_with_pyparsing = partial(parse_query, parser_fn=pyparsing_parse_str_to_query)
 
 _LEFT_SINGLE = "\u2018"
 _RIGHT_SINGLE = "\u2019"
@@ -44,7 +48,7 @@ FOLDED_CASES = [
 def test_typographic_quotes_fold(query: str, canonical_query: str) -> None:
     """A curly-quoted query parses to exactly what its ASCII-quoted twin parses to, in both parsers."""
     assert generate_sql_query(parse_scryfall_query(query)) == generate_sql_query(parse_scryfall_query(canonical_query))
-    assert generate_sql_query(parse_search_query(query)) == generate_sql_query(parse_search_query(canonical_query))
+    assert generate_sql_query(parse_with_pyparsing(query)) == generate_sql_query(parse_with_pyparsing(canonical_query))
 
 
 # Quotation-shaped characters Scryfall does NOT fold. Asserted on the fold itself rather than on a
