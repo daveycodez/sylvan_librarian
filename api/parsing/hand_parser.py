@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 
 from api.parsing.card_query_nodes import CardAttributeNode, CardBinaryOperatorNode, ExactNameNode
-from api.parsing.colors import COLOR_ALIAS_TO_CODES, COLOR_COUNT_NAMES
+from api.parsing.colors import COLOR_ALIAS_TO_CODES, COLOR_COUNT_NAMES, COUNT_NAME_TO_COLUMN, count_name_rejected_for_column
 from api.parsing.db_info import ALIAS_TO_FIELD_INFOS, ParserClass
 from api.parsing.mana_symbols import first_invalid_mana_symbol
 from api.parsing.nodes import (
@@ -62,7 +62,19 @@ _BANG_ALIAS_CLASSES: frozenset[ParserClass] = frozenset(
 # one vocabulary as far as the value parser is concerned: both are words rather than letter
 # strings. What separates them is what CardBinaryOperatorNode does with the result, not whether
 # this parser will accept it.
-_VALID_COLOR_NAMES: frozenset[str] = frozenset(COLOR_ALIAS_TO_CODES) | COLOR_COUNT_NAMES
+#
+# `any` is the exception, and it is a measured one: it counts on produced_mana ONLY. Scryfall does
+# not accept it on the colour columns -- it rejects the term and ignores it, so `t:creature c:any`
+# = `t:creature` -- so acceptance here has to know which column is being asked about. The column
+# comes from db_info rather than from a spelling comparison, so `produces` and any future alias for
+# the same column answer alike.
+_VALID_COLOR_NAMES: frozenset[str] = frozenset(COLOR_ALIAS_TO_CODES) | COLOR_COUNT_NAMES | frozenset(COUNT_NAME_TO_COLUMN)
+_COLOR_ALIAS_TO_COLUMN: dict[str, str] = {
+    alias.lower(): fi.db_column_name
+    for alias, fis in ALIAS_TO_FIELD_INFOS.items()
+    for fi in fis
+    if fi.parser_class == ParserClass.COLOR
+}
 _COLOR_LETTERS: frozenset[str] = frozenset("wubrgcWUBRGC")
 _MIN_MTG_YEAR: int = 1992
 _MAX_YEAR: int = 2040
@@ -660,7 +672,7 @@ class Parser:
         if pc == ParserClass.NUMERIC:
             return self.parse_num_expr_value()
         if pc == ParserClass.COLOR:
-            return self.parse_color_value()
+            return self.parse_color_value(attr)
         if pc == ParserClass.MANA:
             return self.parse_mana_value()
         if pc in (ParserClass.RARITY, ParserClass.LEGALITY):
@@ -741,8 +753,13 @@ class Parser:
         msg = f"Expected string value, got {tok.value!r} at position {tok.pos}"
         raise ParseError(msg)
 
-    def parse_color_value(self) -> QueryNode:
-        """Parse a color value: a color name, a combination of color letters, or a bare integer color count."""
+    def parse_color_value(self, attr: str) -> QueryNode:
+        """Parse a color value: a color name, a combination of color letters, or a bare integer color count.
+
+        *attr* is the search alias that was matched, resolved to its db column below, because one
+        colour word is column-specific: `any` counts on produced_mana and is not a colour name
+        anywhere else (Scryfall ignores `c:any` and `id:any` outright).
+        """
         tok = self.peek()
         if tok.type == TT.QUOTED:
             self.consume()
@@ -772,7 +789,11 @@ class Parser:
             ):
                 self.consume()
                 val += "-" + str(self.consume().value)
-            if val.lower() not in _VALID_COLOR_NAMES and not all(c in _COLOR_LETTERS for c in val):
+            # The column, not the alias: `produces`, and any later alias for the same column,
+            # answer `any` alike, while `c` / `color` / `id` / `identity` / `ci` all refuse it.
+            column = _COLOR_ALIAS_TO_COLUMN.get(attr.lower(), attr.lower())
+            is_color_value = val.lower() in _VALID_COLOR_NAMES or all(c in _COLOR_LETTERS for c in val)
+            if not is_color_value or count_name_rejected_for_column(val, column):
                 msg = f"Invalid color value {val!r} at position {tok.pos}"
                 raise ParseError(msg)
             return StringValueNode(val)

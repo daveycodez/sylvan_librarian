@@ -1125,6 +1125,46 @@ class TestProduces:
         total, _ = _run(engine, "produces:b")
         assert total == 10
 
+    def test_produces_any_is_at_least_one(self, engine: QueryEngine) -> None:
+        # `any` is a COUNT, not a colour: "produces some mana at all" = produces>=1.
+        total_any, cards = _run(engine, "produces:any")
+        total_ge1, _ = _run(engine, "produces>=1")
+        assert total_any == total_ge1
+        assert set(_names(cards)) == {"Black Lotus", "Dark Ritual", "Sol Ring"}
+
+    def test_produces_any_does_not_match_everything(self, engine: QueryEngine) -> None:
+        # The defect: the term used to be dropped, so the query answered its own base.
+        total_any, _ = _run(engine, "produces:any")
+        total_all, _ = _run(engine)
+        assert total_any < total_all
+
+    def test_produces_lt_any_is_zero(self, engine: QueryEngine) -> None:
+        # `<` is the only operator that flips it: the cards that produce nothing at all.
+        total_lt, _ = _run(engine, "produces<any")
+        total_eq0, _ = _run(engine, "produces=0")
+        total_any, _ = _run(engine, "produces:any")
+        total_all, _ = _run(engine)
+        assert total_lt == total_eq0
+        # Counts are total (no mana produced is 0, never NULL), so the two partition the fixture.
+        assert total_lt + total_any == total_all
+
+    def test_produces_lte_any_admits_one_kind(self, engine: QueryEngine) -> None:
+        # `<=` is `<=1`, not the tautology `c<=m` is on the colour columns: Sol Ring produces
+        # only {C} and is in; Black Lotus produces five kinds and is out.
+        total_lte, cards = _run(engine, "produces<=any")
+        total_lte1, _ = _run(engine, "produces<=1")
+        assert total_lte == total_lte1
+        names = set(_names(cards))
+        assert "Sol Ring" in names
+        assert "Black Lotus" not in names
+
+    def test_produces_any_negates_exactly(self, engine: QueryEngine) -> None:
+        # Lowered to an ordinary numeric count, so negation is the exact complement.
+        total_any, _ = _run(engine, "produces:any")
+        total_neg, _ = _run(engine, "-produces:any")
+        total_all, _ = _run(engine)
+        assert total_any + total_neg == total_all
+
 
 class TestTags:
     """Tests for is: (card_is_tags) and otag: (card_oracle_tags).

@@ -114,6 +114,95 @@ def test_produced_mana_counts_six_values_and_colors_count_five() -> None:
     assert "magic.produced_mana_mask" not in colors_sql
 
 
+# `any` is a count on produced_mana and a colour name nowhere -- "produces some mana at all".
+# Measured corpus-wide against api.scryfall.com on 2026-08-28 AND against a `t:creature` second
+# base, so that no equality here can be an artifact of the corpus total; every one held on both.
+# The counts are written out at colors.COUNT_NAME_TO_COLUMN. `!=` is the one that does NOT read the
+# way `m` does on this same column: `produces!=m` groups with `produces<m`, `produces!=any` groups
+# with `produces:any`.
+PRODUCED_ANY_CASES = [
+    # `:` and the four operators that mean the same thing — "produces at least one kind of mana"
+    ("produces:any", "produces>=1"),  # corpus 2,603; t:creature base 756
+    ("produces=any", "produces>=1"),
+    ("produces>any", "produces>=1"),
+    ("produces>=any", "produces>=1"),
+    ("produces!=any", "produces>=1"),
+    # the two that do not: `<` is the cards that make no mana at all, `<=` admits one kind as well
+    ("produces<any", "produces=0"),  # corpus 30,996; t:creature base 17,997
+    ("produces<=any", "produces<=1"),  # corpus 32,139; t:creature base 18,369
+    # case, quoting and negation all reach the same lowering
+    ("produces:ANY", "produces>=1"),
+    ('produces:"any"', "produces>=1"),
+    ("-produces:any", "-produces>=1"),
+]
+
+
+@pytest.mark.parametrize(
+    argnames=("query", "canonical_query"),
+    argvalues=PRODUCED_ANY_CASES,
+    ids=[q for q, _ in PRODUCED_ANY_CASES],
+)
+def test_produces_any_matches_number(query: str, canonical_query: str) -> None:
+    """`produces:any` is a count, not a colour, and it filters instead of being dropped."""
+    assert generate_sql_query(parse_scryfall_query(query)) == generate_sql_query(parse_scryfall_query(canonical_query))
+    assert generate_sql_query(pyparsing_parse_str_to_query(query)) == generate_sql_query(pyparsing_parse_str_to_query(canonical_query))
+
+
+def test_produces_any_is_not_the_unfiltered_query() -> None:
+    """The defect this fixes: the term was ignored, so the query answered its own base.
+
+    `t:legendary t:creature produces:any` used to be a parse error here and answered the
+    UNFILTERED 3,625 in the ports that drop an unparseable term, where Scryfall answers 194.
+    """
+    filtered = generate_sql_query(parse_scryfall_query("t:legendary t:creature produces:any"))
+    unfiltered = generate_sql_query(parse_scryfall_query("t:legendary t:creature"))
+    assert filtered != unfiltered
+    assert filtered == generate_sql_query(parse_scryfall_query("t:legendary t:creature produces>=1"))
+
+
+# `any` IS THE COLUMN'S OWN WORD, pinned in the other direction too. Scryfall does not accept it on
+# the colour columns and does not match nothing there either -- it REJECTS the term and ignores it,
+# which is a different answer: `c:any` on its own comes back "All of your terms were ignored", and
+# `t:creature c:any` = `t:creature` = 18,753, the same for `id:any`. So it must not become a
+# globally valid colour name; both parsers keep answering these the way they did before it existed.
+@pytest.mark.parametrize(
+    argnames="invalid_query",
+    argvalues=["c:any", "id:any", "color:any", "colors:any", "identity:any", "ci:any", "c>=any", "t:creature c:any"],
+)
+def test_any_is_rejected_on_the_color_columns(invalid_query: str) -> None:
+    """`any` counts on produced_mana alone; on a colour column it stays a parse error, in both parsers."""
+    with pytest.raises(ValueError, match="Failed to parse query"):
+        parse_scryfall_query(invalid_query)
+    with pytest.raises(ValueError, match="Failed to parse query"):
+        pyparsing_parse_str_to_query(invalid_query)
+
+
+@pytest.mark.parametrize(
+    argnames="invalid_query",
+    argvalues=["produces:anyw", "produces:wany", "produces:anyone", "c:anyone"],
+)
+def test_any_glued_to_other_letters_is_still_invalid(invalid_query: str) -> None:
+    """`any` is a whole value, not a prefix: gluing letters to it is neither a name nor a letter set."""
+    with pytest.raises(ValueError, match="Failed to parse query"):
+        parse_scryfall_query(invalid_query)
+    with pytest.raises(ValueError, match="Failed to parse query"):
+        pyparsing_parse_str_to_query(invalid_query)
+
+
+@pytest.mark.parametrize(
+    argnames=("query", "expected"),
+    argvalues=[
+        ("produces:any", "the number of kinds of mana produced ≥ 1"),
+        ("produces<any", "the number of kinds of mana produced is 0"),
+        ("produces<=any", "the number of kinds of mana produced ≤ 1"),
+        ("produces>=2", "the number of kinds of mana produced ≥ 2"),
+    ],
+)
+def test_produced_count_explanation_says_kinds_of_mana(query: str, expected: str) -> None:
+    """A lowered count explains as a NUMBER OF KINDS, not as "produced mana ≥ 1" (a quantity)."""
+    assert parse_scryfall_query(query).to_human_explanation() == expected
+
+
 @pytest.mark.parametrize(
     argnames="invalid_query",
     argvalues=["c:mw", "c:wm", "c:mc", "c:mm", "c!=mw", "id:mw", "c:mono", "produces:mw"],

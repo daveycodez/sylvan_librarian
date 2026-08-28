@@ -138,3 +138,44 @@ COLOR_COUNT_NAMES = frozenset(
         "multicoloured",
     }
 )
+
+# The colour values that are a count on ONE column only, as name -> the db column that accepts it.
+#
+# `any` is Scryfall's word for "produces some mana at all", and it is a produced_mana value and
+# nothing else. It is NOT a globally valid colour name: on the colour columns Scryfall rejects it
+# and IGNORES the term, which is a different answer from "match nothing" -- `c:any` on its own
+# comes back "All of your terms were ignored", and `t:creature c:any` = `t:creature` = 18,753, the
+# same for `id:any`. So the value parsers must resolve the name to THIS column before accepting it,
+# and `c:any` / `id:any` stay the parse error they already were.
+#
+# THE OPERATOR TABLE IS MEASURED, corpus-wide against api.scryfall.com on 2026-08-28, and again
+# against a `t:creature` second base so that no equality below can be an artifact of the corpus
+# total; every one of them held on both:
+#
+#   produces:any = produces=any = produces>any = produces>=any = produces!=any
+#                                        -> `produces>=1`   (corpus 2,603; t:creature 756)
+#   produces<any                         -> `produces=0`    (corpus 30,996; t:creature 17,997)
+#   produces<=any                        -> `produces<=1`   (corpus 32,139; t:creature 18,369)
+#
+# `!=` is the asymmetry worth stating out loud, because it does NOT read the way `m` does on this
+# same column: `produces!=m` groups with `produces<m`, while `produces!=any` groups with
+# `produces:any`. Both readings were measured, and they disagree; the tables below keep them apart.
+#
+# The three counts also fall exactly out of the 0..6 partition measured for COLOR_COUNT_NAMES above
+# (30,996 + 1,143 + 504 + 147 + 10 + 693 + 106 = 33,599): `produces>=1` is 33,599 - 30,996 = 2,603
+# and `produces<=1` is 30,996 + 1,143 = 32,139. The `t:creature` base closes the same way --
+# 17,997 + 756 = 18,753 = `t:creature` -- so the two probe runs corroborate each other.
+COUNT_NAME_TO_COLUMN = {
+    "any": "produced_mana",
+}
+
+
+def count_name_rejected_for_column(value: str, db_column: str) -> bool:
+    """Whether *value* is a count name only one column accepts, and *db_column* is not that column.
+
+    Both front-end parsers ask this before accepting a colour word, so `produces:any` is a value and
+    `c:any` / `id:any` are the parse error they were before `any` existed -- one predicate, so the
+    two of them cannot come to different answers (test_parser_parity asserts they never do).
+    """
+    column = COUNT_NAME_TO_COLUMN.get(value.lower())
+    return column is not None and column != db_column

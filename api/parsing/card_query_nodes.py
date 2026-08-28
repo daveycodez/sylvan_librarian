@@ -8,7 +8,7 @@ import unicodedata
 
 from titlecase import titlecase
 
-from api.parsing.colors import COLOR_ALIAS_TO_CODES, COLOR_CODE_TO_NAME, COLOR_COUNT_NAMES
+from api.parsing.colors import COLOR_ALIAS_TO_CODES, COLOR_CODE_TO_NAME, COLOR_COUNT_NAMES, COUNT_NAME_TO_COLUMN
 from api.parsing.db_info import (
     ALIAS_TO_FIELD_INFOS,
     CARD_SUPERTYPES,
@@ -579,7 +579,48 @@ _PRODUCED_COUNT_BY_OPERATOR: typing.Final = {
     "<=": (">=", 1),
 }
 
+# `any` on produced_mana, per operator. Same shape as the two tables above, and kept as its own
+# table because it does NOT read like `m` on the same column: `produces!=m` groups with
+# `produces<m`, while `produces!=any` groups with `produces:any`. Measured on both a corpus-wide
+# and a `t:creature` base; the counts and that asymmetry are written out at
+# colors.COUNT_NAME_TO_COLUMN. `<` and `<=` are the two that need operators the tables above never
+# emit -- `produces<any` is `produces=0` (the cards that make no mana at all, 30,996) and
+# `produces<=any` is `produces<=1` (32,139), neither of which is expressible as a `>=` count.
+_ANY_COUNT_BY_OPERATOR: typing.Final = {
+    ":": (">=", 1),
+    "=": (">=", 1),
+    ">": (">=", 1),
+    ">=": (">=", 1),
+    "!=": (">=", 1),
+    "<": ("=", 0),
+    "<=": ("<=", 1),
+}
+
+# The single-column count names, as name -> its operator table. The COLUMN each one is legal on
+# lives in colors.COUNT_NAME_TO_COLUMN, which is what the value parsers resolve against, so a name
+# is never accepted for a column that has no table for it here.
+_SINGLE_COLUMN_COUNT_TABLES: typing.Final = {
+    "any": _ANY_COUNT_BY_OPERATOR,
+}
+
 _COLOR_COUNT_ATTRIBUTES: typing.Final = ("card_colors", "card_color_identity", "produced_mana")
+
+
+def _count_lowering(attribute_name: str, value: str, operator: str) -> tuple[str, int] | None:
+    """Return the (operator, count) a colour-COUNT *value* means on *attribute_name*, if it is one.
+
+    Returns None for an ordinary colour value, and for a single-column count name asked of a column
+    that does not accept it -- `c:any` resolves to produced_mana and so is left alone here, exactly
+    as it was before `any` existed. The value parsers reject that case before it ever gets this far;
+    this stays the same shape anyway so the two tables cannot drift apart.
+    """
+    if value in COLOR_COUNT_NAMES:
+        table = _PRODUCED_COUNT_BY_OPERATOR if attribute_name == "produced_mana" else _COLOR_COUNT_BY_OPERATOR
+    elif COUNT_NAME_TO_COLUMN.get(value) == attribute_name:
+        table = _SINGLE_COLUMN_COUNT_TABLES[value]
+    else:
+        return None
+    return table.get(operator)
 
 
 class CardBinaryOperatorNode(BinaryOperatorNode):
@@ -595,6 +636,9 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         them from disagreeing, and the node the rest of the pipeline sees is the ordinary numeric
         one that `c>=2` already produces, on every path: engine JSON, SQL and explanation alike.
 
+        `produces:any` is the same kind of value on a column of its own -- "produces some mana at
+        all", `produces>=1` -- and takes the same route for the same reason.
+
         Args:
             lhs: The left-hand side operand.
             operator: The binary operator.
@@ -604,10 +648,8 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
             isinstance(lhs, CardAttributeNode)
             and isinstance(rhs, StringValueNode)
             and lhs.attribute_name in _COLOR_COUNT_ATTRIBUTES
-            and rhs.value.strip().lower() in COLOR_COUNT_NAMES
         ):
-            table = _PRODUCED_COUNT_BY_OPERATOR if lhs.attribute_name == "produced_mana" else _COLOR_COUNT_BY_OPERATOR
-            lowered = table.get(operator)
+            lowered = _count_lowering(lhs.attribute_name, rhs.value.strip().lower(), operator)
             if lowered is not None:
                 operator, count = lowered
                 rhs = NumericValueNode(count)
@@ -748,8 +790,11 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         """Format explanation for card attribute comparisons."""
         db_column_name = attr_node.attribute_name.lower()
 
-        # Numeric color syntax compares the count of colors, not the colors themselves
-        if db_column_name in ("card_colors", "card_color_identity") and isinstance(self.rhs, NumericValueNode):
+        # Numeric color syntax compares the count of colors, not the colors themselves. produced_mana
+        # belongs here too: `produces>=2` is a count, and so is every `produces:any` / `produces:m`
+        # the constructor lowered into one -- without it those explain as "produced mana ≥ 1", which
+        # reads as a quantity of mana rather than a number of kinds.
+        if db_column_name in _COLOR_COUNT_ATTRIBUTES and isinstance(self.rhs, NumericValueNode):
             noun = {
                 "card_color_identity": "colors in the color identity",
                 "produced_mana": "kinds of mana produced",  # SIX kinds: colorless is one of them

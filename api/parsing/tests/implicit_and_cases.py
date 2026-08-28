@@ -66,6 +66,15 @@ TESTCASES = [
     {"query": "c:3", "expected": "c:3", "id": "color_count_colon"},
     {"query": "id<2 c=1", "expected": "id<2 AND c=1", "id": "identity_and_color_counts"},
     {"query": "-id>=4", "expected": "-id>=4", "id": "negated_identity_count"},
+    # `any` is a count too, and a produced_mana-only one — both parsers must lower it alike
+    {"query": "produces:any", "expected": "produces:any", "id": "produces_any_colon"},
+    {"query": "produces<=any", "expected": "produces<=any", "id": "produces_any_lte"},
+    {
+        "query": "t:legendary t:creature produces:any",
+        "expected": "t:legendary AND t:creature AND produces:any",
+        "id": "produces_any_with_types",
+    },
+    {"query": "-produces<any", "expected": "-produces<any", "id": "negated_produces_any_lt"},
     # Arithmetic in comparison — no AND inside expression
     {"query": "power+toughness>cmc+cmc", "expected": "power+toughness>cmc+cmc", "id": "arithmetic_comparison"},
     {
