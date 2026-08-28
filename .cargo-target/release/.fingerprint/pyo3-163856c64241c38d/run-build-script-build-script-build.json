@@ -1,0 +1,1 @@
+{"rustc":9783247635632824192,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[3902110657731208025,"build_script_build",false,9320679039607142436],[4884873376658218508,"build_script_build",false,7836008678212666898]],"local":[{"Precalculated":"0.29.2"}],"rustflags":["-C","link-arg=-undefined","-C","link-arg=dynamic_lookup"],"config":0,"compile_kind":0}

@@ -1,0 +1,10 @@
+/private/tmp/claude-501/-Users-david-Developer-sylvan-librarian-cloudflare/f1f4d5fe-2c4f-4639-a791-416d8749c614/scratchpad/wt-912/.cargo-target/release/deps/chacha20-f17b883b2ce4e3e2.d: /Users/david/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.10.1/src/lib.rs /Users/david/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.10.1/src/variants.rs /Users/david/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.10.1/src/backends.rs /Users/david/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.10.1/src/rng.rs /Users/david/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.10.1/src/../README.md /Users/david/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.10.1/src/backends/neon.rs
+
+/private/tmp/claude-501/-Users-david-Developer-sylvan-librarian-cloudflare/f1f4d5fe-2c4f-4639-a791-416d8749c614/scratchpad/wt-912/.cargo-target/release/deps/libchacha20-f17b883b2ce4e3e2.rmeta: /Users/david/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.10.1/src/lib.rs /Users/david/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.10.1/src/variants.rs /Users/david/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.10.1/src/backends.rs /Users/david/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.10.1/src/rng.rs /Users/david/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.10.1/src/../README.md /Users/david/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.10.1/src/backends/neon.rs
+
+/Users/david/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.10.1/src/lib.rs:
+/Users/david/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.10.1/src/variants.rs:
+/Users/david/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.10.1/src/backends.rs:
+/Users/david/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.10.1/src/rng.rs:
+/Users/david/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.10.1/src/../README.md:
+/Users/david/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/chacha20-0.10.1/src/backends/neon.rs:

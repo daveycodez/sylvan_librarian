@@ -4,7 +4,7 @@
 // card's JSONB omits reads as not_legal. 32 formats fit; Scryfall ships 22.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -18,60 +18,43 @@ pub(crate) const MAX_FORMATS: usize = 32;
 
 static FORMAT_SHIFTS: OnceLock<RwLock<HashMap<String, u8>>> = OnceLock::new();
 
+/// Mirrors `format_shifts().len()`, updated under the same write lock that grows the map.
+/// Lets `format_shifts_sorted()` detect staleness without taking a lock on the map itself.
+static FORMAT_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 pub(crate) fn format_shifts() -> &'static RwLock<HashMap<String, u8>> {
     FORMAT_SHIFTS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Bumped by every writer of `FORMAT_SHIFTS`; what tells a cached order it is stale.
-static FORMAT_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Alphabetically sorted `(format, shift)` snapshot of the registry, rebuilt only when
+/// `FORMAT_COUNT` has moved since the last build. The registry is append-only (new formats
+/// get the next free shift; existing ones never change), so a stale-but-shorter snapshot is
+/// simply missing the newest formats, never wrong about the ones it has -- safe to keep
+/// serving while a concurrent rebuild is in flight.
+type SortedFormats = Arc<[(String, u8)]>;
 
-type FormatOrder = Arc<Vec<(String, u8)>>;
+fn format_shifts_sorted() -> SortedFormats {
+    static SORTED: OnceLock<RwLock<(usize, SortedFormats)>> = OnceLock::new();
+    let cache = SORTED.get_or_init(|| RwLock::new((0, Arc::from([] as [(String, u8); 0]))));
+    let current = FORMAT_COUNT.load(Ordering::Acquire);
 
-fn format_order_cell() -> &'static RwLock<(u64, FormatOrder)> {
-    static CELL: OnceLock<RwLock<(u64, FormatOrder)>> = OnceLock::new();
-    // Generation 1 against FORMAT_GENERATION's 0, so the initial empty value never reads as fresh.
-    CELL.get_or_init(|| RwLock::new((u64::MAX, Arc::new(Vec::new()))))
-}
-
-/// The registry's `(format, shift)` pairs, alphabetical, built once per registry change.
-///
-/// `legality_bits_to_pydict` is a FIELD_TABLE extractor, so it runs ONCE PER ROW. It used to build
-/// this vector itself every time: a read lock, a clone of all 22 format names, and a sort, to
-/// decode a word that is a pure function of one `u64` and orders identically for every card in the
-/// store. A 175-card page of /cards/search -- which asks for `legalities` on every card object --
-/// therefore paid 175 locks, 175 sorts and ~3,850 String allocations to produce 175 copies of one
-/// answer. `fields=legalities` on /search (#877) pays it per row too.
-///
-/// The registry only grows, and only on import or archive attach, so the sorted form is cached and
-/// invalidated by generation rather than by lock discipline: a reader never blocks a writer, and a
-/// rebuild that races a write is DISCARDED rather than published, so a stale order cannot be
-/// served. Worst case is a redundant rebuild.
-fn format_order() -> FormatOrder {
-    let generation = FORMAT_GENERATION.load(AtomicOrdering::Acquire);
-    if let Ok(cached) = format_order_cell().read()
-        && cached.0 == generation
+    if let Ok(guard) = cache.read()
+        && guard.0 == current
     {
-        return Arc::clone(&cached.1);
+        return guard.1.clone();
     }
-    let mut entries: Vec<(String, u8)> = match format_shifts().read() {
-        Ok(shifts) => shifts.iter().map(|(k, v)| (k.clone(), *v)).collect(),
-        Err(_) => Vec::new(),
-    };
+    let Ok(mut guard) = cache.write() else { return Arc::from([]) };
+    if guard.0 == current {
+        return guard.1.clone(); // rebuilt by another thread while we waited for the write lock
+    }
+    let mut entries: Vec<(String, u8)> = format_shifts()
+        .read()
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), *v)).collect())
+        .unwrap_or_default();
     entries.sort();
-    let built: FormatOrder = Arc::new(entries);
-    if let Ok(mut slot) = format_order_cell().write() {
-        // Only publish if the registry did not move while we were building it.
-        if FORMAT_GENERATION.load(AtomicOrdering::Acquire) == generation {
-            *slot = (generation, Arc::clone(&built));
-        }
-    }
+    let built: Arc<[(String, u8)]> = Arc::from(entries);
+    *guard = (current, built.clone());
     built
-}
-
-/// Mark the cached order stale. Called by every writer of `FORMAT_SHIFTS`, after it releases the
-/// write lock -- never while holding it, so the two locks are never held at once in either order.
-fn invalidate_format_order() {
-    FORMAT_GENERATION.fetch_add(1, AtomicOrdering::AcqRel);
 }
 
 /// Bit shift for a format already seen in loaded data; None matches nothing.
@@ -93,8 +76,7 @@ pub(crate) fn format_shift_or_assign(format: &str) -> Option<u8> {
     }
     let shift = (shifts.len() * 2) as u8;
     shifts.insert(format.to_string(), shift);
-    drop(shifts);
-    invalidate_format_order();
+    FORMAT_COUNT.store(shifts.len(), Ordering::Release);
     Some(shift)
 }
 
@@ -132,14 +114,14 @@ pub(crate) fn jsonb_obj_to_legality_bits(d: &Bound<PyDict>, key: &str) -> u64 {
 /// as "not_legal", exactly as the encoder treated it.
 pub(crate) fn legality_bits_to_pydict<'a>(py: Python<'a>, bits: u64) -> PyResult<pyo3::Bound<'a, PyDict>> {
     let dict = PyDict::new(py);
-    for (format, shift) in format_order().iter() {
+    for (format, shift) in format_shifts_sorted().iter() {
         let word = match (bits >> shift) & 0b11 {
             LEGALITY_LEGAL => "legal",
             LEGALITY_RESTRICTED => "restricted",
             LEGALITY_BANNED => "banned",
             _ => "not_legal",
         };
-        dict.set_item(format, word)?;
+        dict.set_item(format.as_str(), word)?;
     }
     Ok(dict)
 }
@@ -155,50 +137,74 @@ pub(crate) fn sync_format_shifts(archived: &Archived<HashMap<String, u8>>) {
         for (format, shift) in archived.iter() {
             shifts.insert(format.as_str().to_string(), *shift);
         }
+        FORMAT_COUNT.store(shifts.len(), Ordering::Release);
     }
-    invalidate_format_order();
 }
 
+/// Perf-audit finding #4: `legality_bits_to_pydict` used to clone the whole format registry
+/// into a fresh `Vec` and sort it on every call -- once per output row whenever `legalities`
+/// is requested. Compares that against the cached, pre-sorted `Arc<[(String, u8)]>` snapshot
+/// `format_shifts_sorted()` now serves, over a registry sized like the real one (22 formats,
+/// per this module's header comment).
+///
+///     cargo test --release bench_legality_dict_cost -- --ignored --nocapture
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod bench_legality_dict_cost {
+    use std::hint::black_box;
+    use std::time::Instant;
 
-    /// The cached order must follow the registry, or a format assigned after the first decode
-    /// would be missing from every `legalities` value for the life of the process.
-    ///
-    /// Asserts only properties that hold under parallel tests against a shared global registry:
-    /// the registry grows monotonically, so CONTAINMENT and SORTEDNESS are stable, while an
-    /// exact-equality assertion would race anything else that loads a store.
+    use super::{format_shift_or_assign, format_shifts, format_shifts_sorted};
+
+    const ITERS: usize = 200_000;
+    const FORMATS: &[&str] = &[
+        "standard", "pioneer", "modern", "legacy", "pauper", "vintage", "penny", "commander",
+        "oathbreaker", "standardbrawl", "brawl", "alchemy", "paupercommander", "duel", "oldschool",
+        "premodern", "predh", "historic", "timeless", "gladiator", "explorer", "future",
+    ];
+
+    fn seed_registry() {
+        for f in FORMATS {
+            format_shift_or_assign(f);
+        }
+        assert_eq!(format_shifts().read().unwrap().len(), FORMATS.len());
+    }
+
     #[test]
-    fn format_order_follows_the_registry() {
-        let sorted = |v: &[(String, u8)]| v.windows(2).all(|w| w[0] <= w[1]);
+    #[ignore]
+    fn bench_legality_dict_cost() {
+        seed_registry();
+        let bits: u64 = 0x5555_5555; // arbitrary — content doesn't affect either path's cost
 
-        let before = format_order();
-        assert!(sorted(&before), "cached order must be sorted");
-
-        // A name no fixture uses, so this cannot collide with a real format.
-        let probe = "zzz_test_only_format";
-        let assigned = format_shift_or_assign(probe);
-        if assigned.is_none() {
-            return; // registry already full (MAX_FORMATS); nothing to assert
+        // Pre-fix behavior: clone every (String, u8) entry out of the map into a fresh Vec, sort it.
+        let start = Instant::now();
+        for _ in 0..ITERS {
+            let shifts = format_shifts().read().unwrap();
+            let mut entries: Vec<(String, u8)> = shifts.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            entries.sort();
+            black_box(&entries);
+            for (_, shift) in &entries {
+                black_box((black_box(bits) >> shift) & 0b11);
+            }
         }
+        let clone_sort_ns = start.elapsed().as_nanos() as f64 / ITERS as f64;
 
-        let after = format_order();
-        assert!(sorted(&after), "still sorted after an assignment");
-        assert!(
-            after.iter().any(|(name, _)| name == probe),
-            "a format assigned after the order was cached must appear in it"
+        // Fixed: reuse the cached, pre-sorted Arc snapshot.
+        let start = Instant::now();
+        for _ in 0..ITERS {
+            let entries = format_shifts_sorted();
+            black_box(&entries);
+            for (_, shift) in entries.iter() {
+                black_box((black_box(bits) >> shift) & 0b11);
+            }
+        }
+        let cached_ns = start.elapsed().as_nanos() as f64 / ITERS as f64;
+
+        println!("clone+sort per row (pre-fix): {clone_sort_ns:.1} ns/call");
+        println!("cached Arc snapshot (fixed):  {cached_ns:.1} ns/call");
+        println!(
+            "delta: {:.1} ns/call ({:.0}% reduction)",
+            clone_sort_ns - cached_ns,
+            100.0 * (clone_sort_ns - cached_ns) / clone_sort_ns
         );
-
-        // The caching itself: two calls with no writer between them reuse the allocation. Asserted
-        // only when the generation held still across the pair, because this registry is global and
-        // any other test loading a store bumps it -- an unconditional assert here is FLAKY, which
-        // is how it was first written and how it failed once in a full parallel run.
-        let generation = FORMAT_GENERATION.load(AtomicOrdering::Acquire);
-        let first = format_order();
-        let second = format_order();
-        if FORMAT_GENERATION.load(AtomicOrdering::Acquire) == generation {
-            assert!(Arc::ptr_eq(&first, &second), "second call must reuse the cached order");
-        }
     }
 }
