@@ -11,7 +11,7 @@ import pytest
 
 from api.parsing import generate_sql_query, parse_scryfall_query
 from api.parsing.card_query_nodes import _color_count_masks
-from api.parsing.pyparsing_based import parse_search_query
+from api.parsing.pyparsing_based import parse_str_to_query as pyparsing_parse_str_to_query
 
 # The colour-COUNT names, as the numeric comparison each one means. `m` is not a colour and spells
 # no letters: it is Scryfall's word for MULTICOLOURED and compares the NUMBER of colours in the
@@ -59,7 +59,7 @@ COLOR_COUNT_CASES = [
 def test_color_count_name_matches_number(query: str, canonical_query: str) -> None:
     """A colour-COUNT name produces exactly the SQL its numeric comparison does, in both parsers."""
     assert generate_sql_query(parse_scryfall_query(query)) == generate_sql_query(parse_scryfall_query(canonical_query))
-    assert generate_sql_query(parse_search_query(query)) == generate_sql_query(parse_search_query(canonical_query))
+    assert generate_sql_query(pyparsing_parse_str_to_query(query)) == generate_sql_query(pyparsing_parse_str_to_query(canonical_query))
 
 
 # produced_mana is the same table on a SIX-value count, intersected with "produces at least one
@@ -84,7 +84,7 @@ PRODUCED_COUNT_CASES = [
 def test_produced_mana_count_name_matches_number(query: str, canonical_query: str) -> None:
     """produced_mana takes the count names too, on its own operator table."""
     assert generate_sql_query(parse_scryfall_query(query)) == generate_sql_query(parse_scryfall_query(canonical_query))
-    assert generate_sql_query(parse_search_query(query)) == generate_sql_query(parse_search_query(canonical_query))
+    assert generate_sql_query(pyparsing_parse_str_to_query(query)) == generate_sql_query(pyparsing_parse_str_to_query(canonical_query))
 
 
 # THE FIVE/SIX SPLIT, PINNED IN BOTH DIRECTIONS so a later tidy-up cannot quietly unify them.
