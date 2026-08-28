@@ -336,3 +336,71 @@ mod tests {
         assert!(!shifts_agree(&shifts, [("modern", 4u8)]), "the same name at another slot IS news");
     }
 }
+
+/// Perf-audit finding #4 (upstream #1056): `legality_bits_to_pydict` used to clone the whole
+/// format registry into a fresh `Vec` and sort it on every call -- once per output row whenever
+/// `legalities` is requested. Compares that against the cached, pre-sorted snapshot
+/// `format_order()` serves on this branch, over a registry sized like the real one (22 formats,
+/// per this module's header comment).
+///
+///     cargo test --release bench_legality_dict_cost -- --ignored --nocapture
+#[cfg(test)]
+mod bench_legality_dict_cost {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    use super::{format_order, format_shift_or_assign, format_shifts};
+
+    const ITERS: usize = 200_000;
+    const FORMATS: &[&str] = &[
+        "standard", "pioneer", "modern", "legacy", "pauper", "vintage", "penny", "commander",
+        "oathbreaker", "standardbrawl", "brawl", "alchemy", "paupercommander", "duel", "oldschool",
+        "premodern", "predh", "historic", "timeless", "gladiator", "explorer", "future",
+    ];
+
+    fn seed_registry() {
+        for f in FORMATS {
+            format_shift_or_assign(f);
+        }
+        assert!(format_shifts().read().unwrap().len() >= FORMATS.len());
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_legality_dict_cost() {
+        seed_registry();
+        let bits: u64 = 0x5555_5555; // arbitrary — content doesn't affect either path's cost
+
+        // Pre-fix behavior: clone every (String, u8) entry out of the map into a fresh Vec, sort it.
+        let start = Instant::now();
+        for _ in 0..ITERS {
+            let shifts = format_shifts().read().unwrap();
+            let mut entries: Vec<(String, u8)> = shifts.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            entries.sort();
+            black_box(&entries);
+            for (_, shift) in &entries {
+                black_box((black_box(bits) >> shift) & 0b11);
+            }
+        }
+        let clone_sort_ns = start.elapsed().as_nanos() as f64 / ITERS as f64;
+
+        // Fixed: reuse the cached, pre-sorted snapshot.
+        let start = Instant::now();
+        for _ in 0..ITERS {
+            let entries = format_order();
+            black_box(&entries);
+            for (_, shift) in entries.iter() {
+                black_box((black_box(bits) >> shift) & 0b11);
+            }
+        }
+        let cached_ns = start.elapsed().as_nanos() as f64 / ITERS as f64;
+
+        println!("clone+sort per row (pre-fix): {clone_sort_ns:.1} ns/call");
+        println!("cached snapshot (fixed):      {cached_ns:.1} ns/call");
+        println!(
+            "delta: {:.1} ns/call ({:.0}% reduction)",
+            clone_sort_ns - cached_ns,
+            100.0 * (clone_sort_ns - cached_ns) / clone_sort_ns
+        );
+    }
+}
