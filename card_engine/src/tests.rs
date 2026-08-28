@@ -4287,7 +4287,13 @@ fn compose_paging_prediction_matches_the_branch_taken() {
                             // arm names the labels that are legal for it, so a wrong branch in the
                             // OTHER direction (`Gather` predicted, walk taken) still fails.
                             let legal: &[PagingTaken] = match predicted {
-                                ComposePaging::Perm => &[PagingTaken::Perm],
+                                // `PermThreePhase` is `Perm`'s own step-5 internal choice (see its
+                                // doc), not a different top-level strategy -- legal here too. Gated
+                                // off by default (`COMPOSE_SIGMA_ENABLED`), so this fuzz sweep cannot
+                                // exercise it yet; widened now so flipping that guard on later
+                                // (elsewhere, e.g. a dedicated subprocess test) doesn't fail here on
+                                // a legality gap nobody noticed.
+                                ComposePaging::Perm => &[PagingTaken::Perm, PagingTaken::PermThreePhase],
                                 ComposePaging::OrderbyWalk => &[PagingTaken::OrderbyWalk, PagingTaken::GatherWalkDeclined],
                                 // Bare `Gather` only. `GatherWalkDeclined` here would mean the
                                 // fastpath found a walk available where acquire predicted none,
@@ -13063,4 +13069,100 @@ fn three_phase_cost_ns_error_distribution() {
     println!("  within 20% error: {:>5.1}%", within(0.20));
     println!("  within 30% error: {:>5.1}%", within(0.30));
     println!("  p50 error = {:.3}  p75 = {:.3}  p90 = {:.3}  p95 = {:.3}  max = {:.3}", pctile(50.0), pctile(75.0), pctile(90.0), pctile(95.0), abs_errors[n - 1]);
+}
+
+/// `should_use_three_phase`'s directional sanity: it must divert to three-phase for the population
+/// it exists for (sparse matches, a deep page -- where `walk_grouped_page` has to scan nearly the
+/// whole permutation to fill a page), and must NOT divert for the opposite population (dense matches,
+/// a shallow page -- where the classic walk is cheap and three-phase would pay a full scatter for no
+/// reason). Pure function, no real.store needed -- see `perm_walk_vs_three_phase_same_process_rates`
+/// (step 4) for where these two regimes' real measured costs came from in the first place.
+#[test]
+fn should_use_three_phase_picks_the_right_side_of_the_crossover() {
+    use super::sigma_bound::should_use_three_phase;
+    const N_CARDS: usize = 31_724;
+    const N_PRINTINGS: usize = 97_812;
+    const KNOB: f64 = 3.0; // COMPOSE_SIGMA_KNOB's default
+
+    // Sparse (50 matches) + deep page (k=200 > matches, so sigma_bound falls back to the exact
+    // worst-case bound): the walk must be predicted expensive, three-phase cheap.
+    assert!(
+        should_use_three_phase(N_CARDS, N_PRINTINGS, 50, 200, 50, KNOB),
+        "sparse matches + deep page should divert to three-phase"
+    );
+
+    // Dense (25,000 of 31,724 cards match) + shallow page (k=20): the walk fills almost immediately,
+    // three-phase pays a full scatter over ~58,725 set printings regardless -- must NOT divert.
+    assert!(
+        !should_use_three_phase(N_CARDS, N_PRINTINGS, 25_000, 20, 58_725, KNOB),
+        "dense matches + shallow page should NOT divert to three-phase"
+    );
+}
+
+/// `compose_perm_three_phase_order` is what step 5 actually wires into `printing_compose_fastpath` --
+/// exercising it directly, with `enabled` as an explicit argument, is what lets this run every time
+/// (no real.store, no fragile per-test toggling of `COMPOSE_SIGMA_ENABLED`'s `LazyLock`, which caches
+/// its env read on first access -- exactly the reason this function takes `enabled` as a plain
+/// argument instead of reading the static itself). Covers what `PagingTaken::PermThreePhase`'s own doc
+/// claims but the acquire/executor legality sweep can't check while the guard is off: the gate really
+/// is off unless `enabled` says so, `Mode::Printing`/`Mode::Artwork` never divert (the promoted walk
+/// is `Mode::Card`-only) regardless of `enabled`, and a real `SortOrder` comes back when it does fire.
+#[test]
+fn compose_perm_three_phase_order_only_fires_when_enabled_and_sparse() {
+    use rand::SeedableRng;
+    const CORPUS_SIZE: usize = 3_000;
+    const KNOB: f64 = 3.0;
+
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(8);
+    let data = fuzz_store_n(&mut rng, CORPUS_SIZE);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let ctx = QueryCtx::from(archived);
+    let n_cards = archived.cards.len();
+    let n_printings = archived.printings.len();
+    let words = n_printings.div_ceil(64);
+
+    let card_matches = |pbits: &[u64]| -> usize {
+        let mut card_seen = vec![false; n_cards];
+        let mut count = 0usize;
+        for (i, &word) in pbits.iter().enumerate() {
+            let mut w = word;
+            while w != 0 {
+                let pid = ((i as u32) << 6 | w.trailing_zeros()) as usize;
+                w &= w - 1;
+                let cid = u32::from(archived.indexes.printing_to_card[pid]) as usize;
+                if !card_seen[cid] {
+                    card_seen[cid] = true;
+                    count += 1;
+                }
+            }
+        }
+        count
+    };
+
+    // Sparse + deep offset: should_use_three_phase's own unit test already proved this population
+    // says "divert". A fresh bitmap per call keeps the three sub-checks below independent.
+    let sparse_params = kernel_params(Mode::Card, SortCol::EdhrecRank, false, 20, 200);
+
+    let pbits = random_pbits(&mut rng, words, n_printings, 0.0005);
+    let total = card_matches(&pbits);
+    assert!(
+        super::compose_perm_three_phase_order(&ctx, &sparse_params, &pbits, Mode::Card, SortCol::EdhrecRank, false, total, false, KNOB).is_none(),
+        "enabled=false must never divert, regardless of population"
+    );
+
+    let pbits = random_pbits(&mut rng, words, n_printings, 0.0005);
+    let total = card_matches(&pbits);
+    let order = super::compose_perm_three_phase_order(&ctx, &sparse_params, &pbits, Mode::Card, SortCol::EdhrecRank, false, total, true, KNOB);
+    assert!(order.is_some(), "enabled=true + sparse + deep offset should divert to three-phase");
+
+    for (label, mode) in [("printing", Mode::Printing), ("artwork", Mode::Artwork)] {
+        let pbits = random_pbits(&mut rng, words, n_printings, 0.0005);
+        let total = card_matches(&pbits); // not meaningful for these modes, but the mode gate must short-circuit before using it
+        let params = kernel_params(mode, SortCol::EdhrecRank, false, 20, 200);
+        assert!(
+            super::compose_perm_three_phase_order(&ctx, &params, &pbits, mode, SortCol::EdhrecRank, false, total, true, KNOB).is_none(),
+            "{label}: the promoted walk is Mode::Card-only, so this must never divert regardless of enabled"
+        );
+    }
 }
