@@ -127,7 +127,35 @@ def extract_frame_data_from_raw_card(raw_card: dict) -> dict[str, bool]:
 # `illustration_id` stays the front's, matching Scryfall's own top-level field.
 _FACE_LIST_UNIONS = ("card_types", "card_subtypes", "illustration_ids")
 _FACE_FLAG_UNIONS = ("card_colors", "card_keywords", "produced_mana")
-_FACE_JOINED_TEXTS = ("oracle_text", "flavor_text", "type_line")
+# `type_line` and `mana_cost_text` join with " // " and the other two with _FACE_TEXT_SEPARATOR --
+# see _JOINED_WITH_SLASHES, which is also the line between the columns search may take apart and
+# the ones it may not (FACE_JOINED_TEXT_COLUMNS).
+_FACE_JOINED_TEXTS = ("oracle_text", "flavor_text", "type_line", "mana_cost_text")
+# The two columns whose separator is SCRYFALL's own rather than one this branch invented, so
+# matching must leave them whole.
+#
+# `type_line` is Scryfall's top-level field for a split card ("Instant // Instant") and `t:/\/\//`
+# answers 930 there. `mana_cost_text` is the same story and took a measurement to establish,
+# because Scryfall's CARD OBJECT is not the evidence: it carries a top-level `mana_cost` on the
+# one-image layouts only (split/adventure/prepare/flip -- 949 of 949 in the 2026-08-28
+# default_cards bulk) and NONE on the two-image ones, while its SEARCH index carries the join for
+# both. Probed on api.scryfall.com 2026-08-28, each as the card's own `!"..."` ANDed with the
+# pattern so the corpus filters cannot confound it:
+#
+#   !"Extus, Oriq Overlord // Awaken the Blood Avatar"  a modal DFC, with NO top-level mana_cost
+#     mana:/\/\//           1   the seam is in the haystack -- the decisive row
+#     mana:/{b}{b} \/\/ /   1   ...and a pattern spans it, so it is ONE string, not a set
+#   !"Fire // Ice" mana:/^{u}$/           0   the back half alone is not a value of its own
+#   !"Delver of Secrets // Insectile Aberration"
+#     mana:/^{u}$/          1   an EMPTY back face contributes nothing, not even a separator
+#     mana:/^{u} /          0
+#   !"Westvale Abbey // Ormendahl, Profane Prince"
+#     mana:/^$/             1   ...so an all-costless card is EMPTY, never " // "
+#     mana:/\/\//          0
+#
+# Corpus-wide the same day: `mana:/\/\// is:mdfc` is 40 of 100, and `mana:/^$/ is:artseries` is
+# 2,243 of 2,243.
+_JOINED_WITH_SLASHES = ("type_line", "mana_cost_text")
 # Copied per GROUP from the first face that has any of the group, so the numeric columns and
 # their _text twins always describe the same face (the schema's check constraints couple them).
 _FACE_STAT_GROUPS = (
@@ -164,7 +192,7 @@ def _merge_processed_faces(faces: list[dict[str, Any]]) -> dict[str, Any]:
             merged[key].update(face[key])
         for key in _FACE_JOINED_TEXTS:
             parts = [part for part in (merged.get(key), face.get(key)) if part]
-            merged[key] = (" // " if key == "type_line" else _FACE_TEXT_SEPARATOR).join(parts)
+            merged[key] = (" // " if key in _JOINED_WITH_SLASHES else _FACE_TEXT_SEPARATOR).join(parts)
         for group in _FACE_STAT_GROUPS:
             if all(merged.get(field) is None for field in group) and any(face.get(field) is not None for field in group):
                 for field in group:

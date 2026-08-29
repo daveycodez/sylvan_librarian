@@ -577,6 +577,83 @@ class TestFaceMerging:
         assert "type_line" in _FACE_JOINED_TEXTS, "it is still a join..."
         assert "type_line" not in FACE_JOINED_TEXT_COLUMNS, "...but not one search may take apart"
 
+    def test_mana_cost_joins_with_scryfalls_own_separator_and_is_not_split(self) -> None:
+        r"""A faced card's printed cost is EVERY face's, joined -- and the " // " is not ours.
+
+        The merge kept the FRONT face's cost, because each face row is the parent card overlaid
+        with the face and `mana_cost_text` is set per face. Scryfall's `mana:` haystack is the
+        faces' non-empty costs joined " // ", and the evidence is NOT its card object: that
+        carries a top-level `mana_cost` on the one-image layouts only (split/adventure/prepare/
+        flip -- 949 of 949 in the 2026-08-28 default_cards bulk) and none at all on the two-image
+        ones, while search carries the join for both. `!"Extus, Oriq Overlord // Awaken the Blood
+        Avatar"` is a modal DFC with no top-level cost and still answers `mana:/\/\//` 1 and
+        `mana:/{b}{b} \/\/ /` 1 on api.scryfall.com (2026-08-28); corpus-wide
+        `mana:/\/\// is:mdfc` is 40 of 100.
+
+        Like `type_line` and unlike the two text columns, search must therefore leave it whole.
+        """
+        card = create_test_card(
+            name="Flame // Frost",
+            layout="split",
+            card_faces=[
+                {"name": "Flame", "type_line": "Instant", "mana_cost": "{1}{R}", "oracle_text": "Deal 2 damage."},
+                {"name": "Frost", "type_line": "Instant", "mana_cost": "{1}{U}", "oracle_text": "Tap target creature."},
+            ],
+        )
+        merged = preprocess_card(card)[0]
+        assert merged["mana_cost_text"] == "{1}{R} // {1}{U}", "the back half, not just the front's"
+        assert FACE_TEXT_SEPARATOR not in merged["mana_cost_text"]
+        assert "mana_cost_text" in _FACE_JOINED_TEXTS, "it is a join..."
+        assert "mana_cost_text" not in FACE_JOINED_TEXT_COLUMNS, "...but not one search may take apart"
+
+    def test_a_costless_face_drops_out_of_the_joined_cost(self) -> None:
+        r"""An empty face contributes NOTHING -- not even a separator.
+
+        Measured per card on api.scryfall.com, 2026-08-28: `!"Delver of Secrets // Insectile
+        Aberration"` answers `mana:/^{u}$/` 1 and `mana:/^{u} /` 0, so its costless back adds no
+        trailing " // "; `!"Westvale Abbey // Ormendahl, Profane Prince"`, costless on BOTH faces,
+        answers `mana:/^$/` 1 and `mana:/\/\//` 0, so an all-costless card is empty rather than
+        " // ". `mana:/^$/` is 1,350 corpus-wide and an empty cost is a VALUE that answers it.
+        """
+        card = create_test_card(
+            name="Test Delver // Test Aberration",
+            layout="transform",
+            card_faces=[
+                {"name": "Test Delver", "type_line": "Creature — Human", "mana_cost": "{U}", "oracle_text": "Look."},
+                {"name": "Test Aberration", "type_line": "Creature — Insect", "mana_cost": "", "oracle_text": "Flying."},
+            ],
+        )
+        assert preprocess_card(card)[0]["mana_cost_text"] == "{U}"
+
+        both = create_test_card(
+            name="Test Abbey // Test Prince",
+            layout="transform",
+            card_faces=[
+                {"name": "Test Abbey", "type_line": "Land", "mana_cost": "", "oracle_text": "{T}: Add {C}."},
+                {"name": "Test Prince", "type_line": "Creature — Demon", "mana_cost": "", "oracle_text": "Flying."},
+            ],
+        )
+        assert preprocess_card(both)[0]["mana_cost_text"] == ""
+
+    def test_the_pip_multiset_stays_the_front_faces(self) -> None:
+        """Only the printed STRING joins.
+
+        `mana_cost_jsonb` and `devotion` are computed per face from that face's own cost and the
+        merge keeps the front's, paired with the card's own `cmc`. Joining them instead would
+        change what `m:` and `devotion:` mean, which no measurement here asked for.
+        """
+        card = create_test_card(
+            name="Flame // Frost",
+            layout="split",
+            card_faces=[
+                {"name": "Flame", "type_line": "Instant", "mana_cost": "{1}{R}", "oracle_text": "Deal 2 damage."},
+                {"name": "Frost", "type_line": "Instant", "mana_cost": "{1}{U}", "oracle_text": "Tap target creature."},
+            ],
+        )
+        merged = preprocess_card(card)[0]
+        assert merged["mana_cost_text"] == "{1}{R} // {1}{U}"
+        assert merged["mana_cost_jsonb"] == {"R": [1]}, "Flame's pips alone, never Flame+Frost's"
+
     def test_back_face_stats_used_when_front_has_none(self) -> None:
         """A land-front / creature-back card (Westvale Abbey) keeps the back's P/T.
 
