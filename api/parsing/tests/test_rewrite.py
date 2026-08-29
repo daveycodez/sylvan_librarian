@@ -197,6 +197,31 @@ def test_nonliteral_regex_stays_regex(parse_query, query: str) -> None:
     assert isinstance(parse_query(query).root.rhs, RegexValueNode)
 
 
+# A NON-ASCII literal is exactly where the engine's byte-walking pattern classifier used to
+# panic, and this table is the split that decided which queries reached it. A pattern that is
+# nothing but literals is lowered here and never becomes a regex leaf at all; one that mixes a
+# metacharacter with a multi-byte character stays a regex and goes to the engine. Counts on
+# api.scryfall.com 2026-08-28: `o:/x—/` 7 (lowered), `o:/.—/` 3,461 and `o:/[a-z]—/` 245 (not).
+NON_ASCII_LOWERED = [("o:/x—/", 'o:"x—"'), ("o:/é/", 'o:"é"')]
+NON_ASCII_STAY_REGEX = ["o:/.—/", "o:/[a-z]—/", r"o:/\w—/", "o:/[a-z]é/", "o:/—[^{]*$/"]
+
+
+@pytest.mark.parametrize(
+    argnames=["regex_query", "substring_query"],
+    argvalues=NON_ASCII_LOWERED,
+    ids=[r for r, _ in NON_ASCII_LOWERED],
+)
+def test_bare_non_ascii_literal_still_lowers(parse_query, regex_query: str, substring_query: str) -> None:
+    """A pattern of nothing but a non-ASCII literal is a substring, and never reaches the engine."""
+    assert parse_query(regex_query) == parse_query(substring_query)
+
+
+@pytest.mark.parametrize(argnames=["query"], argvalues=[[q] for q in NON_ASCII_STAY_REGEX], ids=NON_ASCII_STAY_REGEX)
+def test_metacharacter_beside_non_ascii_stays_regex(parse_query, query: str) -> None:
+    """Mixed shapes stay regex leaves — the engine has to classify them without panicking."""
+    assert isinstance(parse_query(query).root.rhs, RegexValueNode)
+
+
 _PLAIN_LITERAL_CASES = {
     "bare_literal": {"pattern": "sacrifice a", "expected": "sacrifice a"},
     "escaped_dot": {"pattern": r"foo\.bar", "expected": "foo.bar"},

@@ -840,8 +840,35 @@ pub(crate) fn regex_tier(pattern: &str) -> u32 {
 }
 
 /// True when *pattern* needs fancy-regex's backtracking VM (lookarounds, etc.).
+///
+/// THIS WALKS BYTES, SO IT MUST NEVER SLICE THE `&str`. Every token it looks for begins with an
+/// ASCII byte, so the whole scan is expressible on `bytes` — and it has to be: a `pattern[i..]`
+/// reached with `i` inside a multi-byte character panics. Any pattern combining a metacharacter
+/// with a non-ASCII literal took that path, because the `(?P=` probe sat on the catch-all arm and
+/// so ran `&pattern[i..]` at EVERY byte offset — including the continuation bytes of `—`
+/// (E2 80 94) and `é` (C3 A9):
+///
+///     byte index 2 is not a char boundary; it is inside '—' (bytes 1..4) of `.—`
+///
+/// Five shapes reproduce it, each an ordinary query and each answered by api.scryfall.com
+/// (2026-08-28): `o:/[a-z]—/` 245, `o:/\w—/` 382, `o:/[a-z]é/` 5, `o:/.—/` 3,461,
+/// `o:/—[^{]*$/` 2,846 — while `o:/[a-z]x/` (5,212) and `o:/x—/` (7) are fine. A BARE non-ASCII
+/// literal never reaches here at all: `lower_literal_regexes` turns `o:/x—/` into a substring
+/// leaf before the engine sees a pattern. Only the mixed shapes did.
+///
+/// ON THIS TREE THE PANIC IS MASKED rather than user-visible: `_search`'s blanket handler turns
+/// any engine error — a panic included, through PyO3's unwind guard — into a silent PostgreSQL
+/// fallback, so the query is answered by SQL instead of crashing. It is still a real defect, and
+/// in an embedding without that net (a wasm build, where a panic aborts the isolate) it is a 500.
+///
+/// `(?P=` is checked where the other group prefixes are, not on a catch-all arm. On the catch-all
+/// it could not fire at all: a `(?P=name)` is reached with `bytes[i] == b'('` and
+/// `bytes[i + 1] == b'?'`, so the `b'('` arm always matched first and the probe was dead code for
+/// the one input it was written for.
 pub(crate) fn pattern_requires_backtrack(pattern: &str) -> bool {
-    const LOOKAROUNDS: &[&str] = &["(?=", "(?!", "(?<=", "(?<!"];
+    /// Group prefixes fancy-regex must take: lookaround, atomic group, conditional, and a named
+    /// backreference.
+    const BACKTRACK_GROUPS: &[&[u8]] = &[b"(?=", b"(?!", b"(?<=", b"(?<!", b"(?>", b"(?(", b"(?P="];
     let bytes = pattern.as_bytes();
     let mut in_class = false;
     let mut i = 0;
@@ -850,11 +877,8 @@ pub(crate) fn pattern_requires_backtrack(pattern: &str) -> bool {
             b'[' => in_class = true,
             b']' if in_class => in_class = false,
             b'(' if !in_class && i + 1 < bytes.len() && bytes[i + 1] == b'?' => {
-                let rest = &pattern[i..];
-                if LOOKAROUNDS.iter().any(|tok| rest.starts_with(tok)) {
-                    return true;
-                }
-                if rest.starts_with("(?>") || rest.starts_with("(?(") {
+                let rest = &bytes[i..];
+                if BACKTRACK_GROUPS.iter().any(|tok| rest.starts_with(tok)) {
                     return true;
                 }
             }
@@ -865,7 +889,6 @@ pub(crate) fn pattern_requires_backtrack(pattern: &str) -> bool {
                 }
                 i += 1;
             }
-            _ if !in_class && pattern[i..].starts_with("(?P=") => return true,
             _ => {}
         }
         i += 1;
