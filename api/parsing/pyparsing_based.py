@@ -59,6 +59,10 @@ DEFAULT_OPERATORS = one_of(": > < >= <= = !=")
 # still wins over bare '!' here: DEFAULT_OPERATORS is tried first and already matches it whole.
 EQ_ALIAS_OPERATORS = DEFAULT_OPERATORS | Literal("!").set_parse_action(lambda: "=")
 
+# Mirrors hand_parser._MANA_REGEX_ALIASES: the MANA-class aliases that take a regex, which is
+# `mana`/`m` and not `devotion`.
+_MANA_REGEX_ALIASES = frozenset({"mana", "m"})
+
 _NUMERIC_LITERAL_RE = re.compile(r"^\d+(\.\d+)?$")
 _COMPARISON_OPERATORS = frozenset({">", "<", ">=", "<=", "=", "!=", ":"})
 
@@ -345,6 +349,35 @@ def create_color_parsers() -> dict[str, ParserElement]:
     }
 
 
+def create_mana_regex_condition(mana_attr_word: ParserElement, regex_pattern: ParserElement) -> ParserElement:
+    r"""`mana:/.../` is a REGEX over the printed cost string — see hand_parser.parse_mana_value.
+
+    Scoped to `mana`/`m` and to `:`/`=` because Scryfall's is: `devotion:/r/` is `Unknown regular
+    expression keyword "devotion"` there and `mana>=/{r}/` is `Unknown mana symbols "//"`, while
+    `mana=/{r}/` is 6,853 (2026-08-28). Outside that scope the parse action raises, and the hand
+    parser reaches its own "Expected mana value" for the same inputs.
+
+    Args:
+        mana_attr_word: Parser for a MANA-class attribute alias.
+        regex_pattern: Parser for a `/.../` delimited pattern.
+
+    Returns:
+        Parser element matching a mana-column regex condition.
+    """
+
+    def make_mana_regex_condition(tokens: list[object]) -> BinaryOperatorNode:
+        """Build the leaf, rejecting the aliases and operators Scryfall does not take a regex on."""
+        attr, operator, value = tokens
+        if attr.original_attribute.lower() not in _MANA_REGEX_ALIASES or operator not in (":", "="):
+            msg = f"Unknown regular expression keyword {attr.original_attribute!r}"
+            raise ValueError(msg)
+        return BinaryOperatorNode(create_value_node(attr), operator, create_value_node(value))
+
+    condition = mana_attr_word + EQ_ALIAS_OPERATORS + regex_pattern
+    condition.set_parse_action(make_mana_regex_condition)
+    return condition
+
+
 def create_all_condition_parsers(basic_parsers: dict, mana_parsers: dict, color_parsers: dict) -> dict[str, ParserElement]:
     """Create all condition parsers using factory functions.
 
@@ -400,6 +433,8 @@ def create_all_condition_parsers(basic_parsers: dict, mana_parsers: dict, color_
     mana_value_or_string = mana_value | mana_quoted_value
     mana_condition = create_condition_parser(mana_attr_word, mana_value_or_string, operators=EQ_ALIAS_OPERATORS)
 
+    mana_regex_condition = create_mana_regex_condition(mana_attr_word, basic_parsers["regex_pattern"])
+
     color_condition = create_condition_parser(color_attr_word, color_value | quoted_string, operators=EQ_ALIAS_OPERATORS)
 
     regex_pattern = basic_parsers["regex_pattern"]
@@ -426,7 +461,8 @@ def create_all_condition_parsers(basic_parsers: dict, mana_parsers: dict, color_
     attr_attr_condition.set_parse_action(make_binary_operator_node)
 
     condition = (
-        mana_condition
+        mana_regex_condition
+        | mana_condition
         | rarity_condition
         | legality_condition
         | color_condition
@@ -445,6 +481,7 @@ def create_all_condition_parsers(basic_parsers: dict, mana_parsers: dict, color_
         "arithmetic_expr": arithmetic_expr,
         "unified_numeric_comparison": unified_numeric_comparison,
         "mana_condition": mana_condition,
+        "mana_regex_condition": mana_regex_condition,
         "color_condition": color_condition,
         "rarity_condition": rarity_condition,
         "legality_condition": legality_condition,

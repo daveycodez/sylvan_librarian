@@ -222,6 +222,17 @@ def test_metacharacter_beside_non_ascii_stays_regex(parse_query, query: str) -> 
     assert isinstance(parse_query(query).root.rhs, RegexValueNode)
 
 
+# THE LOWERING IS TEXT-COLUMNS-ONLY, because "the substring this pattern spells" is only a legal
+# value where a bare value IS a substring test. `mana:` is the one non-text column that can carry
+# a pattern, and there the two readings are different queries: `mana:/p/ mv=1` is 9 on
+# api.scryfall.com (2026-08-28), every one Phyrexian, while the lowered `mana:p` is `Invalid
+# expression "mana:p" was ignored. Unknown mana symbols "P".` and answers the unfiltered 3,244.
+@pytest.mark.parametrize(argnames=["query"], argvalues=[["mana:/p/"], ["m:/rr/"], ["mana:/2/"]], ids=["mana-p", "m-rr", "mana-2"])
+def test_plain_literal_mana_regex_does_not_lower(parse_query, query: str) -> None:
+    """A plain-literal pattern on the mana column stays a regex — lowering it discards the filter."""
+    assert isinstance(parse_query(query).root.rhs, RegexValueNode)
+
+
 _PLAIN_LITERAL_CASES = {
     "bare_literal": {"pattern": "sacrifice a", "expected": "sacrifice a"},
     "escaped_dot": {"pattern": r"foo\.bar", "expected": "foo.bar"},

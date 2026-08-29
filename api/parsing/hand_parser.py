@@ -61,6 +61,12 @@ _BANG_ALIAS_CLASSES: frozenset[ParserClass] = frozenset(
 _VALID_COLOR_NAMES: frozenset[str] = frozenset(COLOR_ALIAS_TO_CODES)
 _COLOR_LETTERS: frozenset[str] = frozenset("wubrgcWUBRGC")
 
+# The MANA-class aliases that take a REGEX, which is `mana`/`m` and NOT `devotion`. One parser
+# class, two answers, measured on api.scryfall.com 2026-08-28: `mana:/p/ mv=1` is 9 and
+# `devotion:/r/` is `Unknown regular expression keyword "devotion"`, while `devotion:{r}` still
+# answers 5,290 -- a statement about the pattern form, not about the column.
+_MANA_REGEX_ALIASES: frozenset[str] = frozenset({"mana", "m"})
+
 
 def _color_value_from_text(text: str, pos: int) -> QueryNode:
     r"""One already-assembled colour value, validated exactly as the WORD arm does.
@@ -545,7 +551,7 @@ class Parser:
         if pc is not None and (next_tok.type == TT.OP or bang_alias):
             op = "=" if bang_alias else next_tok.value
             self.consume()
-            return CardBinaryOperatorNode(CardAttributeNode(wl, pc), op, self.parse_value_for_class(pc, wl))
+            return CardBinaryOperatorNode(CardAttributeNode(wl, pc), op, self.parse_value_for_class(pc, wl, op))
         if pc is not None:
             # alias recognised but no operator → might still be a hyphenated bare word (e.g. "a-b-c")
             return self.parse_hyphenated_name(word)
@@ -663,7 +669,7 @@ class Parser:
 
     # ── value parsers ─────────────────────────────────────────────────────────
 
-    def parse_value_for_class(self, pc: ParserClass, attr: str) -> QueryNode:
+    def parse_value_for_class(self, pc: ParserClass, attr: str, op: str) -> QueryNode:
         """Route to the correct value parser based on the attribute's parser class."""
         if pc == ParserClass.TEXT:
             return self.parse_text_value(attr)
@@ -672,7 +678,7 @@ class Parser:
         if pc == ParserClass.COLOR:
             return self.parse_color_value()
         if pc == ParserClass.MANA:
-            return self.parse_mana_value()
+            return self.parse_mana_value(attr, op)
         if pc in (ParserClass.RARITY, ParserClass.LEGALITY):
             return self.parse_string_value()
         if pc == ParserClass.DATE:
@@ -707,9 +713,42 @@ class Parser:
         msg = f"Expected value for {attr!r}, got {tok.value!r} at position {tok.pos}"
         raise ParseError(msg)
 
-    def parse_mana_value(self) -> QueryNode:
-        """Parse a mana cost value: a sequence of mana symbols, words, or numbers (no gaps)."""
+    def parse_mana_value(self, attr: str, op: str) -> QueryNode:
+        r"""Parse a mana cost value: a sequence of mana symbols, words, or numbers (no gaps).
+
+        `mana:/.../` IS A REAL REGEX, run against the printed mana cost STRING -- not, as the
+        slash form's colour twin above, a value with the delimiters skipped. `mana:` is NOT on
+        https://scryfall.com/docs/regular-expressions' keyword list; the page is incomplete, and
+        the measurement wins. Both readings answer the row that first raised the question
+        (`mana:/p/ mv=1` and `mana:/\smp/ mv=1` are both 9, every one Phyrexian), so the
+        discriminating probes are the ones a value reading cannot produce at all. Measured on
+        api.scryfall.com 2026-08-28:
+
+            mana:/^{2}/          400 "Invalid regular expression: quantifier operand invalid."
+            mana:/g|w/ mv=1      1,276      alternation, which is not a mana symbol
+            mana:/[wu]/ mv=1     1,193      a character class, likewise
+            mana:/^{r}$/           526      anchored, against mana:{r}'s 6,852
+            mana:/}{/           26,815      every multi-symbol cost, a pure string artefact
+            mana:/rr/              404      because "{R}{R}" has no "rr" in it
+            mana:/2/             8,315      against mana:2's 19,692 -- the character, not generic
+            mana:/^$/            1,350      the cards with no mana cost at all
+            mana:/ /               435      = mana:/\/\// -- split costs join "{1}{R} // {1}{U}"
+            mana:/\smh/            605      Scryfall's own \s... shorthands apply here too
+
+        The error sentence is the conclusive one: Scryfall COMPILED it.
+
+        SCOPED TO `:` AND `=`, AND TO `mana`/`m`, because Scryfall's is. On every other operator
+        the slashes go back to being value characters and the symbol lexer rejects them, quoting
+        the slashes back -- `mana!=/^tap/` is `Unknown mana symbols "/^TAP/"` and `mana>=/{r}/` is
+        `Unknown mana symbols "//"` (the `{R}` read, the delimiters left over) -- while
+        `mana=/{r}/` is 6,853, exactly `mana:/{r}/`. `devotion` shares this parser class and is
+        `Unknown regular expression keyword "devotion"` there, while `devotion:{r}` still answers
+        5,290, so the alias set is part of the rule rather than a guard on it.
+        """
         tok = self.peek()
+        if tok.type == TT.REGEX and attr.lower() in _MANA_REGEX_ALIASES and op in (":", "="):
+            self.consume()
+            return RegexValueNode(str(tok.value))
         if tok.type == TT.QUOTED:
             self.consume()
             value = str(tok.value).upper()

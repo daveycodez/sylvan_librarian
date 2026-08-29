@@ -761,6 +761,16 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
 
         # Special handling for mana attributes with comparison operators
         if attr in ("mana_cost_text", "mana_cost_jsonb"):
+            # `mana:/.../` runs against the printed cost STRING, not the pip multiset every other
+            # spelling of this column compiles to -- see hand_parser.parse_mana_value for the
+            # measurements. `mana_cost_text` is Scryfall's own top-level field, so a split card
+            # holds "{1}{R} // {1}{U}" here exactly as there, which is what makes `mana:/ /` (435)
+            # and `mana:/^$/` (1,350) reproduce without a per-face split. Without this arm the
+            # pattern reaches mana_cost_str_to_dict, which finds no symbols in it and emits the
+            # vacuously true `'{}'::jsonb <@ mana_cost_jsonb AND cmc >= 0` -- the whole filter
+            # thrown away silently.
+            if isinstance(self.rhs, RegexValueNode):
+                return f"(card.mana_cost_text ~* {context.add(self.rhs.value)})"
             return self._handle_mana_cost_comparison(context)
 
         # Special handling for date/year searches
