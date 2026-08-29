@@ -12059,6 +12059,33 @@ fn mana_regex_runs_against_the_cost_string() {
     );
 }
 
+/// A regex on a tag/JSONB_OBJECT column DECLINES rather than answering a different query.
+///
+/// `card_keywords`, `card_frame_data`, `card_oracle_tags`, `card_art_tags` and `card_is_tags`
+/// reach the engine as the normalized comparison KEYS of a tag object, so a pattern used to
+/// arrive as the tag it spells — `otag:/^remov/` as the tag `^remov`, `kw:/f.y/` as the keyword
+/// `f.y`. Neither exists, so this answered nothing and reported nothing, the same shape
+/// `t:/dragon/` had before the RegexValueNode route in `build_binary`. With the parser passing the
+/// node through, the leaf lands here and this is the error that turns into a 400.
+#[test]
+fn a_regex_on_a_tag_column_declines() {
+    for attr in ["card_keywords", "card_frame_data", "card_oracle_tags", "card_art_tags", "card_is_tags"] {
+        let node = serde_json::json!({
+            "node_type": "CardBinaryOperatorNode",
+            "kwargs": {
+                "lhs": {"node_type": "CardAttributeNode", "kwargs": {"attribute_name": attr, "original_attribute": attr}},
+                "op": ":",
+                "rhs": {"node_type": "RegexValueNode", "kwargs": {"value": "^remov"}},
+            },
+        });
+        let want = format!("regex not supported on {attr}");
+        assert!(
+            matches!(super::build_filter(&node), Err(ref e) if *e == want),
+            "{attr} must decline a pattern, not answer one"
+        );
+    }
+}
+
 #[test]
 fn regex_builds_on_every_string_field_the_store_holds() {
     // `~*` applies to all of these on the SQL path. Restricting the engine to

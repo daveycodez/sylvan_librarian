@@ -564,8 +564,17 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         attr = self.lhs.attribute_name
 
         if field_type == FieldType.JSONB_OBJECT:
-            # Mana cost and devotion: pass raw ManaValueNode for Rust to parse pip counts
-            if field_info.parser_class == ParserClass.MANA:
+            # Two nodes pass through untouched. Mana cost and devotion: the raw ManaValueNode,
+            # for Rust to parse pip counts. And a REGEX, WHICH IS NOT A TAG NAME -- every
+            # comparison-key reader below takes a STRING and normalizes it into one key, so a
+            # RegexValueNode came out as whatever letters its pattern happens to contain:
+            # `otag:/^remov/` became the tag `^remov` and `kw:/f.y/` the keyword `f.y`. No such
+            # tag exists, so the engine and the SQL path BOTH answered a different query with
+            # confidence -- a silent empty result rather than a decline, which is the same shape
+            # the JSONB_ARRAY branch above was already fixed for (`t:/^drag/`). Passing the node
+            # through lets `build_text_filter` decline it (`regex not supported on
+            # card_oracle_tags`), which the route reports as a 400.
+            if field_info.parser_class == ParserClass.MANA or isinstance(self.rhs, RegexValueNode):
                 return _node_to_json(self.rhs)
             val = self.rhs.value.strip()
             if attr in ("card_colors", "card_color_identity", "produced_mana"):
@@ -1041,6 +1050,13 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
         # Produce the query as a jsonb object
         lhs_sql = self.lhs.to_sql(context)
         attr = self.lhs.attribute_name
+        # Same guard as `_rhs_to_json`'s, and for the same reason: every reader below turns the
+        # rhs into a comparison KEY, so a pattern would be looked up as the tag it spells. This
+        # path is only reached when the engine has already declined the leaf, so refusing here
+        # turns a silently wrong answer into the 400 `_search_sql` raises for a ValueError.
+        if isinstance(self.rhs, RegexValueNode):
+            msg = f"regex is not supported on {attr}"
+            raise ValueError(msg)
         is_color_identity = False
         if attr in ("card_colors", "card_color_identity", "produced_mana"):
             rhs = get_colors_comparison_object(self.rhs.value.strip().lower(), attr)
