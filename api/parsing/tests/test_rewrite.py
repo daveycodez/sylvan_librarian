@@ -216,7 +216,7 @@ def test_bare_non_ascii_literal_still_lowers(parse_query, regex_query: str, subs
     assert parse_query(regex_query) == parse_query(substring_query)
 
 
-@pytest.mark.parametrize(argnames=["query"], argvalues=[[q] for q in NON_ASCII_STAY_REGEX], ids=NON_ASCII_STAY_REGEX)
+@pytest.mark.parametrize(argnames=["query"], argvalues=[(q,) for q in NON_ASCII_STAY_REGEX], ids=NON_ASCII_STAY_REGEX)
 def test_metacharacter_beside_non_ascii_stays_regex(parse_query, query: str) -> None:
     """Mixed shapes stay regex leaves — the engine has to classify them without panicking."""
     assert isinstance(parse_query(query).root.rhs, RegexValueNode)
@@ -227,10 +227,44 @@ def test_metacharacter_beside_non_ascii_stays_regex(parse_query, query: str) -> 
 # a pattern, and there the two readings are different queries: `mana:/p/ mv=1` is 9 on
 # api.scryfall.com (2026-08-28), every one Phyrexian, while the lowered `mana:p` is `Invalid
 # expression "mana:p" was ignored. Unknown mana symbols "P".` and answers the unfiltered 3,244.
-@pytest.mark.parametrize(argnames=["query"], argvalues=[["mana:/p/"], ["m:/rr/"], ["mana:/2/"]], ids=["mana-p", "m-rr", "mana-2"])
+@pytest.mark.parametrize(argnames=["query"], argvalues=[("mana:/p/",), ("m:/rr/",), ("mana:/2/",)], ids=["mana-p", "m-rr", "mana-2"])
 def test_plain_literal_mana_regex_does_not_lower(parse_query, query: str) -> None:
     """A plain-literal pattern on the mana column stays a regex — lowering it discards the filter."""
     assert isinstance(parse_query(query).root.rhs, RegexValueNode)
+
+
+# `~` IS A METACHARACTER in Scryfall's dialect — an automatic alias for the card's own
+# self-reference, which the engine expands into a word-bounded alternation of the card's names and
+# a fixed "this <noun>" phrase family. Reading it as the literal tilde turns `o:/~/` into the
+# substring search `o:~`, which no oracle text on earth satisfies: 404 against 19,228 on
+# api.scryfall.com (2026-08-28). The escaped form is not protected either — `o:/\~/` answers the
+# same 19,228 there.
+@pytest.mark.parametrize(
+    argnames=["query"],
+    argvalues=[("o:/~/",), (r"o:/\~/",), ("o:/~ deals 3 damage/",), ("ft:/~/",), ("name:/~/",), ("t:/~/",)],
+    ids=["oracle", "escaped", "with-literal", "flavor", "name", "type"],
+)
+def test_tilde_is_not_a_plain_literal(parse_query, query: str) -> None:
+    """A `~` pattern stays a regex on EVERY column, including the ones that do not expand it.
+
+    Lowering is a parser-side decision and the alias is an engine-side one, so the parser cannot
+    take the column into account here — and it does not need to: on `ft:`/`name:` the engine
+    compiles the tilde as the literal it looks like, which is exactly what `ft:/~/`'s 2 cards
+    (Blighted Agent and Urabrask the Hidden, whose Phyrexian-script flavor text contains one) and
+    `name:/~/`'s 404 say it should be.
+    """
+    assert isinstance(parse_query(query).root.rhs, RegexValueNode)
+
+
+def test_tilde_costs_one_token_in_the_regex_budget() -> None:
+    r"""`~` is one piece of user-written structure, the same call the `\\s…` shorthands get.
+
+    Its expansion is a 17-way alternation, so measuring that instead would put `o:/~~/` past
+    MAX_ALTERNATIONS_PER_PATTERN — and the expansion is a fixed constant this codebase chose, not
+    something the searcher typed. Python's `re` already reads `~` as an ordinary literal, so this
+    needs no rewrite; the test is here so a later one is a deliberate change.
+    """
+    parse_scryfall_query("o:/~~~~~~~~/")
 
 
 _PLAIN_LITERAL_CASES = {

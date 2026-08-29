@@ -1,7 +1,7 @@
 use memchr::memmem;
 use fancy_regex::Error as FancyError;
 use serde_json::Value;
-use super::regex_compat::{CompiledRegex, QUERY_REGEX_FLAGS};
+use super::regex_compat::{CompiledRegex, QUERY_REGEX_FLAGS, SELF_REF_SENTINEL, SelfRefScope};
 use super::{AOracleCard, APrinting, AStrings, str_at, mana_lane, lane_add, lanes_ge, LANES6_HI, LANES8_HI, mana_pip_counts, mana_cmc, color_list_to_mask, card_type_str_to_bit, trigram_candidates, trigram_min_posting, ARTIST_NONE, NONE_STR, FlavorIndex, NameBigramIndex, NO_TYPE_LINE_INDEX, OracleTextIndex, SortedTrigramIndex, TypeLineIndex, flavor_fingerprint, flavor_match_sets};
 use super::legality::{LEGALITY_LEGAL, LEGALITY_BANNED, LEGALITY_RESTRICTED, format_shift};
 
@@ -22,6 +22,11 @@ pub(crate) const REGEX_MATCH_ERR_PREFIX: &str = "regex_match:";
 /// a backtracking match is bounded by [`REGEX_BACKTRACK_LIMIT`].
 pub(crate) fn compile_search_regex(pattern: &str) -> Result<CompiledRegex, String> {
     CompiledRegex::new(pattern).map_err(|e| format!("{REGEX_COMPILE_ERR_PREFIX}{e}"))
+}
+
+/// [`compile_search_regex`] with `~` expanded — the two rules-text columns only.
+pub(crate) fn compile_search_regex_self_referential(pattern: &str, scope: SelfRefScope) -> Result<CompiledRegex, String> {
+    CompiledRegex::new_self_referential(pattern, scope).map_err(|e| format!("{REGEX_COMPILE_ERR_PREFIX}{e}"))
 }
 
 use std::cell::Cell;
@@ -904,6 +909,148 @@ pub(crate) fn pattern_requires_backtrack(pattern: &str) -> bool {
     false
 }
 
+/// A card's own name, truncated where Magic's legendary short name is.
+///
+/// MEASURED, and the separator set is the whole rule. `!"Rankle, Master of Pranks" o:/~/` is 1 on
+/// api.scryfall.com 2026-08-28 and Rankle's text never spells the full name — it says "Whenever
+/// Rankle deals combat damage" — so the pre-comma form is an alias. So are the two other
+/// conventional cuts: Eron the Relentless ("Regenerate Eron"), Svyelun of Sea and Sky ("Svyelun
+/// has indestructible"), Braulios of Pheres Band, Storm of Memories (whose stripped text opens on
+/// the bare line "Storm", which is what makes `o:/^~$/` answer exactly 1 corpus-wide).
+///
+/// It is NOT "the first word": Hurska Sweet-Tooth's text says "Whenever Hurska attacks" and the
+/// card does NOT match, because its name carries none of the three separators. Nor is it
+/// legendary-only — For the Common Good, From the Catacombs, Turn the Tide, Choice of Damnations
+/// and Start the TARDIS all match on their prefixes, and not one of them is legendary.
+///
+/// The EARLIEST separator wins, which is what keeps "Rankle, Master of Pranks" cutting at the
+/// comma rather than at the " of ".
+fn legendary_short_name(name: &str) -> &str {
+    let mut cut = name.len();
+    for sep in [",", " the ", " of "] {
+        match name.find(sep) {
+            Some(at) if at > 0 && at < cut => cut = at,
+            _ => {}
+        }
+    }
+    &name[..cut]
+}
+
+/// `\w` as the compiled patterns mean it: the regex crate's Unicode `\w` is
+/// `[\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\p{Join_Control}]`, of which this covers everything a card
+/// name or an oracle text has ever carried.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Whether `\b` holds between two adjacent characters, a string edge counting as non-word.
+fn is_boundary(before: Option<char>, after: Option<char>) -> bool {
+    before.is_some_and(is_word_char) != after.is_some_and(is_word_char)
+}
+
+/// Write the sentinel over every `\b<needle>\b` occurrence, leaving unbounded ones alone.
+fn replace_bounded(text: &str, needle: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    let mut consumed = 0usize;
+    while let Some(at) = rest.find(needle) {
+        let start = consumed + at;
+        let end = start + needle.len();
+        let before = text[..start].chars().next_back();
+        let first = needle.chars().next();
+        let last = needle.chars().next_back();
+        let after = text[end..].chars().next();
+        if is_boundary(before, first) && is_boundary(last, after) {
+            out.push_str(&rest[..at]);
+            out.push(SELF_REF_SENTINEL);
+        } else {
+            out.push_str(&rest[..at + needle.len()]);
+        }
+        rest = &rest[at + needle.len()..];
+        consumed = end;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Write [`SELF_REF_SENTINEL`] over every occurrence of the card's own names in its text.
+///
+/// The inverse of what a reader expects, and deliberately: the ALTERNATIVE is to interpolate the
+/// name into the pattern, which makes the pattern card-dependent and costs one regex compile per
+/// candidate — and a `~` query is unnarrowable, so "per candidate" is the whole corpus. Compiling
+/// once with a sentinel and rewriting the haystack instead is one compile and one scan.
+///
+/// THE WORD BOUNDARY IS CHECKED HERE, against the NAME's own edges, because that is where
+/// Scryfall checks it. `\b(?:name|…)\b` is what its alias compiles to, and `\b` is a boundary
+/// between a word character and a non-word one — so for a name that ENDS in punctuation it
+/// demands a word character AFTER the punctuation, which almost never follows. That is not a
+/// curiosity: `!"Kaboom!" o:/~/` is 404 on api.scryfall.com (2026-08-28) even though the card's
+/// text opens "Kaboom! deals damage equal to…", and a sentinel wearing its own `\b` would have
+/// called it a match. Checking the name's edges and then writing a BARE sentinel reproduces
+/// Scryfall's answer for both shapes.
+///
+/// The ordinary half is measured the same way: `!"On the Job"`, `!"Get the Point"` and `!"In the
+/// Presence of Ages"` are all 404, each short form ("On", "Get", "In") appearing in its text only
+/// inside "control", "target" and "into" — while every card whose short name stands as its own
+/// word matches.
+///
+/// Longest name first, so "Rankle, Master of Pranks" is consumed before the "Rankle" inside it.
+///
+/// Borrows when no name occurs, which is the common case by a wide margin: 3,046 of the 19,228
+/// cards `o:/~/` matches do so through a NAME (`o:/~/ -o:/this/`), so roughly nine candidates in
+/// ten never allocate at all.
+fn with_self_reference<'a>(text: &'a str, names: &[String]) -> std::borrow::Cow<'a, str> {
+    if !names.iter().any(|n| !n.is_empty() && text.contains(n.as_str())) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = std::borrow::Cow::Borrowed(text);
+    for name in names {
+        if name.is_empty() || !out.contains(name.as_str()) {
+            continue;
+        }
+        out = std::borrow::Cow::Owned(replace_bounded(&out, name));
+    }
+    out
+}
+
+/// The names `~` may stand for on one card row.
+///
+/// THE `A-` PREFIX IS NOT PART OF THE SELF-REFERENCE. An Alchemy rebalance is named "A-Blood
+/// Artist" and its oracle text says "Whenever Blood Artist or another creature dies", so the name
+/// as printed never appears in the text at all — and `!"A-Blood Artist" o:/~/` is 1 on
+/// api.scryfall.com (2026-08-28). It is not a rounding error either: `name:/^a-/ o:/~/` is 138
+/// there, against a corpus-wide `o:/~/` gap of 144 before this line existed.
+///
+/// A TWO-FACED CARD IS TWO ROWS HERE and both carry the COMBINED `card_name` ("Delver of Secrets
+/// // Insectile Aberration"), because `preprocess_card` lifts the name before it expands the
+/// faces. Each half is offered separately, which is what makes the front face's "transform Delver
+/// of Secrets" a self-reference at all — the combined string appears in no card's text. It is a
+/// SUPERSET by exactly one shape: a face whose text names its TWIN and never itself, of which the
+/// 2026-05-31 corpus holds 4.
+fn self_names_of(card_name_lower: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |name: &str| {
+        if name.is_empty() {
+            return;
+        }
+        for candidate in [name, legendary_short_name(name)] {
+            if !candidate.is_empty() && !out.iter().any(|n| n == candidate) {
+                out.push(candidate.to_string());
+            }
+        }
+    };
+    push(card_name_lower);
+    for face in card_name_lower.split(" // ") {
+        push(face);
+        if let Some(rebalanced) = face.strip_prefix("a-") {
+            push(rebalanced);
+        }
+    }
+    // Longest first, so "rankle, master of pranks" is consumed before the "rankle" inside it.
+    out.sort_by_key(|n| std::cmp::Reverse(n.len()));
+    out
+}
+
 /// Whether a node can NEVER settle the card-level pass — it compares only
 /// printing-level fields, so at card level it always returns PrintingDep and
 /// its evaluation there is pure deferral. Ordering such children after the
@@ -1748,6 +1895,15 @@ impl FilterExpr {
 
             FilterExpr::TextRegex { field, regex } => {
                 match text_field_value(card, printing, strings, *field) {
+                    // `~` is a per-CARD haystack rewrite, not a per-card pattern: the compiled
+                    // alternation carries a sentinel, and the card's own names are written over
+                    // the text in a copy before the match. See `with_self_reference`. The common
+                    // case pays nothing — `has_self_reference` is a cached bool, and a pattern
+                    // without `~` takes the same branch it always did.
+                    StrVal::Known(s) if regex.has_self_reference() => {
+                        let names = self_names_of(card.card_name_lower.as_str());
+                        tri_bool(regex_is_match(regex, &with_self_reference(s, &names)))
+                    }
                     StrVal::Known(s) => tri_bool(regex_is_match(regex, s)),
                     StrVal::Null => Tri::Null,
                     StrVal::PDep => Tri::PrintingDep,
@@ -2380,7 +2536,6 @@ fn build_text_filter(attr: &str, op: &str, rhs: &Value, orig: &str) -> Result<Fi
 
     if rhs_node_type == "RegexValueNode" {
         let pattern  = rhs["kwargs"]["value"].as_str().unwrap_or("");
-        let re = compile_search_regex(pattern)?;
         // Every field the store holds as a string can carry a regex: `~*`
         // applies to all of them on the SQL path, and restricting the engine to
         // the first four only sent the rest to that path as a decline. The
@@ -2418,6 +2573,20 @@ fn build_text_filter(attr: &str, op: &str, rhs: &Value, orig: &str) -> Result<Fi
             // pattern for it. TIER: the linear engine, no narrowing arm, a full scan.
             "mana_cost_jsonb" => TextField::ManaCostText,
             _ => return Err(format!("regex not supported on {attr}")),
+        };
+        // `~` IS EXPANDED ON THE RULES-TEXT COLUMNS AND NOWHERE ELSE, which is why the field has
+        // to be chosen before the pattern is compiled. `name:/~/` is 404 on api.scryfall.com
+        // (2026-08-28) — if `~` were the card's name there it would be the whole corpus — and
+        // `t:/~/` and `mana:/~/` are 404 too. FLAVOR IS NOT AN ORACLE COLUMN for this purpose,
+        // which took two measurements to establish: `ft:/~/` is 2, a number small enough to read
+        // as an alias answering thinly, and the two cards are Blighted Agent and Urabrask the
+        // Hidden, whose Phyrexian-script flavor text carries a literal `~` — the plain substring
+        // `ft:"~"` returns the same two. Expanding names there answers 680.
+        let re = match field {
+            TextField::OracleTextLower | TextField::FullOracleTextLower => {
+                compile_search_regex_self_referential(pattern, SelfRefScope::Oracle)?
+            }
+            _ => compile_search_regex(pattern)?,
         };
         return Ok(FilterExpr::TextRegex { field, regex: re });
     }
