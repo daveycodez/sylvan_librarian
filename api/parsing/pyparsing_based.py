@@ -319,7 +319,26 @@ def create_color_parsers() -> dict[str, ParserElement]:
     # on validity, and a colour name accepted by only one of them is exactly that failure).
     color_word = make_regex_pattern(COLOR_ALIAS_TO_CODES)
     color_letter_pattern = Regex(r"[wubrgcWUBRGC]+")
-    color_value = color_word | color_letter_pattern
+
+    def make_slashed_color_value(tokens: list[str]) -> StringValueNode:
+        r"""A `/.../` colour value is the text between the slashes, not a regex.
+
+        Scryfall runs no regex on a colour column — `c:/w/` is 7,105 there and so is `c:w`, and
+        `c:/white/` and `c:/yore-tiller/` behave the same way (measured 2026-08-28). It validates
+        the text the delimiters contained, which is why `c:/xyz/` answers `Unknown color "x"`:
+        the term is echoed WITH its slashes and the letter is named from WITHOUT them. Shared
+        with hand_parser._color_value_from_text through the same two acceptances.
+        """
+        value = tokens[0][1:-1].replace("\\/", "/")
+        if value.lower() not in COLOR_ALIAS_TO_CODES and not all(c in "wubrgcWUBRGC" for c in value):
+            msg = f"Invalid color value {value!r}"
+            raise ValueError(msg)
+        return StringValueNode(value)
+
+    slashed_color_value = QuotedString("/", esc_char="\\", unquote_results=False, convert_whitespace_escapes=False).set_parse_action(
+        make_slashed_color_value,
+    )
+    color_value = color_word | color_letter_pattern | slashed_color_value
 
     return {
         "color_value": color_value,

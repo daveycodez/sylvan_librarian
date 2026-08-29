@@ -60,6 +60,20 @@ _BANG_ALIAS_CLASSES: frozenset[ParserClass] = frozenset(
 
 _VALID_COLOR_NAMES: frozenset[str] = frozenset(COLOR_ALIAS_TO_CODES)
 _COLOR_LETTERS: frozenset[str] = frozenset("wubrgcWUBRGC")
+
+
+def _color_value_from_text(text: str, pos: int) -> QueryNode:
+    r"""One already-assembled colour value, validated exactly as the WORD arm does.
+
+    Only the slash-delimited form reaches this. `parse_color_value` owns its own token
+    bookkeeping (the hyphen glue), and the point of the helper is that the delimited text is
+    subject to the SAME acceptance -- a colour name, or nothing but colour letters -- so
+    `c:/xyz/` produces the very sentence `c:xyz` does.
+    """
+    if text.lower() not in _VALID_COLOR_NAMES and not all(c in _COLOR_LETTERS for c in text):
+        msg = f"Invalid color value {text!r} at position {pos}"
+        raise ParseError(msg)
+    return StringValueNode(text)
 _MIN_MTG_YEAR: int = 1992
 _MAX_YEAR: int = 2040
 
@@ -738,8 +752,38 @@ class Parser:
         raise ParseError(msg)
 
     def parse_color_value(self) -> QueryNode:
-        """Parse a color value: a recognized color name or a combination of color letters."""
+        r"""Parse a color value: a recognized color name or a combination of color letters.
+
+        A SLASH-DELIMITED VALUE IS NOT A REGEX HERE. Scryfall reads `/.../` on a colour column as
+        ordinary value text; every measured pair on api.scryfall.com 2026-08-28 is an exact
+        equality with the undelimited spelling:
+
+            c:/w/            7,105 = c:w              id:/w/           7,993 = id:w
+            c:/wu/             718 = c:wu             ci:/w/           7,993 = commander:/w/
+            c:/white/        7,105 = c:white          produces:/g/     1,274 = produces:g
+            c:/yore-tiller/     62 = c:yore-tiller    colour:/w/       7,105
+
+        THE FAILURE MODE IS THE UNDELIMITED ONE TOO: `c:/xyz/`, `id:/xyz/` and `produces:/xyz/`
+        all come back `400 All of your terms were ignored.` with `Invalid expression "c:/xyz/"
+        was ignored. Unknown color "x"` -- the same sentence `c:xyz` gets, quoting the term AS
+        TYPED while naming the letter from WITHOUT the slashes. Validating the delimited text
+        through exactly the WORD path below is what reproduces that rather than approximating it.
+
+        NOT PORTED, because this tree does not have the reading they measure: `c:/2/` is 3,811 on
+        Scryfall and equals `c:2`, a colour COUNT. `c:2` is a parse error here, with or without
+        the slashes, so the identity still holds -- both spellings are refused together, and
+        adding the count reading is a separate change with its own measurements.
+
+        NOT DONE, measured and left alone: Scryfall skips non-colour characters ANYWHERE in a
+        colour value, not only at the delimiters (`c:w|u` and `c:w-u` are both 718, `c:/{w}/` is
+        7,105, `c://` and `c:""` are both the whole corpus). Those spellings do not survive the
+        tokenizer as one token, so widening the rule would be a grammar change rather than a value
+        change.
+        """
         tok = self.peek()
+        if tok.type == TT.REGEX:
+            self.consume()
+            return _color_value_from_text(str(tok.value), tok.pos)
         if tok.type == TT.QUOTED:
             self.consume()
             return StringValueNode(str(tok.value))
