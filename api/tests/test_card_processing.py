@@ -10,7 +10,8 @@ from typing import Any, ClassVar
 
 import pytest
 
-from api.card_processing import extract_frame_data_from_raw_card, preprocess_card
+from api.card_processing import _FACE_JOINED_TEXTS, extract_frame_data_from_raw_card, preprocess_card
+from api.parsing.db_info import FACE_JOINED_TEXT_COLUMNS, FACE_TEXT_SEPARATOR
 
 # Project root directory for accessing sample data
 _PROJECT_ROOT = pathlib.Path(__file__).parent.parent.parent
@@ -545,10 +546,36 @@ class TestFaceMerging:
     def test_oracle_text_joins_faces_with_separator(self) -> None:
         """Each face's text is substring-searchable in the one joined column.
 
-        The newline separator keeps `.`-based regexes from matching across the face boundary.
+        The newline keeps `.` from crossing a face boundary, and that is ALL it keeps out: a
+        pattern spelling the separator's own characters matched it happily, which is why search
+        splits this value back apart before matching it (`FACE_JOINED_TEXT_COLUMNS`).
         """
         merged = preprocess_card(self._battle_card())[0]
         assert merged["oracle_text"] == ("When this Siege enters, look at the top card.\n//\nThis creature can't be blocked.")
+        assert FACE_TEXT_SEPARATOR in merged["oracle_text"]
+        assert "oracle_text" in FACE_JOINED_TEXT_COLUMNS
+
+    def test_flavor_text_joins_faces_with_the_same_separator(self) -> None:
+        r"""And is therefore split the same way: `ft:/\/\//` is 0 on Scryfall and was 262 here."""
+        card = self._battle_card()
+        card["card_faces"][0]["flavor_text"] = "The siege begins."
+        card["card_faces"][1]["flavor_text"] = "And ends."
+        merged = preprocess_card(card)[0]
+        assert merged["flavor_text"] == f"The siege begins.{FACE_TEXT_SEPARATOR}And ends."
+        assert "flavor_text" in FACE_JOINED_TEXT_COLUMNS
+
+    def test_type_line_joins_with_scryfalls_own_separator_and_is_not_split(self) -> None:
+        r"""The type line's " // " is NOT ours, so undoing it would be inventing a bug.
+
+        Scryfall's own top-level `type_line` for a split card is "Instant // Instant", and
+        `t:/\/\//` answers 930 there (2026-08-28) where `o:/\/\//` answers 1. Three columns join
+        faces and only two of the separators are this project's; the third has to keep showing.
+        """
+        merged = preprocess_card(self._battle_card())[0]
+        assert merged["type_line"] == "Battle — Siege // Creature — Moonfolk Ninja"
+        assert FACE_TEXT_SEPARATOR not in merged["type_line"]
+        assert "type_line" in _FACE_JOINED_TEXTS, "it is still a join..."
+        assert "type_line" not in FACE_JOINED_TEXT_COLUMNS, "...but not one search may take apart"
 
     def test_back_face_stats_used_when_front_has_none(self) -> None:
         """A land-front / creature-back card (Westvale Abbey) keeps the back's P/T.

@@ -8,6 +8,7 @@ import re
 from typing import TYPE_CHECKING, Any
 
 from api.parsing.card_query_nodes import calculate_devotion, fold_accents, mana_cost_str_to_dict
+from api.parsing.db_info import FACE_TEXT_SEPARATOR as _FACE_TEXT_SEPARATOR
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -110,6 +111,8 @@ def extract_frame_data_from_raw_card(raw_card: dict) -> dict[str, bool]:
         frame_data[effect.title()] = True
 
     return frame_data
+
+
 # Face-merge policy for multi-face cards (#400, #873). Scryfall AND's search predicates at the
 # CARD level, each satisfiable by any face — measured against api.scryfall.com 2026-08-08:
 # `t:sorcery t:land` returns the MDFC lands (no single face is both), o: conjunctions match
@@ -131,9 +134,11 @@ _FACE_STAT_GROUPS = (
     ("creature_power", "creature_toughness", "creature_power_text", "creature_toughness_text"),
     ("planeswalker_loyalty", "planeswalker_loyalty_text"),
 )
-# Joins face texts. "\n" so substring/regex matches cannot span faces in practice (`.` does not
-# cross newlines), "//" because that is the face separator Scryfall itself renders.
-_FACE_TEXT_SEPARATOR = "\n//\n"
+# Joins face texts, and is defined in api/parsing/db_info.py because SEARCH has to know it too:
+# "in practice" was not good enough. The newline stops `.` crossing a face boundary and nothing
+# else -- `o:/\ndraw/` matched the separator's own newline and answered 389 where Scryfall answers
+# 381, and `o://` matched the "//" and answered 849 where Scryfall answers 1. Matching now splits
+# the value back on this constant, per face, on both the engine and SQL paths.
 
 
 def _merge_processed_faces(faces: list[dict[str, Any]]) -> dict[str, Any]:
