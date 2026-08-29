@@ -924,7 +924,8 @@ pub(crate) fn pattern_requires_backtrack(pattern: &str) -> bool {
 /// and Start the TARDIS all match on their prefixes, and not one of them is legendary.
 ///
 /// The EARLIEST separator wins, which is what keeps "Rankle, Master of Pranks" cutting at the
-/// comma rather than at the " of ".
+/// comma rather than at the " of ". What the separators CANNOT reach is
+/// [`SELF_REF_CURATED_SHORT_NAMES`], which is data and not a rule.
 fn legendary_short_name(name: &str) -> &str {
     let mut cut = name.len();
     for sep in [",", " the ", " of "] {
@@ -1013,7 +1014,83 @@ fn with_self_reference<'a>(text: &'a str, names: &[String]) -> std::borrow::Cow<
     out
 }
 
+/// Short names Wizards uses that no separator can find. CURATED DATA, and a SNAPSHOT.
+///
+/// [`legendary_short_name`] cuts at `,` / ` the ` / ` of `, and after that cut and the phrase
+/// family in `SELF_REF_THIS_PHRASES` the corpus-wide diff against api.scryfall.com (2026-08-28,
+/// full `o:/~/` id sets both sides, 19,228 there) came to 53 names missing here. Forty-seven were
+/// the two absent phrases. These six are the whole rest, each measured `!"<card>" o:/~/` = 1 with
+/// the oracle text that earns it:
+///
+/// | card | text says | why no rule finds it |
+/// |---|---|---|
+/// | Drizzt Do'Urden | "When Drizzt enters" | no separator in the name |
+/// | Hazezon Tamar | "When Hazezon enters" | no separator |
+/// | King Darien XLVIII | "on King Darien" | no separator, and the alias is TWO words |
+/// | Rasputin Dreamweaver | "Rasputin enters with seven dream counters" | no separator |
+/// | Ryan Sinclair | "Whenever Ryan attacks" | no separator |
+/// | Zurgo Bellstriker | "Zurgo can't block" | no separator |
+///
+/// KING DARIEN REFUTES "the first word", and Hurska Sweet-Tooth refutes it again from the other
+/// side: its text says "Whenever Hurska attacks" and `!"Hurska Sweet-Tooth" o:/~/` is 0. One
+/// two-word alias and one first-word non-alias, so what remains is a table Wizards keeps and
+/// Scryfall reads — the CARDNAME templating each card is written against — not a derivation.
+///
+/// THEREFORE THIS DRIFTS. Every new legendary whose printed text uses a short name the separators
+/// cannot cut is a new row, and nothing in the build will notice. To refresh: fetch both full
+/// `o:/~/` id sets (Scryfall paginates 175/page, so does `/cards/search` here), diff them, and
+/// sort each missing card into "the phrase family should have caught it" or "another row here".
+const SELF_REF_CURATED_SHORT_NAMES: &[(&str, &str)] = &[
+    ("drizzt do'urden", "drizzt"),
+    ("hazezon tamar", "hazezon"),
+    ("king darien xlviii", "king darien"),
+    ("rasputin dreamweaver", "rasputin"),
+    ("ryan sinclair", "ryan"),
+    ("zurgo bellstriker", "zurgo"),
+];
+
+/// Names whose own text uses them as a GAME TERM, which Scryfall does not count as a self
+/// reference. CURATED DATA, and a SNAPSHOT, for the same reason as above.
+///
+/// The other half of the 2026-08-28 diff: 16 names matched here and not there, and these seven are
+/// the ones no rule explains. Each is a card named after a keyword ability, a keyword action or a
+/// creature type, whose text spells that term because the term is what the card DOES:
+///
+/// | card | the occurrence | `!"<card>" o:/~/` |
+/// |---|---|---|
+/// | Assembly-Worker | "Target Assembly-Worker creature" (a creature TYPE) | 0 |
+/// | Fear | "Enchanted creature has fear" | 0 |
+/// | Lifelink | "Enchanted creature has lifelink" | 0 |
+/// | Manifest Dread | "Manifest dread." | 0 |
+/// | Regenerate | "Regenerate target creature." | 0 |
+/// | Suspend | "it gains suspend" | 0 |
+/// | Vigilance | "Enchanted creature has vigilance" | 0 |
+///
+/// CASE IS NOT THE RULE, tested both ways so the cheaper fix stays refuted. Regenerate and
+/// Assembly-Worker spell the name in EXACT case and still do not match, so a case-sensitive alias
+/// would not exclude them; and Sorry's text says `may say "sorry."` in lowercase against a name
+/// spelled "Sorry", yet `o:/Say "~"/` returns it — so the alias is case-INSENSITIVE and a
+/// case-sensitive alias would wrongly drop a card that matches. Neither direction survives.
+///
+/// Nor is it "the card is not legendary": For the Common Good and Turn the Tide are not legendary
+/// and DO alias (see `legendary_short_name`). It is a judgement about what the sentence means,
+/// which is data. The refresh procedure is the one above, read from the other side of the diff.
+const SELF_REF_NON_ALIASING_NAMES: &[&str] =
+    &["assembly-worker", "fear", "lifelink", "manifest dread", "regenerate", "suspend", "vigilance"];
+
 /// The names `~` may stand for on one card row.
+///
+/// A PERIOD IN AN ALIAS KILLS IT, and that one IS a rule rather than a table. Nine of the sixteen
+/// 2026-08-28 over-matches were cards whose only self-reference-shaped text is a name form
+/// carrying a `.`: Black Waltz No. 3, Devil K. Nevil, Dr. Julius Jumblemorph, J. Jonah Jameson,
+/// Mr. Foxglove, Ms. Marvel (both printings, aliasing at "Ms. Marvel"), U.S.Agent and
+/// U.S.S. Enterprise-D. Checked over ALL 69 cards whose name contains a period, not just those
+/// nine: ten reach a period-bearing form and nothing else, and not one of the ten is in Scryfall's
+/// set; every period-named card that IS in the set gets there by a `this <noun>` phrase or by a
+/// short name with no period in it — Nick Fury (from "Nick Fury, Agent of S.H.I.E.L.D.") and
+/// Phoebe (from "Phoebe, Head of S.N.E.A.K.") are both 1. Zero counterexamples in either
+/// direction. Goblin S.W.A.T. Team looks like one and is not: it matches, but `o:/Say "~"/` is 3
+/// and it is not among them, so its `Say "Goblin S.W.A.T. Team"` is not where the match lands.
 ///
 /// THE `A-` PREFIX IS NOT PART OF THE SELF-REFERENCE. An Alchemy rebalance is named "A-Blood
 /// Artist" and its oracle text says "Whenever Blood Artist or another creature dies", so the name
@@ -1030,11 +1107,13 @@ fn with_self_reference<'a>(text: &'a str, names: &[String]) -> std::borrow::Cow<
 fn self_names_of(card_name_lower: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |name: &str| {
-        if name.is_empty() {
+        if name.is_empty() || SELF_REF_NON_ALIASING_NAMES.contains(&name) {
             return;
         }
-        for candidate in [name, legendary_short_name(name)] {
-            if !candidate.is_empty() && !out.iter().any(|n| n == candidate) {
+        let curated = SELF_REF_CURATED_SHORT_NAMES.iter().find(|(n, _)| *n == name).map(|(_, s)| *s);
+        for candidate in [name, legendary_short_name(name)].into_iter().chain(curated) {
+            // A period anywhere in the form and the form is not an alias — see the doc comment.
+            if !candidate.is_empty() && !candidate.contains('.') && !out.iter().any(|n| n == candidate) {
                 out.push(candidate.to_string());
             }
         }
