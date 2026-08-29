@@ -75,7 +75,7 @@ def _collect_regex_patterns(node: QueryNode) -> list[str]:
 
 
 def _translate_are_escapes(pattern: str) -> str:
-    r"""Rewrite the PostgreSQL ARE escapes Python's ``re`` cannot spell.
+    r"""Rewrite the escapes Python's ``re`` cannot spell, and fold each ``\s…`` shorthand to one token.
 
     ``o:/.../`` is documented against PostgreSQL's ``~*``, whose word-boundary
     escapes are ``\y``/``\Y``/``\m``/``\M``. Python's ``re`` rejects all four
@@ -90,6 +90,21 @@ def _translate_are_escapes(pattern: str) -> str:
     the backtracking engine that ``MAX_LOOKAROUNDS_PER_PATTERN`` exists to bound.
 
     ``\Z`` needs no entry -- Python and ARE agree it is end-of-string.
+
+    THE ``\s…`` SHORTHANDS ARE MEASURED AS ONE TOKEN EACH, not as the expansions
+    ``card_engine/src/regex_compat.rs`` substitutes. Python's ``re`` would otherwise read ``\sm``
+    as whitespace-then-``m`` and cost a pattern that never runs, and expanding them would charge
+    the searcher for a constant this codebase chose: ``\sm`` alone expands to five alternations
+    and ten AST nodes, so ``o:/\sm\sm\sm\sm\sm\sm\sm/`` — seven mana symbols in a row, a
+    perfectly ordinary query — would exceed both ``MAX_REGEX_AST_NODES`` and
+    ``MAX_ALTERNATIONS_PER_PATTERN``. One shorthand is one piece of user-written structure, and
+    that is what the budget is bounding.
+
+    Costing it that way is safe because of where the expansions run: every one but ``\smr``
+    compiles on the linear engine, which has no backtracking to blow up, and ``\smr``'s
+    backreference is bounded at runtime by ``REGEX_BACKTRACK_LIMIT``. Note that this is also what
+    lets ``\smr`` through at all — the backreference the engine synthesises for it is never the
+    user's, and ``metrics.backreferences > 0`` below would otherwise reject every use of it.
 
     Only the returned string is measured; the pattern stored on the node is left
     alone, because the SQL path hands it to PostgreSQL, which speaks ARE natively.
@@ -108,11 +123,18 @@ def _translate_are_escapes(pattern: str) -> str:
                 out.append("\\")
                 break
             nxt = pattern[i + 1]
-            if class_pos is None:
-                out.append(_ARE_ESCAPES.get(nxt, "\\" + nxt))
-            else:
+            if class_pos is not None:
                 out.append("\\" + nxt)
                 class_pos += 2
+                i += 2
+                continue
+            if nxt == "s":
+                suffix = next((sfx for sfx in _SHORTHAND_SUFFIXES if pattern.startswith(sfx, i + 2)), None)
+                if suffix is not None:
+                    out.append(_SHORTHAND_TOKEN)
+                    i += 2 + len(suffix)
+                    continue
+            out.append(_ARE_ESCAPES.get(nxt, "\\" + nxt))
             i += 2
             continue
         if class_pos is None:
@@ -130,6 +152,16 @@ def _translate_are_escapes(pattern: str) -> str:
         i += 1
     return "".join(out)
 
+
+# Scryfall's `\s…` shorthands, LONGEST FIRST so `\smm` is the -X/-X shorthand rather than `\sm`
+# followed by a literal `m`. The table mirrors SCRYFALL_SHORTHANDS in
+# card_engine/src/regex_compat.rs, which carries the measured expansions and the counts behind
+# them; only the spellings matter here, because each one costs a single token.
+_SHORTHAND_SUFFIXES = ("mh", "mp", "mm", "mr", "pt", "pp", "m", "s", "c")
+
+# U+E000, the first private-use codepoint: a character `re` parses as an ordinary literal and no
+# card text contains, so folding a shorthand to it changes the measured structure and nothing else.
+_SHORTHAND_TOKEN = "\ue000"
 
 _ARE_ESCAPES = {
     "y": r"\b",

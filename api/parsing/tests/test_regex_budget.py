@@ -137,6 +137,46 @@ class TestAreWordBoundaryEscapes:
         with pytest.raises(InvalidRegexPatternError):
             parse_scryfall_query(r"o:/\q/")
 
+    @pytest.mark.parametrize(
+        "query",
+        [
+            r"o:/\ss/",
+            r"o:/\sm/",
+            r"o:/\sc/",
+            r"o:/\smh/",
+            r"o:/\smp/",
+            r"o:/\smr/",
+            r"o:/\spt/",
+            r"o:/\spp/",
+            r"o:/\smm/",
+            # Seven mana symbols in a row: measured through its expansion this would be 70 AST
+            # nodes and 35 alternations, past both caps. A shorthand costs one token.
+            r"o:/\sm\sm\sm\sm\sm\sm\sm/",
+            # `\smr` is the one that becomes a backreference on the engine, which
+            # `metrics.backreferences > 0` would reject if the expansion were what got measured.
+            r"o:/\smr\smr/",
+            # A quantifier still binds to the folded token, so the bound is still checked.
+            r"o:/\sm{3}/",
+        ],
+    )
+    def test_accepts_scryfall_shorthands(self, query: str) -> None:
+        parse_scryfall_query(query)
+
+    def test_a_quantified_shorthand_still_spends_quantifier_budget(self) -> None:
+        # Folding the shorthand to one token must not fold away the `{n}` after it.
+        with pytest.raises(QueryBudgetExceeded) as exc_info:
+            parse_scryfall_query(r"o:/\sm{2000}/")
+        assert exc_info.value.kind == "regex_pattern"
+
+    def test_a_shorthand_inside_a_class_is_not_folded(self) -> None:
+        # Inside `[...]` nothing is rewritten, on either side of the seam: `[\sm]` is the class
+        # "whitespace or the letter m", which Python parses and the engine compiles unchanged.
+        parse_scryfall_query(r"o:/[\sm]/")
+
+    def test_a_bare_backslash_s_is_still_whitespace(self) -> None:
+        # `\s` followed by a letter that is not a shorthand suffix keeps its ordinary meaning.
+        parse_scryfall_query(r"o:/\sdraw/")
+
 
 class TestRegexOperatorCoverage:
     @pytest.mark.parametrize(
