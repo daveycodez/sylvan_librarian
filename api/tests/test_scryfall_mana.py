@@ -7,6 +7,12 @@ A hand-written expectation for those would only re-assert whatever the implement
 
 The colour cases are exhaustive: all 31 non-empty subsets of WUBRG, each written both forwards and
 backwards, so `_canonical_colors` is pinned over its whole domain rather than at a few samples.
+
+A second measurement session on 2026-08-28 added the HYBRID goldens -- 61 more requests, one per row,
+driven by `GET /symbology`'s own inventory of 84 symbols rather than by what the parser happened to
+accept. That inventory is what the parser is now written against, because the rule it used to carry
+("a hybrid has exactly two halves") rejected `{W/U/P}` -- a printed Phyrexian hybrid that four live
+cards put in their mana cost.
 """
 
 from __future__ import annotations
@@ -437,6 +443,268 @@ GOLDENS = [
             "multicolored": True,
         },
     ),
+    # --- The hybrid inventory, measured from `GET /symbology` on 2026-08-28 -----------------------
+    #
+    # All ten PHYREXIAN HYBRIDS. These were 422s here until 2026-08-28: the parser required a hybrid
+    # to have exactly two halves, which is right for `{W/U/B}` and wrong for every row below.
+    (
+        "{W/U/P}",
+        {"cost": "{W/U/P}", "colors": ["W", "U"], "cmc": 1.0, "colorless": False, "monocolored": False, "multicolored": True},
+    ),
+    (
+        "{W/B/P}",
+        {"cost": "{W/B/P}", "colors": ["W", "B"], "cmc": 1.0, "colorless": False, "monocolored": False, "multicolored": True},
+    ),
+    (
+        "{U/B/P}",
+        {"cost": "{U/B/P}", "colors": ["U", "B"], "cmc": 1.0, "colorless": False, "monocolored": False, "multicolored": True},
+    ),
+    (
+        "{U/R/P}",
+        {"cost": "{U/R/P}", "colors": ["U", "R"], "cmc": 1.0, "colorless": False, "monocolored": False, "multicolored": True},
+    ),
+    (
+        "{B/R/P}",
+        {"cost": "{B/R/P}", "colors": ["B", "R"], "cmc": 1.0, "colorless": False, "monocolored": False, "multicolored": True},
+    ),
+    (
+        "{B/G/P}",
+        {"cost": "{B/G/P}", "colors": ["B", "G"], "cmc": 1.0, "colorless": False, "monocolored": False, "multicolored": True},
+    ),
+    (
+        "{R/G/P}",
+        {"cost": "{R/G/P}", "colors": ["R", "G"], "cmc": 1.0, "colorless": False, "monocolored": False, "multicolored": True},
+    ),
+    (
+        "{R/W/P}",
+        {"cost": "{R/W/P}", "colors": ["W", "R"], "cmc": 1.0, "colorless": False, "monocolored": False, "multicolored": True},
+    ),
+    (
+        "{G/W/P}",
+        {"cost": "{G/W/P}", "colors": ["W", "G"], "cmc": 1.0, "colorless": False, "monocolored": False, "multicolored": True},
+    ),
+    (
+        "{G/U/P}",
+        {"cost": "{G/U/P}", "colors": ["U", "G"], "cmc": 1.0, "colorless": False, "monocolored": False, "multicolored": True},
+    ),
+    # The four cards that actually print one, mana cost as `/cards/search?q=is:phyrexian is:hybrid`
+    # gives it (2026-08-28, 4 results, no more): Ajani, Sleeper Agent (DMU); Tamiyo, Compleated Sage
+    # (NEO); Nahiri, the Unforgiving (ONE); Lukka, Bound to Ruin (ONE). Every one of these was a 422.
+    (
+        "{1}{G}{G/W/P}{W}",
+        {
+            "cost": "{1}{G/W/P}{G}{W}",
+            "colors": ["W", "G"],
+            "cmc": 4.0,
+            "colorless": False,
+            "monocolored": False,
+            "multicolored": True,
+        },
+    ),
+    (
+        "{2}{G}{G/U/P}{U}",
+        {
+            "cost": "{2}{G/U/P}{G}{U}",
+            "colors": ["U", "G"],
+            "cmc": 5.0,
+            "colorless": False,
+            "monocolored": False,
+            "multicolored": True,
+        },
+    ),
+    (
+        "{1}{R}{R/W/P}{W}",
+        {
+            "cost": "{1}{R/W/P}{R}{W}",
+            "colors": ["W", "R"],
+            "cmc": 4.0,
+            "colorless": False,
+            "monocolored": False,
+            "multicolored": True,
+        },
+    ),
+    (
+        "{2}{R}{R/G/P}{G}",
+        {
+            "cost": "{2}{R/G/P}{R}{G}",
+            "colors": ["R", "G"],
+            "cmc": 5.0,
+            "colorless": False,
+            "monocolored": False,
+            "multicolored": True,
+        },
+    ),
+    # The colorless hybrids, which the two-halves rule also rejected -- not for the count, but
+    # because it priced only colours, digits and `P`, and `C` is none of the three. `{C/P}` produces
+    # NO colour.
+    ("{C/W}", {"cost": "{C/W}", "colors": ["W"], "cmc": 1.0, "colorless": False, "monocolored": True, "multicolored": False}),
+    ("{C/U}", {"cost": "{C/U}", "colors": ["U"], "cmc": 1.0, "colorless": False, "monocolored": True, "multicolored": False}),
+    ("{C/B}", {"cost": "{C/B}", "colors": ["B"], "cmc": 1.0, "colorless": False, "monocolored": True, "multicolored": False}),
+    ("{C/R}", {"cost": "{C/R}", "colors": ["R"], "cmc": 1.0, "colorless": False, "monocolored": True, "multicolored": False}),
+    ("{C/G}", {"cost": "{C/G}", "colors": ["G"], "cmc": 1.0, "colorless": False, "monocolored": True, "multicolored": False}),
+    ("{C/P}", {"cost": "{C/P}", "colors": [], "cmc": 1.0, "colorless": True, "monocolored": False, "multicolored": False}),
+    # A TWO-part hybrid may be written either way round and comes back in the listed spelling. A
+    # three-part one may not -- see UNPARSEABLE_MESSAGES, where `{U/W/P}` is a 422 though `{W/U/P}`
+    # parses.
+    ("{U/W}", {"cost": "{W/U}", "colors": ["W", "U"], "cmc": 1.0, "colorless": False, "monocolored": False, "multicolored": True}),
+    ("{W/2}", {"cost": "{2/W}", "colors": ["W"], "cmc": 2.0, "colorless": False, "monocolored": True, "multicolored": False}),
+    ("{P/W}", {"cost": "{W/P}", "colors": ["W"], "cmc": 1.0, "colorless": False, "monocolored": True, "multicolored": False}),
+    ("{W/C}", {"cost": "{C/W}", "colors": ["W"], "cmc": 1.0, "colorless": False, "monocolored": True, "multicolored": False}),
+    ("{W/G}", {"cost": "{G/W}", "colors": ["W", "G"], "cmc": 1.0, "colorless": False, "monocolored": False, "multicolored": True}),
+    (
+        "{W/U}{U/W}",
+        {"cost": "{W/U}{W/U}", "colors": ["W", "U"], "cmc": 2.0, "colorless": False, "monocolored": False, "multicolored": True},
+    ),
+    # EMISSION ORDER. Every row here was also requested written the other way round and answered
+    # the same, which is what makes it a sort rather than the writing order. The order is
+    # `/symbology` catalog order -- the plain colour pips are the one exception, and keep the
+    # canonical colour order the goldens above pin. `{G/W}{W/U}` and `{G/U}{W/B}` are the rows a
+    # colour-rank sort cannot reach: both put the LATER colour's hybrid first.
+    (
+        "{G}{G/W}{W}",
+        {"cost": "{G/W}{G}{W}", "colors": ["W", "G"], "cmc": 3.0, "colorless": False, "monocolored": False, "multicolored": True},
+    ),
+    ("{W}{HW}", {"cost": "{HW}{W}", "colors": ["W"], "cmc": 1.5, "colorless": False, "monocolored": True, "multicolored": False}),
+    (
+        "{R}{HR}{R/W}",
+        {"cost": "{R/W}{HR}{R}", "colors": ["W", "R"], "cmc": 2.5, "colorless": False, "monocolored": False, "multicolored": True},
+    ),
+    ("{W}{C/P}", {"cost": "{C/P}{W}", "colors": ["W"], "cmc": 2.0, "colorless": False, "monocolored": True, "multicolored": False}),
+    ("{C}{C/P}", {"cost": "{C/P}{C}", "colors": [], "cmc": 2.0, "colorless": True, "monocolored": False, "multicolored": False}),
+    ("{S}{C}", {"cost": "{C}{S}", "colors": [], "cmc": 2.0, "colorless": True, "monocolored": False, "multicolored": False}),
+    (
+        "{HR}{HW}",
+        {"cost": "{HW}{HR}", "colors": ["W", "R"], "cmc": 1.0, "colorless": False, "monocolored": False, "multicolored": True},
+    ),
+    (
+        "{G/W}{W/U}",
+        {
+            "cost": "{W/U}{G/W}",
+            "colors": ["W", "U", "G"],
+            "cmc": 2.0,
+            "colorless": False,
+            "monocolored": False,
+            "multicolored": True,
+        },
+    ),
+    (
+        "{G/U}{W/B}",
+        {
+            "cost": "{W/B}{G/U}",
+            "colors": ["W", "U", "B", "G"],
+            "cmc": 2.0,
+            "colorless": False,
+            "monocolored": False,
+            "multicolored": True,
+        },
+    ),
+    (
+        "{U/B}{W/U}{B/R}",
+        {
+            "cost": "{W/U}{B/R}{U/B}",
+            "colors": ["W", "U", "B", "R"],
+            "cmc": 3.0,
+            "colorless": False,
+            "monocolored": False,
+            "multicolored": True,
+        },
+    ),
+    (
+        "{C/G}{G/P}{2/G}{G/W}",
+        {
+            "cost": "{G/W}{C/G}{2/G}{G/P}",
+            "colors": ["W", "G"],
+            "cmc": 5.0,
+            "colorless": False,
+            "monocolored": False,
+            "multicolored": True,
+        },
+    ),
+    (
+        "{G}{G/U/P}{U}{G/W}",
+        {
+            "cost": "{G/W}{G/U/P}{G}{U}",
+            "colors": ["W", "U", "G"],
+            "cmc": 4.0,
+            "colorless": False,
+            "monocolored": False,
+            "multicolored": True,
+        },
+    ),
+    (
+        "{HW}{R}",
+        {"cost": "{HW}{R}", "colors": ["W", "R"], "cmc": 1.5, "colorless": False, "monocolored": False, "multicolored": True},
+    ),
+    (
+        "{HR}{G/W}",
+        {
+            "cost": "{G/W}{HR}",
+            "colors": ["W", "R", "G"],
+            "cmc": 1.5,
+            "colorless": False,
+            "monocolored": False,
+            "multicolored": True,
+        },
+    ),
+    (
+        "{2/W}{G/U}",
+        {
+            "cost": "{G/U}{2/W}",
+            "colors": ["W", "U", "G"],
+            "cmc": 3.0,
+            "colorless": False,
+            "monocolored": False,
+            "multicolored": True,
+        },
+    ),
+    (
+        "{G/U/P}{W/U}",
+        {
+            "cost": "{W/U}{G/U/P}",
+            "colors": ["W", "U", "G"],
+            "cmc": 2.0,
+            "colorless": False,
+            "monocolored": False,
+            "multicolored": True,
+        },
+    ),
+    (
+        "{G/W/P}{G/U/P}",
+        {
+            "cost": "{G/U/P}{G/W/P}",
+            "colors": ["W", "U", "G"],
+            "cmc": 2.0,
+            "colorless": False,
+            "monocolored": False,
+            "multicolored": True,
+        },
+    ),
+    (
+        "{G/W}{G/W/P}",
+        {"cost": "{G/W}{G/W/P}", "colors": ["W", "G"], "cmc": 2.0, "colorless": False, "monocolored": False, "multicolored": True},
+    ),
+    (
+        "2{W/U/P}{G}",
+        {
+            "cost": "{2}{W/U/P}{G}",
+            "colors": ["W", "U", "G"],
+            "cmc": 4.0,
+            "colorless": False,
+            "monocolored": False,
+            "multicolored": True,
+        },
+    ),
+    (
+        "{W/U/P}{W/U/P}",
+        {
+            "cost": "{W/U/P}{W/U/P}",
+            "colors": ["W", "U"],
+            "cmc": 2.0,
+            "colorless": False,
+            "monocolored": False,
+            "multicolored": True,
+        },
+    ),
     (
         "WUBRG",
         {
@@ -480,6 +748,25 @@ UNPARSEABLE_MESSAGES = [
     # A triple hybrid is not a Magic symbol. This one is also the reason the rule above had to be
     # worked out at all: the recognized halves come out and only the punctuation is reported.
     ("{W/U/B}", "{//}"),
+    # The boundary the hybrid goldens sit against, one request per row on 2026-08-28. A slash symbol
+    # parses only if `GET /symbology` lists it, so a fourth half, the same symbol spelled backwards,
+    # a combination that is not printed and a generic half that is not 2 are all 422s -- even though
+    # `{W/U/P}` itself parses. These fragments also pin what "everything Scryfall could read" strikes
+    # out: the ten one-character symbols and nothing else. `P`, `H` and digits SURVIVE, which the
+    # residue rule here used to get wrong by striking whatever the parser could price.
+    ("{U/W/P}", "{//P}"),
+    ("{P/W/U}", "{P//}"),
+    ("{W/U/P/P}", "{//P/P}"),
+    ("{C/W/P}", "{//P}"),
+    ("{W/W/P}", "{//P}"),
+    ("{2/W/P}", "{2//P}"),
+    ("{3/W}", "{3/}"),
+    ("{S/W}", "{/}"),
+    ("{X/W}", "{/}"),
+    ("{C/S}", "{/}"),
+    # `H` is not a prefix over any colour: `GET /symbology` lists {HW} and {HR}, and no others.
+    ("{H/W}", "{H/}"),
+    ("{HB}", "{H}"),
     # SEVERAL fragments, which is what the "(s)" in the message is about. They concatenate in written
     # order with NO separator, and the readable symbols between them leave no trace. An earlier pass
     # here asserted a space, which nothing measured supported and `{Q}W{T}` disproves.
@@ -556,13 +843,30 @@ class TestParseManaProperties:
         assert parse_mana_cost("xyzzy")["cost"] == "{X}{Y}{Y}{Z}{Z}"
         assert parse_mana_cost("zyx")["cost"] == "{X}{Y}{Z}"
 
-    def test_a_hybrid_has_exactly_two_halves(self) -> None:
-        """`{W/U/B}` is not printable, and pricing it answered a three-coloured cost for one."""
+    def test_a_hybrid_is_the_symbols_scryfall_lists(self) -> None:
+        """The rule this replaced counted halves, which gets `{W/U/B}` right and `{W/U/P}` wrong.
+
+        Neither "exactly two" nor "two or three" is the boundary -- the inventory is.
+        """
         assert parse_mana_cost("{W/U}")["cost"] == "{W/U}"
+        assert parse_mana_cost("{W/U/P}")["cost"] == "{W/U/P}"
         assert parse_mana_cost("{2/W}")["cmc"] == 2.0
         assert parse_mana_cost("{W/P}")["cmc"] == 1.0
-        with pytest.raises(ManaCostError):
-            parse_mana_cost("{W/U/B}")
+        assert parse_mana_cost("{W/U/P}")["cmc"] == 1.0
+        for written in ("{W/U/B}", "{U/W/P}", "{3/W}"):
+            with pytest.raises(ManaCostError):
+                parse_mana_cost(written)
+
+    def test_a_phyrexian_hybrid_contributes_both_its_colours_and_one_mana(self) -> None:
+        """Ajani, Sleeper Agent -- the whole point of the fix.
+
+        `is:phyrexian is:hybrid` finds four cards and this route used to 422 on all four
+        (measured 2026-08-28).
+        """
+        ajani = parse_mana_cost("{1}{G}{G/W/P}{W}")
+        assert ajani["cost"] == "{1}{G/W/P}{G}{W}"
+        assert ajani["colors"] == ["W", "G"]
+        assert ajani["cmc"] == 4.0
 
     def test_every_unreadable_fragment_is_named_at_once(self) -> None:
         """The message says "fragment(s)" because it can name more than one -- concatenated, not spaced.

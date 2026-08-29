@@ -9,9 +9,10 @@ because nothing documents them:
 
 - **The normalized cost reorders colored pips into the canonical colour order**, so `RUW` comes back
   as `{U}{R}{W}` (Jeskai) and not as it was written. `_canonical_colors` is that rule.
-- **The emission order is X, then generic, then colored pips, then `{C}`**, regardless of where they
-  appeared in the input: `2XWU` normalizes to `{X}{2}{W}{U}`, and `CW` to `{W}{C}`. Generic pips are
-  summed into one symbol, so `1{1}` is `{2}`.
+- **The emission order is X, then generic, then every other pip in `GET /symbology` catalog
+  order**, regardless of where they appeared in the input: `2XWU` normalizes to `{X}{2}{W}{U}`, and
+  `CW` to `{W}{C}`. Generic pips are summed into one symbol, so `1{1}` is `{2}`. `_PIP_ORDER` is
+  that rule.
 """
 
 from __future__ import annotations
@@ -32,11 +33,102 @@ _VARIABLE_PIPS = frozenset({"X", "Y", "Z"})
 _BRACED = re.compile(r"\{([^}]*)\}")
 
 # Half-mana symbols are written {HW}; the half applies to the symbol that follows the H.
+# `GET /symbology` lists exactly these two (2026-08-28), and reading `H` as a prefix over any colour
+# was one symbol too generous: `?cost={HB}` is a 422 on api.scryfall.com, measured the same day.
+_HALF_SYMBOLS = frozenset({"HW", "HR"})
 _HALF_MANA = 0.5
 
-# A hybrid symbol has exactly this many halves. `{W/U/B}` is not a Magic symbol, and
-# api.scryfall.com rejects it rather than pricing it (measured 2026-08-16).
-_HYBRID_HALVES = 2
+# Every hybrid symbol api.scryfall.com knows, in the order `GET /symbology` lists them.
+#
+# Fetched whole on 2026-08-28: 84 symbols, 36 of them hybrids, and this is all 36. The inventory is
+# the rule -- a hybrid parses if and only if it is one of these -- because no rule stated in terms of
+# the halves gets the boundary right. This module used to require exactly TWO halves, which rejects
+# the ten PHYREXIAN HYBRIDS below: `{W/U/P}` and its nine siblings are printed symbols, and four live
+# cards carry one in their mana cost (`is:phyrexian is:hybrid`, 2026-08-28 -- Ajani, Sleeper Agent
+# `{1}{G}{G/W/P}{W}`; Tamiyo, Compleated Sage `{2}{G}{G/U/P}{U}`; Nahiri, the Unforgiving
+# `{1}{R}{R/W/P}{W}`; Lukka, Bound to Ruin `{2}{R}{R/G/P}{G}`). Loosening the count to "two or three"
+# would be just as wrong in the other direction: `{W/U/B}` and `{3/W}` are still 422s.
+#
+# The order is load-bearing twice over -- it is also the order hybrids are EMITTED in, see _PIP_ORDER.
+_HYBRID_SYMBOLS = (
+    # Colour pairs.
+    "W/U",
+    "W/B",
+    "B/R",
+    "B/G",
+    "U/B",
+    "U/R",
+    "R/G",
+    "R/W",
+    "G/W",
+    "G/U",
+    # Phyrexian hybrids -- one of two colours, or 2 life. All ten colour pairs exist.
+    "B/G/P",
+    "B/R/P",
+    "G/U/P",
+    "G/W/P",
+    "R/G/P",
+    "R/W/P",
+    "U/B/P",
+    "U/R/P",
+    "W/B/P",
+    "W/U/P",
+    # Colorless hybrids.
+    "C/W",
+    "C/U",
+    "C/B",
+    "C/R",
+    "C/G",
+    # Twobrid.
+    "2/W",
+    "2/U",
+    "2/B",
+    "2/R",
+    "2/G",
+    # Phyrexian.
+    "W/P",
+    "U/P",
+    "B/P",
+    "R/P",
+    "G/P",
+    "C/P",
+)
+
+# Every SPELLING that names one of those symbols, mapped to the spelling Scryfall answers with.
+#
+# A two-part hybrid may be written either way round and comes back canonical -- measured one request
+# each on 2026-08-28, once per family: `{U/W}`->`{W/U}`, `{W/2}`->`{2/W}`, `{P/W}`->`{W/P}`,
+# `{W/C}`->`{C/W}`. A three-part one may NOT: `{U/W/P}` and `{P/W/U}` are both 422s where `{W/U/P}`
+# parses, so the ten Phyrexian hybrids are accepted only as spelled above.
+_HYBRID_CANONICAL = {
+    spelling: symbol
+    for symbol in _HYBRID_SYMBOLS
+    for spelling in ((symbol, "/".join(reversed(symbol.split("/")))) if symbol.count("/") == 1 else (symbol,))
+}
+
+# The order pips are EMITTED in: `GET /symbology` catalog order, for everything a cost can carry
+# besides generic and variable pips (fetched 2026-08-28).
+#
+# Measured, one request per row on 2026-08-28, each written both ways round to prove it is a sort and
+# not the writing order::
+#
+#     ?cost={G}{G/W}{W}    {G/W}{G}{W}     a hybrid comes out ahead of a plain pip of its colour
+#     ?cost={W}{HW}        {HW}{W}         so does a half pip
+#     ?cost={R}{HR}{R/W}   {R/W}{HR}{R}    and a hybrid comes out ahead of a half pip
+#     ?cost={W}{C/P}       {C/P}{W}        a colourless hybrid sorts with the hybrids, not at the end
+#     ?cost={S}{C}         {C}{S}          the colorless pips have an order of their own
+#
+# Between two hybrids it is THIS list's order and not the colour order, which is the one thing a
+# colour-rank sort cannot express: `{G/W}{W/U}` answers `{W/U}{G/W}` and `{G/U}{W/B}` answers
+# `{W/B}{G/U}`, both of which put the later colour first. Same for half pips: `{HR}{HW}` answers
+# `{HW}{HR}` though Boros orders R before W.
+#
+# The five PLAIN colour pips are the exception, and the only one: `RUW` answers `{U}{R}{W}`, so they
+# come out in canonical colour order rather than catalog order. They occupy five consecutive catalog
+# slots, so ranking them within that block says exactly that -- see `_PLAIN_PIP_AT`.
+_PIP_ORDER = (*_HYBRID_SYMBOLS, "HW", "HR", "W", "U", "B", "R", "G", "C", "S")
+_PIP_INDEX = {symbol: index for index, symbol in enumerate(_PIP_ORDER)}
+_PLAIN_PIP_AT = _PIP_INDEX["W"]
 
 # How many CHARACTERS of the joined fragment list the error names before Scryfall cuts it.
 #
@@ -107,18 +199,16 @@ def _symbol_value(symbol: str) -> float:
         return float(symbol)
     if symbol in _VARIABLE_PIPS:
         return 0.0
-    if symbol.startswith("H") and len(symbol) > 1:
+    if symbol in _HALF_SYMBOLS:
         return _HALF_MANA
     if "/" in symbol:
-        # A hybrid has exactly TWO halves. `{W/U/B}` is not a Magic symbol and api.scryfall.com
-        # rejects it with a 422 (measured 2026-08-16); this summed it to 1 and answered a
-        # three-coloured ManaCost for a cost that cannot be printed. Each half must also be a
-        # colour, a generic amount, or Phyrexian `P` -- the three things the rule below can price.
-        parts = symbol.split("/")
-        if len(parts) != _HYBRID_HALVES or not all(part.isdigit() or part in _COLOR_INDEX or part == "P" for part in parts):
+        # A hybrid parses if and only if it is one of the 36 symbols Scryfall lists -- see
+        # _HYBRID_SYMBOLS for why the inventory rather than a rule about the halves.
+        canonical = _HYBRID_CANONICAL.get(symbol)
+        if canonical is None:
             raise _UnparseableSymbolError
-        # A hybrid is worth its more expensive half: {2/W} is 2, {W/U} and {W/P} are 1.
-        return max(float(part) if part.isdigit() else 1.0 for part in parts)
+        # A hybrid is worth its most expensive part: {2/W} is 2, {W/U}, {W/U/P} and {C/P} are 1.
+        return max(float(part) if part.isdigit() else 1.0 for part in canonical.split("/"))
     if symbol in _COLORLESS_PIPS or symbol in _COLOR_INDEX:
         return 1.0
     raise _UnparseableSymbolError
@@ -195,6 +285,17 @@ def _reported_fragment(token: _Token) -> str:
     with everything Scryfall could read removed. `{QQQ}` keeps all three Qs because none of them is
     a symbol; `{W/U/B}` keeps only its punctuation.
 
+    What counts as "could read" is exactly the ten ONE-CHARACTER mana symbols -- the five colours,
+    `{C}`, `{S}` and the three variables. `P`, `H` and digits are NOT struck, which this used to get
+    wrong by inferring the set from what the parser prices rather than measuring it. Five more rows,
+    one request each on 2026-08-28, all of them costs the inventory above now rejects::
+
+        ?cost={U/W/P}   “{//P}”    a Phyrexian hybrid spelled backwards -- the P survives
+        ?cost={2/W/P}   “{2//P}”   and so does the generic half
+        ?cost={3/W}     “{3/}”     there is no {3/W}; only {2/X} twobrids exist
+        ?cost={H/W}     “{H/}”     H survives too
+        ?cost={HB}      “{H}”      there is no {HB} either; only {HW} and {HR}
+
     Args:
         token: The token that could not be parsed.
 
@@ -204,13 +305,7 @@ def _reported_fragment(token: _Token) -> str:
     if not token.braced:
         return token.spelling
     residue = "".join(
-        char
-        for char in token.symbol
-        if char not in _COLOR_INDEX
-        and char not in _COLORLESS_PIPS
-        and char not in _VARIABLE_PIPS
-        and not char.isdigit()
-        and char not in {"P", "H"}
+        char for char in token.symbol if char not in _COLOR_INDEX and char not in _COLORLESS_PIPS and char not in _VARIABLE_PIPS
     )
     return f"{{{residue}}}"
 
@@ -231,8 +326,10 @@ def parse_mana_cost(raw: str) -> dict[str, Any]:
 
     generic = 0
     variables: list[str] = []
-    colored: list[str] = []
-    colorless: list[str] = []
+    # One list for every pip that is neither generic nor variable -- colored, colorless and hybrid
+    # alike -- because their emission order is one catalog order and not three buckets: `{W}{C/P}`
+    # answers `{C/P}{W}`, so a colourless hybrid comes out AHEAD of a coloured pip.
+    pips: list[str] = []
     color_set: set[str] = set()
     total = 0.0
 
@@ -260,10 +357,9 @@ def parse_mana_cost(raw: str) -> dict[str, Any]:
             generic += int(token.symbol)
         elif token.symbol in _VARIABLE_PIPS:
             variables.append(token.symbol)
-        elif token.symbol in _COLORLESS_PIPS:
-            colorless.append(token.symbol)
         else:
-            colored.append(token.symbol)
+            # A hybrid is emitted in the spelling Scryfall answers with, not the one it was written in.
+            pips.append(_HYBRID_CANONICAL.get(token.symbol, token.symbol))
 
     if bad:
         msg = f"The string fragment(s) “{bad[:_FRAGMENT_ECHO_LIMIT]}” could not be understood as part of mana cost."
@@ -272,7 +368,7 @@ def parse_mana_cost(raw: str) -> dict[str, Any]:
     colors = _canonical_colors(color_set)
     # An empty cost is null, but a cost that was written and happens to be free is `{0}`: Scryfall
     # answers `cost=` with null and `cost=0` with "{0}", so the two cannot share a branch.
-    cost = _render_cost(variables, generic, colored, colorless, colors) if tokens else None
+    cost = _render_cost(variables, generic, pips, colors) if tokens else None
 
     return {
         "object": "mana_cost",
@@ -288,8 +384,7 @@ def parse_mana_cost(raw: str) -> dict[str, Any]:
 def _render_cost(
     variables: list[str],
     generic: int,
-    colored: list[str],
-    colorless: list[str],
+    pips: list[str],
     colors: list[str],
 ) -> str | None:
     """Assemble the normalized cost string.
@@ -297,22 +392,23 @@ def _render_cost(
     Args:
         variables: X/Y/Z pips, in the order written.
         generic: Summed generic mana.
-        colored: Symbols carrying at least one colour, in the order written.
-        colorless: {C} and {S} pips.
-        colors: The canonical colour order to sort `colored` by.
+        pips: Every other symbol, in the order written.
+        colors: The canonical colour order the five plain colour pips come out in.
 
     Returns:
         The normalized cost. A cost whose symbols all cancel to nothing renders as `{0}`.
     """
     rank = {color: index for index, color in enumerate(colors)}
 
-    def sort_key(symbol: str) -> tuple[int, int]:
-        # A multi-colour symbol sorts by its earliest colour, which keeps hybrids adjacent to the
-        # pips they share a colour with rather than at one end.
-        own = _symbol_colors(symbol)
-        return (min((rank[color] for color in own), default=len(rank)), colored.index(symbol))
+    def sort_key(symbol: str) -> int:
+        # Catalog order, with the five plain colour pips ranked inside their own block of the
+        # catalog so that they alone come out in canonical colour order. Every pip that reaches here
+        # is a symbol Scryfall lists, so the lookup always hits.
+        if symbol in rank:
+            return _PLAIN_PIP_AT + rank[symbol]
+        return _PIP_INDEX.get(symbol, len(_PIP_ORDER))
 
-    ordered = sorted(colored, key=sort_key)
+    ordered = sorted(pips, key=sort_key)
     # Variables come out in X, Y, Z order regardless of how they were written, and repeats group:
     # `?cost=xyzzy` is `{X}{Y}{Y}{Z}{Z}` on api.scryfall.com (measured 2026-08-16) where writing
     # order gives `{X}{Y}{Z}{Z}{Y}`. A plain sort does both at once -- the alphabet and the pip
@@ -321,5 +417,4 @@ def _render_cost(
     if generic:
         parts.append(f"{{{generic}}}")
     parts.extend(f"{{{symbol}}}" for symbol in ordered)
-    parts.extend(f"{{{symbol}}}" for symbol in colorless)
     return "".join(parts) or "{0}"
