@@ -417,7 +417,8 @@ BOOLEAN_IS_TAGS: dict[str, str] = {
     "giftbox": "cards.raw_card_blob->'promo_types' @> '\"giftbox\"'",
     "glossy": "cards.raw_card_blob->'promo_types' @> '\"glossy\"'",
     "hires": "cards.raw_card_blob->'highres_image' = 'true'::jsonb",
-    "hybrid": r"cards.mana_cost_text ~ '\{[WUBRG]/[WUBRG]\}'",
+    # Matches color/color, 2/color, colorless/color, and color/color/phyrexian.
+    "hybrid": r"cards.mana_cost_text ~ '\{[2CWUBRG]/[WUBRG]'",
     "instore": "cards.raw_card_blob->'promo_types' @> '\"instore\"'",
     "intro_pack": "cards.raw_card_blob->'promo_types' @> '\"intropack\"'",
     "judge_gift": "cards.raw_card_blob->'promo_types' @> '\"judgegift\"'",
@@ -428,7 +429,8 @@ BOOLEAN_IS_TAGS: dict[str, str] = {
     # against the corpus), so checking for "Partner" alone already covers both.
     "nonfoil": "cards.raw_card_blob->'nonfoil' = 'true'::jsonb",
     "partner": "cards.raw_card_blob->'keywords' @> '\"Partner\"'",
-    "phyrexian": r"cards.mana_cost_text ~ '\{[WUBRG]/P\}'",
+    # Search for `/P}` in mana costs and oracle texts.
+    "phyrexian": r"(cards.mana_cost_text ~ '/P\}' OR cards.oracle_text ~ '/P\}')",
     "planeswalker_deck": "cards.raw_card_blob->'promo_types' @> '\"planeswalkerdeck\"'",
     "player_rewards": "cards.raw_card_blob->'promo_types' @> '\"playerrewards\"'",
     "prerelease": "cards.raw_card_blob->'promo_types' @> '\"prerelease\"'",
