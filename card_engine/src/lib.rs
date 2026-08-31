@@ -3511,6 +3511,13 @@ struct SortOrder<'a> {
 /// with no ASCII equivalent must be kept, not dropped. The corpus cannot tell the two apart today
 /// (all 134 non-ASCII names fold to ASCII), so this is the choice that fails safe if one arrives.
 ///
+/// THE NEEDLE SIDE OF BOTH NAME ROUTES as well, since `name_key_tier`: Scryfall compares names
+/// collated on `named?exact=` and on a `POST /cards/collection` `{"name"}` identifier alike.
+/// Measured on api.scryfall.com, 2026-08-31 -- `exact=delverofsecrets`, `exact=Lightning-Bolt`,
+/// `exact=limduls vault`, `exact=Kongming Sleeping Dragon` and `exact=whowhatwhenwherewhy` all
+/// resolve, as do the same spellings as collection identifiers, and the FOLDED comparison those
+/// two routes did before answered 404 to every one of them.
+///
 /// ONE definition, called from both `assign_name_ranks` (which ranks it into the archive) and
 /// `encode_sort_key` (which writes it onto the wire). Those two must agree exactly or a partitioned
 /// merge orders differently from a single archive, which is precisely what the differential test
@@ -4302,9 +4309,8 @@ impl<'a> FuzzyRace<'a> {
 /// this?" -- through this index. Measured on a ~31.7k-card corpus, the exact-name scan cost 884 us
 /// against 75 us for `name:ward`.
 ///
-/// SOUND because the callers require the needle as a CONTIGUOUS SUBSTRING of the stored folded name
-/// (`folded_name_matches` accepts the whole name or one side of a " // " split; the containment
-/// stage uses `contains`), so a matching name holds every trigram of the needle and cannot lie
+/// SOUND for the containment stage, whose needle is a CONTIGUOUS SUBSTRING of the stored folded
+/// name by construction, so a matching name holds every trigram of the needle and cannot lie
 /// outside the intersection. Callers still re-verify; this only decides who gets asked.
 ///
 /// THE NEEDLE IS COLLATED HERE because the index is: `name_trigram` is built over
@@ -4316,9 +4322,14 @@ impl<'a> FuzzyRace<'a> {
 /// argument the literal `name:"…"` predicate rides on in `memoize_text_predicates`, and the
 /// callers here re-verify against the unfolded string exactly as it does.
 ///
-/// A needle that collates to nothing (all punctuation), or to under 3 bytes, has no window at all
-/// and falls back to the full scan, which verifies every card instead. NOT usable for
-/// `autocomplete_names`, which matches `card_name_lower`.
+/// SOUND FOR THE BY-NAME LOOKUPS TOO, on THIS branch, and that is a difference from the sibling
+/// that wrote `name_key_tier`: there the index is built over `card_name_folded`, so a collated
+/// needle like `limduls vault` shares no window with the stored `lim-dul's vault` it matches and
+/// `name_best` has to re-run a miss as a full scan. Here both sides are collated. A whole-name key
+/// IS the indexed string, and a FACE key is a prefix or a suffix of it (the `" // "` join is
+/// non-alphanumeric, so it collates away and `collate(front) + collate(back)` is exactly the
+/// indexed string) -- either way the needle is a contiguous window of what was indexed. `name_best`
+/// keeps the second pass anyway, belt to braces; it costs a 404 and never an answer.
 fn name_scan_candidates(data: &Archived<CardData>, needle: &str) -> Vec<u32> {
     let idx = &data.indexes.name_trigram;
     // APPLICABILITY CHECK, the same shape every other index gets (`sort_perms::order` length-checks
@@ -4339,15 +4350,76 @@ fn name_scan_candidates(data: &Archived<CardData>, needle: &str) -> Vec<u32> {
     trigram_candidates(idx, &collated).unwrap_or_else(|| (0..data.cards.len() as u32).collect())
 }
 
-/// Scryfall's exact-name rule: the whole stored name, or either side of a " // " split.
-fn folded_name_matches(stored: &str, needle: &str) -> bool {
-    if stored == needle {
-        return true;
+/// One by-name lookup: the `(cid, pid)` a needle resolves to under one scope, or None.
+/// `exact_name_match` and `collection_name_match` are the two, and `QueryEngine::card_by_name`
+/// takes whichever of them the route it is serving wants.
+type NameLookup = fn(&Archived<CardData>, &str, Option<&str>) -> Option<(usize, usize)>;
+
+/// Descending precedence for the name scan. Compared, never interpreted, so their ORDER is the
+/// contract and their magnitudes are not.
+const TIER_WHOLE_NAME: u8 = 2;
+const TIER_FACE_NAME: u8 = 1;
+
+/// Which name keys a lookup may match. `named?exact=` reads a strict SUPERSET of what a
+/// `POST /cards/collection` `{"name"}` identifier does -- see `collection_name_match` for the
+/// measurements that separate them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NameScope {
+    Exact,
+    Collection,
+}
+
+/// Whether `stored` COLLATES to `collated_needle`, without collating `stored` into a `String`.
+///
+/// The scan runs this per candidate; allocating a name per card is the cost the trigram narrowing
+/// was added to avoid, and a mismatch here usually dies on the first character.
+fn collates_to(stored: &str, collated_needle: &str) -> bool {
+    let mut needle = collated_needle.chars();
+    for c in stored.chars().filter(|c| c.is_alphanumeric()) {
+        if needle.next() != Some(c) {
+            return false;
+        }
     }
-    match stored.split_once(" // ") {
-        Some((front, back)) => front == needle || back == needle,
-        None => false,
+    needle.next().is_none()
+}
+
+/// The tier at which `needle` -- already COLLATED -- is one of this card's name keys, or None for a
+/// card the needle does not name. `folded` is the card's stored folded name.
+///
+/// Measured against api.scryfall.com on 2026-08-31, ONE IDENTIFIER PER REQUEST -- a collection
+/// response's `data` is not in identifier order, and a batched probe silently mis-attributes its
+/// answers to the wrong needles:
+///
+///   {"name":"Delver of Secrets"}                   -> Delver of Secrets // Insectile Aberration
+///   {"name":"Insectile Aberration"}                -> the same card (a BACK face names it)
+///   {"name":"Delver of Secrets // Insectile ..."}  -> not_found   <- and `exact=` HITS it
+///   {"name":"Fire // Ice"}, {"name":"Wear // Tear"},
+///   {"name":"Bonecrusher Giant // Stomp"}          -> not_found, all three
+///   {"name":"Who // What // When // Where // Why"} -> und/75 (a FIVE-part name IS a key)
+///   {"name":"Who"}                                 -> not_found (so is `exact=Who`)
+///
+/// So a card answers to its two FACE names when its name splits in EXACTLY two, and to its whole
+/// name otherwise -- never both. `exact=` adds the joined name of a two-faced card, and that is the
+/// only key the two surfaces disagree about.
+///
+/// EXACTLY two is the load-bearing word, and `split_once(" // ")` got it wrong: it read
+/// *Who // What // When // Where // Why* as "Who" plus the rest, so `exact=Who` answered und/75
+/// where Scryfall 404s, while `exact=Why` -- the last part, and no more a key than the first --
+/// answered nothing either way.
+///
+/// The halves are split BEFORE they are collated, because the `" // "` join is itself
+/// non-alphanumeric: collating first would make the boundary vanish and let a needle straddle it.
+fn name_key_tier(folded: &str, needle: &str, scope: NameScope) -> Option<u8> {
+    let mut halves = folded.split(" // ");
+    let front = halves.next().unwrap_or("");
+    let back = halves.next();
+    if let Some(back) = back.filter(|_| halves.next().is_none()) {
+        if collates_to(front, needle) || collates_to(back, needle) {
+            return Some(TIER_FACE_NAME);
+        }
+        return (scope == NameScope::Exact && collates_to(folded, needle)).then_some(TIER_WHOLE_NAME);
     }
+    collates_to(folded, needle).then_some(TIER_WHOLE_NAME)
 }
 
 /// The card's best printing, optionally restricted to a set.
@@ -4366,25 +4438,95 @@ fn prefer_of(data: &Archived<CardData>, pid: usize) -> f32 {
     data.printings[pid].prefer_score.as_ref().map_or(f32::MIN, |v| v.to_native())
 }
 
-/// `named?exact=`: the card whose folded name is exactly the needle, else one matching a FACE.
+/// `named?exact=`: the best printing of the card the needle NAMES, `exact=`'s keys.
+///
+/// `name_key_tier`'s keys plus the JOINED name of a two-faced card -- Scryfall answers
+/// `exact=Delver of Secrets // Insectile Aberration` with that card and reports the same string as
+/// a collection identifier not_found.
 ///
 /// A whole-name match beats a face match rather than competing with it -- matching a face is right
 /// (Scryfall resolves `exact=Delver of Secrets` to the two-faced card) but on this corpus
 /// `exact=Lightning Bolt` would otherwise answer "Emeritus of Conflict // Lightning Bolt", whose
-/// prefer_score is the higher of the two. Ranked on (whole-name, prefer_score), in that order.
+/// prefer_score is the higher of the two. Ranked on (tier, prefer_score), in that order.
+///
+/// FLAVOR NAMES are the one part of Scryfall's `exact=` rule this cannot express: `exact=Godzilla,
+/// King of the Monsters` answers Zilortha, Strength Incarnate there and 404s here, because no
+/// column in this corpus carries a printing's flavor name. It is a pre-existing gap, not one the
+/// scope split opens -- and it happens to leave the COLLECTION surface right, since a flavor name
+/// is not a collection identifier's key either.
 pub(crate) fn exact_name_match(data: &Archived<CardData>, folded: &str, set_code: Option<&str>) -> Option<(usize, usize)> {
-    let mut best: Option<(bool, f32, usize, usize)> = None;
-    for cid in name_scan_candidates(data, folded) {
+    name_best(data, folded, set_code, NameScope::Exact)
+}
+
+/// `POST /cards/collection`'s `{"name": ...}` identifier: the best printing it names, within `set`.
+///
+/// The twin of `exact_name_match` over the same scan, differing only in scope. A collection
+/// identifier reads `name_key_tier`'s keys and NOTHING else -- the two FACE names when the name
+/// splits in exactly two, the whole name otherwise, never both, never the joined name. The
+/// measurements that separate the two surfaces are on `name_key_tier`.
+///
+/// Everything past the key rule is `exact=`'s: same tier ranking, same set filter, same printing
+/// chosen. Every needle both surfaces accept answers the same card on both.
+pub(crate) fn collection_name_match(data: &Archived<CardData>, folded: &str, set_code: Option<&str>) -> Option<(usize, usize)> {
+    name_best(data, folded, set_code, NameScope::Collection)
+}
+
+/// The shared scan behind both name surfaces: the best `(cid, pid)` for `folded` under `scope`.
+///
+/// TWO PASSES, and the second is a full scan. On the sibling branch this arrived from, it is the
+/// CORRECTNESS path: there `name_trigram` is built over `card_name_folded` while the comparison is
+/// COLLATED, so `limduls vault` shares no trigram with the `lim-dul's vault` it matches and
+/// narrowing alone would 404 exactly the spellings the collated comparison was added to accept.
+///
+/// ON THIS BRANCH THE INDEX IS ALREADY COLLATED (`build_trigram_index(.., collated_name_of)`), so
+/// the narrowing is sound for these lookups on its own -- the argument is written out over
+/// `name_scan_candidates`. The second pass is kept anyway, identical to the sibling's, so the two
+/// branches carry one spelling of this function between them; here it costs a 404 the extra scan
+/// and can never change an answer.
+///
+/// WHAT IT LEAVES THERE AND NOT HERE: two DISTINCT cards whose folded names collate alike but are
+/// spelled differently (`Lightning Bolt` and a hypothetical `Lightning-Bolt`) reach the narrowed
+/// pass separately when the index is folded, so the lower-ranked one can answer. A collated index
+/// files both under the same windows, which is the archive-format change that branch names and
+/// this one already carries.
+fn name_best(
+    data: &Archived<CardData>,
+    folded: &str,
+    set_code: Option<&str>,
+    scope: NameScope,
+) -> Option<(usize, usize)> {
+    let needle = collate_name(folded);
+    // Nobody's name. Worth its own line because the alternative is a full scan of every card for a
+    // needle that cannot match one: `{"name": "  "}` is a shape a collection POST can carry.
+    if needle.is_empty() {
+        return None;
+    }
+    let candidates = name_scan_candidates(data, folded);
+    let narrowed = candidates.len() < data.cards.len();
+    let best = name_best_over(data, candidates.into_iter(), &needle, set_code, scope);
+    if best.is_none() && narrowed {
+        return name_best_over(data, 0..data.cards.len() as u32, &needle, set_code, scope);
+    }
+    best
+}
+
+/// `name_best`'s inner loop over one candidate set. `needle` is already collated.
+fn name_best_over(
+    data: &Archived<CardData>,
+    candidates: impl Iterator<Item = u32>,
+    needle: &str,
+    set_code: Option<&str>,
+    scope: NameScope,
+) -> Option<(usize, usize)> {
+    let mut best: Option<(u8, f32, usize, usize)> = None;
+    for cid in candidates {
         let cid = cid as usize;
         let stored = folded_name(&data.cards[cid], &data.strings);
-        if !folded_name_matches(stored, folded) {
-            continue;
-        }
-        let whole = stored == folded;
+        let Some(tier) = name_key_tier(stored, needle, scope) else { continue };
         let Some(pid) = best_printing_in_set(data, cid, set_code) else { continue };
         let score = prefer_of(data, pid);
-        if best.is_none_or(|(bw, bs, _, _)| (whole, score) > (bw, bs)) {
-            best = Some((whole, score, cid, pid));
+        if best.is_none_or(|(bt, bs, _, _)| (tier, score) > (bt, bs)) {
+            best = Some((tier, score, cid, pid));
         }
     }
     best.map(|(_, _, cid, pid)| (cid, pid))
@@ -16616,6 +16758,34 @@ impl QueryEngine {
         *guard = Some(CachedMmap { mmap: Arc::clone(&mmap), inode });
         Ok(mmap)
     }
+
+    /// The body shared by `exact_card_by_name` and `collection_card_by_name`.
+    ///
+    /// Off the `#[pymethods]` block on purpose: everything in there is exported to Python, and the
+    /// two name routes differ only by which lookup they hand in -- a Rust function with no Python
+    /// spelling, so this is not a signature a caller could reach.
+    fn card_by_name<'py>(
+        &self,
+        py: Python<'py>,
+        folded: &str,
+        set_code: Option<&str>,
+        fields: Option<Vec<String>>,
+        lookup: NameLookup,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let resolved_fields = resolve_fields(fields)?;
+        let mmap = self.get_mmap()?;
+        // Safety: see the access_unchecked justification in query().
+        let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
+        let Some((cid, pid)) = lookup(data, folded, set_code) else { return Ok(None) };
+        Ok(Some(card_to_pydict(
+            py,
+            &data.cards[cid],
+            &data.printings[pid],
+            &data.strings,
+            &data.coll_vocab,
+            &resolved_fields,
+        )?))
+    }
 }
 
 #[pymethods]
@@ -17769,7 +17939,11 @@ impl QueryEngine {
         }
     }
 
-    /// The card whose folded name is exactly `folded`, or one whose FACE is, restricted to `set`.
+    /// The card `named?exact=folded` resolves to, restricted to `set`.
+    ///
+    /// `folded` must already be accent-folded and lowercased by the caller, the way
+    /// `card_name_folded` was at import (`fold_accents`); the COLLATING is done here, so the caller
+    /// passes the needle as typed and does not have to know the rule.
     ///
     /// `named?exact=` is the last lookup on this surface that answered from SQL. It is a scan of
     /// every card's folded name, which is what `name_trigram` exists to avoid: measured on a
@@ -17782,19 +17956,24 @@ impl QueryEngine {
         set_code: Option<&str>,
         fields: Option<Vec<String>>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let resolved_fields = resolve_fields(fields)?;
-        let mmap = self.get_mmap()?;
-        // Safety: see the access_unchecked justification in query().
-        let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
-        let Some((cid, pid)) = exact_name_match(data, folded, set_code) else { return Ok(None) };
-        Ok(Some(card_to_pydict(
-            py,
-            &data.cards[cid],
-            &data.printings[pid],
-            &data.strings,
-            &data.coll_vocab,
-            &resolved_fields,
-        )?))
+        self.card_by_name(py, folded, set_code, fields, exact_name_match)
+    }
+
+    /// The card a `POST /cards/collection` `{"name": ...}` identifier resolves to, within `set`.
+    ///
+    /// Its own entry point and not a call to `exact_card_by_name`, because the KEYS ARE NOT THE
+    /// SAME: measured on api.scryfall.com, `{"name":"Delver of Secrets // Insectile Aberration"}`
+    /// is not_found while `exact=` of that string is the card. `name_key_tier` carries the rest of
+    /// the measurements.
+    #[pyo3(signature = (folded, set_code=None, fields=None))]
+    fn collection_card_by_name<'py>(
+        &self,
+        py: Python<'py>,
+        folded: &str,
+        set_code: Option<&str>,
+        fields: Option<Vec<String>>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
+        self.card_by_name(py, folded, set_code, fields, collection_name_match)
     }
 
     /// One printing per DISTINCT card name whose folded name contains every one of `words`.
