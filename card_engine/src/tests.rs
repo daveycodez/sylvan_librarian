@@ -21,7 +21,7 @@ use super::{
     build_printing_by_scryfall_id, build_oracle_by_oracle_id, find_printing_by_scryfall_id, find_oracle_by_oracle_id,
     build_external_id_index, find_printing_by_external_id, EXT_MULTIVERSE, EXT_MTGO, EXT_ARENA, EXT_TCGPLAYER,
     trigram_similarity, fuzzy_name_match, autocomplete_names, FuzzyOutcome,
-    exact_name_match, names_containing_all_words,
+    exact_name_match, collection_name_match, names_containing_all_words,
     VOCAB_NONE, COMPAT_PROMO, COMPAT_REPRINT, COMPAT_TEXTLESS, GAME_PAPER, GAME_ARENA, FINISH_FOIL, FINISH_NONFOIL,
     TextField, TextSearchField, Tri, SortedTrigramIndex, VocabInterner, ARTIST_NONE, NONE_STR, TYPE_ARTIFACT, TYPE_CREATURE,
     TYPE_ENCHANTMENT, TYPE_INSTANT, TYPE_LAND, TYPE_LEGENDARY, TYPE_PLANESWALKER, TYPE_SNOW, TYPE_SORCERY,
@@ -13398,7 +13398,10 @@ fn name_lookups_agree_with_and_without_the_trigram_index() {
             "emeritus of conflict // lightning bolt",
             "delver of secrets // insectile aberration",
             "shock",
-            "counterspell",
+            // Punctuated, so a COLLATED needle for it (`limduls vault`) shares no trigram with the
+            // stored spelling and the narrowed pass finds nothing -- the case the full-scan
+            // fallback in `name_best` exists for, and the one this test has to reach.
+            "lim-dul's vault",
         ];
         let mut cards = Vec::new();
         for (i, name) in names.iter().enumerate() {
@@ -13426,11 +13429,25 @@ fn name_lookups_agree_with_and_without_the_trigram_index() {
         "shock",
         "no such card",
         "li", // under 3 bytes: the index has nothing to say and both sides scan
+        // COLLATED spellings. Each of these matches a card whose stored folded name shares no
+        // trigram with it, so the narrowed side reaches its answer only through the full-scan
+        // fallback -- and an unnarrowed side that quietly disagreed would be the bug.
+        "limduls vault",
+        "limdulsvault",
+        "lim-duls vault",
+        "lightningbolt",
+        "lightning-bolt",
+        "delverofsecrets",
     ] {
         assert_eq!(
             exact_name_match(scan, needle, None),
             exact_name_match(idx, needle, None),
             "exact_name_match disagrees for {needle:?}"
+        );
+        assert_eq!(
+            collection_name_match(scan, needle, None),
+            collection_name_match(idx, needle, None),
+            "collection_name_match disagrees for {needle:?}"
         );
     }
     for words in [vec!["lightning".to_owned()], vec!["of".to_owned(), "secrets".to_owned()], vec!["zzz".to_owned()]] {
@@ -13447,6 +13464,143 @@ fn name_lookups_agree_with_and_without_the_trigram_index() {
     assert_eq!(exact_name_match(idx, "lightning bolt", None).map(|(cid, _)| cid), Some(0));
     // A face match is still found when nothing carries the whole name.
     assert_eq!(exact_name_match(idx, "insectile aberration", None).map(|(cid, _)| cid), Some(2));
+}
+
+/// A store of `names`, folded == lowered (the fixture leaves `card_name_folded_id` unset), with
+/// `printing_counts[i]` printings on card i. The by-name tests below all want the same shape.
+fn name_store(names: &[&str], printing_counts: &[usize]) -> CardData {
+    let mut vocab = VocabInterner::new();
+    let mut cards = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
+        c.card_name_lower = InlineStr::from_str(name);
+        cards.push(c);
+    }
+    store_of(cards, printing_counts, vocab)
+}
+
+/// The two name surfaces over one scan: a collection identifier's `{"name"}` reads a card's FACE
+/// names when the name splits in EXACTLY two and its whole name otherwise; `named?exact=` reads
+/// that set PLUS the joined name.
+///
+/// Measured against api.scryfall.com on 2026-08-31, one identifier per request -- a collection
+/// response's `data` is not in identifier order, so a batched probe answers the wrong needles:
+///
+///   {"name":"Delver of Secrets"}                   -> Delver of Secrets // Insectile Aberration
+///   {"name":"Insectile Aberration"}                -> the same card (a BACK face names it)
+///   {"name":"Delver of Secrets // Insectile ..."}  -> not_found, where `exact=` is the card
+///   {"name":"Fire // Ice"}                         -> not_found, likewise
+///   {"name":"Who // What // When // Where // Why"} -> und/75, a FIVE-part name IS a key
+///   {"name":"Who"}                                 -> not_found, and so is `exact=Who`
+#[test]
+fn a_collection_identifier_reads_faces_where_exact_also_reads_the_joined_name() {
+    let names = ["delver of secrets // insectile aberration", "who // what // when // where // why", "fire // ice"];
+    let data = name_store(&names, &[1, 1, 1]);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let d = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let exact = |n: &str| exact_name_match(d, n, None).map(|(cid, _)| cid);
+    let coll = |n: &str| collection_name_match(d, n, None).map(|(cid, _)| cid);
+
+    // Either FACE names the card on both surfaces. The BACK is the half the SQL predicate the
+    // collection route carried never looked at: it split on ' // ' and compared part 1 only.
+    for needle in ["delver of secrets", "insectile aberration"] {
+        assert_eq!(exact(needle), Some(0), "exact= resolves a face name: {needle:?}");
+        assert_eq!(coll(needle), Some(0), "a collection identifier resolves a face name: {needle:?}");
+    }
+
+    // The JOINED name is the one key the two surfaces disagree about.
+    for (needle, cid) in [("delver of secrets // insectile aberration", 0), ("fire // ice", 2)] {
+        assert_eq!(exact(needle), Some(cid), "exact= answers the joined name: {needle:?}");
+        assert_eq!(coll(needle), None, "a collection identifier does not: {needle:?}");
+    }
+
+    // MORE than two halves: the whole name is the key and NO part of it is, on either surface.
+    // `split_once(" // ")` read this name as "who" plus the rest and answered und/75 for `who`.
+    let five = "who // what // when // where // why";
+    assert_eq!(exact(five), Some(1), "the five-part name is a key");
+    assert_eq!(coll(five), Some(1), "on both surfaces");
+    for part in ["who", "what", "when", "where", "why"] {
+        assert_eq!(exact(part), None, "no part of a five-part name is an exact= key: {part:?}");
+        assert_eq!(coll(part), None, "nor a collection identifier's: {part:?}");
+    }
+}
+
+/// Both name surfaces compare COLLATED names -- accent-folded (already, by the caller), lowercased,
+/// every non-alphanumeric character removed -- which is what Scryfall compares.
+///
+/// api.scryfall.com, 2026-08-31: `exact=limduls vault`, `exact=lim-duls vault`,
+/// `exact=Lightning-Bolt`, `exact=delverofsecrets` and `exact=whowhatwhenwherewhy` all resolve, and
+/// so do the same spellings as collection identifiers. Every one of them answered 404 here.
+#[test]
+fn both_name_surfaces_compare_collated_names() {
+    let names = ["lim-dul's vault", "lightning bolt", "delver of secrets // insectile aberration"];
+    let data = name_store(&names, &[1, 1, 1]);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let d = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let exact = |n: &str| exact_name_match(d, n, None).map(|(cid, _)| cid);
+    let coll = |n: &str| collection_name_match(d, n, None).map(|(cid, _)| cid);
+
+    for needle in ["lim-dul's vault", "limduls vault", "lim-duls vault", "limdulsvault"] {
+        assert_eq!(exact(needle), Some(0), "exact= {needle:?}");
+        assert_eq!(coll(needle), Some(0), "collection {needle:?}");
+    }
+    for needle in ["lightning bolt", "lightning-bolt", "lightningbolt", "lightning  bolt"] {
+        assert_eq!(exact(needle), Some(1), "exact= {needle:?}");
+        assert_eq!(coll(needle), Some(1), "collection {needle:?}");
+    }
+
+    // A FACE collates the same way, and the " // " it sits beside does not leak into it: the
+    // halves are split BEFORE either side is collated, so no needle straddles the join.
+    assert_eq!(coll("delverofsecrets"), Some(2));
+    assert_eq!(coll("secretsinsectile"), None, "a needle across the join names nothing");
+
+    // Collating does not make the joined name a collection key, only a differently spelled one.
+    assert_eq!(exact("delverofsecretsinsectileaberration"), Some(2));
+    assert_eq!(coll("delverofsecretsinsectileaberration"), None);
+
+    // A KEY, not a substring. `{"name":"Elves"}` answers *Elves* (ffdn/9) on api.scryfall.com --
+    // the obscure card actually named that, not one of the hundreds whose names contain the word,
+    // which is what a containment lookup ordered by popularity would have said.
+    for needle in ["elves", "bolt", "vault", "dul"] {
+        assert_eq!(exact(needle), None, "exact= {needle:?}");
+        assert_eq!(coll(needle), None, "collection {needle:?}");
+    }
+    // A needle with no alphanumerics at all collates to nothing and names nothing -- answered
+    // without a scan, because `{"name":"  "}` is a shape a collection POST can carry.
+    for needle in ["", "  ", " // "] {
+        assert_eq!(exact(needle), None, "exact= {needle:?}");
+        assert_eq!(coll(needle), None, "collection {needle:?}");
+    }
+}
+
+/// A WHOLE-name match beats a FACE match on the collection surface too, and `set` filters the
+/// lookup rather than its answer.
+///
+/// The tier is not decoration: without it the collection rule is wrong wherever a needle is one
+/// card's whole name and another's face, and the loser scores higher. `{"name":"Delver of
+/// Secrets","set":"mid"}` answers mid/47 on api.scryfall.com -- the same card the unset identifier
+/// resolves, in the set asked for -- so the set narrows which PRINTING answers, and a card with no
+/// printing in that set drops out of the lookup entirely.
+#[test]
+fn a_collection_identifier_ranks_whole_over_face_and_takes_set_as_a_filter() {
+    // Card 1's printings score higher than card 0's (store_of scores a range descending from its
+    // length), so a rule ordering on prefer_score alone answers the FACE match here.
+    let names = ["lightning bolt", "emeritus of conflict // lightning bolt"];
+    let mut data = name_store(&names, &[1, 2]);
+    for (pid, code) in [(0, "aaa"), (1, "bbb"), (2, "ccc")] {
+        data.printings[pid].card_set_code = InlineStr::from_str(code);
+    }
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let d = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+
+    assert_eq!(collection_name_match(d, "lightning bolt", None), Some((0, 0)), "whole name beats the face");
+    assert_eq!(exact_name_match(d, "lightning bolt", None), Some((0, 0)), "on exact= alike");
+
+    // Restricted to the set the FACE card is printed in, the face match is the only candidate left.
+    assert_eq!(collection_name_match(d, "lightning bolt", Some("bbb")), Some((1, 1)));
+    assert_eq!(collection_name_match(d, "lightning bolt", Some("ccc")), Some((1, 2)));
+    // And a set nothing is printed in resolves nothing, rather than falling back to any printing.
+    assert_eq!(collection_name_match(d, "lightning bolt", Some("zzz")), None);
 }
 
 #[test]
