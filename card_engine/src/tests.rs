@@ -1,5 +1,5 @@
 use super::{
-    and_child_rank, assign_name_ranks,
+    and_child_rank, assign_name_ranks, split_lower_name, NAME_INLINE,
     build_numeric_index, build_oracle_text_index, build_trigram_index,
     build_rarity_index, build_flavor_index, build_hybrid_tag_index, build_layout_hybrid_index, bitmap_beats_postings, HybridTagIndex, build_sort_permutations,
     assign_artwork_groups, assign_artist_ranks, build_artwork_base_from, build_bit_planes, build_border_printing_planes, build_rarity_printing_planes, build_divergent_ids, build_name_bigram_index, build_name_unigram_index, build_printing_to_card, flavor_fingerprint, flavor_match_sets,
@@ -197,6 +197,7 @@ fn test_tag_index_str_lookup() {
 fn stub_card(oracle_id: u128, card_types: u16, subtypes: &[&str], vocab: &mut VocabInterner) -> OracleCard {
     OracleCard {
         card_name_lower: InlineStr::from_str(""),
+        card_name_lower_id: NONE_STR,
         card_name_folded_id: NONE_STR,
         card_colors: 0,
         card_color_identity: 0,
@@ -10474,6 +10475,78 @@ fn name_ranks_dense_and_shared_across_duplicates() {
     assert_eq!(ranks, vec![3, 4, 0, 4, 1, 2]);
 }
 
+/// The `!` operator over a name PAST the inline bound, on both sides of the cut.
+///
+/// The ascending name permutation is keyed on `name_rank`, i.e. on the INLINE field, and for an
+/// over-long name the inline is a prefix of what the card is called. That makes the binary search
+/// wrong in two opposite directions, and because `ExactName` narrows TIGHT -- the walk never
+/// re-verifies a tight set -- each one is a wrong answer rather than a slow one:
+///
+///   - the real name is not in the permutation under its own spelling, so the search answered the
+///     EMPTY set for a card that exists (`!"Curse of the Fire Penguin // …Creature"` -> 0 rows);
+///   - the cut IS in it, so the search answered the card for a string nothing is named
+///     (`!"Curse of the Fire Penguin Creatu"` -> 1 row, where api.scryfall.com answers 0).
+///
+/// Both measured on a deployment of this engine 2026-08-31. The arm now declines the first (the
+/// scan verifies through `lower_name` instead) and drops spilled cards from the block for the
+/// second, so the narrowing and the predicate agree again -- which is what `tight` claims.
+#[test]
+fn exact_name_narrowing_survives_a_name_past_the_inline_bound() {
+    let long = "curse of the fire penguin // curse of the fire penguin creature";
+    let cut = &long[..NAME_INLINE];
+    assert!(long.len() > NAME_INLINE, "the fixture has to be over the bound to test anything");
+
+    let mut data = name_store(&[long, "fog"], &[1, 1]);
+    assign_name_ranks(&mut data.cards);
+    data.indexes.sort_perms = build_sort_permutations(&data.cards, &data.offsets);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let narrow = |name: &str| {
+        super::narrow_rec(
+            &FilterExpr::ExactName(name.to_string()),
+            &archived.indexes,
+            &archived.offsets,
+            &archived.cards,
+            false,
+        )
+    };
+    let matches = |cid: usize, name: &str| {
+        FilterExpr::ExactName(name.to_string()).matches(
+            &archived.cards[cid],
+            &archived.printings[cid],
+            &archived.strings,
+        )
+    };
+
+    // The whole name: the permutation cannot answer it, so the arm DECLINES rather than answering
+    // the empty set, and the unnarrowed walk finds the card.
+    assert!(narrow(long).is_none(), "a needle the inline bound cuts declines the permutation");
+    assert!(matches(0, long), "and the predicate itself matches the whole name");
+
+    // The cut: the permutation lands on the card's block, and the spill filter removes it. Empty,
+    // and still tight -- the predicate agrees.
+    let n = narrow(cut).expect("a needle that fits the bound still narrows");
+    assert!(n.tight, "still a tight card set");
+    assert_eq!(n.set.len(), 0, "the {NAME_INLINE}-byte cut names no card");
+    assert!(!matches(0, cut), "and the predicate agrees the cut is not the name");
+
+    // The struct's OTHER unfolded name reader, on the same store: `TextField::NameLower` backs
+    // `name:` as an exact text compare and the `name:/…/` regex surface, and it read the inline
+    // field too -- so it answered about the cut on exactly these 36 cards.
+    let text_eq = |cid: usize, name: &str| {
+        FilterExpr::TextExact { field: TextField::NameLower, op: CmpOp::Eq, value: name.to_string() }
+            .matches(&archived.cards[cid], &archived.printings[cid], &archived.strings)
+    };
+    assert!(text_eq(0, long), "an exact text compare sees the whole name");
+    assert!(!text_eq(0, cut), "and not the cut");
+
+    // A short name in the same store is untouched by any of it.
+    let fog = narrow("fog").expect("narrows");
+    assert!(fog.tight);
+    assert_eq!(fog.set.len(), 1, "the ordinary case still resolves through the permutation");
+    assert!(matches(1, "fog"));
+}
+
 // ExactName narrows to the exact, tight card set through the ascending name
 // permutation: hit (single), hit (duplicate pair), boundary names, and a miss
 // proving the empty set.
@@ -13178,6 +13251,23 @@ fn compat_fields_survive_the_archive_round_trip() {
     assert_eq!(u16::from(a.flags) & COMPAT_TEXTLESS, 0, "textless was not set");
 }
 
+/// `card_name_lower_id` costs the archived row NOTHING, and that is why it is a u32 sitting beside
+/// a 62-byte inline rather than four bytes taken out of the inline to pay for itself.
+///
+/// `oracle_id` gives `Archived<OracleCard>` 16-byte alignment, and the trailing round-up already
+/// held more than four spare bytes: the row measured 256 before the field and measures 256 with it.
+/// The cliff is real and not far away — widening the inline to `InlineStr<65>` takes the row to 272,
+/// which over ~31,700 cards is ~500 KB of archive — so this is pinned rather than left to be
+/// rediscovered by whoever adds the next field.
+#[test]
+fn the_overflow_id_is_free_in_the_row() {
+    assert_eq!(std::mem::size_of::<Archived<OracleCard>>(), 256);
+    assert_eq!(std::mem::size_of::<Archived<Printing>>(), 256);
+    // The inline width is unchanged by this field: 61 bytes plus the length byte, and the u32 that
+    // follows starts at 64 either way. Narrowing it would only push more names onto the spill path.
+    assert_eq!(std::mem::size_of::<InlineStr<NAME_INLINE>>(), 62);
+}
+
 #[test]
 fn the_niche_actually_niches() {
     // The size the "Halve What the Compat Residue Costs a Printing" reasoning depends on, pinned
@@ -13468,15 +13558,27 @@ fn name_lookups_agree_with_and_without_the_trigram_index() {
 
 /// A store of `names`, folded == lowered (the fixture leaves `card_name_folded_id` unset), with
 /// `printing_counts[i]` printings on card i. The by-name tests below all want the same shape.
+///
+/// Names go in through `split_lower_name`, the SAME function the builder writes them with, so a
+/// name past the inline bound spills to `strings` here exactly as it does in a real store. A
+/// fixture that called `InlineStr::from_str` directly would store the cut and quietly test the bug.
 fn name_store(names: &[&str], printing_counts: &[usize]) -> CardData {
     let mut vocab = VocabInterner::new();
+    let mut strings: Vec<String> = Vec::new();
     let mut cards = Vec::new();
     for (i, name) in names.iter().enumerate() {
         let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
-        c.card_name_lower = InlineStr::from_str(name);
+        let (inline, id) = split_lower_name(name, |s| {
+            strings.push(s);
+            (strings.len() - 1) as u32
+        });
+        c.card_name_lower = inline;
+        c.card_name_lower_id = id;
         cards.push(c);
     }
-    store_of(cards, printing_counts, vocab)
+    let mut data = store_of(cards, printing_counts, vocab);
+    data.strings = strings;
+    data
 }
 
 /// The two name surfaces over one scan: a collection identifier's `{"name"}` reads a card's FACE
@@ -13571,6 +13673,61 @@ fn both_name_surfaces_compare_collated_names() {
         assert_eq!(exact(needle), None, "exact= {needle:?}");
         assert_eq!(coll(needle), None, "collection {needle:?}");
     }
+}
+
+/// A name too long for the inline field survives the build WHOLE, on every name surface.
+///
+/// `card_name_lower` is an `InlineStr<61>` whose `from_str` cuts in SILENCE, and the comment beside
+/// it used to claim 61 bytes covered every card name in the Scryfall dataset. 36 names in
+/// `all_cards` are longer: 34 doubled `X // X` art-series and reversible names, the 141-character
+/// Unhinged elemental, and this one -- 63 bytes, and the only one of the 36 whose two halves say
+/// different things, which is what makes it the one that loses a searchable FACE.
+/// The folded name is DERIVED from the same field, so the single cut reached every surface at once.
+///
+/// Measured on a deployment of this engine 2026-08-31, against api.scryfall.com, which answers the
+/// first three and not the fourth:
+///
+///   !"Curse of the Fire Penguin Creature"     0 here   1 there
+///   name:"fire penguin creature"              0 here   1 there
+///   /cards/named?exact= of the same string    404      the card
+///   !"Curse of the Fire Penguin Creatu"       1 HERE   0 there
+///
+/// The last line is how it was found: the 61-byte cut answered, and the name the card prints did
+/// not. It is also the assertion at the bottom of this test -- the one that fails on the old build,
+/// where every other assertion here fails by returning None.
+#[test]
+fn a_name_past_the_inline_bound_survives_every_name_surface() {
+    let long = "curse of the fire penguin // curse of the fire penguin creature";
+    assert!(long.len() > NAME_INLINE, "the fixture has to be over the bound to test anything: {}", long.len());
+    let cut = &long[..NAME_INLINE];
+
+    let data = name_store(&[long, "lightning bolt"], &[1, 1]);
+    assert_ne!(data.cards[0].card_name_lower_id, NONE_STR, "the fixture spilled, as the builder would");
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let d = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let exact = |n: &str| exact_name_match(d, n, None).map(|(cid, _)| cid);
+    let coll = |n: &str| collection_name_match(d, n, None).map(|(cid, _)| cid);
+
+    // The WHOLE joined name, which no version of the inline field ever held.
+    assert_eq!(exact(long), Some(0), "the whole joined name is an exact= key");
+    // Both FACES. The front one the cut never lost; the back one begins at byte 29 and runs past
+    // 61, so it existed only in the half of the string that was thrown away.
+    assert_eq!(exact("curse of the fire penguin"), Some(0), "the front face");
+    assert_eq!(coll("curse of the fire penguin"), Some(0), "on the collection surface too");
+    assert_eq!(exact("curse of the fire penguin creature"), Some(0), "the BACK face, which the cut lost");
+    assert_eq!(coll("curse of the fire penguin creature"), Some(0), "and a collection identifier reads it");
+    // The COLLATED spelling of the same back face -- separators removed, which is what Scryfall
+    // compares. It is derived from the stored name at query time, so a cut name cut this too.
+    assert_eq!(exact("curseofthefirepenguincreature"), Some(0), "the collated back face");
+    assert_eq!(coll("curseofthefirepenguincreature"), Some(0), "as a collection identifier");
+
+    // AND THE CUT IS NOBODY'S NAME. This is the assertion that fails on the old build rather than
+    // erroring: the 61-byte prefix answered the card, on both surfaces, because it was literally
+    // what the store held.
+    assert_eq!(exact(cut), None, "the {NAME_INLINE}-byte cut is not an exact= key");
+    assert_eq!(coll(cut), None, "nor a collection identifier's");
+    // Nor is the cut of the back face alone, for the same reason.
+    assert_eq!(exact("curse of the fire penguin creatu"), None, "and neither is a cut of the face");
 }
 
 /// A WHOLE-name match beats a FACE match on the collection surface too, and `set` filters the
@@ -13775,6 +13932,39 @@ fn autocomplete_matches_the_sql_routes_set_and_order() {
     // whichever name the corpus happened to reach first.
     assert_eq!(autocomplete_names(a, "sh", 1), vec!["Shock"], "capped, after ordering");
     assert!(autocomplete_names(a, "zzz", 20).is_empty());
+
+    // THE OVER-LONG NAME, in its own store so it cannot perturb the ordering asserted above (it
+    // contains "sh", twice). The catalog matches on the FOLDED name, which for a name with no
+    // diacritic is the lowercase one -- so before `lower_name` it matched the 61-byte inline, and
+    // everything past byte 61 of a 141-character name was simply not in the catalog. "absolute
+    // longest" starts at byte 102.
+    {
+        let elemental = "Our Market Research Shows That Players Like Really Long Card Names So We Made this Card to Have the Absolute Longest Card Name Ever Elemental";
+        assert!(elemental.len() > NAME_INLINE * 2, "the fixture is well past the bound");
+        let mut v4 = VocabInterner::new();
+        let mut i4 = Interner::new();
+        let mut c = stub_card(1, 0, &[], &mut v4);
+        let (inline, id) = split_lower_name(&elemental.to_lowercase(), |s| i4.intern(s));
+        c.card_name_lower = inline;
+        c.card_name_lower_id = id;
+        assert_ne!(id, NONE_STR, "the fixture spilled, as the builder would");
+        c.card_name_id = i4.intern(elemental.to_string());
+        let mut d4 = store_of(vec![c], &[1], v4);
+        d4.strings = i4.strings;
+        let b4 = rkyv::to_bytes::<Error>(&d4).expect("serialize");
+        let a4 = rkyv::access::<Archived<CardData>, Error>(&b4).expect("access");
+
+        assert_eq!(
+            autocomplete_names(a4, "absolute longest", 20),
+            vec![elemental],
+            "a needle PAST the inline bound reaches the name at all"
+        );
+        assert_eq!(
+            autocomplete_names(a4, "our market", 20),
+            vec![elemental],
+            "and a prefix needle answers the WHOLE string, not a completion to the inline cut"
+        );
+    }
 }
 
 // ─── Price orderings pick the group's cheapest printing ───────────────────────

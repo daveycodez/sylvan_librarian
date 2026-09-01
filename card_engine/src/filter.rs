@@ -474,7 +474,10 @@ fn text_field_value<'a>(
     field: TextField,
 ) -> StrVal<'a> {
     match field {
-        TextField::NameLower       => StrVal::Known(card.card_name_lower.as_str()),
+        // `lower_name`, not the inline field: the inline is a CUT for the 36 names past its bound,
+        // and the surfaces reading this one -- `name:` as an exact text compare, and `name:/…/` --
+        // must see the whole string or they answer about a prefix no card is called.
+        TextField::NameLower       => StrVal::Known(crate::lower_name(card, strings)),
         TextField::OracleTextLower => opt_sv(str_at(strings, u32::from(card.oracle_text_lower_id))),
         TextField::Layout          => opt_sv(str_at(strings, u32::from(card.card_layout_id))),
         TextField::FlavorTextLower => printing.map_or(StrVal::PDep, |p| opt_sv(str_at(strings, u32::from(p.flavor_text_lower_id)))),
@@ -1457,7 +1460,10 @@ impl FilterExpr {
                 Tri::PrintingDep => Tri::PrintingDep,
             },
 
-            FilterExpr::ExactName(lower) => tri_bool(card.card_name_lower.as_str() == lower.as_str()),
+            // WHOLE name, not the inline: `!"curse of the fire penguin // curse of the fire penguin
+            // creature"` compares against a 63-byte string the inline field cannot hold, so
+            // reading the cut answered `false` for it -- and `true` for the cut spelling.
+            FilterExpr::ExactName(lower) => tri_bool(crate::lower_name(card, strings) == lower.as_str()),
 
             FilterExpr::NumericCmp { lhs, op, rhs } => {
                 numeric_cmp_tri(lhs, *op, rhs, &|f| field_num(card, printing, f))

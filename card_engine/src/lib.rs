@@ -407,10 +407,37 @@ impl Default for CompatFields {
 #[derive(Archive, Serialize, Deserialize)]
 struct OracleCard {
     // Hot fields first — fits in the first cache lines for fast filter short-circuiting.
-    card_name_lower: InlineStr<61>, // 61 bytes covers every card name in the Scryfall dataset
+    //
+    // The first NAME_INLINE bytes of the lowercase name, and NOT NECESSARILY ALL OF IT. The
+    // comment that used to sit here said "61 bytes covers every card name in the Scryfall
+    // dataset"; it does not, and `InlineStr::from_str` cuts what does not fit in SILENCE. 36 names
+    // in `all_cards` are longer -- 34 doubled `X // X` art-series and reversible names,
+    // "Curse of the Fire Penguin // Curse of the Fire Penguin Creature" (63 bytes), and the
+    // 141-character Unhinged elemental -- so `card_name_lower_id` below carries the whole string
+    // whenever this field does not. RESOLVE WITH `lower_name`, never by reading this field.
+    card_name_lower: InlineStr<NAME_INLINE>,
+    // The whole lowercase name when it does not fit inline above, `NONE_STR` when it does -- the
+    // same shape as `card_name_folded_id` below, and NONE_STR on all but 36 of 31,724 cards.
+    //
+    // THE ROW DOES NOT GROW FOR IT, and the width above does not shrink to pay either: measured
+    // with `size_of::<Archived<OracleCard>>()`, the row was 256 bytes before this field and is 256
+    // with it. `oracle_id` gives the struct 16-byte alignment, and the trailing round-up already
+    // held more than four spare bytes -- the same sweep puts the cliff at `InlineStr<65>`, where
+    // the row goes to 272. So the id is free here, unlike on a row with no slack, where it would
+    // have had to come out of the inline. Nothing is gained by widening the inline to swallow the
+    // 36 instead: "wide enough for the corpus I looked at" is the assumption this commit is
+    // deleting, and a spilled name costs one interned string.
+    //
+    // WHAT IT BOUGHT, measured on a deployment of this engine 2026-08-31 against api.scryfall.com,
+    // which answers all four: `!"Curse of the Fire Penguin Creature"`,
+    // `name:"fire penguin creature"` and `/cards/named?exact=` of the same string answered NOTHING
+    // here, while `!"Curse of the Fire Penguin Creatu"` -- the 61-byte cut -- answered the card.
+    // One truncation reached every name surface at once, because the folded name and both name
+    // routes are DERIVED from this field.
+    card_name_lower_id: u32,
     // Accent-folded card_name_lower (e.g. "éowyn" -> "eowyn"), precomputed in Python via
     // fold_accents() (#649). Backs fuzzy name: search (name_trigram/name_bigrams/TextContains)
-    // so "eowyn" matches "Éowyn"; exact-match paths deliberately keep using card_name_lower.
+    // so "eowyn" matches "Éowyn"; exact-match paths deliberately keep using the unfolded name.
     //
     // An INTERNED ID, not a second inline copy. It differs from `card_name_lower` only where a name
     // carries a diacritic -- 88 of 31,724 cards on the current corpus -- so 61 bytes a card stored
@@ -450,10 +477,17 @@ struct OracleCard {
     planeswalker_loyalty: Option<u8>, // always 1-12
     edhrec_rank: Option<u32>,         // up to ~30k unique cards
     cubecobra_score: Option<f32>,
-    // Dense rank of card_name_lower in byte order (equal names share a rank so
+    // Dense rank of the INLINE card_name_lower in byte order (equal names share a rank so
     // sort secondaries break their ties). Assigned post-load by
     // assign_name_ranks; the sort key for SortCol::Name. Ranks stay below 2^24
     // so the f32 sort-key conversion is exact.
+    //
+    // The inline field and not `lower_name`, deliberately: this rank is also the KEY OF THE
+    // ASCENDING NAME PERMUTATION that `narrow_rec`'s `ExactName` arm binary-searches, and the two
+    // have to order by the same string or the search reads a permutation sorted by something else.
+    // What it leaves is that the 36 over-long names ORDER by their inline prefix -- unchanged from
+    // before this field existed, and a tie the sort secondaries already break. It is not a
+    // MEMBERSHIP question: that one is answered exactly, by the spill filter in that arm.
     name_rank: u32,
 
     // Collection elements interned as u16 ids into CardData.coll_vocab (see
@@ -553,8 +587,15 @@ struct Printing {
 /// commit pass groups rows by oracle_id and splits them into OracleCard +
 /// Printing. Never archived.
 struct CardRow {
-    card_name_lower: InlineStr<61>,
-    card_name_folded: InlineStr<61>,
+    // FULL strings, not the `InlineStr` the archived twin stores. A parse-time row is never
+    // archived, so the only thing an inline bought here was TRUNCATION: `InlineStr::from_str` cuts
+    // at its bound in silence, and 36 names in `all_cards` are longer than the 61 bytes this used
+    // to be. The archived folded id is DERIVED from these two by comparing them, so the cut
+    // reached the strings table as well as the inline, and a back face nobody could search for
+    // (`!"Curse of the Fire Penguin Creature"` answered nothing while
+    // `!"Curse of the Fire Penguin Creatu"` answered the card) started right here.
+    card_name_lower: String,
+    card_name_folded: String,
     card_colors: u8,
     card_color_identity: u8,
     produced_mana: u8,
@@ -646,25 +687,73 @@ pub(crate) type AOffsets = Archived<Vec<u32>>;
 /// Sentinel id for absent optional strings (a card never has 4 billion distinct strings).
 const NONE_STR: u32 = u32::MAX;
 
-/// A card's accent-folded lowercase name.
+/// How much of a lowercase card name `OracleCard` stores inline; the rest spills to `strings`.
 ///
-/// `NONE_STR` in `card_name_folded_id` means "identical to `card_name_lower`", which is every card
-/// whose name carries no diacritic, so this is an inline read on the overwhelming majority and a
-/// `strings` lookup only for the handful that need one.
-fn folded_name<'a>(card: &'a AOracleCard, strings: &'a AStrings) -> &'a str {
-    let id = u32::from(card.card_name_folded_id);
+/// Named rather than spelled `61` at each site because three of them have to agree: the field's own
+/// width, the builder's "does it fit" test, and `narrow_rec`'s `ExactName` arm, which declines the
+/// name permutation for any needle this bound cuts. The value is unchanged -- it is the SILENT
+/// truncation past it that this constant now makes checkable.
+pub(crate) const NAME_INLINE: usize = 61;
+
+/// A card's LOWERCASE name, WHOLE — the inline field holds only its first `NAME_INLINE` bytes.
+///
+/// `NONE_STR` in `card_name_lower_id` means "the inline field is the whole of it", true for all but
+/// 36 cards, so this is an inline read on 99.9% of the corpus and a `strings` lookup only for a
+/// name too long to fit. Every reader goes through here; reading `card_name_lower` directly is how
+/// a back face became unsearchable (see the field's own note). The two deliberate exceptions are
+/// `assign_name_ranks` and the permutation search it keys, which order by the inline BY DESIGN.
+pub(crate) fn lower_name<'a>(card: &'a AOracleCard, strings: &'a AStrings) -> &'a str {
+    let id = u32::from(card.card_name_lower_id);
     if id == NONE_STR {
         return card.card_name_lower.as_str();
     }
     str_at(strings, id).unwrap_or_else(|| card.card_name_lower.as_str())
 }
 
+/// The two fields a lowercase card name occupies on `OracleCard`: the inline prefix, and the id of
+/// the whole string for a name the prefix is not the whole of (`NONE_STR` when it is).
+///
+/// ONE function because the bound has to be agreed on in more than one place, and the bug this
+/// exists to close is what happens when a place forgets it: the builder writes the pair, the
+/// fixtures build stores with the same shape, and `narrow_rec` declines a needle the bound cuts.
+/// `push` interns or appends, whichever the caller's table is.
+pub(crate) fn split_lower_name(name: &str, push: impl FnOnce(String) -> u32) -> (InlineStr<NAME_INLINE>, u32) {
+    let id = if name.len() <= NAME_INLINE { NONE_STR } else { push(name.to_owned()) };
+    (InlineStr::from_str(name), id)
+}
+
+/// Build-time twin of `lower_name`, over unarchived rows and the interner's plain `Vec<String>`.
+fn lower_name_of<'a>(card: &'a OracleCard, strings: &'a [String]) -> &'a str {
+    if card.card_name_lower_id == NONE_STR {
+        return card.card_name_lower.as_str();
+    }
+    strings.get(card.card_name_lower_id as usize).map_or_else(|| card.card_name_lower.as_str(), String::as_str)
+}
+
+/// A card's accent-folded lowercase name.
+///
+/// `NONE_STR` in `card_name_folded_id` means "identical to `card_name_lower`", which is every card
+/// whose name carries no diacritic, so this is an inline read on the overwhelming majority and a
+/// `strings` lookup only for the handful that need one.
+///
+/// The fallback is `lower_name` and NOT the inline field: an over-long name folds to itself on the
+/// overwhelming majority (no diacritic), so it takes exactly this branch, and returning the inline
+/// here would hand the 61-byte cut to `name:`, both name routes and the autocomplete catalog --
+/// which is what they were all answering with.
+fn folded_name<'a>(card: &'a AOracleCard, strings: &'a AStrings) -> &'a str {
+    let id = u32::from(card.card_name_folded_id);
+    if id == NONE_STR {
+        return lower_name(card, strings);
+    }
+    str_at(strings, id).unwrap_or_else(|| lower_name(card, strings))
+}
+
 /// Build-time twin of `folded_name`, over unarchived rows and the interner's plain `Vec<String>`.
 fn folded_name_of<'a>(card: &'a OracleCard, strings: &'a [String]) -> &'a str {
     if card.card_name_folded_id == NONE_STR {
-        return card.card_name_lower.as_str();
+        return lower_name_of(card, strings);
     }
-    strings.get(card.card_name_folded_id as usize).map_or_else(|| card.card_name_lower.as_str(), String::as_str)
+    strings.get(card.card_name_folded_id as usize).map_or_else(|| lower_name_of(card, strings), String::as_str)
 }
 
 /// Sentinel for a printing with no artist (see Printing.card_artist_vid).
@@ -1164,9 +1253,9 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
     let released_at_int: Option<u32> = released_at.replace('-', "").parse().ok();
     // Raw strings from the dict; interned to ids as the struct is built below.
     let card_name = opt_str(d, "card_name").unwrap_or_default();
-    let card_name_lower = InlineStr::<61>::from_str(&card_name.to_lowercase());
+    let card_name_lower = card_name.to_lowercase();
     // Already lowercased + accent-folded in Python (fold_accents(), #649); read as-is.
-    let card_name_folded = InlineStr::<61>::from_str(&opt_str(d, "card_name_folded").unwrap_or_default());
+    let card_name_folded = opt_str(d, "card_name_folded").unwrap_or_default();
     let oracle_text = opt_str(d, "oracle_text").unwrap_or_default();
     let oracle_text_lower_id = it.intern(oracle_text.to_lowercase());
     let flavor_text = opt_str(d, "flavor_text").unwrap_or_default();
@@ -5930,14 +6019,36 @@ fn narrow_rec(
             // card_name_lower byte order — so equal-name blocks are contiguous
             // and equality is a binary-searched range: an exact, tight card
             // set. A miss proves the empty set (names are never null).
+            //
+            // THE KEY IS THE INLINE FIELD, WHICH IS A CUT for the 36 names past `NAME_INLINE`, and
+            // both halves of that have to be handled or this arm answers the wrong set TIGHTLY —
+            // which is worse than not narrowing, because a tight set is never verified:
+            //
+            //   - A needle the bound would cut is not in the permutation under its own spelling,
+            //     so the search would answer the empty set for a name that exists. Decline
+            //     instead: the walk then verifies every card through `lower_name` and finds it.
+            //     This is what `!"Curse of the Fire Penguin // Curse of the Fire Penguin Creature"`
+            //     needs, and it answered nothing before.
+            //   - A SPILLED card inside the block matched on its cut, not on its name — the needle
+            //     is a strict prefix of what the card is called — so it is dropped here.
+            //     `!"Curse of the Fire Penguin Creatu"`, the 61-byte cut, answered that card on
+            //     production 2026-08-31 where api.scryfall.com answers nothing; this is the line
+            //     that stops it.
             let perm = &indexes.sort_perms.name[0];
             if perm.len() != n_cards || cards.len() != n_cards || n_cards == 0 {
                 return None; // store without name permutations
             }
+            if InlineStr::<NAME_INLINE>::from_str(needle).as_str() != needle.as_str() {
+                return None; // longer than the key this permutation is sorted on
+            }
             let name_of = |cid: &Archived<u32>| cards[u32::from(*cid) as usize].card_name_lower.as_str();
             let lo = perm.partition_point(|cid| name_of(cid) < needle.as_str());
             let width = perm[lo..].partition_point(|cid| name_of(cid) == needle.as_str());
-            let ids: Vec<u32> = perm[lo..lo + width].iter().map(|x| u32::from(*x)).collect();
+            let ids: Vec<u32> = perm[lo..lo + width]
+                .iter()
+                .map(|x| u32::from(*x))
+                .filter(|&cid| u32::from(cards[cid as usize].card_name_lower_id) == NONE_STR)
+                .collect();
             Narrowed::tight(Candidates::Cards(ids))
         }
 
@@ -14583,7 +14694,21 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 // are already spent the same way by two sibling branches (#920's `scryfall_prefer_score`, #913's
 // own re-pin of the rank fields) — three open branches, three distinct values, so no pair can
 // merge textually clean into one value meaning two layouts.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026082703;
+//
+// 2026083101 — `OracleCard` GAINS `card_name_lower_id`, the whole lowercase name for the 36 cards
+// whose name does not fit `card_name_lower`'s 61 inline bytes. The row does not grow for it (256
+// before, 256 after — the trailing round-up under 16-byte alignment already had the four bytes),
+// but every field after the inline MOVES. The inline cut names in silence, so the folded name
+// derived from it was cut too: measured on a deployment of this engine 2026-08-31,
+// `!"Curse of the Fire Penguin Creature"`, `name:"fire penguin creature"` and
+// `/cards/named?exact=` of the same string all answered nothing, while
+// `!"Curse of the Fire Penguin Creatu"` — the 61-byte cut — answered the card.
+//
+// The date is ahead of every sibling branch's value (…708 on #929, …707 on #927/#928, …703 on
+// #912/#922 before this), which is the point — the never-reuse invariant is satisfied by the
+// highest value winning at merge, and a value dated today is above all four whichever order they
+// land in.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026083101;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -15087,16 +15212,27 @@ impl QueryEngine {
             let is_new = cards.last().is_none_or(|c| c.oracle_id != row.oracle_id);
             if is_new {
                 offsets.push(printings.len() as u32);
+                // The inline field takes the first NAME_INLINE bytes; the id beside it takes the
+                // whole string when there are more. EVERY DERIVATION BELOW READS THE ROW, NOT THE
+                // INLINE -- that is the bug this shape fixes. `card_name_folded_id` used to be
+                // decided by comparing two already-truncated `InlineStr<61>`s, so for an over-long
+                // name the comparison was between two cuts and whichever answer it gave was about
+                // a string neither field held.
+                let (card_name_lower, card_name_lower_id) =
+                    split_lower_name(&row.card_name_lower, |s| interner.intern(s));
                 cards.push(OracleCard {
-                    card_name_lower: row.card_name_lower,
+                    card_name_lower,
+                    card_name_lower_id,
                     // Only names that actually fold differently reach the table; the rest carry
-                    // NONE_STR, meaning "identical to card_name_lower". Interned rather than
+                    // NONE_STR, meaning "identical to card_name_lower" -- which now resolves
+                    // through `lower_name`, so an over-long name's fallback is the whole string
+                    // rather than the inline prefix. Interned rather than
                     // appended because the interner is still whole here, so the handful of
                     // exceptions dedupe against strings the corpus already holds.
-                    card_name_folded_id: if row.card_name_folded.as_str() == row.card_name_lower.as_str() {
+                    card_name_folded_id: if row.card_name_folded == row.card_name_lower {
                         NONE_STR
                     } else {
-                        interner.intern(row.card_name_folded.as_str().to_owned())
+                        interner.intern(row.card_name_folded.clone())
                     },
                     card_colors: row.card_colors,
                     card_color_identity: row.card_color_identity,
