@@ -23,7 +23,7 @@ def create_test_card(  # noqa: PLR0913, PLR0917
     name: str = "Test Card",
     legalities: dict | None = None,
     games: list | None = None,
-    type_line: str = "Creature — Test",
+    type_line: str | None = None,
     colors: list | None = None,
     color_identity: list | None = None,
     keywords: list | None = None,
@@ -44,7 +44,12 @@ def create_test_card(  # noqa: PLR0913, PLR0917
         name: Card name
         legalities: Card legalities dict
         games: List of games the card is legal in
-        type_line: Card type line
+        type_line: Card top-level type line. Defaults to the faces' lines joined " // " when
+            `card_faces` is given -- which is what Scryfall's own card object carries, on 5,110
+            of the 5,112 faced printings in the 2026-08-31 default_cards bulk that have one --
+            and to a plain creature line otherwise. Pass it to model the exceptions: the
+            five-faced card, whose line is the bare "Instant", or a reversible printing, which
+            has none at all.
         colors: Card colors list
         color_identity: Card color identity list
         keywords: List of keywords
@@ -73,6 +78,9 @@ def create_test_card(  # noqa: PLR0913, PLR0917
         keywords = []
     if prices is None:
         prices = {"usd": "1.00"}
+    if type_line is None:
+        faces = kwargs.get("card_faces")
+        type_line = " // ".join(face["type_line"] for face in faces if face.get("type_line")) if faces else "Creature — Test"
     card_id = card_id or str(uuid.uuid4())
     jpg_part = f"{card_id[0]}/{card_id[1]}/{card_id}.jpg"
     card = {
@@ -576,6 +584,66 @@ class TestFaceMerging:
         assert FACE_TEXT_SEPARATOR not in merged["type_line"]
         assert "type_line" in _FACE_JOINED_TEXTS, "it is still a join..."
         assert "type_line" not in FACE_JOINED_TEXT_COLUMNS, "...but not one search may take apart"
+        # ...and the card's own top-level line is that join, which is why the join may show.
+        assert self._battle_card()["type_line"] == merged["type_line"]
+
+    def test_the_cards_own_type_line_outranks_the_joined_faces(self) -> None:
+        """The join is Scryfall's answer almost everywhere, and the card's own line is it always.
+
+        Measured over the 2026-08-31 default_cards bulk: of the 5,112 faced printings carrying a
+        top-level `type_line`, 5,110 carry exactly the faces' lines joined " // ". The two that do
+        not are the two printings of the only five-faced card in the corpus, `Who // What // When
+        // Where // Why` (und/75 and unh/120), where Scryfall says the bare "Instant" against a
+        join of five -- confirmed live on api.scryfall.com the same day. Taking the card's own
+        line settles both shapes with one rule.
+        """
+        two_halves = create_test_card(
+            name="Bind // Liberate",
+            layout="split",
+            type_line="Instant // Instant",
+            card_faces=[
+                {"name": "Bind", "type_line": "Instant", "mana_cost": "{1}{G}", "oracle_text": "Counter target spell."},
+                {"name": "Liberate", "type_line": "Instant", "mana_cost": "{1}{W}", "oracle_text": "Exile target creature."},
+            ],
+        )
+        merged = preprocess_card(two_halves)[0]
+        assert merged["type_line"] == "Instant // Instant", "the join and the card's own line agree here"
+
+        five_parts = create_test_card(
+            name="Who // What // When // Where // Why",
+            layout="split",
+            type_line="Instant",
+            card_faces=[
+                {"name": part, "type_line": "Instant", "mana_cost": "{1}{W}", "oracle_text": f"Do {part.lower()}."}
+                for part in ("Who", "What", "When", "Where", "Why")
+            ],
+        )
+        merged = preprocess_card(five_parts)[0]
+        assert merged["type_line"] == "Instant", "the card's own line, not five joined"
+        # The TYPES stay the per-face union -- the reading a joined line cannot be parsed back into.
+        assert merged["card_types"] == ["Instant"]
+        assert merged["card_subtypes"] == []
+
+    def test_a_card_with_no_type_line_of_its_own_keeps_the_join(self) -> None:
+        """A reversible printing carries no top-level `type_line`, so the join is its only one.
+
+        All 81 reversible printings in the 2026-08-31 default_cards bulk lack the field. Most are
+        `X // X` and the name filter drops them, but three survive every filter above -- tdm/378,
+        tdm/379 and tdm/381, the Tarkir omen dragons, shaped like the card below. Reading the
+        card's line unconditionally would null the type line on exactly those three.
+        """
+        omen_dragon = create_test_card(
+            name="Bloomvine Regent // Claim Territory // Bloomvine Regent",
+            layout="reversible_card",
+            card_faces=[
+                {"name": "Bloomvine Regent", "type_line": "Creature — Dragon", "mana_cost": "{3}{R}{G}", "oracle_text": "Flying."},
+                {"name": "Claim Territory", "type_line": "Sorcery — Omen", "mana_cost": "{1}{G}", "oracle_text": "Search."},
+            ],
+        )
+        del omen_dragon["type_line"]
+        assert "type_line" not in omen_dragon, "the shape under test is the ABSENT field"
+        merged = preprocess_card(omen_dragon)[0]
+        assert merged["type_line"] == "Creature — Dragon // Sorcery — Omen", "no card line, so the join stands"
 
     def test_mana_cost_joins_with_scryfalls_own_separator_and_is_not_split(self) -> None:
         r"""A faced card's printed cost is EVERY face's, joined -- and the " // " is not ours.

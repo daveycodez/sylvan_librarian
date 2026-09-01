@@ -260,6 +260,33 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
         if not face_rows:
             return []
         merged_row = _merge_processed_faces(face_rows)
+        # ...and then the CARD's own type line outranks the join, because Scryfall's row is that
+        # line and not always the join. `type_line` here is the top-level field read off the card
+        # above, before any face was folded in.
+        #
+        # The join IS Scryfall's answer nearly everywhere -- measured over the 2026-08-31
+        # default_cards bulk, 5,110 of 5,112 faced printings that carry a top-level `type_line`
+        # carry exactly `" // ".join(face type lines)`: split (`Bind // Liberate` and `Fire // Ice`
+        # are both "Instant // Instant"), adventure (`Champions of Archery // Join the Group` is
+        # "Legendary Creature — Human Archer // Sorcery — Adventure"), flip, transform, MDFC. The
+        # two that differ are the two printings of the only five-faced card, `Who // What // When
+        # // Where // Why` (und/75 and unh/120): Scryfall says the bare "Instant" where the join
+        # says it five times. Neither reaches this line -- both are `not_legal` in every format --
+        # so this is the rule stated where the join is made rather than a change to today's rows.
+        #
+        # The FALLBACK is the live half. A reversible printing carries no top-level `type_line` at
+        # all (81 of 81 in the same bulk), and three of them survive the filters above -- tdm/378,
+        # tdm/379, tdm/381, the Tarkir omen dragons, whose doubled siblings the `X // X` name
+        # filter drops. Taking `card["type_line"]` unconditionally would null the type line on
+        # those three; the join is their only one, so it stands.
+        #
+        # `card_types`/`card_subtypes` are NOT recomputed from this string, deliberately: they are
+        # the per-face union built in `_merge_processed_faces` (`_FACE_LIST_UNIONS`), which is the
+        # only reading that survives a joined line. `parse_type_line` splits on the FIRST em dash,
+        # so parsing "Legendary Creature — Human Archer // Sorcery — Adventure" back would file
+        # "Sorcery" under SUBTYPES. The union is right and stays.
+        if type_line:
+            merged_row["type_line"] = type_line
         # The blob is the card-level object with its faces re-attached — what Scryfall sent, not a
         # face promoted to look like a card. Every searchable field is already merged onto the row
         # above, so the blob has no derivation left to do, and keeping it verbatim is what makes it
