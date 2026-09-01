@@ -12,6 +12,7 @@ import copy
 import json
 import uuid
 from typing import TYPE_CHECKING
+from urllib.parse import urlencode
 
 import falcon
 import falcon.testing
@@ -21,6 +22,7 @@ from cachebox import LRUCache
 
 from api.enums import SortDirection, resolve_direction
 from api.scryfall_compat.objects import PAGE_SIZE
+from api.settings import settings
 from api.tests.helpers import make_raw_card
 from api.utils.generation_cache import GenerationCache
 
@@ -34,6 +36,19 @@ BOLT_ID = "11111111-1111-4111-8111-111111111111"
 BEAR_ID = "22222222-2222-4222-8222-222222222222"
 DELVER_ID = "33333333-3333-4333-8333-333333333333"
 BOLT_ORACLE_ID = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+
+# The by-name key rule wants two more shapes -- a name with FIVE halves and a punctuated, accented
+# one -- and they live in a set of their own so the `s:sfc` paging tests keep asserting three cards.
+NAME_SET_CODE = "sfn"
+WHO_ID = "55555555-5555-4555-8555-555555555555"
+VAULT_ID = "66666666-6666-4666-8666-666666666666"
+# 50 bytes, and deliberately short: the engine stores a card's folded name in an `InlineStr<61>`
+# and TRUNCATES anything longer, so a five-part name spelled "Compat ..." five times (70 bytes) is
+# unreachable through the engine while the SQL fallback still finds it. That is a pre-existing bug
+# in its own right -- 36 names in the real corpus are over the limit -- and not the one under test
+# here, so this name stays inside the bound rather than pinning the wrong divergence.
+WHO_NAME = "Cw Who // Cw What // Cw When // Cw Where // Cw Why"
+VAULT_NAME = "Compat Lim-Dûl's Vault"
 
 
 def _bolt() -> dict:
@@ -118,10 +133,65 @@ def _delver() -> dict:
     return card
 
 
+def _who() -> dict:
+    """A FIVE-part name, which has no face keys at all.
+
+    `{"name":"Who // What // When // Where // Why"}` answers und/75 on api.scryfall.com while
+    `{"name":"Who"}` and `exact=Who` are each not_found -- the whole name is the key and its parts
+    are not. A rule built on `split_part(name, ' // ', 1)` reads this as a card with a front face
+    named "Compat Who" and answers it.
+    """
+    card = make_raw_card(card_id=WHO_ID, name=WHO_NAME)
+    card |= {
+        "object": "card",
+        "set": NAME_SET_CODE,
+        "set_name": "Scryfall Compat Names",
+        "collector_number": "1",
+        "layout": "split",
+        "type_line": " // ".join(["Sorcery"] * 5),
+        "colors": ["W"],
+        "color_identity": ["W"],
+        "card_faces": [
+            {
+                "object": "card_face",
+                "name": part,
+                "mana_cost": "{W}",
+                "type_line": "Sorcery",
+                "oracle_text": f"{part} does nothing.",
+            }
+            for part in WHO_NAME.split(" // ")
+        ],
+    }
+    card.pop("image_uris", None)
+    return card
+
+
+def _vault() -> dict:
+    """A name carrying an accent AND an apostrophe AND a hyphen, so collation has something to do.
+
+    `{"name":"limduls vault"}` and `{"name":"lim-duls vault"}` both answer Lim-Dûl's Vault on
+    api.scryfall.com, and `exact=` of either does too. Every one of those spellings was a 404 here.
+    """
+    card = make_raw_card(card_id=VAULT_ID, name=VAULT_NAME)
+    card |= {
+        "object": "card",
+        "set": NAME_SET_CODE,
+        "set_name": "Scryfall Compat Names",
+        "collector_number": "2",
+        "mana_cost": "{1}{B}",
+        "type_line": "Instant",
+        "oracle_text": "Look at the top five cards of your library.",
+        "colors": ["B"],
+        "color_identity": ["B"],
+        "lang": "en",
+    }
+    return card
+
+
 @pytest.fixture(name="compat_corpus", scope="module")
 def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
     """Load this module's cards and their rulings once, then hand back the resource."""
-    api_resource.admin._upsert_cards([copy.deepcopy(card) for card in (_bolt(), _bear(), _delver())])
+    api_resource.admin._upsert_cards([copy.deepcopy(card) for card in (_bolt(), _bear(), _delver(), _who(), _vault())])
     with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
         cursor.execute("DELETE FROM magic.rulings WHERE oracle_id = %(oracle_id)s", {"oracle_id": BOLT_ORACLE_ID})
         # Three rulings across two dates, two of them same-day: a single ruling cannot tell one
@@ -156,6 +226,22 @@ def dispatch(api: APIResource, path: str, query_string: str = "", *, method: str
     resp = falcon.Response()
     api._handle(req, resp)
     return resp
+
+
+@pytest.fixture(name="by_name_paths", params=["engine", "sql"])
+def by_name_paths_fixture(request, compat_corpus: APIResource):
+    """The corpus with the engine serving, and again with it gated off so SQL answers.
+
+    On this branch the two name surfaces below are answered in SQL either way -- the engine's
+    by-name entry points arrive with #912 -- so the second parameter is a no-op for them today. It
+    is here anyway: the rule has to hold on both paths or the same request answers differently
+    depending on which worker takes it, and this is the assertion that will say so the day the
+    engine path lands beside the SQL.
+    """
+    saved = settings.enable_engine
+    settings.enable_engine = request.param == "engine"
+    yield compat_corpus
+    settings.enable_engine = saved
 
 
 def payload(resp) -> dict:
@@ -373,6 +459,132 @@ class TestNamed:
         assert (
             found.value.headers["location"] == "https://cards.scryfall.io/large/back/3/3/33333333-3333-4333-8333-333333333333.jpg"
         )
+
+
+class TestNameKeyRule:
+    """The keys a card answers to, on `named?exact=` and on a collection `{"name"}` identifier.
+
+    THE TWO ARE NOT THE SAME LOOKUP. Measured against api.scryfall.com on 2026-08-31, ONE
+    IDENTIFIER PER REQUEST -- a collection response's `data` is not in identifier order, and a
+    batched probe attributes its answers to the wrong needles, which is how the first reading of
+    this rule came out wrong:
+
+      {"name":"Delver of Secrets"}                   -> Delver of Secrets // Insectile Aberration
+      {"name":"Insectile Aberration"}                -> the same card (a BACK face names it)
+      {"name":"Delver of Secrets // Insectile ..."}  -> not_found, where `exact=` is the card
+      {"name":"Fire // Ice"} / {"Wear // Tear"} /
+      {"name":"Bonecrusher Giant // Stomp"}          -> not_found, all three
+      {"name":"Who // What // When // Where // Why"} -> und/75, a FIVE-part name IS a key
+      {"name":"Who"}                                 -> not_found, and so is `exact=Who`
+      {"name":"Elves"}                               -> Elves (ffdn/9), a KEY and not a substring
+      {"name":"limduls vault"}                       -> Lim-Dûl's Vault, collated
+      {"name":"  Lightning Bolt  "}                  -> Lightning Bolt, trimmed
+      {"name":"Delver of Secrets","set":"mid"}       -> mid/47, set FILTERS the lookup
+
+    Every case runs TWICE, through `by_name_paths`: once with the engine serving and once with it
+    gated off. Both reach the same SQL on this branch, because the engine's by-name entry points
+    arrive with #912; the parametrization is what will catch the two drifting apart once they do.
+    """
+
+    @staticmethod
+    def _collection(api: APIResource, name: str, set_code: str | None = None) -> dict:
+        identifier: dict = {"name": name}
+        if set_code:
+            identifier["set"] = set_code
+        return payload(dispatch(api, "/cards/collection", method="POST", body={"identifiers": [identifier]}))
+
+    @staticmethod
+    def _resolves(api: APIResource, name: str, set_code: str | None = None) -> str | None:
+        """The id a collection identifier resolves to, or None for not_found."""
+        body = TestNameKeyRule._collection(api, name, set_code)
+        return body["data"][0]["id"] if body["data"] else None
+
+    @staticmethod
+    def _exact(api: APIResource, name: str) -> str | None:
+        """The id `named?exact=name` resolves to, or None for a 404."""
+        resp = dispatch(api, "/cards/named", urlencode({"exact": name}))
+        return None if resp.status == falcon.HTTP_404 else payload(resp)["id"]
+
+    @pytest.mark.parametrize("name", ["Compat Delver", "Compat Aberration"])
+    def test_either_face_names_the_card_on_both_surfaces(self, by_name_paths: APIResource, name):
+        """The BACK face is the half the predicate this replaced never looked at.
+
+        It compared `split_part(card_name, ' // ', 1)` and the whole name, so
+        `{"name":"Compat Aberration"}` missed a card api.scryfall.com resolves.
+        """
+        assert self._resolves(by_name_paths, name) == DELVER_ID
+        assert self._exact(by_name_paths, name) == DELVER_ID
+
+    def test_the_joined_name_is_exacts_key_and_not_a_collection_identifiers(self, by_name_paths: APIResource):
+        """The one key the two surfaces disagree about."""
+        joined = "Compat Delver // Compat Aberration"
+        assert self._exact(by_name_paths, joined) == DELVER_ID
+        assert self._resolves(by_name_paths, joined) is None
+
+    def test_a_five_part_name_is_a_key_and_none_of_its_parts_is(self, by_name_paths: APIResource):
+        """EXACTLY two halves is what makes a face key, which `split_part` cannot say on its own."""
+        assert self._resolves(by_name_paths, WHO_NAME) == WHO_ID
+        assert self._exact(by_name_paths, WHO_NAME) == WHO_ID
+        for part in WHO_NAME.split(" // "):
+            assert self._resolves(by_name_paths, part) is None, part
+            assert self._exact(by_name_paths, part) is None, part
+
+    @pytest.mark.parametrize(
+        "spelling",
+        [
+            "Compat Lim-Dûl's Vault",
+            "Compat Lim-Dul's Vault",
+            "compat limduls vault",
+            "compat lim-duls vault",
+            "compatlimdulsvault",
+            "COMPAT LIMDULS VAULT",
+        ],
+    )
+    def test_names_compare_collated(self, by_name_paths: APIResource, spelling):
+        """Accent, apostrophe, hyphen and spacing all drop out of the comparison."""
+        assert self._resolves(by_name_paths, spelling) == VAULT_ID
+        assert self._exact(by_name_paths, spelling) == VAULT_ID
+
+    def test_a_collated_face_does_not_straddle_the_join(self, by_name_paths: APIResource):
+        """The halves are split BEFORE either side is collated, so `" // "` is not just punctuation.
+
+        Collating first would delete the join and let `compatdelvercompataberration` -- and worse,
+        a needle spanning it -- read as a face.
+        """
+        assert self._resolves(by_name_paths, "compatdelver") == DELVER_ID
+        assert self._resolves(by_name_paths, "delvercompataberration") is None
+        assert self._resolves(by_name_paths, "compatdelvercompataberration") is None
+        assert self._exact(by_name_paths, "compatdelvercompataberration") == DELVER_ID
+
+    def test_leading_and_trailing_whitespace_is_not_part_of_the_name(self, by_name_paths: APIResource):
+        """`{"name":"  Lightning Bolt  "}` resolves on api.scryfall.com; this compared it as posted."""
+        assert self._resolves(by_name_paths, "  Compat Bolt  ") == BOLT_ID
+
+    @pytest.mark.parametrize("needle", ["Compat", "Bolt", "Vault", "", "   "])
+    def test_a_substring_of_a_name_is_not_a_key(self, by_name_paths: APIResource, needle):
+        """A name lookup, not a search.
+
+        `{"name":"Elves"}` answers *Elves* (ffdn/9) on api.scryfall.com -- the card actually named
+        that, not one of the hundreds whose names contain the word, which is what a containment
+        lookup cut to one row would have answered.
+        """
+        assert self._resolves(by_name_paths, needle) is None
+
+    def test_set_filters_the_lookup(self, by_name_paths: APIResource):
+        """`{"name":"Delver of Secrets","set":"mid"}` answers mid/47 -- the card, in the set asked for.
+
+        A card with no printing in that set drops out of the lookup rather than answering another
+        printing, which is the same thing `exact=&set=` does.
+        """
+        assert self._resolves(by_name_paths, "Compat Bolt", SET_CODE) == BOLT_ID
+        assert self._resolves(by_name_paths, "Compat Bolt", NAME_SET_CODE) is None
+        assert self._resolves(by_name_paths, VAULT_NAME, NAME_SET_CODE) == VAULT_ID
+
+    def test_an_unresolvable_name_comes_back_in_not_found(self, by_name_paths: APIResource):
+        """Reported, not dropped: the client has to be able to tell which identifier failed."""
+        body = self._collection(by_name_paths, "Compat Delver // Compat Aberration")
+        assert body["data"] == []
+        assert body["not_found"] == [{"name": "Compat Delver // Compat Aberration"}]
 
 
 class TestAutocomplete:
