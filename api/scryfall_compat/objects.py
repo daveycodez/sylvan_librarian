@@ -246,13 +246,30 @@ _TWO_IMAGE_LAYOUTS = frozenset({"art_series", "double_faced_token", "modal_dfc",
 # the card's `oracle_id` and `cmc` instead, 0 of 81 disagreeing, so omitting them loses nothing.
 _REVERSIBLE_LAYOUT = "reversible_card"
 
-# The layouts whose `edhrec` link keeps the JOINED name. Every other multi-face layout links the
-# FRONT face -- verified card for card against api.scryfall.com. The two tcgplayer_infinite_*
-# searches take the joined name on every layout, so the two are deliberately not one string.
-_EDHREC_JOINED_LAYOUTS = frozenset({"double_faced_token", "reversible_card", "split"})
+# The layouts a SEARCH LINK spells with the JOINED name -- `related_uris.edhrec` and all three
+# marketplace fallbacks in `purchase_uris`, which take one and the same string. Every other
+# multi-face layout searches the FRONT face -- verified card for card against api.scryfall.com.
+#
+# THE MARKETPLACES SPLIT THE SAME WAY, which is why this is no longer edhrec's list alone. Measured
+# on api.scryfall.com 2026-08-31 over `unique=prints`, on the first printing of each card whose ids
+# are MISSING so the SEARCH form is what gets emitted, reading the tcgplayer term out of the `u=`
+# parameter of Scryfall's own partner redirect:
+#
+#   split               Bind // Liberate                      cmb2/88   cardhoarder `Bind // Liberate`
+#   reversible_card     Mechtitan // Mechtitan                sld/1969  cardhoarder `Mechtitan // Mechtitan`
+#   double_faced_token  Snake // Zombie                       cc2/9     all three, `Snake // Zombie`
+#   split               Who // What // When // Where // Why   und/75    cardhoarder the whole name
+#   adventure           Champions of Archery // Join the …    ph19/4    `Champions of Archery`
+#   flip                Curse of the Fire Penguin // …        unh/73    `Curse of the Fire Penguin`
+#   art_series          Aang and Katara // Aang and Katara    atle/8    `Aang and Katara`
+#   transform           Delver of Secrets // Insectile …      sld/2367  `Delver of Secrets`
+#
+# The two `tcgplayer_infinite_*` searches in `related_uris` are the exception that stays: they take
+# the joined name on EVERY layout, so those two and this are deliberately not one string.
+_JOINED_SEARCH_LAYOUTS = frozenset({"double_faced_token", "reversible_card", "split"})
 
 
-def _related_uris(name: str, edhrec_name: str, multiverse_ids: list[Any], lang: str) -> dict[str, str]:
+def _related_uris(name: str, search_name: str, multiverse_ids: list[Any], lang: str) -> dict[str, str]:
     """Scryfall's `related_uris`, pointing at the destinations directly.
 
     Scryfall wraps the TCGplayer entries in `partner.tcgplayer.com/...?u=<encoded real URL>` with
@@ -277,11 +294,11 @@ def _related_uris(name: str, edhrec_name: str, multiverse_ids: list[Any], lang: 
         f"https://www.tcgplayer.com/search/articles?productLineName=magic&q={quoted}"
     )
     out["tcgplayer_infinite_decks"] = f"https://www.tcgplayer.com/search/decks?productLineName=magic&q={quoted}"
-    out["edhrec"] = f"https://edhrec.com/route/?cc={urllib.parse.quote_plus(edhrec_name)}"
+    out["edhrec"] = f"https://edhrec.com/route/?cc={urllib.parse.quote_plus(search_name)}"
     return out
 
 
-def _purchase_uris(row: dict[str, Any], name: str) -> dict[str, str]:
+def _purchase_uris(row: dict[str, Any], search_name: str) -> dict[str, str]:
     """Scryfall's `purchase_uris`, product links where the ids exist and name searches where not.
 
     Rebuilt from the marketplace ids -- or, for a key whose id this printing does not have, from a
@@ -293,10 +310,15 @@ def _purchase_uris(row: dict[str, Any], name: str) -> dict[str, str]:
     marketplace product ids belong to the English printing. Emitting nothing was the alternative,
     and it made `purchase_uris` an empty object on 426,416 printings.
 
-    The search text is the FRONT FACE name (`Invasion of Alara`, not `Invasion of Alara // Awaken
-    the Maelstrom`): the joined string matches no product.
+    `search_name` IS `_related_uris`' -- the caller decides the string, and all three marketplaces
+    split by layout exactly the way edhrec does (the measurements are on _JOINED_SEARCH_LAYOUTS).
+    This took the joined name and cut the front face off it here, on EVERY layout, which searched
+    for `Snake // Zombie` (cc2/9) as `Snake` and `Who // What // When // Where // Why` (und/75) as
+    `Who` against a Scryfall that spells both whole. On a transforming card the front face is still
+    right -- `Invasion of Alara`, not `Invasion of Alara // Awaken the Maelstrom` -- because there
+    the joined string matches no product.
     """
-    q = urllib.parse.quote_plus(name.split(" // ", 1)[0])
+    q = urllib.parse.quote_plus(search_name)
     tcg, cm, mtgo = row.get("tcgplayer_id"), row.get("cardmarket_id"), row.get("mtgo_id")
     return {
         "tcgplayer": (
@@ -431,8 +453,10 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
     two_image = has_faces and layout in _TWO_IMAGE_LAYOUTS
     reversible = layout == _REVERSIBLE_LAYOUT
     faces = _faces(row, two_image=two_image, reversible=reversible)
-    # `edhrec` links the FRONT face on every multi-face layout but the split-likes.
-    edhrec_name = name.split(" // ", 1)[0] if faces and layout not in _EDHREC_JOINED_LAYOUTS else name
+    # The name a SEARCH LINK spells: the joined one, except on the layouts whose searches take the
+    # front face (see _JOINED_SEARCH_LAYOUTS). `related_uris.edhrec` and every `purchase_uris`
+    # fallback take THIS string; the two `tcgplayer_infinite_*` links take the joined `name`.
+    search_name = name.split(" // ", 1)[0] if faces and layout not in _JOINED_SEARCH_LAYOUTS else name
 
     card: dict[str, Any] = {
         "object": "card",
@@ -480,7 +504,7 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
         "booster": bool(row.get("booster")),
         "story_spotlight": bool(row.get("story_spotlight")),
         "prices": _prices(row),
-        "related_uris": _related_uris(name, edhrec_name, row.get("multiverse_ids") or [], lang),
+        "related_uris": _related_uris(name, search_name, row.get("multiverse_ids") or [], lang),
     }
     # A printing NO MARKETPLACE SELLS omits the key rather than carrying three dead links. The
     # rule is the marketplaces, not `digital` -- measured 2026-08-16: prm/80925 (games ["mtgo"],
@@ -489,7 +513,7 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
     # about the printing rather than a gap.
     games = row.get("games")
     if games is None or not games or any(g in ("paper", "mtgo") for g in games):
-        card["purchase_uris"] = _purchase_uris(row, name)
+        card["purchase_uris"] = _purchase_uris(row, search_name)
 
     # A two-image layout keeps `colors`, `card_back_id` and `illustration_id` on its FACES alone --
     # there is no shared back and no card-level illustration when the card is two pictures --
