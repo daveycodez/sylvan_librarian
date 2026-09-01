@@ -3208,10 +3208,16 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
 /// (`!"Curse of the Fire Penguin // Curse of the Fire Penguin Creature"`, 1 on both). The
 /// collation is untouched: `!"limduls vault"` still answers `Lim-Dûl's Vault`, 1 on both.
 ///
-/// This is the `!` SEARCH operator and nothing else. `/cards/named?exact=` deliberately answers on
-/// ORACLE names alone (see `core_api::folded_name_matches` and the route's own note) — the two
-/// surfaces share a rule shape, not a scope, and conflating them would widen a route Scryfall keeps
-/// narrow.
+/// THE SAME KEY SET `/cards/named?exact=` ANSWERS ON, and the by-name routes now say so in their
+/// own words: `_EXACT_NAME_MATCH` in api/scryfall_compat/routes.py is this predicate as SQL, and the
+/// block above `_collate_name` there carries the route-side measurements. They are two spellings of
+/// one rule rather than one rule shared, because those routes answer from SQL on this branch and
+/// this arm answers from the store — a needle both can reach must resolve the same card on both.
+///
+/// A `POST /cards/collection` `{"name"}` identifier is the one surface that reads NARROWER: it
+/// takes the two face names or the whole name, never both, so the joined name of a two-faced card
+/// is a key here and not_found there (`_COLLECTION_NAME_MATCH`). Nothing in the engine expresses
+/// that scope, because the `!` operator does not have it.
 pub(crate) fn exact_name_matches(stored: &str, needle: &str) -> bool {
     if crate::collate_name(stored) == needle {
         return true;

@@ -245,6 +245,109 @@ def _unseparated(word: str) -> str:
     return "".join(char for char in word if char.isalnum())
 
 
+# ------------------------------------------------------------------ the two by-name key sets
+#
+# `named?exact=` and a `POST /cards/collection` `{"name"}` identifier are two lookups over one set
+# of keys, and they are NOT the same lookup. Measured against api.scryfall.com on 2026-08-31, ONE
+# IDENTIFIER PER REQUEST -- a collection response's `data` is not in identifier order, and a batched
+# probe silently attributes its answers to the wrong needles:
+#
+#   {"name":"Delver of Secrets"}                   -> Delver of Secrets // Insectile Aberration
+#   {"name":"Insectile Aberration"}                -> the same card (a BACK face names it)
+#   {"name":"Delver of Secrets // Insectile ..."}  -> not_found   <- `exact=` answers the card
+#   {"name":"Fire // Ice"}                         -> not_found
+#   {"name":"Wear // Tear"}                        -> not_found
+#   {"name":"Bonecrusher Giant // Stomp"}          -> not_found
+#   {"name":"Who // What // When // Where // Why"} -> und/75 (a FIVE-part name IS a key)
+#   {"name":"Who"}                                 -> not_found (so is `exact=Who`)
+#   {"name":"Elves"}                               -> Elves (ffdn/9), the card named that and not
+#                                                     one of the hundreds containing the word
+#   {"name":"limduls vault"}                       -> Lim-Dul's Vault (collated)
+#   {"name":"Delver of Secrets","set":"mid"}       -> mid/47 (set FILTERS the lookup)
+#
+# So a card answers to its two FACE names when its name splits in EXACTLY two, and to its whole name
+# otherwise -- never both. `exact=` adds the joined name of a two-faced card, and that is the only
+# key the two surfaces disagree about.
+#
+# THE SAME RULE THE ENGINE ALREADY APPLIES to the `!"..."` SEARCH operator, in
+# `card_engine/src/filter.rs`'s `exact_name_matches` -- collated, and a face key only for a name
+# that splits in exactly two. These fragments are that rule on the by-name ROUTES, which on this
+# branch answer from SQL alone: there is no engine by-name lookup here, so this is the path that
+# ships rather than a fallback. Sibling PR #912 states the same rule a third time, in the
+# `name_key_tier` scan its engine-served routes use; if these three ever disagree, one of the three
+# surfaces is answering a different question than the other two.
+#
+# `_collated_sql` deliberately repeats `_UNSEPARATED`'s regexp rather than reusing it: that template
+# coalesces NULL and is spelled to match an expression INDEX character for character, and neither
+# applies to a `split_part` of a NOT NULL column.
+
+
+def _collate_name(value: str) -> str:
+    """Collate a name: accent-folded, lowercased, every non-alphanumeric character removed.
+
+    This is what Scryfall compares on both name surfaces. Measured on api.scryfall.com, 2026-08-31:
+    `exact=delverofsecrets`, `exact=Lightning-Bolt`, `exact=limduls vault`,
+    `exact=Kongming Sleeping Dragon` and `exact=whowhatwhenwherewhy` all resolve, as do the same
+    spellings as collection identifiers -- and the folded comparison both routes used before
+    answered 404 to every one of them. It subsumes trimming: `{"name":"  Lightning Bolt  "}`
+    resolves there and did not here, because the collection route compared the string as posted.
+
+    `str.isalnum` per character rather than an ASCII class, matching the engine's
+    `char::is_alphanumeric`: the value is accent-folded first, so a character still non-ASCII at
+    this point is one NFKD had no base letter for and must be kept, not dropped.
+
+    Args:
+        value: A name as the client spelled it.
+
+    Returns:
+        Its collated form, which is "" for a value carrying no alphanumeric character at all.
+    """
+    return "".join(char for char in fold_accents(value.lower()) if char.isalnum())
+
+
+def _collated_sql(expr: str) -> str:
+    """The SQL that collates `expr` the way `_collate_name` collates the needle.
+
+    `[:alnum:]` is the server's character class where the engine uses Rust's
+    `char::is_alphanumeric`. The two agree over ASCII, which is all `card_name_folded` holds on this
+    corpus -- it is written by `fold_accents` at import. That is the one place these can drift from
+    the engine's own spelling of the rule, and it needs a name NFKD cannot reduce to ASCII to do it.
+
+    Args:
+        expr: A SQL expression yielding a folded name.
+
+    Returns:
+        That expression, collated.
+    """
+    return f"regexp_replace(lower({expr}), '[^[:alnum:]]', '', 'g')"
+
+
+_NAME_FRONT = "split_part(card_name_folded, ' // ', 1)"
+_NAME_BACK = "split_part(card_name_folded, ' // ', 2)"
+
+# EXACTLY two halves, which is the load-bearing word: a name with more of them has no face keys at
+# all. `exact=Who`, `exact=What` and `{"name":"Who"}` are each not_found on api.scryfall.com while
+# `Who // What // When // Where // Why` answers und/75 on both surfaces -- the five-part name is the
+# key and its parts are not. Part 3 being empty is what distinguishes the two cases.
+_NAME_SPLITS_IN_TWO = f"({_NAME_BACK} <> '' AND split_part(card_name_folded, ' // ', 3) = '')"
+
+_FACE_NAME_MATCH = f"(%(collated)s IN ({_collated_sql(_NAME_FRONT)}, {_collated_sql(_NAME_BACK)}))"
+_WHOLE_NAME_MATCH = f"({_collated_sql('card_name_folded')} = %(collated)s)"
+
+# A collection identifier's keys: the faces, or the whole name, never both.
+_COLLECTION_NAME_MATCH = f"(CASE WHEN {_NAME_SPLITS_IN_TWO} THEN {_FACE_NAME_MATCH} ELSE {_WHOLE_NAME_MATCH} END)"
+
+# `exact=`'s keys: the same set, plus the JOINED name of a two-faced card.
+_EXACT_NAME_MATCH = f"({_WHOLE_NAME_MATCH} OR ({_NAME_SPLITS_IN_TWO} AND {_FACE_NAME_MATCH}))"
+
+# A WHOLE-name match beats a FACE match on both surfaces, ahead of prefer_score rather than beside
+# it. Without it a needle that is one card's whole name and another's face answers whichever scores
+# higher: on this corpus `Lightning Bolt` would resolve "Emeritus of Conflict // Lightning Bolt".
+# One expression for both scopes -- a two-faced card matched by a face cannot also carry the needle
+# as its whole collated name.
+_WHOLE_NAME_FIRST = f"{_WHOLE_NAME_MATCH} DESC, "
+
+
 # Returned by the similarity stage when two names are too close to choose between. A distinct
 # object rather than a flag so the caller compares with `is` and cannot confuse it with a row.
 _AMBIGUOUS: dict[str, Any] = {"ambiguous": True}
@@ -878,23 +981,18 @@ class ScryfallCardsRoutes:
             params["set_code"] = set
 
         if exact:
-            # Scryfall's exact match ignores case and diacritics, and matches a single face of a
-            # multi-face card as well as the combined "Front // Back" this corpus stores.
-            params["folded"] = fold_accents(exact.strip().lower())
-            clauses.append(
-                "(lower(card_name_folded) = %(folded)s "
-                "OR lower(split_part(card_name_folded, ' // ', 1)) = %(folded)s "
-                "OR lower(split_part(card_name_folded, ' // ', 2)) = %(folded)s)",
-            )
-            # A WHOLE-name match beats a face match. Matching a face is right -- Scryfall resolves
-            # `exact=Delver of Secrets` to the two-faced card -- but it is a fallback, not a peer:
-            # on the current corpus `exact=Lightning Bolt` otherwise answers
-            # "Emeritus of Conflict // Lightning Bolt", whose prefer_score is the higher of the two.
-            card = self._fetch_one_card(
-                " AND ".join(clauses),
-                params,
-                rank_first="(lower(card_name_folded) = %(folded)s) DESC, ",
-            )
+            # Scryfall's exact match ignores case, diacritics AND punctuation, and matches a single
+            # face of a two-faced card as well as the combined "Front // Back" this corpus stores.
+            # `_EXACT_NAME_MATCH` is that key set; the block above `_collate_name` carries the
+            # measurements, and the two things it corrects here are that the comparison is COLLATED
+            # rather than folded (`exact=limduls vault` and `exact=delverofsecrets` resolve on
+            # api.scryfall.com and 404ed here), and that a face key exists only when the name splits
+            # in EXACTLY two -- an unguarded `split_part(..., 1)` read
+            # *Who // What // When // Where // Why* as having a front face named "Who", so
+            # `exact=Who` answered und/75 where Scryfall 404s.
+            params["collated"] = _collate_name(exact)
+            clauses.append(_EXACT_NAME_MATCH)
+            card = self._fetch_one_card(" AND ".join(clauses), params, rank_first=_WHOLE_NAME_FIRST)
             if card is None:
                 return self._scryfall_respond(
                     falcon_response,
@@ -1442,13 +1540,51 @@ class ScryfallCardsRoutes:
                 {"set_code": str(identifier["set"]), "number": str(identifier["collector_number"])},
             )
         if "name" in identifier:
-            clauses = ["lower(card_name) = lower(%(name)s) OR lower(split_part(card_name, ' // ', 1)) = lower(%(name)s)"]
-            params: dict[str, Any] = {"name": str(identifier["name"])}
-            if identifier.get("set"):
-                clauses = [f"({clauses[0]})", "lower(card_set_code) = lower(%(set_code)s)"]
-                params["set_code"] = str(identifier["set"])
-            return self._fetch_one_card(" AND ".join(clauses), params)
+            set_code = identifier.get("set")
+            return self._card_by_name_identifier(
+                str(identifier["name"]),
+                str(set_code) if set_code else None,
+            )
         return None
+
+    def _card_by_name_identifier(self, name: str, set_code: str | None) -> dict[str, Any] | None:
+        """Resolve a collection identifier's `name` -- a NAME LOOKUP with its OWN keys.
+
+        Not `named?exact=`'s keys, which is why this is its own predicate and not a call to that
+        route's: `{"name":"Delver of Secrets // Insectile Aberration"}` is not_found on
+        api.scryfall.com while `exact=` of that same string answers the card. The block above
+        `_collate_name` carries the measurements for both.
+
+        Five things the SQL this replaces got wrong, each measured. It never looked at the BACK face
+        (`{"name":"Insectile Aberration"}` answers the card there and missed here) -- `split_part`
+        part 2 was simply absent. It accepted the JOINED name (`{"name":"Fire // Ice"}` is not_found
+        there and answered here). It read a five-part name as having a front face
+        (`{"name":"Who"}` is not_found there and answered und/75 here). It compared `card_name` AS
+        POSTED -- not folded, not collated, not trimmed -- so no accent, punctuation or spacing
+        difference resolved and `{"name":"  Lightning Bolt  "}` missed on its own whitespace. And it
+        had no ranking at all, so a needle that is one card's whole name and another's face answered
+        whichever carried the higher prefer_score.
+
+        Args:
+            name: The identifier's `name` value, as posted.
+            set_code: The identifier's `set`, which FILTERS the lookup -- `{"name":"Delver of
+                Secrets","set":"mid"}` answers mid/47, the same card in the set asked for, and a
+                card with no printing in that set drops out rather than answering another printing.
+
+        Returns:
+            The card it names, or None for not_found.
+        """
+        collated = _collate_name(name)
+        # A needle with no alphanumeric character is nobody's name. Answered here rather than as a
+        # query, because `%(collated)s = ''` would match any card whose name is punctuation alone.
+        if not collated:
+            return None
+        clauses = [_COLLECTION_NAME_MATCH]
+        params: dict[str, Any] = {"collated": collated}
+        if set_code:
+            clauses.append("lower(card_set_code) = lower(%(set_code)s)")
+            params["set_code"] = set_code
+        return self._fetch_one_card(" AND ".join(clauses), params, rank_first=_WHOLE_NAME_FIRST)
 
     # ---------------------------------------------------------------- GET /cards and /cards/...
 
