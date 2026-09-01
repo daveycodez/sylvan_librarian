@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime
 import json
 import pathlib
+import urllib.parse
 
 import pytest
 
@@ -147,6 +148,62 @@ class TestToScryfallCard:
             assert "partner.tcgplayer.com" not in uri
             assert "affiliate_id" not in uri
             assert "scryfall" not in uri
+
+    @pytest.mark.parametrize(
+        ("layout", "name", "faces", "expected"),
+        [
+            ("transform", "Invasion of Alara // Awaken the Maelstrom",
+             ["Invasion of Alara", "Awaken the Maelstrom"], "Invasion of Alara"),
+            ("adventure", "Champions of Archery // Join the Group",
+             ["Champions of Archery", "Join the Group"], "Champions of Archery"),
+            ("art_series", "Aang and Katara // Aang and Katara",
+             ["Aang and Katara", "Aang and Katara"], "Aang and Katara"),
+            ("split", "Bind // Liberate", ["Bind", "Liberate"], "Bind // Liberate"),
+            ("double_faced_token", "Snake // Zombie", ["Snake", "Zombie"], "Snake // Zombie"),
+            ("reversible_card", "Mechtitan // Mechtitan", ["Mechtitan", "Mechtitan"], "Mechtitan // Mechtitan"),
+            ("split", "Who // What // When // Where // Why",
+             ["Who", "What", "When", "Where", "Why"], "Who // What // When // Where // Why"),
+            ("normal", "Lightning Bolt", [], "Lightning Bolt"),
+        ],
+    )
+    def test_a_marketplace_search_spells_the_name_the_way_edhrec_does(self, layout, name, faces, expected):
+        """The search string splits by LAYOUT, and by exactly the split `related_uris.edhrec` uses.
+
+        `_purchase_uris` cut the front face off the joined name on every layout, so `Snake // Zombie`
+        was searched for as `Snake`. Measured on api.scryfall.com 2026-08-31 over `unique=prints`,
+        on the first printing of each card whose marketplace ids are MISSING so the SEARCH form is
+        what gets emitted -- a printing WITH the id gets a product link and says nothing -- and
+        reading the tcgplayer term out of the `u=` parameter of Scryfall's partner redirect:
+
+          split               Bind // Liberate                      cmb2/88   `Bind // Liberate`
+          reversible_card     Mechtitan // Mechtitan                sld/1969  `Mechtitan // Mechtitan`
+          double_faced_token  Snake // Zombie                       cc2/9     `Snake // Zombie`, all three
+          split               Who // What // When // Where // Why   und/75    the whole five-part name
+          adventure           Champions of Archery // Join the …    ph19/4    `Champions of Archery`
+          flip                Curse of the Fire Penguin // …        unh/73    `Curse of the Fire Penguin`
+          art_series          Aang and Katara // Aang and Katara    atle/8    `Aang and Katara`
+          transform           Delver of Secrets // Insectile …      sld/2367  `Delver of Secrets`
+
+        The ids are dropped from the row on purpose: with them the object carries product links and
+        the search string is never built.
+        """
+        card = to_scryfall_card(row(
+            name=name, layout=layout,
+            card_faces=[{"name": face} for face in faces],
+            tcgplayer_id=None, cardmarket_id=None, mtgo_id=None,
+        ))
+        quoted = urllib.parse.quote_plus(expected)
+        assert card["purchase_uris"] == {
+            "tcgplayer": f"https://www.tcgplayer.com/search/magic/product?productLineName=magic&q={quoted}&view=grid",
+            "cardmarket": f"https://www.cardmarket.com/en/Magic/Products/Search?searchString={quoted}",
+            "cardhoarder": f"https://www.cardhoarder.com/cards?data%5Bsearch%5D={quoted}",
+        }
+        # edhrec takes the same string, and the two tcgplayer_infinite_* searches take the JOINED
+        # name on every layout -- the exception this rule is deliberately not extended to.
+        assert card["related_uris"]["edhrec"] == f"https://edhrec.com/route/?cc={quoted}"
+        joined = urllib.parse.quote_plus(name)
+        assert card["related_uris"]["tcgplayer_infinite_articles"].endswith(f"q={joined}")
+        assert card["related_uris"]["tcgplayer_infinite_decks"].endswith(f"q={joined}")
 
     def test_absent_keys_stay_absent(self):
         """Scryfall OMITS a key it has no value for. Emitting null would differ on every row."""

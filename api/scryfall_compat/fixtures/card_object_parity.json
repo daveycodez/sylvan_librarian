@@ -569,9 +569,9 @@
         "prints_search_uri": "https://api.example/v1/cards/search?order=released&q=oracleid%3A&unique=prints",
         "promo": false,
         "purchase_uris": {
-          "cardhoarder": "https://www.cardhoarder.com/cards?data%5Bsearch%5D=Fire",
-          "cardmarket": "https://www.cardmarket.com/en/Magic/Products/Search?searchString=Fire",
-          "tcgplayer": "https://www.tcgplayer.com/search/magic/product?productLineName=magic&q=Fire&view=grid"
+          "cardhoarder": "https://www.cardhoarder.com/cards?data%5Bsearch%5D=Fire+%2F%2F+Ice",
+          "cardmarket": "https://www.cardmarket.com/en/Magic/Products/Search?searchString=Fire+%2F%2F+Ice",
+          "tcgplayer": "https://www.tcgplayer.com/search/magic/product?productLineName=magic&q=Fire+%2F%2F+Ice&view=grid"
         },
         "rarity": null,
         "related_uris": {
@@ -823,9 +823,9 @@
         "prints_search_uri": "https://api.example/v1/cards/search?order=released&q=oracleid%3A33333333-4444-5555-6666-777777777777&unique=prints",
         "promo": false,
         "purchase_uris": {
-          "cardhoarder": "https://www.cardhoarder.com/cards?data%5Bsearch%5D=Propaganda",
-          "cardmarket": "https://www.cardmarket.com/en/Magic/Products/Search?searchString=Propaganda",
-          "tcgplayer": "https://www.tcgplayer.com/search/magic/product?productLineName=magic&q=Propaganda&view=grid"
+          "cardhoarder": "https://www.cardhoarder.com/cards?data%5Bsearch%5D=Propaganda+%2F%2F+Propaganda",
+          "cardmarket": "https://www.cardmarket.com/en/Magic/Products/Search?searchString=Propaganda+%2F%2F+Propaganda",
+          "tcgplayer": "https://www.tcgplayer.com/search/magic/product?productLineName=magic&q=Propaganda+%2F%2F+Propaganda&view=grid"
         },
         "rarity": null,
         "related_uris": {
