@@ -12,6 +12,7 @@ import copy
 import json
 import uuid
 from typing import TYPE_CHECKING
+from unittest.mock import MagicMock, patch
 from urllib.parse import urlencode
 
 import falcon
@@ -21,6 +22,7 @@ import pytest
 from cachebox import LRUCache
 
 from api.enums import SortDirection, resolve_direction
+from api.parsing import parse_scryfall_query
 from api.scryfall_compat.objects import PAGE_SIZE
 from api.settings import settings
 from api.tests.helpers import make_raw_card
@@ -49,6 +51,15 @@ VAULT_ID = "66666666-6666-4666-8666-666666666666"
 # here, so this name stays inside the bound rather than pinning the wrong divergence.
 WHO_NAME = "Cw Who // Cw What // Cw When // Cw Where // Cw Why"
 VAULT_NAME = "Compat Lim-Dûl's Vault"
+
+# The collection-scope tests want ONE name with TWO printings in different sets, so a scope has
+# something to choose between. Sets of their own, so nothing else here counts them.
+SCOPE_NAME = "Compat Scoped Bolt"
+SCOPE_ORACLE_ID = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
+SCOPE_SET_A = "sfa"
+SCOPE_SET_B = "sfb"
+SCOPE_A_ID = "77777777-7777-4777-8777-777777777777"
+SCOPE_B_ID = "88888888-8888-4888-8888-888888888888"
 
 
 def _bolt() -> dict:
@@ -188,10 +199,38 @@ def _vault() -> dict:
     return card
 
 
+def _scoped(card_id: str, set_code: str, number: str) -> dict:
+    """One of the two printings of `SCOPE_NAME`, the card a collection scope filters between."""
+    card = make_raw_card(card_id=card_id, name=SCOPE_NAME)
+    card |= {
+        "object": "card",
+        "oracle_id": SCOPE_ORACLE_ID,
+        "set": set_code,
+        "set_name": f"Scryfall Compat Scope {set_code.upper()}",
+        "collector_number": number,
+        "mana_cost": "{R}",
+        "type_line": "Instant",
+        "oracle_text": f"{SCOPE_NAME} deals 3 damage to any target.",
+        "colors": ["R"],
+        "color_identity": ["R"],
+        "lang": "en",
+    }
+    return card
+
+
 @pytest.fixture(name="compat_corpus", scope="module")
 def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
     """Load this module's cards and their rulings once, then hand back the resource."""
-    api_resource.admin._upsert_cards([copy.deepcopy(card) for card in (_bolt(), _bear(), _delver(), _who(), _vault())])
+    cards = (
+        _bolt(),
+        _bear(),
+        _delver(),
+        _who(),
+        _vault(),
+        _scoped(SCOPE_A_ID, SCOPE_SET_A, "1"),
+        _scoped(SCOPE_B_ID, SCOPE_SET_B, "1"),
+    )
+    api_resource.admin._upsert_cards([copy.deepcopy(card) for card in cards])
     with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
         cursor.execute("DELETE FROM magic.rulings WHERE oracle_id = %(oracle_id)s", {"oracle_id": BOLT_ORACLE_ID})
         # Three rulings across two dates, two of them same-day: a single ruling cannot tell one
@@ -736,6 +775,122 @@ class TestCollection:
     def test_get_is_not_allowed(self, compat_corpus: APIResource):
         with pytest.raises(falcon.HTTPMethodNotAllowed):
             dispatch(compat_corpus, "/cards/collection")
+
+
+class TestCollectionScope:
+    """POST /cards/collection?q= -- the batch's SCOPE, this API's extension to Scryfall's endpoint.
+
+    A search query applied to every `{name}` and `{name, set}` identifier: its filter terms
+    restrict the printings a name may resolve to, and the printing answered is the best of those
+    that pass. Identifiers that already name one printing never consult it, and a name none of
+    whose printings pass is not_found, exactly as a name that does not exist.
+
+    Every resolution case runs TWICE through `by_name_paths`, the engine serving and then the SQL
+    fallback. The scope is a filter either path can apply, and a rule one of them skipped would
+    make the same request answer differently depending on which worker took it.
+    """
+
+    @staticmethod
+    def _collection(api: APIResource, identifiers: list[dict], q: str | None = None) -> falcon.Response:
+        query_string = urlencode({"q": q}) if q is not None else ""
+        return dispatch(api, "/cards/collection", query_string, method="POST", body={"identifiers": identifiers})
+
+    @classmethod
+    def _ids(cls, api: APIResource, identifiers: list[dict], q: str | None = None) -> list[str]:
+        return [card["id"] for card in payload(cls._collection(api, identifiers, q))["data"]]
+
+    def test_without_a_scope_the_default_pick_stands(self, by_name_paths: APIResource):
+        """Two printings, no scope: the lookup is what it always was, one of them by default order."""
+        assert self._ids(by_name_paths, [{"name": SCOPE_NAME}]) in ([SCOPE_A_ID], [SCOPE_B_ID])
+
+    @pytest.mark.parametrize(
+        ("q", "expected"),
+        [
+            (f"e:{SCOPE_SET_B}", SCOPE_B_ID),
+            (f"e:{SCOPE_SET_A}", SCOPE_A_ID),
+            (f"-e:{SCOPE_SET_B}", SCOPE_A_ID),
+            (f"s:{SCOPE_SET_B} t:instant", SCOPE_B_ID),
+        ],
+    )
+    def test_the_scope_filters_a_names_printings(self, by_name_paths: APIResource, q, expected):
+        """The full query syntax, applied to the name's printings rather than to the search page."""
+        assert self._ids(by_name_paths, [{"name": SCOPE_NAME}], q) == [expected]
+
+    def test_a_name_none_of_whose_printings_pass_is_not_found(self, by_name_paths: APIResource):
+        body = payload(self._collection(by_name_paths, [{"name": SCOPE_NAME}], "e:sfz"))
+        assert body["data"] == []
+        assert body["not_found"] == [{"name": SCOPE_NAME}]
+
+    def test_the_identifiers_own_set_and_the_scope_compose(self, by_name_paths: APIResource):
+        """`{"name", "set"}` filters to one set and the scope to another: nothing is in both."""
+        identifier = {"name": SCOPE_NAME, "set": SCOPE_SET_A}
+        body = payload(self._collection(by_name_paths, [identifier], f"e:{SCOPE_SET_B}"))
+        assert body["data"] == []
+        assert body["not_found"] == [identifier]
+
+    def test_id_shaped_identifiers_never_consult_the_scope(self, by_name_paths: APIResource):
+        """An id and a set+number each name ONE printing; only the name is scoped to the other set."""
+        identifiers = [{"id": SCOPE_A_ID}, {"set": SCOPE_SET_A, "collector_number": "1"}, {"name": SCOPE_NAME}]
+        assert self._ids(by_name_paths, identifiers, f"e:{SCOPE_SET_B}") == [SCOPE_A_ID, SCOPE_B_ID]
+
+    def test_a_scope_that_does_not_parse_is_scryfalls_400(self, compat_corpus: APIResource):
+        """The same parser and the same 400 `/cards/search` and `/cards/random` answer with."""
+        resp = self._collection(compat_corpus, [{"name": SCOPE_NAME}], "(t:goblin")
+        assert resp.status == falcon.HTTP_400
+        body = payload(resp)
+        assert body["code"] == "bad_request"
+        assert body["details"] == 'Failed to parse query: "(t:goblin"'
+
+    def test_a_blank_scope_is_no_scope(self, compat_corpus: APIResource):
+        assert self._ids(compat_corpus, [{"id": SCOPE_A_ID}], "   ") == [SCOPE_A_ID]
+
+    def test_the_body_is_validated_before_the_scope(self, compat_corpus: APIResource):
+        """A malformed body answers its own error; the scope is not parsed until the body passes."""
+        resp = dispatch(
+            compat_corpus,
+            "/cards/collection",
+            urlencode({"q": "(t:goblin"}),
+            method="POST",
+            body={"identifiers": "nope"},
+        )
+        body = payload(resp)
+        assert body["code"] == "validation_error"
+        assert body["status"] == 422
+
+    @pytest.mark.usefixtures("engine_enabled")
+    def test_the_names_go_to_the_engine_as_one_batch(self, stub_api_resource: APIResource):
+        """ONE `collection_cards_by_names` call carries every name, in order, with the scope.
+
+        The scope is bound inside that call -- the filter compiled, the prefer's vocabulary ids
+        resolved -- so one call per request is what keeps a 75-name batch from binding it 75 times.
+        The id-shaped identifier takes its own lookup and never sees the scope.
+        """
+        engine = MagicMock()
+        engine.size.return_value = 7
+        engine.card_by_scryfall_id.return_value = {"scryfall_id": BOLT_ID, "name": "Compat Bolt"}
+        engine.collection_cards_by_names.return_value = [{"scryfall_id": SCOPE_B_ID, "name": SCOPE_NAME}, None]
+        identifiers = [{"name": SCOPE_NAME}, {"id": BOLT_ID}, {"name": "No Such Compat Card", "set": "sfc"}]
+        q = f"-e:{SCOPE_SET_A} t:instant"
+        with patch.object(stub_api_resource.app_context, "engine", engine):
+            body = payload(self._collection(stub_api_resource, identifiers, q))
+
+        engine.collection_cards_by_names.assert_called_once()
+        args, kwargs = engine.collection_cards_by_names.call_args
+        assert args[0] == [(SCOPE_NAME.lower(), None), ("no such compat card", "sfc")]
+        assert kwargs["prefer"] == "default"
+        assert kwargs["filters"].to_json() == parse_scryfall_query(q).to_json()
+        assert [card["id"] for card in body["data"]] == [SCOPE_B_ID, BOLT_ID]
+        assert body["not_found"] == [{"name": "No Such Compat Card", "set": "sfc"}]
+
+    @pytest.mark.usefixtures("engine_enabled")
+    def test_no_scope_reaches_the_engine_as_none(self, stub_api_resource: APIResource):
+        engine = MagicMock()
+        engine.size.return_value = 7
+        engine.collection_cards_by_names.return_value = [{"scryfall_id": SCOPE_A_ID, "name": SCOPE_NAME}]
+        with patch.object(stub_api_resource.app_context, "engine", engine):
+            body = payload(self._collection(stub_api_resource, [{"name": SCOPE_NAME}]))
+        assert engine.collection_cards_by_names.call_args.kwargs["filters"] is None
+        assert [card["id"] for card in body["data"]] == [SCOPE_A_ID]
 
 
 class TestRulings:

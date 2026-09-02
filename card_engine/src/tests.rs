@@ -21,7 +21,7 @@ use super::{
     build_printing_by_scryfall_id, build_oracle_by_oracle_id, find_printing_by_scryfall_id, find_oracle_by_oracle_id,
     build_external_id_index, find_printing_by_external_id, EXT_MULTIVERSE, EXT_MTGO, EXT_ARENA, EXT_TCGPLAYER,
     trigram_similarity, fuzzy_name_match, autocomplete_names, FuzzyOutcome,
-    exact_name_match, collection_name_match, names_containing_all_words,
+    exact_name_match, collection_name_match, names_containing_all_words, name_best, NameScope, CollectionScope,
     VOCAB_NONE, COMPAT_FULL_ART, COMPAT_PROMO, COMPAT_REPRINT, COMPAT_TEXTLESS, GAME_PAPER, GAME_ARENA, FINISH_FOIL, FINISH_NONFOIL,
     TextField, TextSearchField, Tri, SortedTrigramIndex, VocabInterner, ARTIST_NONE, NONE_STR, TYPE_ARTIFACT, TYPE_CREATURE,
     TYPE_ENCHANTMENT, TYPE_INSTANT, TYPE_LAND, TYPE_LEGENDARY, TYPE_PLANESWALKER, TYPE_SNOW, TYPE_SORCERY,
@@ -13554,6 +13554,66 @@ fn name_lookups_agree_with_and_without_the_trigram_index() {
     assert_eq!(exact_name_match(idx, "lightning bolt", None).map(|(cid, _)| cid), Some(0));
     // A face match is still found when nothing carries the whole name.
     assert_eq!(exact_name_match(idx, "insectile aberration", None).map(|(cid, _)| cid), Some(2));
+}
+
+/// A collection SCOPE narrows a `{name}` identifier to the printings passing its filter and
+/// picks among them by its prefer -- the `?q=` of `POST /cards/collection`.
+///
+/// Clive, Ifrit's Dominant in miniature: the plain fin/133 first in default order, the
+/// date-stamped prerelease promo second, the borderless fin/318 third. No scope answers
+/// fin/133; `prefer:atypical` answers the promo (a date stamp is an atypical treatment, and it
+/// ranks first among the atypical ones, on api.scryfall.com too); `-is:datestamped
+/// prefer:atypical` answers the borderless one; and a filter no printing passes is None, exactly
+/// as a name that does not exist.
+#[test]
+fn a_collection_scope_filters_the_printings_and_prefers_among_them() {
+    let mut vocab = VocabInterner::new();
+    let datestamped = vocab.intern("datestamped".to_owned()).expect("vocab");
+    let prerelease = vocab.intern("prerelease".to_owned()).expect("vocab");
+    let mut card = stub_card(1, TYPE_CREATURE, &[], &mut vocab);
+    card.card_name_lower = InlineStr::from_str("clive, ifrit's dominant");
+    let mut data = store_of(vec![card], &[3], vocab);
+    data.strings.push("black".to_owned());
+    data.strings.push("borderless".to_owned());
+    let (black, borderless) = ((data.strings.len() - 2) as u32, (data.strings.len() - 1) as u32);
+    for (p, set) in data.printings.iter_mut().zip(["fin", "pfin", "fin"]) {
+        p.card_set_code = InlineStr::from_str(set);
+        p.card_border_id = black;
+    }
+    // The tag is what `-is:datestamped` reads; the promo_types member is what the atypical class
+    // reads (see `PreferClassIds`) -- the importer writes both from the one bulk key.
+    data.printings[1].card_is_tags = vec![datestamped];
+    data.printings[1].compat.promo_types = vec![prerelease, datestamped];
+    data.printings[2].card_border_id = borderless;
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+
+    let is_tag = |tag: &str| FilterExpr::CollectionCmp { field: CollField::IsTags, op: CmpOp::Ge, value: tag.to_owned(), value_id: None };
+    let not_datestamped = || FilterExpr::Not(Box::new(is_tag("datestamped")));
+    // Bound the way `bind_collection_scope` binds: the filter against this store's vocabs, the
+    // prefer's class ids through `bind_prefer`.
+    let scope = |prefer: &str, filter: Option<FilterExpr>| CollectionScope {
+        prefer: QueryParams::from_strs("printing", prefer, "name", "asc", 1, 0).bind_prefer(&archived.coll_vocab).prefer,
+        filter: filter.map(|mut f| {
+            f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+            f
+        }),
+    };
+    let pick = |set_code: Option<&str>, scope: Option<&CollectionScope>| -> Option<usize> {
+        name_best(archived, "clive, ifrit's dominant", set_code, NameScope::Collection, scope).map(|(_, pid)| pid)
+    };
+
+    assert_eq!(pick(None, None), Some(0), "no scope: the default pick");
+    assert_eq!(pick(None, Some(&scope("atypical", None))), Some(1), "the date stamp is atypical and ranks first");
+    assert_eq!(pick(None, Some(&scope("atypical", Some(not_datestamped())))), Some(2), "filtered to the borderless printing");
+    assert_eq!(pick(None, Some(&scope("default", Some(not_datestamped())))), Some(0), "a filter alone keeps the default order");
+    let none_pass = FilterExpr::And(vec![is_tag("datestamped"), is_tag("nonexistenttag")]);
+    assert_eq!(pick(None, Some(&scope("atypical", Some(none_pass)))), None, "a filter no printing passes is not_found");
+    // The identifier's own `set` and the scope COMPOSE: inside `pfin`, `-is:datestamped` leaves nothing.
+    assert_eq!(pick(Some("pfin"), None), Some(1));
+    assert_eq!(pick(Some("pfin"), Some(&scope("default", Some(not_datestamped())))), None);
+    // `exact=` never consults a scope.
+    assert_eq!(exact_name_match(archived, "clive, ifrit's dominant", None).map(|(_, pid)| pid), Some(0));
 }
 
 /// A store of `names`, folded == lowered (the fixture leaves `card_name_folded_id` unset), with

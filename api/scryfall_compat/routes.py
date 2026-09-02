@@ -64,6 +64,8 @@ from api.utils.routing import route
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
+    from api.parsing.nodes import Query
+
 logger = logging.getLogger(__name__)
 
 # Columns every card lookup needs: the blob `to_scryfall_card` reads, plus the id it is re-sorted
@@ -289,6 +291,22 @@ class _EngineMiss:
 
 
 _ENGINE_MISS = _EngineMiss()
+
+
+class _NameIdentifier:
+    """A collection identifier of the `{name}` / `{name, set}` shape, held back for the batch.
+
+    `_resolve_identifier` answers every other shape on the spot; a name is answered by
+    `_cards_by_name_identifiers`, ONE engine call for the whole request, so the batch's scope is
+    bound once rather than once per identifier.
+    """
+
+    __slots__ = ("name", "set_code")
+
+    def __init__(self, name: str, set_code: str | None) -> None:
+        self.name = name
+        self.set_code = set_code
+
 
 # SQL fallback only: the blob subfields each external-id namespace maps to. The engine path uses its
 # own index and never reads these.
@@ -1479,14 +1497,22 @@ class ScryfallCardsRoutes:
         falcon_response: falcon.Response | None = None,
         request: falcon.Request | None = None,
         pretty: str = "false",
+        q: str | None = None,
         **_: object,
     ) -> dict[str, Any] | None:
         """Resolve up to 75 card identifiers in one request.
+
+        `q` is this API's extension to Scryfall's endpoint: a search query that SCOPES every
+        `{name}` and `{name, set}` identifier in the batch -- see `_collection_scope`. In the URL
+        rather than the body, because the body is Scryfall's `{identifiers}` schema and a client
+        built on a Scryfall SDK can append a query parameter where it could not add a body key;
+        `q` is where the search surface already puts it.
 
         Args:
             falcon_response: The Falcon response to write to.
             request: The Falcon request, whose JSON body carries the identifiers.
             pretty: Whether to indent JSON output.
+            q: A search query every `{name}` identifier resolves under; optional.
 
         Returns:
             A List object whose `data` holds the cards found and whose `not_found` holds the
@@ -1525,11 +1551,16 @@ class ScryfallCardsRoutes:
                 pretty=is_pretty,
             )
 
+        # THE BATCH'S `?q=`, parsed after the body is validated so a malformed body still answers
+        # its own error first.
+        scope, refused = self._collection_scope(q)
+        if refused is not None:
+            return self._scryfall_respond(falcon_response, refused, pretty=is_pretty)
+
         found: list[dict[str, Any]] = []
         not_found: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for identifier in identifiers:
-            card = self._resolve_identifier(identifier) if isinstance(identifier, dict) else None
+        for identifier, card in zip(identifiers, self._resolve_identifiers(identifiers, scope), strict=True):
             if card is None:
                 not_found.append(identifier)
                 continue
@@ -1540,11 +1571,98 @@ class ScryfallCardsRoutes:
 
         return self._scryfall_respond(falcon_response, card_list(found, not_found=not_found), pretty=is_pretty)
 
-    def _resolve_identifier(self, identifier: dict[str, Any]) -> dict[str, Any] | None:
+    def _collection_scope(self, q: str | None) -> tuple[Query | None, dict[str, Any] | None]:
+        """Parse the batch's `?q=`: the SCOPE every `{name}` identifier resolves under.
+
+        Its filter terms restrict the printings a name may resolve to, and the printing answered
+        is the best of those that pass -- `?q=e:sld` answers a name's Secret Lair printing, and a
+        name with no printing in the set is `not_found`, exactly as a name that does not exist.
+        Identifiers that already name ONE printing (id, oracle id, illustration id, external id,
+        set+number) never consult it.
+
+        ONE PARSER. The query goes through `parse_scryfall_query`, the parser `/cards/search` and
+        `/cards/random` use, and a query that does not parse is answered with the same 400s they
+        answer: the budget's stable message, the regex message, or Scryfall's
+        `Failed to parse query`. Scryfall's `include_extras` defaults are NOT applied -- a
+        collection resolves tokens and extras by id, and a scope is the caller's own filter, not
+        the search page's.
+
+        The scope's PREFER half -- `prefer:atypical` picking among the printings that pass -- is
+        the engine's `CollectionScope`, reached through the `prefer` argument of
+        `collection_cards_by_names`. Nothing on this route sets it yet: a `prefer:` written inside
+        `q` is folded out of the query by the in-query directive fold (#893), which is what puts
+        it there, together with the warnings for the page-shaping directives (`unique:`, `sort:`,
+        `direction:`) that mean nothing to a lookup answering one printing per identifier.
+
+        Args:
+            q: The query parameter as sent, or None.
+
+        Returns:
+            The parsed query (None for no scope), and the error object to answer with (None when
+            the query parsed).
+        """
+        if not q or not q.strip():
+            return None, None
+        try:
+            return parse_scryfall_query(q), None
+        except QueryBudgetExceeded as err:
+            # Same treatment `_search` gives the budget: the stable non-disclosing message, and a
+            # bounded preview in the log rather than the full query in the body.
+            log_ctx = bounded_query_log_context(q)
+            logger.info(
+                "Query budget exceeded (%s) preview=%r digest=%s",
+                err.kind,
+                log_ctx["query_preview"],
+                log_ctx["query_digest"],
+            )
+            return None, bad_request_error(err.user_message)
+        except InvalidRegexPatternError as err:
+            return None, bad_request_error(err.user_message_for_query(q))
+        except ValueError:
+            return None, bad_request_error(f'Failed to parse query: "{q}"')
+
+    def _resolve_identifiers(self, identifiers: list[Any], scope: Query | None) -> list[dict[str, Any] | None]:
+        """Resolve every identifier: one answer per identifier, in the order they were sent.
+
+        The id-shaped identifiers resolve one at a time, each through its own lookup. The
+        `{name}` identifiers are gathered and resolved as ONE batch, because that is where the
+        scope is bound -- once per request, not once per name.
+
+        Args:
+            identifiers: The request's `identifiers` array, validated for length only.
+            scope: The batch's parsed `?q=`, or None.
+
+        Returns:
+            The card each identifier names, or None for one that resolved to nothing or whose
+            shape is not one Scryfall defines.
+        """
+        resolved: list[dict[str, Any] | None] = []
+        deferred: list[tuple[int, _NameIdentifier]] = []
+        for at, identifier in enumerate(identifiers):
+            card = self._resolve_identifier(identifier, defer_names=True) if isinstance(identifier, dict) else None
+            if isinstance(card, _NameIdentifier):
+                deferred.append((at, card))
+                resolved.append(None)
+            else:
+                resolved.append(card)
+        if deferred:
+            names = [(named.name, named.set_code) for _, named in deferred]
+            for (at, _), card in zip(deferred, self._cards_by_name_identifiers(names, scope), strict=True):
+                resolved[at] = card
+        return resolved
+
+    def _resolve_identifier(
+        self,
+        identifier: dict[str, Any],
+        *,
+        defer_names: bool = False,
+    ) -> dict[str, Any] | _NameIdentifier | None:
         """Resolve one collection identifier to a card.
 
         Args:
             identifier: One entry of the request's `identifiers` array.
+            defer_names: Hand a `{name}` identifier back as a `_NameIdentifier` for the caller
+                to batch, rather than resolving it here.
 
         Returns:
             The card it names, or None when nothing matched or the shape is not one Scryfall
@@ -1567,14 +1685,18 @@ class ScryfallCardsRoutes:
             )
         if "name" in identifier:
             set_code = identifier.get("set")
-            return self._card_by_name_identifier(
-                str(identifier["name"]),
-                str(set_code) if set_code else None,
-            )
+            named = _NameIdentifier(str(identifier["name"]), str(set_code) if set_code else None)
+            if defer_names:
+                return named
+            return self._cards_by_name_identifiers([(named.name, named.set_code)], None)[0]
         return None
 
-    def _card_by_name_identifier(self, name: str, set_code: str | None) -> dict[str, Any] | None:
-        """Resolve a collection identifier's `name` -- a NAME LOOKUP with its own keys.
+    def _cards_by_name_identifiers(
+        self,
+        names: list[tuple[str, str | None]],
+        scope: Query | None,
+    ) -> list[dict[str, Any] | None]:
+        """Resolve collection identifiers' `name`s -- a NAME LOOKUP with its own keys, batched.
 
         Not `named?exact=`'s keys, which is why this is its own engine entry point and not a call
         to the one beside it: `{"name":"Delver of Secrets // Insectile Aberration"}` is not_found on
@@ -1595,31 +1717,58 @@ class ScryfallCardsRoutes:
         where SQL answering a needle the engine reported not_found would be the pre-existing bug
         coming back through the fallback.
 
+        ONE ENGINE CALL for the whole batch (`collection_cards_by_names`), because the scope is
+        bound there -- the filter compiled, the prefer's vocabulary ids resolved -- and binding it
+        once per identifier is not free: the Cloudflare port measured a 75-identifier batch at
+        ~70ms with a tag scope and ~165ms with a regex in the scope against 25ms unscoped when it
+        bound per identifier, and 31ms and 29ms batched.
+
+        The SQL fallback applies the scope's FILTER through `generate_sql_query`, the same
+        translation `/cards/random` uses, and keeps the default order for its pick -- which is
+        the engine's answer under no prefer, so the two paths agree on everything this route sends
+        today (see `_collection_scope` for where the prefer half arrives).
+
         Args:
-            name: The identifier's `name` value, as posted.
-            set_code: The identifier's `set`, which FILTERS the lookup -- `{"name":"Delver of
-                Secrets","set":"mid"}` answers mid/47, the same card in the set asked for, and a
-                card with no printing in that set drops out rather than answering another printing.
+            names: Each identifier's `name` as posted and its `set`, which FILTERS the lookup --
+                `{"name":"Delver of Secrets","set":"mid"}` answers mid/47, the same card in the set
+                asked for, and a card with no printing in that set drops out rather than answering
+                another printing.
+            scope: The batch's parsed `?q=`, or None.
 
         Returns:
-            The card it names, or None for not_found.
+            One entry per name, in order: the card it names, or None for not_found.
         """
-        collated = _collate_name(name)
+        out: list[dict[str, Any] | None] = [None] * len(names)
         # A needle with no alphanumeric character is nobody's name. Answered here rather than as a
         # query, because `%(collated)s = ''` would match any card whose name is punctuation alone.
-        if not collated:
-            return None
-        found = self._engine_card(
-            lambda e: e.collection_card_by_name(fold_accents(name.strip().lower()), set_code, list(CARD_OBJECT_FIELDS)),
-        )
-        if found is not _ENGINE_MISS:
-            return found
-        clauses = [_COLLECTION_NAME_MATCH]
-        params: dict[str, Any] = {"collated": collated}
-        if set_code:
-            clauses.append("lower(card_set_code) = lower(%(set_code)s)")
-            params["set_code"] = set_code
-        return self._fetch_one_card(" AND ".join(clauses), params, rank_first=_WHOLE_NAME_FIRST)
+        asked = [(at, name, set_code) for at, (name, set_code) in enumerate(names) if _collate_name(name)]
+        if not asked:
+            return out
+        engine = self._engine_for_lookup()
+        if engine is not None:
+            try:
+                rows = engine.collection_cards_by_names(
+                    [(fold_accents(name.strip().lower()), set_code) for _, name, set_code in asked],
+                    list(CARD_OBJECT_FIELDS),
+                    prefer=str(PreferOrder.DEFAULT),
+                    filters=scope,
+                )
+            # Any engine failure is a fallback, never a 500.
+            except Exception:
+                logger.exception("Engine collection lookup failed, falling back to SQL")
+            else:
+                for (at, _, _), row in zip(asked, rows, strict=True):
+                    out[at] = to_scryfall_card(row) if row else None
+                return out
+        scope_where, scope_params = generate_sql_query(scope) if scope is not None else ("TRUE", {})
+        for at, name, set_code in asked:
+            clauses = [_COLLECTION_NAME_MATCH, f"({scope_where})"]
+            params: dict[str, Any] = {**scope_params, "collated": _collate_name(name)}
+            if set_code:
+                clauses.append("lower(card_set_code) = lower(%(set_code)s)")
+                params["set_code"] = set_code
+            out[at] = self._fetch_one_card(" AND ".join(clauses), params, rank_first=_WHOLE_NAME_FIRST)
+        return out
 
     # ---------------------------------------------------------------- GET /cards and /cards/...
 

@@ -3364,6 +3364,34 @@ pub(crate) enum NameScope {
     Collection,
 }
 
+/// The `?q=` of a `POST /cards/collection`, bound against one store and applied to every `{name}`
+/// and `{name, set}` identifier in the batch.
+///
+/// Two halves, both optional. A FILTER every candidate printing must pass (`-is:datestamped`,
+/// `-is:promo`, `e:sld` -- the full query syntax, compiled by the same binder `/cards/search`
+/// uses), and a PREFER that picks among the printings that pass (`prefer:atypical`, the same
+/// `prefer_score` a `unique=cards` search picks its representative with). Without a scope the
+/// lookup is what it always was: the name record's first printing in default order, the default
+/// pick. Identifiers that already name ONE printing (id, oracle id, set+number, ...) never
+/// consult it, and a name none of whose printings pass is None, exactly as a name that does not
+/// exist.
+///
+/// Why it exists: `prefer:atypical` alone answers Clive, Ifrit's Dominant with the date-stamped
+/// prerelease promo pfin/133s, on api.scryfall.com's search and here alike, because the date
+/// stamp is an atypical treatment and that printing ranks first among the atypical ones by
+/// collector number. A client that wants the borderless printing says so --
+/// `-is:datestamped prefer:atypical` -- and gets fin/318.
+///
+/// Bound ONCE per batch (`QueryEngine::bind_collection_scope`), not once per identifier. Measured
+/// in the Cloudflare port on a 75-identifier batch before its batch entry point existed: binding
+/// per identifier cost ~45ms with a tag scope and ~140ms with a regex in the scope (75 regex
+/// compiles), against 25ms unscoped; batched, 31ms and 29ms.
+struct CollectionScope {
+    prefer: Prefer,
+    /// `None` for a query that was only directives, or no query at all: no filter.
+    filter: Option<FilterExpr>,
+}
+
 /// A name COLLATED: every non-alphanumeric character removed. The needle side of the comparison.
 ///
 /// Scryfall compares names this way, on both name surfaces. Measured on api.scryfall.com,
@@ -3449,6 +3477,39 @@ fn prefer_of(data: &Archived<CardData>, pid: usize) -> f32 {
     data.printings[pid].prefer_score.as_ref().map_or(f32::MIN, |v| v.to_native())
 }
 
+/// `best_printing_in_set` under a collection scope: the best printing that passes the set filter
+/// AND the scope's filter, "best" being the scope's prefer over the printings that pass -- the
+/// same `prefer_score` `unique=cards` picks a representative with, so `?q=prefer:atypical` on a
+/// collection answers the printing `prefer:atypical` answers on a search. No scope is exactly
+/// `best_printing_in_set`, scored by the default order.
+fn best_printing_in_scope(
+    data: &Archived<CardData>,
+    cid: usize,
+    set_code: Option<&str>,
+    scope: Option<&CollectionScope>,
+) -> Option<(usize, f64)> {
+    let Some(scope) = scope else {
+        return best_printing_in_set(data, cid, set_code).map(|pid| (pid, f64::from(prefer_of(data, pid))));
+    };
+    let card = &data.cards[cid];
+    let (from, to) = (u32::from(data.offsets[cid]) as usize, u32::from(data.offsets[cid + 1]) as usize);
+    let passes = |pid: usize| {
+        let p = &data.printings[pid];
+        set_code.is_none_or(|code| p.card_set_code.as_str().eq_ignore_ascii_case(code))
+            && scope.filter.as_ref().is_none_or(|f| FilterExpr::residual_matches(card, p, &data.strings, &[f], false))
+    };
+    let mut best: Option<(usize, f64)> = None;
+    for pid in (from..to).filter(|&pid| passes(pid)) {
+        let score = prefer_score(card, &data.printings[pid], scope.prefer, &data.strings);
+        // Strict >, so the first printing in store order (the default pick) wins a tie -- the
+        // rule every representative choice in the engine uses.
+        if best.is_none_or(|(_, s)| score > s) {
+            best = Some((pid, score));
+        }
+    }
+    best
+}
+
 /// `named?exact=`: the best printing of the card the needle NAMES, `exact=`'s keys.
 ///
 /// `name_key_tier`'s keys plus the JOINED name of a two-faced card -- Scryfall answers
@@ -3466,7 +3527,7 @@ fn prefer_of(data: &Archived<CardData>, pid: usize) -> f32 {
 /// scope split opens -- and it happens to leave the COLLECTION surface right, since a flavor name
 /// is not a collection identifier's key either.
 pub(crate) fn exact_name_match(data: &Archived<CardData>, folded: &str, set_code: Option<&str>) -> Option<(usize, usize)> {
-    name_best(data, folded, set_code, NameScope::Exact)
+    name_best(data, folded, set_code, NameScope::Exact, None)
 }
 
 /// `POST /cards/collection`'s `{"name": ...}` identifier: the best printing it names, within `set`.
@@ -3478,8 +3539,12 @@ pub(crate) fn exact_name_match(data: &Archived<CardData>, folded: &str, set_code
 ///
 /// Everything past the key rule is `exact=`'s: same tier ranking, same set filter, same printing
 /// chosen. Every needle both surfaces accept answers the same card on both.
+///
+/// The route reaches this scan through `QueryEngine::collection_cards_by_names`, which passes a
+/// `CollectionScope`; this scope-free form is what the differential index test compares.
+#[cfg(test)]
 pub(crate) fn collection_name_match(data: &Archived<CardData>, folded: &str, set_code: Option<&str>) -> Option<(usize, usize)> {
-    name_best(data, folded, set_code, NameScope::Collection)
+    name_best(data, folded, set_code, NameScope::Collection, None)
 }
 
 /// The shared scan behind both name surfaces: the best `(cid, pid)` for `folded` under `scope`.
@@ -3497,11 +3562,15 @@ pub(crate) fn collection_name_match(data: &Archived<CardData>, folded: &str, set
 /// prefer_score the narrowed pass answers the lower-ranked card. Closing it needs the index rebuilt
 /// over a collated name, which is an archive-format change and not this commit's; whether the
 /// corpus holds such a pair at all is not something this commit measured.
+///
+/// `restrict` is a collection batch's `?q=` -- see `CollectionScope`. With one, the printing
+/// answered is the best of those passing its filter under its prefer; `exact=` never passes one.
 fn name_best(
     data: &Archived<CardData>,
     folded: &str,
     set_code: Option<&str>,
     scope: NameScope,
+    restrict: Option<&CollectionScope>,
 ) -> Option<(usize, usize)> {
     let needle = collate_name(folded);
     // Nobody's name. Worth its own line because the alternative is a full scan of every card for a
@@ -3511,28 +3580,31 @@ fn name_best(
     }
     let candidates = name_scan_candidates(data, folded);
     let narrowed = candidates.len() < data.cards.len();
-    let best = name_best_over(data, candidates.into_iter(), &needle, set_code, scope);
+    let best = name_best_over(data, candidates.into_iter(), &needle, set_code, scope, restrict);
     if best.is_none() && narrowed {
-        return name_best_over(data, 0..data.cards.len() as u32, &needle, set_code, scope);
+        return name_best_over(data, 0..data.cards.len() as u32, &needle, set_code, scope, restrict);
     }
     best
 }
 
 /// `name_best`'s inner loop over one candidate set. `needle` is already collated.
+///
+/// Ranked on (tier, score), the score being the SCOPE's prefer score when there is one, so two
+/// cards of one name are ranked by the same key the winner's printing was chosen by.
 fn name_best_over(
     data: &Archived<CardData>,
     candidates: impl Iterator<Item = u32>,
     needle: &str,
     set_code: Option<&str>,
     scope: NameScope,
+    restrict: Option<&CollectionScope>,
 ) -> Option<(usize, usize)> {
-    let mut best: Option<(u8, f32, usize, usize)> = None;
+    let mut best: Option<(u8, f64, usize, usize)> = None;
     for cid in candidates {
         let cid = cid as usize;
         let stored = folded_name(&data.cards[cid], &data.strings);
         let Some(tier) = name_key_tier(stored, needle, scope) else { continue };
-        let Some(pid) = best_printing_in_set(data, cid, set_code) else { continue };
-        let score = prefer_of(data, pid);
+        let Some((pid, score)) = best_printing_in_scope(data, cid, set_code, restrict) else { continue };
         if best.is_none_or(|(bt, bs, _, _)| (tier, score) > (bt, bs)) {
             best = Some((tier, score, cid, pid));
         }
@@ -15204,11 +15276,33 @@ impl QueryEngine {
         Ok(mmap)
     }
 
-    /// The body shared by `exact_card_by_name` and `collection_card_by_name`.
+    /// `CollectionScope` bound against the mapped store: the filter compiled by the same binder
+    /// `query` uses (`bind_and_split_filter`, whose UNSPLIT form is what a per-printing check
+    /// wants), the prefer's vocabulary ids resolved through `bind_prefer`. Built once per batch
+    /// rather than once per identifier -- a regex in the scope is compiled here, not in the scan.
+    fn bind_collection_scope(
+        py: Python<'_>,
+        data: &Archived<CardData>,
+        prefer: &str,
+        filters: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<CollectionScope> {
+        let filter = match filters {
+            Some(filters) => {
+                let (_, _, _, unsplit) = bind_and_split_filter(py, filters, "printing", data, SortCol::Name)?;
+                // A query that was only directives leaves a TrueNode behind, which is no filter.
+                (!matches!(unsplit, FilterExpr::True)).then_some(unsplit)
+            }
+            None => None,
+        };
+        let prefer = QueryParams::from_strs("printing", prefer, "name", "asc", 1, 0).bind_prefer(&data.coll_vocab).prefer;
+        Ok(CollectionScope { prefer, filter })
+    }
+
+    /// The body of `exact_card_by_name`, and of `collection_card_by_name` before it grew a scope.
     ///
     /// Off the `#[pymethods]` block on purpose: everything in there is exported to Python, and the
-    /// two name routes differ only by which lookup they hand in -- a Rust function with no Python
-    /// spelling, so this is not a signature a caller could reach.
+    /// name routes differ by which lookup they hand in -- a Rust function with no Python spelling,
+    /// so this is not a signature a caller could reach.
     fn card_by_name<'py>(
         &self,
         py: Python<'py>,
@@ -16136,15 +16230,68 @@ impl QueryEngine {
     /// SAME: measured on api.scryfall.com, `{"name":"Delver of Secrets // Insectile Aberration"}`
     /// is not_found while `exact=` of that string is the card. `name_key_tier` carries the rest of
     /// the measurements.
-    #[pyo3(signature = (folded, set_code=None, fields=None))]
+    ///
+    /// `prefer` and `filters` are the batch's `?q=` -- see `CollectionScope`. One identifier is a
+    /// batch of one: this delegates to `collection_cards_by_names`, which is what the route calls.
+    #[pyo3(signature = (folded, set_code=None, fields=None, prefer="default", filters=None))]
     fn collection_card_by_name<'py>(
         &self,
         py: Python<'py>,
         folded: &str,
         set_code: Option<&str>,
         fields: Option<Vec<String>>,
+        prefer: &str,
+        filters: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        self.card_by_name(py, folded, set_code, fields, collection_name_match)
+        let identifiers = vec![(folded.to_owned(), set_code.map(str::to_owned))];
+        Ok(self.collection_cards_by_names(py, identifiers, fields, prefer, filters)?.pop().flatten())
+    }
+
+    /// `collection_card_by_name` over a whole batch: ONE ANSWER PER IDENTIFIER, in the order they
+    /// were sent, None for a name that resolves to nothing. The shape `POST /cards/collection`
+    /// calls, because the SCOPE IS BOUND ONCE HERE and reused for every identifier -- see
+    /// `CollectionScope` for what binding per identifier measured at.
+    ///
+    /// `prefer` is a `prefer=` value under this API's spellings ("default" is no preference) and
+    /// `filters` the parsed query whose terms every candidate printing must pass, exactly the
+    /// objects `query` takes. Neither given is the unscoped lookup, byte for byte.
+    #[pyo3(signature = (identifiers, fields=None, prefer="default", filters=None))]
+    fn collection_cards_by_names<'py>(
+        &self,
+        py: Python<'py>,
+        identifiers: Vec<(String, Option<String>)>,
+        fields: Option<Vec<String>>,
+        prefer: &str,
+        filters: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Vec<Option<Bound<'py, PyDict>>>> {
+        let resolved_fields = resolve_fields(fields)?;
+        let mmap = self.get_mmap()?;
+        // Safety: see the access_unchecked justification in query().
+        let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
+        let scope = (prefer != "default" || filters.is_some())
+            .then(|| Self::bind_collection_scope(py, data, prefer, filters))
+            .transpose()?;
+        let mut out = Vec::with_capacity(identifiers.len());
+        for (folded, set_code) in &identifiers {
+            let Some((cid, pid)) = name_best(data, folded, set_code.as_deref(), NameScope::Collection, scope.as_ref()) else {
+                out.push(None);
+                continue;
+            };
+            out.push(Some(card_to_pydict(
+                py,
+                &data.cards[cid],
+                &data.printings[pid],
+                &data.strings,
+                &data.coll_vocab,
+                &resolved_fields,
+            )?));
+        }
+        // A regex in the scope that failed to match is a query error, not a not_found -- the same
+        // rule `query` applies after its scan.
+        if scope.as_ref().is_some_and(|s| s.filter.is_some()) {
+            check_regex_match_failed()?;
+        }
+        Ok(out)
     }
 
     /// One printing per DISTINCT card name whose folded name contains every one of `words`.
