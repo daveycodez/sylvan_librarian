@@ -282,6 +282,10 @@ struct PrintingFace {
     illustration_id: u128,
     card_artist_vid: u16,
     flavor_text_id: u32,
+    // Scryfall's FACE-level `flavor_name`, interned (NONE_STR = absent). The card-level twin is
+    // `Printing.flavor_name_id`, and a printing carries one or the other, never both;
+    // `printing_has_flavor_name` reads both for `prefer:borderless`.
+    flavor_name_id: u32,
 }
 
 // Bit positions in `CompatFields.flags`. Twelve booleans Scryfall sends on every card object; a
@@ -527,6 +531,12 @@ struct Printing {
 
     flavor_text_id: u32,
     flavor_text_lower_id: u32,
+    // Scryfall's top-level `flavor_name`: the alternate name a printing is SOLD under (Godzilla,
+    // Tidus, Spider-Gwen) with this card's rules text underneath. Interned, NONE_STR = absent;
+    // read from the row's `flavor_name` key when the loader carries one -- `ENGINE_COLUMNS` does
+    // not select it yet, so until it does every printing stores NONE_STR and the field costs
+    // four bytes. `prefer:borderless` never answers a printing carrying one.
+    flavor_name_id: u32,
     // Interned id into CardData.artist_vocab (~2.2k distinct lowercase artist
     // names); ARTIST_NONE = absent. Artist predicates resolve their match set
     // against the vocab once per query (FilterExpr::ArtistMatch), so no artist
@@ -610,6 +620,7 @@ struct CardRow {
     oracle_text_lower_id: u32,
     flavor_text_id: u32,
     flavor_text_lower_id: u32,
+    flavor_name_id: u32,
     card_artist_vid: u16,
     card_set_code: InlineStr<8>,
     card_layout_id: u32,
@@ -674,6 +685,7 @@ struct FaceRow {
     illustration_id: u128,
     card_artist_vid: u16,
     flavor_text_id: u32,
+    flavor_name_id: u32,
 }
 
 // Type aliases for the archived (mmap-backed) store types
@@ -1243,6 +1255,7 @@ fn faces_from_pydict(d: &Bound<PyDict>, it: &mut Interner, artists: &mut VocabIn
             illustration_id: opt_str(face, "illustration_id").map_or(0, |s| parse_uuid_or_hash(&s)),
             card_artist_vid,
             flavor_text_id: it.intern_opt(opt_str(face, "flavor_text")),
+            flavor_name_id: it.intern_opt(opt_str(face, "flavor_name")),
         });
     }
     Ok(faces)
@@ -1278,6 +1291,7 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
         oracle_text_id: it.intern(oracle_text),
         flavor_text_lower_id,
         flavor_text_id: it.intern(flavor_text),
+        flavor_name_id: it.intern_opt(opt_str(d, "flavor_name")),
         card_artist_vid,
         card_set_code: InlineStr::<8>::from_str(&opt_str(d, "card_set_code").unwrap_or_default()),
         card_layout_id: it.intern(opt_str(d, "card_layout").unwrap_or_default()),
@@ -7020,22 +7034,14 @@ impl PreferClassIds {
 }
 
 /// Is this printing an ATYPICAL frame in Scryfall's sense? See `PreferClassIds` for the measured
-/// rule; `strings` is for the border, which is an interned string rather than a vocab id.
+/// rule; `strings` is for the border, which is an interned string rather than a vocab id. Two
+/// halves: the FRAME variants (`printing_is_frame_variant`) and the promo TREATMENTS.
 fn printing_is_atypical(p: &APrinting, ids: &PreferClassIds, strings: &AStrings) -> bool {
     let has = |list: &Archived<Vec<u16>>, want: u16| want != VOCAB_NONE && list.iter().any(|v| u16::from(*v) == want);
-    if compat_flag(p, COMPAT_FULL_ART) || compat_flag(p, COMPAT_TEXTLESS) {
-        return true;
-    }
-    if str_at(strings, u32::from(p.card_border_id)) == Some("borderless") {
-        return true;
-    }
-    if ids.frame_effects.iter().any(|&fx| has(&p.compat.frame_effects, fx)) {
+    if printing_is_frame_variant(p, ids, strings) {
         return true;
     }
     if ids.promo_types.iter().any(|&pt| has(&p.compat.promo_types, pt)) {
-        return true;
-    }
-    if has(&p.card_frame_data, ids.future_frame) {
         return true;
     }
     // Surge foil is a variant only where it is the printing's ONLY finish — a set's ordinary
@@ -7043,16 +7049,46 @@ fn printing_is_atypical(p: &APrinting, ids: &PreferClassIds, strings: &AStrings)
     p.compat.finishes == FINISH_FOIL && has(&p.compat.promo_types, ids.surgefoil)
 }
 
+/// The FRAME half of the atypical class: a border, a frame effect, full art, textless or the
+/// future frame — what makes a printing LOOK different, as opposed to a promo treatment (a date
+/// stamp, a promo-pack stamp) that decorates the standard frame. `prefer:borderless`'s second tier.
+fn printing_is_frame_variant(p: &APrinting, ids: &PreferClassIds, strings: &AStrings) -> bool {
+    let has = |list: &Archived<Vec<u16>>, want: u16| want != VOCAB_NONE && list.iter().any(|v| u16::from(*v) == want);
+    compat_flag(p, COMPAT_FULL_ART)
+        || compat_flag(p, COMPAT_TEXTLESS)
+        || printing_is_borderless(p, strings)
+        || ids.frame_effects.iter().any(|&fx| has(&p.compat.frame_effects, fx))
+        || has(&p.card_frame_data, ids.future_frame)
+}
+
+fn printing_is_borderless(p: &APrinting, strings: &AStrings) -> bool {
+    str_at(strings, u32::from(p.card_border_id)) == Some("borderless")
+}
+
+/// Does this printing carry a flavor name — is it SOLD as someone else (Godzilla, Tidus,
+/// Spider-Gwen)? Either place Scryfall puts the key counts.
+fn printing_has_flavor_name(p: &APrinting) -> bool {
+    u32::from(p.flavor_name_id) != NONE_STR || p.faces.iter().any(|f| u32::from(f.flavor_name_id) != NONE_STR)
+}
+
 /// Is this printing a Universes Beyond one — does it carry the `universesbeyond` `is:` tag?
 fn printing_is_universes_beyond(p: &APrinting, ids: &PreferClassIds) -> bool {
     ids.universesbeyond != VOCAB_NONE && p.card_is_tags.iter().any(|v| u16::from(*v) == ids.universesbeyond)
 }
 
-/// Every `prefer=` Scryfall's syntax page lists, plus `Default` for "no preference". `EurLow`,
+/// Every `prefer=` Scryfall's syntax page lists, plus `Default` for "no preference" and
+/// `Borderless`, THIS API'S OWN: "the best-looking printing that is still this card". Three
+/// tiers over the printings that carry NO flavor name — borderless, then any other frame
+/// variant, then the plain printings — default order inside each; a flavor-named printing is
+/// never a candidate, because it is drawn and sold as someone else (Najeela's four borderless
+/// printings are Spider-Gwen, Cloud Strife, Eivor and Archaeon; Thrasios's fca/58 is Tidus).
+/// Najeela answers her etched cmr/514 over every crossover, Thrasios his Special Guests spg/16
+/// over the Final Fantasy fca/58. A card's original printing never carries a flavor name, so
+/// the first tier that is non-empty always exists. `EurLow`,
 /// `EurHigh`, `TixLow` and `TixHigh` are the eur/tix twins of the usd pair; `prefer_for_sort`
 /// also reaches for the `*Low` ones to express "cheapest printing" under a price ordering.
 ///
-/// The four CLASS prefers carry their vocabulary ids — see `PreferClassIds` for the measured
+/// The CLASS prefers carry their vocabulary ids — see `PreferClassIds` for the measured
 /// class and `QueryParams::bind_prefer` for where the ids come from. `DefaultFrame` is Scryfall's
 /// `prefer:default` ("default Magic frame"), the complement of `Atypical`; it is NOT `Default`,
 /// which is this API's "no preference" and reproduces Scryfall's ordering when no prefer is
@@ -7074,6 +7110,7 @@ enum Prefer {
     Atypical(PreferClassIds),
     UniversesBeyond(PreferClassIds),
     NotUniversesBeyond(PreferClassIds),
+    Borderless(PreferClassIds),
 }
 
 fn prefer_from_str(s: &str) -> Prefer {
@@ -7091,6 +7128,7 @@ fn prefer_from_str(s: &str) -> Prefer {
         "atypical"           => Prefer::Atypical(PreferClassIds::UNBOUND),
         "universesbeyond"    => Prefer::UniversesBeyond(PreferClassIds::UNBOUND),
         "notuniversesbeyond" => Prefer::NotUniversesBeyond(PreferClassIds::UNBOUND),
+        "borderless"         => Prefer::Borderless(PreferClassIds::UNBOUND),
         _          => Prefer::Default,
     }
 }
@@ -7171,6 +7209,19 @@ fn prefer_score(card: &AOracleCard, p: &APrinting, prefer: Prefer, strings: &ASt
         Prefer::DefaultFrame(ids) => class_score(!printing_is_atypical(p, &ids, strings)),
         Prefer::UniversesBeyond(ids) => class_score(printing_is_universes_beyond(p, &ids)),
         Prefer::NotUniversesBeyond(ids) => class_score(!printing_is_universes_beyond(p, &ids)),
+        // Three tiers, and a flavor-named printing sits below all of them: with at least one
+        // same-named printing on every card, it can never be the answer.
+        Prefer::Borderless(ids) => {
+            if printing_has_flavor_name(p) {
+                default_score()
+            } else if printing_is_borderless(p, strings) {
+                3.0 * CLASS_BONUS + default_score()
+            } else if printing_is_frame_variant(p, &ids, strings) {
+                2.0 * CLASS_BONUS + default_score()
+            } else {
+                CLASS_BONUS + default_score()
+            }
+        }
     }
 }
 
@@ -7555,6 +7606,7 @@ impl QueryParams {
             Prefer::Atypical(_) => Prefer::Atypical(PreferClassIds::bind(coll_vocab)),
             Prefer::UniversesBeyond(_) => Prefer::UniversesBeyond(PreferClassIds::bind(coll_vocab)),
             Prefer::NotUniversesBeyond(_) => Prefer::NotUniversesBeyond(PreferClassIds::bind(coll_vocab)),
+            Prefer::Borderless(_) => Prefer::Borderless(PreferClassIds::bind(coll_vocab)),
             other => other,
         };
         self
@@ -14951,7 +15003,13 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 // #912/#922 before this), which is the point — the never-reuse invariant is satisfied by the
 // highest value winning at merge, and a value dated today is above all four whichever order they
 // land in.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026083101;
+//
+// 2026090201 — `Printing` and `PrintingFace` GAIN `flavor_name_id`, Scryfall's alternate SOLD-AS
+// name (Godzilla, Tidus, Spider-Gwen) at either level it puts the key, for `prefer:borderless`:
+// a flavor-named printing is a picture of someone else and is never that prefer's answer. Every
+// field after `flavor_text_lower_id` moves, so the header would catch this on its own; the value
+// is dated ahead of every sibling branch's for the same never-reuse reason as 2026083101.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026090201;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -15556,6 +15614,7 @@ impl QueryEngine {
                 illustration_id: row.illustration_id,
                 flavor_text_id: row.flavor_text_id,
                 flavor_text_lower_id: row.flavor_text_lower_id,
+                flavor_name_id: row.flavor_name_id,
                 card_artist_vid: row.card_artist_vid,
                 card_set_code: row.card_set_code,
                 // Both assigned once the whole printing list exists, by assign_set_ranks /
@@ -15587,6 +15646,7 @@ impl QueryEngine {
                         illustration_id: f.illustration_id,
                         card_artist_vid: f.card_artist_vid,
                         flavor_text_id: f.flavor_text_id,
+                        flavor_name_id: f.flavor_name_id,
                     })
                     .collect(),
             
