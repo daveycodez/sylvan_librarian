@@ -15022,11 +15022,14 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 // highest value winning at merge, and a value dated today is above all four whichever order they
 // land in.
 //
-// 2026090201 — `Printing` and `PrintingFace` GAIN `flavor_name_id`, Scryfall's alternate SOLD-AS
-// name (Godzilla, Tidus, Spider-Gwen) at either level it puts the key, for `prefer:borderless`:
-// a flavor-named printing is a picture of someone else and is never that prefer's answer. Every
-// field after `flavor_text_lower_id` moves, so the header would catch this on its own; the value
-// is dated ahead of every sibling branch's for the same never-reuse reason as 2026083101.
+// 2026090201 — `Printing` GAINS `flavor_name_id` + `flavor_name_folded_id` and `PrintingFace`
+// GAINS `flavor_name_id`: multilingual-store's (#927) flavor-name storage, carried here line for
+// line (its 9424ede5 and 7cbfc505) because `prefer:borderless` excludes a flavor-named printing
+// — a picture of someone else — and needs the fact in the row. The `flavor_names` index those
+// commits also build stays with the annex on #927. `Printing` grows after `faces` and every
+// `PrintingFace` field after `flavor_text_id` moves, so the header would catch this on its own;
+// the value is dated ahead of every sibling branch's for the same never-reuse reason as
+// 2026083101, and #927 spends its own stake on the same layout.
 const ARCHIVE_FORMAT_VERSION: u32 = 2026090201;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
