@@ -14915,6 +14915,92 @@ fn include_multilingual_rolls_up_to_the_canonical_row() {
     assert_eq!(u128::from(page[1].1.scryfall_id), 2);
 }
 
+/// `is:flavorname` reads the printing's flavor name — top-level OR on a face — and WIDENS.
+///
+/// api.scryfall.com, 2026-09-01: 476 cards / 661 printings. 6 of the 661 are Japanese rows
+/// returned with no `lang:` written (iko/387 ja prints "Mechagodzilla, the Weapon" over
+/// 結晶の巨人), and 15 carry the key on their FACES alone and never at the top level (vow/341
+/// is "Dracula the Voyager" // "Casket of Native Earth"). One printing per shape here, plus
+/// an English sibling and a plain card that must both stay out.
+#[test]
+fn is_flavorname_reads_either_place_the_key_lives_and_widens() {
+    let mut vocab = VocabInterner::new();
+    let en = vocab.intern("en".to_string()).expect("intern en");
+    let ja = vocab.intern("ja".to_string()).expect("intern ja");
+    // Four cards, one canonical printing each (scryfall ids 1..=4): Vial Smasher the Fierce with
+    // the top-level key (sld/1864's shape), Crystalline Giant whose English row carries nothing
+    // and whose Japanese ANNEX row (id 5) does, Edgar, Charmed Groom with the key on its faces
+    // alone, and a plain card.
+    let (oracle_faces, mut printing_faces) = two_faces();
+    let mut cards: Vec<OracleCard> = (1..=4).map(|i| stub_card(i, 0, &[], &mut vocab)).collect();
+    cards[2].faces = oracle_faces;
+    let mut data = store_of(cards, &[1, 1, 1, 1], vocab);
+    // Padded past the largest interned id `two_faces` hands out, so no face field dangles.
+    let mut strings: Vec<String> = (0..20).map(|i| format!("s{i}")).collect();
+    strings[0] = "Clive Rosfield".to_string();
+    strings[1] = "Mechagodzilla, the Weapon".to_string();
+    strings[2] = "Dracula the Voyager".to_string();
+    strings[3] = "Casket of Native Earth".to_string();
+    data.strings = strings;
+    for p in &mut data.printings {
+        p.compat.lang_id = en;
+    }
+    data.printings[0].flavor_name_id = 0;
+    printing_faces[0].flavor_name_id = 2;
+    printing_faces[1].flavor_name_id = 3;
+    data.printings[2].faces = printing_faces;
+    assert_eq!(data.printings[2].flavor_name_id, NONE_STR, "face-only: Scryfall emits no top-level key there");
+
+    let mut foreign = stub_printing(5, 5, None);
+    foreign.compat.lang_id = ja;
+    foreign.flavor_name_id = 1;
+    data.foreign = vec![foreign];
+    data.foreign_offsets = vec![0, 0, 1, 1, 1];
+    data.indexes.langs = build_lang_index(&data.printings, &data.coll_vocab);
+    data.indexes.foreign_langs = build_lang_index(&data.foreign, &data.coll_vocab);
+    data.indexes.foreign_to_card = build_printing_to_card(&data.foreign_offsets);
+    data.indexes.printed_names = build_printed_name_index(&data.printings, &data.foreign, &data.strings, |p| p.printed_name_folded_id);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+
+    // The tag arrives as `card_is_tags` membership like every other `is:` value and becomes its
+    // own leaf here, beside `localizedname` — nothing is stored for it.
+    let filter = super::build_filter(&serde_json::json!({
+        "node_type": "CardBinaryOperatorNode",
+        "kwargs": {
+            "op": ":",
+            "lhs": {"node_type": "CardAttributeNode", "kwargs": {"attribute_name": "card_is_tags", "original_attribute": "is"}},
+            "rhs": ["flavorname"],
+        }
+    }))
+    .expect("is:flavorname must build");
+    assert!(matches!(filter, FilterExpr::FlavorNamePresent), "is:flavorname must build its own leaf");
+    assert!(filter.widens_to_annex(), "its presence reaches the annex with no lang: written");
+
+    let ids_of = |page: &[(&crate::AOracleCard, &crate::APrinting)]| {
+        let mut ids: Vec<u128> = page.iter().map(|(_, p)| u128::from(p.scryfall_id)).collect();
+        ids.sort_unstable();
+        ids
+    };
+    let prints = QueryParams::from_strs("printing", "default", "edhrec", "asc", 100, 0);
+    let (total, page) = run_query_widened(a, &prints, &filter);
+    assert_eq!(total, 3, "the top-level English row, the Japanese annex row, and the face-only transform");
+    assert_eq!(ids_of(&page), [1, 3, 5], "the English Giant (2) carries no flavor name and stays out");
+
+    // Per PRINTING under unique=prints, and still three CARDS under unique=cards: the Giant is
+    // answered through its Japanese row, the way `clive is:flavorname` is three cards there.
+    let cards = QueryParams::from_strs("card", "default", "edhrec", "asc", 100, 0);
+    let (total, page) = run_query_widened(a, &cards, &filter);
+    assert_eq!(total, 3);
+    assert_eq!(ids_of(&page), [1, 3, 5]);
+
+    // The complement, over the same widened space: the English Giant and the plain card.
+    let negated = FilterExpr::Not(Box::new(FilterExpr::FlavorNamePresent));
+    let (total, page) = run_query_widened(a, &prints, &negated);
+    assert_eq!(total, 2);
+    assert_eq!(ids_of(&page), [2, 4]);
+}
+
 /// `order=set`'s second key is the collector number, by Scryfall's own (int, string) rule.
 ///
 /// Read off api.scryfall.com on 2026-08-16: khm answers `... 39, 40, A-40, 41 ... 378, A-378,
