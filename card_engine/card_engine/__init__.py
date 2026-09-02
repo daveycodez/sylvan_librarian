@@ -71,6 +71,11 @@ ENGINE_COLUMNS: list[str] = [
     "creature_toughness",
     "edhrec_rank",
     "flavor_text",
+    # `flavor_name`, the name a printing is SOLD under, and its folded lookup key — the columns
+    # api/db/2026-08-16-03-flavor-name.sql adds. `name:` containment, `exact=` and `is:flavorname`
+    # read them.
+    "flavor_name",
+    "flavor_name_folded",
     "mana_cost_jsonb",
     "mana_cost_text",
     "oracle_text",
