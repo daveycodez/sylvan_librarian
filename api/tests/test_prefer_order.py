@@ -71,6 +71,7 @@ class TestPreferOrder(unittest.TestCase):
         assert PreferOrder.ATYPICAL == "atypical"
         assert PreferOrder.UNIVERSESBEYOND == "universesbeyond"
         assert PreferOrder.NOTUNIVERSESBEYOND == "notuniversesbeyond"
+        assert PreferOrder.BORDERLESS == "borderless"
 
     def test_search_accepts_prefer_parameter(self) -> None:
         """Test that search method accepts prefer parameter without error."""
@@ -96,5 +97,6 @@ class TestPreferOrder(unittest.TestCase):
             PreferOrder.ATYPICAL,
             PreferOrder.UNIVERSESBEYOND,
             PreferOrder.NOTUNIVERSESBEYOND,
+            PreferOrder.BORDERLESS,
         ):
             assert "prefer_score" in self._search_sql("cmc=3", member)["compiled"]
