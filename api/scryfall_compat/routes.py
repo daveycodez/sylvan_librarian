@@ -366,6 +366,11 @@ def _set_cards_cache(falcon_response: falcon.Response | None) -> None:
 # reached over TLS, which is what `next_page` has to say for a client to follow it.
 _PLAINTEXT_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0", "[::1]")  # noqa: S104
 
+# The only two schemes `X-Forwarded-Proto` / `Forwarded` are allowed to name. Anything else is
+# ignored in favour of the request's own scheme -- a `next_page` a client cannot follow is worse
+# than one built from what we actually know.
+_FORWARDABLE_SCHEMES = frozenset(("http", "https"))
+
 # Spelled out rather than falcon.MEDIA_JSON, which omits the charset Scryfall sends.
 _JSON_CONTENT_TYPE = "application/json; charset=utf-8"
 
@@ -458,32 +463,88 @@ def _as_int(value: str | None) -> int | None:
         return None
 
 
+def _is_trusted_proxy_host(host: str) -> bool:
+    """Whether `host` is one the operator listed in TRUSTED_PROXY_HOSTS.
+
+    Exact, whole-string, case-insensitive match -- NOT a suffix match, so a rule for
+    ``cards.example.com`` never admits ``evil-cards.example.com``. An empty allowlist (the default)
+    trusts nothing.
+
+    Args:
+        host: The raw `X-Proxy-Host` value a request presented.
+
+    Returns:
+        True only when the trimmed, lowercased value is in the configured allowlist.
+    """
+    wanted = host.strip().lower()
+    return bool(wanted) and wanted in settings.trusted_proxy_hosts
+
+
+def _resolve_self_origin(request: falcon.Request | None, request_host: str) -> tuple[str, str]:
+    """Decide the host and scheme an absolute self-URL (`next_page`) should be built from.
+
+    WHY THIS IS NOT `X-Proxy-Host` and `request.forwarded_scheme` taken on faith, which is what it
+    was: both headers are unauthenticated and neither is part of the cache key, while `/cards/*` now
+    answers `public, max-age=57600`. So one request carrying a forged `X-Proxy-Host` (or
+    `X-Forwarded-Proto: http`) would seed a 16-hour cached response, keyed by a URL anyone can
+    request, whose `next_page` points off-host or downgrades to plaintext -- served to everyone who
+    hits that URL. Upstream reads `X-Proxy-Host` unconditionally and is right to: it sits behind a
+    reverse proxy it controls, so the only party who can set the header IS that proxy. The fix is to
+    trust the header only from a proxy the operator named.
+
+    The scheme is coupled to the host deliberately: the forwarded scheme is honoured only on a
+    request that ALSO presented an allowlisted `X-Proxy-Host`. A proxy that rewrites the origin
+    sends both (rewriting the host is why the header is read at all); honouring the scheme on its
+    own would leave the downgrade half of the vector open on every request.
+
+    UNSET (the default) means "no rewriting proxy in front": both headers are ignored and the
+    request's own host and scheme decide. That is correct for a deployment fronted directly -- a
+    real hostname, or workers.dev in the sibling port -- which is what this project ships.
+
+    Args:
+        request: The request being answered, or None for an internal caller with no client to
+            forge anything.
+        request_host: Host passed down from dispatch; only consulted for the internal-caller case.
+
+    Returns:
+        The (host, scheme) pair, scheme being "http" or "https".
+    """
+    if request is None:
+        # No request to read means an internal caller, not a served request: there is no client
+        # who could forge the host, so trust what was passed and guess the scheme from it.
+        host = request_host or "api.scryfall.com"
+        scheme = "http" if host.split(":")[0] in _PLAINTEXT_HOSTS else "https"
+        return host, scheme
+
+    claimed_host = request.get_header("X-Proxy-Host")
+    if claimed_host and _is_trusted_proxy_host(claimed_host):
+        # An allowlisted proxy: honour the host it names and, riding on it, the forwarded scheme
+        # (`request.forwarded_scheme` reads `Forwarded` / `X-Forwarded-Proto`), clamped to a real
+        # scheme and otherwise falling back to the scheme the request itself arrived on.
+        forwarded = (request.forwarded_scheme or "").lower()
+        scheme = forwarded if forwarded in _FORWARDABLE_SCHEMES else request.scheme
+        return claimed_host.strip(), scheme
+
+    # Default / untrusted: ignore both proxy headers and build from the request's own origin.
+    return request.host, request.scheme
+
+
 def _self_base_url(request: falcon.Request | None, request_host: str, path: str) -> str:
     """Build the absolute URL of a route on this host.
 
-    A `next_page` a client cannot follow is worse than no pagination at all, so the scheme is the
-    request's own as corrected by `Forwarded` / `X-Forwarded-Proto` — the only signal that knows
-    about a TLS-terminating proxy, behind which the request itself arrives as plain `http`. A
-    deployment that terminates TLS in front of this service must send one of those headers, as it
-    must already for `X-Proxy-Host` to give the right host.
-
-    Guessing `https` from the host name instead was tried and is worse: it silently breaks any
-    plain-HTTP deployment on a real hostname, which is a configuration this project supports,
-    to paper over one that is misconfigured. The host only decides when there is no request to
-    read, which is an internal caller rather than a served request.
+    Host and scheme come from `_resolve_self_origin`, which refuses to trust the `X-Proxy-Host` /
+    forwarded-scheme headers unless the operator allowlisted the proxy -- see that function for why
+    an unconditional read is a cache-poisoning vector on these now-cacheable routes.
 
     Args:
         request: The request being answered, when the handler has one.
-        request_host: Host the request arrived on.
+        request_host: Host the request arrived on (used only for an internal, request-less caller).
         path: Absolute route path, leading slash included.
 
     Returns:
         The absolute URL, with no query string.
     """
-    host = request_host or "api.scryfall.com"
-    if request is not None:
-        return f"{request.forwarded_scheme}://{host}{path}"
-    scheme = "http" if host.split(":")[0] in _PLAINTEXT_HOSTS else "https"
+    host, scheme = _resolve_self_origin(request, request_host)
     return f"{scheme}://{host}{path}"
 
 

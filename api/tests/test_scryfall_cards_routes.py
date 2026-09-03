@@ -1134,7 +1134,17 @@ class TestThroughTheFullApp:
 
 
 class TestSelfUrlScheme:
-    """`next_page` has to be followable, which means getting the scheme right behind a proxy."""
+    """`next_page` has to be followable AND unforgeable.
+
+    These routes now answer `public, max-age=57600`, so a `next_page` built from an unauthenticated
+    request header is a cache-poisoning vector: one forged `X-Proxy-Host` (or `X-Forwarded-Proto`)
+    would seed a cached response, keyed by a URL anyone can request, whose pagination link points
+    off-host or downgrades to plaintext for everyone. The default therefore trusts neither header
+    and builds from the request's own origin; the headers are honoured only from a proxy the
+    operator allowlisted in TRUSTED_PROXY_HOSTS. See `_self_base_url` in scryfall_compat/routes.py.
+    """
+
+    ALLOWED_HOST = "cards.example.test"
 
     def _next_page(self, api: APIResource, monkeypatch, headers: dict[str, str] | None = None) -> str:
         monkeypatch.setattr("api.scryfall_compat.routes.PAGE_SIZE", 1)
@@ -1143,22 +1153,67 @@ class TestSelfUrlScheme:
         api._handle(req, resp)
         return payload(resp)["next_page"]
 
+    def _allow(self, monkeypatch, *hosts: str) -> None:
+        """Point TRUSTED_PROXY_HOSTS at the given hosts for the duration of one test."""
+        monkeypatch.setattr(settings, "trusted_proxy_hosts", frozenset(hosts))
+
+    # ---- default: no trusted proxy configured, so both headers are ignored --------------------
+
     def test_plain_http_request_stays_http(self, compat_corpus: APIResource, monkeypatch):
         assert self._next_page(compat_corpus, monkeypatch).startswith("http://falconframework.org/")
 
-    def test_a_forwarded_proto_wins_over_the_requests_own_scheme(self, compat_corpus: APIResource, monkeypatch):
-        """Behind a TLS-terminating proxy the request itself is http; only the header knows better."""
+    def test_a_forged_proxy_host_is_ignored_by_default(self, compat_corpus: APIResource, monkeypatch):
+        """The poisoning payload: a forged host must not reach `next_page` when nothing is trusted."""
+        url = self._next_page(compat_corpus, monkeypatch, {"X-Proxy-Host": "evil.example"})
+        assert url.startswith("http://falconframework.org/cards?")
+        assert "evil.example" not in url
+
+    def test_a_forwarded_proto_is_ignored_by_default(self, compat_corpus: APIResource, monkeypatch):
+        """The downgrade/upgrade half: no forwarded scheme is honoured without a trusted host."""
         url = self._next_page(compat_corpus, monkeypatch, {"X-Forwarded-Proto": "https"})
-        assert url.startswith("https://")
+        assert url.startswith("http://falconframework.org/")
 
-    def test_the_rfc_7239_forwarded_header_is_honored_too(self, compat_corpus: APIResource, monkeypatch):
+    def test_the_rfc_7239_forwarded_header_is_ignored_by_default(self, compat_corpus: APIResource, monkeypatch):
         url = self._next_page(compat_corpus, monkeypatch, {"Forwarded": "proto=https"})
-        assert url.startswith("https://")
+        assert url.startswith("http://falconframework.org/")
 
-    def test_the_proxy_host_header_sets_the_host(self, compat_corpus: APIResource, monkeypatch):
+    # ---- with an operator-configured allowlist ------------------------------------------------
+
+    def test_an_allowlisted_proxy_host_and_scheme_are_honored(self, compat_corpus: APIResource, monkeypatch):
+        self._allow(monkeypatch, self.ALLOWED_HOST)
         url = self._next_page(
             compat_corpus,
             monkeypatch,
-            {"X-Proxy-Host": "cards.example.test", "X-Forwarded-Proto": "https"},
+            {"X-Proxy-Host": self.ALLOWED_HOST, "X-Forwarded-Proto": "https"},
         )
-        assert url.startswith("https://cards.example.test/cards?")
+        assert url.startswith(f"https://{self.ALLOWED_HOST}/cards?")
+
+    def test_an_allowlisted_host_match_is_case_insensitive(self, compat_corpus: APIResource, monkeypatch):
+        """Matching is case-insensitive; the honoured host keeps its sent casing, scheme its own http."""
+        self._allow(monkeypatch, self.ALLOWED_HOST)
+        url = self._next_page(compat_corpus, monkeypatch, {"X-Proxy-Host": "Cards.Example.Test"})
+        assert url.startswith("http://Cards.Example.Test/cards?")
+
+    def test_an_allowlisted_host_without_a_forwarded_scheme_keeps_the_request_scheme(self, compat_corpus: APIResource, monkeypatch):
+        """The scheme rides on the host but is not invented: with no forwarded header it stays http."""
+        self._allow(monkeypatch, self.ALLOWED_HOST)
+        url = self._next_page(compat_corpus, monkeypatch, {"X-Proxy-Host": self.ALLOWED_HOST})
+        assert url.startswith(f"http://{self.ALLOWED_HOST}/cards?")
+
+    def test_a_non_allowlisted_host_is_refused(self, compat_corpus: APIResource, monkeypatch):
+        self._allow(monkeypatch, self.ALLOWED_HOST)
+        url = self._next_page(
+            compat_corpus,
+            monkeypatch,
+            {"X-Proxy-Host": "evil.example", "X-Forwarded-Proto": "https"},
+        )
+        assert url.startswith("http://falconframework.org/cards?")
+        assert "evil.example" not in url
+
+    def test_a_suffix_lookalike_host_is_refused(self, compat_corpus: APIResource, monkeypatch):
+        """Exact match only: a rule for cards.example.test must not admit a look-alike around it."""
+        self._allow(monkeypatch, self.ALLOWED_HOST)
+        for lookalike in ("evil-cards.example.test", "cards.example.test.evil.example"):
+            url = self._next_page(compat_corpus, monkeypatch, {"X-Proxy-Host": lookalike})
+            assert url.startswith("http://falconframework.org/cards?"), lookalike
+            assert lookalike not in url
