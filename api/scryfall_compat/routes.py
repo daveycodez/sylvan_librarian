@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any
 import falcon
 import orjson
 
+from api.card_processing import EXTRA_IS_TAG
 from api.enums import CardOrdering, PreferOrder, SortDirection, UniqueOn
 from api.parsing import generate_sql_query, parse_scryfall_query
 from api.parsing.card_query_nodes import fold_accents
@@ -160,6 +161,10 @@ _WHOLE_NAME_MATCH = f"({_collated_sql('card_name_folded')} = %(collated)s)"
 
 # A collection identifier's keys: the faces, or the whole name, never both.
 _COLLECTION_NAME_MATCH = f"(CASE WHEN {_NAME_SPLITS_IN_TWO} THEN {_FACE_NAME_MATCH} ELSE {_WHOLE_NAME_MATCH} END)"
+
+# The scoped pool's exclusion of extras -- see `_cards_by_name_identifiers`. `coalesce` because
+# `?` on a NULL object is NULL, and NOT NULL would drop the row rather than keep it.
+_NOT_AN_EXTRA = "NOT coalesce(card_is_tags ? %(extra_tag)s, false)"
 
 # `exact=`'s keys: the same set, plus the JOINED name of a two-faced card.
 _EXACT_NAME_MATCH = f"({_WHOLE_NAME_MATCH} OR ({_NAME_SPLITS_IN_TWO} AND {_FACE_NAME_MATCH}))"
@@ -1764,6 +1769,13 @@ class ScryfallCardsRoutes:
         for at, name, set_code in asked:
             clauses = [_COLLECTION_NAME_MATCH, f"({scope_where})"]
             params: dict[str, Any] = {**scope_params, "collated": _collate_name(name)}
+            # The scoped POOL excludes extras, as the engine's `best_printing_in_scope` does: an
+            # art-series card or a token is never a scope's answer, while an unscoped `{name}` (and
+            # every id-shaped identifier) still resolves one, because a collection resolves extras
+            # by id. Same clause on both paths, or the two workers answer differently.
+            if scope is not None:
+                clauses.append(_NOT_AN_EXTRA)
+                params["extra_tag"] = EXTRA_IS_TAG
             if set_code:
                 clauses.append("lower(card_set_code) = lower(%(set_code)s)")
                 params["set_code"] = set_code

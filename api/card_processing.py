@@ -107,6 +107,13 @@ _FACE_STAT_GROUPS = (
 # cross newlines), "//" because that is the face separator Scryfall itself renders.
 _FACE_TEXT_SEPARATOR = "\n//\n"
 
+# The `is:` value the extras class is stored under. Read by the collection route's scoped pool
+# (`_cards_by_name_identifiers`) and spelled once more in card_engine's `EXTRA_IS_TAG`; the two
+# must agree or the exclusion silently comes back empty. This importer writes no such tag yet --
+# never-legal and funny-set cards are dropped at import (`preprocess_card`), so no extra reaches
+# the corpus -- and the exclusion is inert until the multilingual import (#927) writes it.
+EXTRA_IS_TAG = "extra"
+
 # What `card_faces` stores per face, in Scryfall's own key names and value shapes.
 #
 # The merged row above is what the query planner filters on; this is what a face IS. Keeping it

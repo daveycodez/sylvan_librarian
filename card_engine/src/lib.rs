@@ -3419,6 +3419,9 @@ struct CollectionScope {
     prefer: Prefer,
     /// `None` for a query that was only directives, or no query at all: no filter.
     filter: Option<FilterExpr>,
+    /// The `extra` `is:` tag's vocab id, or None when this store never interned it (a fixture, a
+    /// corpus with no extras). See `best_printing_in_scope` for what it excludes.
+    extra_vid: Option<u16>,
 }
 
 /// A name COLLATED: every non-alphanumeric character removed. The needle side of the comparison.
@@ -3436,6 +3439,11 @@ struct CollectionScope {
 fn collate_name(folded: &str) -> String {
     folded.chars().filter(|c| c.is_alphanumeric()).collect()
 }
+
+/// The `is:` value that carries the extras class, as `preprocess_card`'s `_is_extra` writes it.
+/// Spelled once there, once in the TypeScript parser's COMPUTED_IS_TAGS, and once here, where
+/// `sets_with_extras` folds it; the three must agree or the fold silently comes back empty.
+pub(crate) const EXTRA_IS_TAG: &str = "extra";
 
 /// Whether `stored` COLLATES to `collated_needle`, without collating `stored` into a `String`.
 ///
@@ -3511,6 +3519,18 @@ fn prefer_of(data: &Archived<CardData>, pid: usize) -> f32 {
 /// same `prefer_score` `unique=cards` picks a representative with, so `?q=prefer:atypical` on a
 /// collection answers the printing `prefer:atypical` answers on a search. No scope is exactly
 /// `best_printing_in_set`, scored by the default order.
+///
+/// THE POOL EXCLUDES EXTRAS, the default exclusion `/cards/search` ANDs into every query on
+/// Scryfall (`-is:extra` unless `include_extras`): art-series cards, tokens and the rest of the
+/// memorabilia are never a preference's answer. Without it, Birgi, God of Storytelling under
+/// `prefer:borderless` answered akhm/31 — her ART-SERIES card, which is borderless, carries no
+/// flavor name and is in-universe, so it won the top tier over every real printing — and
+/// `prefer:atypical` the same, since borderless is atypical; `prefer:oldest` on Coruscation Mage
+/// answered the token tblb/17. A scope that names no extras term cannot mean "prefer the
+/// art-series card", so the exclusion is unconditional here. The tag is `EXTRA_IS_TAG`, resolved
+/// once per batch in `bind_collection_scope`; this corpus imports no extras today (the importer
+/// drops never-legal and funny-set cards), so the id is None and the check is free until the
+/// multilingual import (#927) writes the tag, at which point it is what keeps them out.
 fn best_printing_in_scope(
     data: &Archived<CardData>,
     cid: usize,
@@ -3525,6 +3545,7 @@ fn best_printing_in_scope(
     let passes = |pid: usize| {
         let p = &data.printings[pid];
         set_code.is_none_or(|code| p.card_set_code.as_str().eq_ignore_ascii_case(code))
+            && scope.extra_vid.is_none_or(|vid| !p.card_is_tags.iter().any(|t| u16::from(*t) == vid))
             && scope.filter.as_ref().is_none_or(|f| FilterExpr::residual_matches(card, p, &data.strings, &[f], false))
     };
     let mut best: Option<(usize, f64)> = None;
@@ -15381,7 +15402,8 @@ impl QueryEngine {
             None => None,
         };
         let prefer = QueryParams::from_strs("printing", prefer, "name", "asc", 1, 0).bind_prefer(&data.coll_vocab).prefer;
-        Ok(CollectionScope { prefer, filter })
+        let extra_vid = data.coll_vocab.iter().position(|s| s.as_str() == EXTRA_IS_TAG).map(|p| p as u16);
+        Ok(CollectionScope { prefer, filter, extra_vid })
     }
 
     /// The body of `exact_card_by_name`, and of `collection_card_by_name` before it grew a scope.

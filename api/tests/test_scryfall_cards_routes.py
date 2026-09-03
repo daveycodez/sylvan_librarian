@@ -60,6 +60,9 @@ SCOPE_SET_A = "sfa"
 SCOPE_SET_B = "sfb"
 SCOPE_A_ID = "77777777-7777-4777-8777-777777777777"
 SCOPE_B_ID = "88888888-8888-4888-8888-888888888888"
+# The third printing: an art-series card, tagged `extra`, in a set only a scope or a `set` key reaches.
+SCOPE_SET_X = "asfa"
+SCOPE_X_ID = "99999999-9999-4999-8999-999999999999"
 
 
 def _bolt() -> dict:
@@ -199,9 +202,23 @@ def _vault() -> dict:
     return card
 
 
-def _scoped(card_id: str, set_code: str, number: str) -> dict:
-    """One of the two printings of `SCOPE_NAME`, the card a collection scope filters between."""
+def _scoped(card_id: str, set_code: str, number: str, *, extra: bool = False) -> dict:
+    """One of the printings of `SCOPE_NAME`, the card a collection scope filters between.
+
+    `extra` makes it the art-series card: borderless, tagged `extra` the way the multilingual
+    import (#927) tags one, released before the others so it never wins the default order -- the
+    shape a scoped pool must exclude (Birgi's akhm/31). Its legalities stay legal so the fixture
+    import keeps it; on the real corpus that is what #927's relaxed import does.
+    """
     card = make_raw_card(card_id=card_id, name=SCOPE_NAME)
+    if extra:
+        card |= {
+            "layout": "art_series",
+            "border_color": "borderless",
+            "set_type": "memorabilia",
+            "released_at": "2000-01-01",
+            "card_is_tags": {"extra": True},
+        }
     card |= {
         "object": "card",
         "oracle_id": SCOPE_ORACLE_ID,
@@ -229,6 +246,7 @@ def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
         _vault(),
         _scoped(SCOPE_A_ID, SCOPE_SET_A, "1"),
         _scoped(SCOPE_B_ID, SCOPE_SET_B, "1"),
+        _scoped(SCOPE_X_ID, SCOPE_SET_X, "31", extra=True),
     )
     api_resource.admin._upsert_cards([copy.deepcopy(card) for card in cards])
     with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
@@ -820,6 +838,20 @@ class TestCollectionScope:
         body = payload(self._collection(by_name_paths, [{"name": SCOPE_NAME}], "e:sfz"))
         assert body["data"] == []
         assert body["not_found"] == [{"name": SCOPE_NAME}]
+
+    def test_an_extra_is_never_a_scoped_pick(self, by_name_paths: APIResource):
+        """A scoped pool never answers an extra; an identifier's own `set` still reaches one.
+
+        The art-series printing is the only one in its set: under a scope naming that set the
+        pool excludes it and the name is not_found, while the same set on the identifier, with no
+        scope, resolves it -- a collection resolves extras by id. And a scope both it and a real
+        printing pass answers the real one.
+        """
+        body = payload(self._collection(by_name_paths, [{"name": SCOPE_NAME}], f"e:{SCOPE_SET_X}"))
+        assert body["data"] == []
+        assert body["not_found"] == [{"name": SCOPE_NAME}]
+        assert self._ids(by_name_paths, [{"name": SCOPE_NAME, "set": SCOPE_SET_X}]) == [SCOPE_X_ID]
+        assert self._ids(by_name_paths, [{"name": SCOPE_NAME}], f"-e:{SCOPE_SET_B}") == [SCOPE_A_ID]
 
     def test_the_identifiers_own_set_and_the_scope_compose(self, by_name_paths: APIResource):
         """`{"name", "set"}` filters to one set and the scope to another: nothing is in both."""

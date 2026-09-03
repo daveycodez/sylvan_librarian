@@ -13567,23 +13567,30 @@ fn name_lookups_agree_with_and_without_the_trigram_index() {
 /// picks among them by its prefer -- the `?q=` of `POST /cards/collection`.
 ///
 /// Clive, Ifrit's Dominant in miniature: the plain fin/133 first in default order, the
-/// date-stamped prerelease promo second, the borderless fin/318 third. No scope answers
-/// fin/133; `prefer:atypical` answers the promo (a date stamp is an atypical treatment, and it
-/// ranks first among the atypical ones, on api.scryfall.com too); `-is:datestamped
-/// prefer:atypical` answers the borderless one; and a filter no printing passes is None, exactly
-/// as a name that does not exist.
+/// date-stamped prerelease promo second, his ART-SERIES card third, the borderless fin/318
+/// fourth. No scope answers fin/133; `prefer:atypical` answers the promo (a date stamp is an
+/// atypical treatment, and it ranks first among the atypical ones, on api.scryfall.com too);
+/// `-is:datestamped prefer:atypical` answers the borderless one; and a filter no printing passes
+/// is None, exactly as a name that does not exist.
+///
+/// The art-series card is borderless, in-universe and carries no flavor name, ranks ABOVE fin/318,
+/// and is tagged `extra` -- Birgi's akhm/31 shape, which won `prefer:borderless` and
+/// `prefer:atypical` on a scoped collection before the pool excluded extras. It never wins a
+/// scoped pick; an identifier's own `set` still reaches it, because a collection resolves extras
+/// BY ID.
 #[test]
 fn a_collection_scope_filters_the_printings_and_prefers_among_them() {
     let mut vocab = VocabInterner::new();
     let datestamped = vocab.intern("datestamped".to_owned()).expect("vocab");
     let prerelease = vocab.intern("prerelease".to_owned()).expect("vocab");
+    let extra = vocab.intern(crate::EXTRA_IS_TAG.to_owned()).expect("vocab");
     let mut card = stub_card(1, TYPE_CREATURE, &[], &mut vocab);
     card.card_name_lower = InlineStr::from_str("clive, ifrit's dominant");
-    let mut data = store_of(vec![card], &[3], vocab);
+    let mut data = store_of(vec![card], &[4], vocab);
     data.strings.push("black".to_owned());
     data.strings.push("borderless".to_owned());
     let (black, borderless) = ((data.strings.len() - 2) as u32, (data.strings.len() - 1) as u32);
-    for (p, set) in data.printings.iter_mut().zip(["fin", "pfin", "fin"]) {
+    for (p, set) in data.printings.iter_mut().zip(["fin", "pfin", "afin", "fin"]) {
         p.card_set_code = InlineStr::from_str(set);
         p.card_border_id = black;
     }
@@ -13591,7 +13598,12 @@ fn a_collection_scope_filters_the_printings_and_prefers_among_them() {
     // reads (see `PreferClassIds`) -- the importer writes both from the one bulk key.
     data.printings[1].card_is_tags = vec![datestamped];
     data.printings[1].compat.promo_types = vec![prerelease, datestamped];
+    // id 3: the art-series card, borderless, an extra -- and the OLDEST, so `prefer:oldest` would
+    // reach it too (Coruscation Mage's token tblb/17 shape).
     data.printings[2].card_border_id = borderless;
+    data.printings[2].card_is_tags = vec![extra];
+    data.printings[2].released_at_int = Some(19800101);
+    data.printings[3].card_border_id = borderless;
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
@@ -13605,6 +13617,7 @@ fn a_collection_scope_filters_the_printings_and_prefers_among_them() {
             f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
             f
         }),
+        extra_vid: archived.coll_vocab.iter().position(|s| s.as_str() == crate::EXTRA_IS_TAG).map(|p| p as u16),
     };
     let pick = |set_code: Option<&str>, scope: Option<&CollectionScope>| -> Option<usize> {
         name_best(archived, "clive, ifrit's dominant", set_code, NameScope::Collection, scope).map(|(_, pid)| pid)
@@ -13612,8 +13625,14 @@ fn a_collection_scope_filters_the_printings_and_prefers_among_them() {
 
     assert_eq!(pick(None, None), Some(0), "no scope: the default pick");
     assert_eq!(pick(None, Some(&scope("atypical", None))), Some(1), "the date stamp is atypical and ranks first");
-    assert_eq!(pick(None, Some(&scope("atypical", Some(not_datestamped())))), Some(2), "filtered to the borderless printing");
+    assert_eq!(pick(None, Some(&scope("atypical", Some(not_datestamped())))), Some(3), "filtered to the borderless printing, never the art-series extra");
+    assert_eq!(pick(None, Some(&scope("borderless", None))), Some(3), "the art-series card is borderless and outranks fin/318, and still never wins");
+    assert_eq!(pick(None, Some(&scope("oldest", None))), Some(3), "nor under `prefer:oldest`, though it is the oldest");
     assert_eq!(pick(None, Some(&scope("default", Some(not_datestamped())))), Some(0), "a filter alone keeps the default order");
+    // An identifier's own `set` resolves the extra without a scope -- a collection resolves extras
+    // by id -- and a scope over that set has nothing left to pick from.
+    assert_eq!(pick(Some("afin"), None), Some(2));
+    assert_eq!(pick(Some("afin"), Some(&scope("default", None))), None);
     let none_pass = FilterExpr::And(vec![is_tag("datestamped"), is_tag("nonexistenttag")]);
     assert_eq!(pick(None, Some(&scope("atypical", Some(none_pass)))), None, "a filter no printing passes is not_found");
     // The identifier's own `set` and the scope COMPOSE: inside `pfin`, `-is:datestamped` leaves nothing.
