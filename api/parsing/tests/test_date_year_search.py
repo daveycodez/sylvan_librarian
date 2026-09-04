@@ -4,29 +4,17 @@ import itertools
 
 import pytest
 
-from api.parsing import AttributeNode, BinaryOperatorNode, QueryContext, StringValueNode, set_dates
+from api.parsing import AndNode, AttributeNode, BinaryOperatorNode, NotNode, QueryContext, StringValueNode, set_dates
 from api.parsing.rewrite import InvalidDateValueError
 
 
 @pytest.mark.parametrize(
-    argnames=("searchattr", "searchoperator", "searchvalue"),
-    argvalues=list(
-        itertools.product(
-            ["date"],
-            [":", "=", ">", "<", ">=", "<="],
-            ["2025-02-02", "2025"],
-        ),
-    )
-    + list(
-        itertools.product(
-            ["year"],
-            [":", "=", ">", "<", ">=", "<="],
-            ["2025"],  # Year only accepts 4-digit years
-        ),
-    ),
+    argnames=("searchattr", "searchoperator"),
+    argvalues=list(itertools.product(["date", "year"], [":", "=", ">", "<", ">=", "<="])),
 )
-def test_date_year_search_parsing(parse_query, searchattr: str, searchoperator: str, searchvalue: str) -> None:
-    """Test that date and year searches parse correctly with all operators."""
+def test_full_date_and_year_search_parsing(parse_query, searchattr: str, searchoperator: str) -> None:
+    """A full `date:` day and a `year:` value parse to one leaf carrying the value as typed."""
+    searchvalue = "2025-02-02" if searchattr == "date" else "2025"
     query_str = f"{searchattr}{searchoperator}{searchvalue}"
     parsed = parse_query(query_str)
 
@@ -38,6 +26,81 @@ def test_date_year_search_parsing(parse_query, searchattr: str, searchoperator: 
     # RHS should be a StringValueNode with the search value
     assert isinstance(parsed.root.rhs, StringValueNode)
     assert parsed.root.rhs.value == searchvalue
+
+
+def _leaf(node) -> tuple[str, str]:
+    assert isinstance(node, BinaryOperatorNode)
+    assert isinstance(node.rhs, StringValueNode)
+    return (node.operator, node.rhs.value)
+
+
+@pytest.mark.parametrize(
+    argnames=("query", "expected"),
+    argvalues=[
+        # A bare year is the whole year under every operator -- measured against `e:khm` (323 cards,
+        # 2021-02-05) on api.scryfall.com 2026-09-03: date:2021 306 = date=2021 = date<=2021,
+        # date<2021 0, date>2021 18 = date>=2022, date>=2021 323, date!=2021 18.
+        ("date:2021", [(">=", "2021-01-01"), ("<", "2022-01-01")]),
+        ("date=2021", [(">=", "2021-01-01"), ("<", "2022-01-01")]),
+        ("date<2021", [("<", "2021-01-01")]),
+        ("date<=2021", [("<", "2022-01-01")]),
+        ("date>2021", [(">=", "2022-01-01")]),
+        ("date>=2021", [(">=", "2021-01-01")]),
+        # A month the same way, and December rolls into the next year.
+        ("date:2021-02", [(">=", "2021-02-01"), ("<", "2021-03-01")]),
+        ("date<=2021-01", [("<", "2021-02-01")]),
+        ("date>2021-01", [(">=", "2021-02-01")]),
+        ("date:2021-12", [(">=", "2021-12-01"), ("<", "2022-01-01")]),
+    ],
+)
+def test_partial_date_is_a_window_of_full_days(parse_query, query: str, expected: list[tuple[str, str]]) -> None:
+    """A year or month in `date:` widens to full-day comparisons both search paths can run."""
+    parsed = parse_query(query)
+    if len(expected) == 1:
+        assert _leaf(parsed.root) == expected[0]
+    else:
+        assert isinstance(parsed.root, AndNode)
+        assert [_leaf(op) for op in parsed.root.operands] == expected
+    # And the SQL path sees only full-day literals -- Postgres rejects `'2021'` as a date.
+    context = QueryContext()
+    sql = parsed.to_sql(context)
+    assert "card.released_at" in sql
+    assert all(len(v) == len("2021-01-01") for v in context.values()), list(context.values())
+
+
+def test_partial_date_not_equal_is_the_complement_of_the_window(parse_query) -> None:
+    """`date!=2021` is 18 on the khm anchor where `date:2021` is 306: outside the window, not a day."""
+    parsed = parse_query("date!=2021")
+    assert isinstance(parsed.root, NotNode)
+    assert isinstance(parsed.root.operand, AndNode)
+    assert [_leaf(op) for op in parsed.root.operand.operands] == [(">=", "2021-01-01"), ("<", "2022-01-01")]
+
+
+def test_partial_date_window_serializes_full_days_for_engine(parse_query) -> None:
+    """The engine receives full days, never the zero-padded `20210000` it used to compare against."""
+    payload = parse_query("date<=2021 or date:2021-02").to_json()
+    values = [n["kwargs"]["value"] for n in _walk_string_values(payload)]
+    assert sorted(values) == ["2021-02-01", "2021-03-01", "2022-01-01"]
+
+
+def _walk_string_values(node: dict) -> list[dict]:
+    if node.get("node_type") == "StringValueNode":
+        return [node]
+    found: list[dict] = []
+    for value in node.get("kwargs", {}).values():
+        if isinstance(value, dict):
+            found.extend(_walk_string_values(value))
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    found.extend(_walk_string_values(item))
+    return found
+
+
+def test_month_out_of_range_is_refused_by_name(parse_query) -> None:
+    """`date:2021-13` is refused rather than widened to a window that does not exist."""
+    with pytest.raises(ValueError, match=r"2021-13|Failed to parse"):
+        parse_query("date:2021-13")
 
 
 @pytest.mark.parametrize(
@@ -196,11 +259,11 @@ def test_set_code_resolves_inside_compounds_and_negation(parse_query, known_sets
     assert "3ed" not in values
 
 
-@pytest.mark.parametrize("query", ["date:2025", "date:2025-02-02", "date:2021-02"])
-def test_date_shapes_are_left_alone(parse_query, known_sets, query: str) -> None:
-    """A value that already is a date shape never goes through the registry."""
+@pytest.mark.parametrize("query", ["date:2025-02-02", "date>=1993-08-05"])
+def test_full_dates_are_left_alone(parse_query, known_sets, query: str) -> None:
+    """A full day never goes through the registry and is not widened."""
     parsed = parse_query(query)
-    assert parsed.root.rhs.value == query.removeprefix("date:")
+    assert parsed.root.rhs.value == query.split("date")[1].lstrip(":<>=")
 
 
 @pytest.mark.parametrize(

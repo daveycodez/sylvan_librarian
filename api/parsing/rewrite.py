@@ -426,28 +426,101 @@ class InvalidDateValueError(ValueError):
     Scryfall's own sentence, curly quotes and lower-cased value included, so the client sees the
     same words for `date>=zzzz` here as there. `year>=hob` is deliberately NOT this error: Scryfall
     404s it, and both parsers already fail it as a plain parse error.
+
+    A value that IS date-shaped but names a month that does not exist (`date:2021-13`) gets
+    Scryfall's shorter sentence for that case, `Invalid date “2021-13”`, without the set-code half:
+    the shape parsed and only the month was out of range (measured 2026-09-03).
     """
 
-    def __init__(self, value: str) -> None:
+    def __init__(self, value: str, *, malformed_date: bool = False) -> None:
         """Initialize with the offending value; the message is the user-facing sentence."""
         self.value = value
-        self.user_message = f"Invalid date or unknown set code \u201c{value.lower()}\u201d"
+        if malformed_date:
+            self.user_message = f"Invalid date \u201c{value.lower()}\u201d"
+        else:
+            self.user_message = f"Invalid date or unknown set code \u201c{value.lower()}\u201d"
         super().__init__(self.user_message)
 
 
-def _resolve_date_leaves(node: QueryNode) -> None:
-    """Replace set codes in `date:` leaves with the set's ISO release date, in place.
+_FULL_DATE_PARTS = 3  # YYYY-MM-DD; fewer parts name a window
+_DECEMBER = 12
 
-    In place for the same reason as `_lower_regex_leaves`: only `rhs` changes, and rebuilding the
-    leaf would drop its concrete card-specific class. Date-shaped values are left exactly as the
-    parser delivered them; the SQL and engine paths already know what to do with those.
+
+def _partial_date_window(value: str) -> tuple[str, str] | None:
+    """The half-open `[lo, hi)` ISO window a bare year or month stands for, or None for a full day.
+
+    Measured against `e:khm` (323 cards, released 2021-02-05) on api.scryfall.com 2026-09-03: `date:2021`
+    306 = `date=2021` = `date<=2021`, `date<2021` 0, `date>2021` 18 = `date>=2022`, `date>=2021` 323,
+    `date!=2021` 18; and by month `date:2021-02` 305, `date<=2021-01` 0, `date>2021-01` 323 =
+    `date>=2021-02`, `date<2021-02` 0. So a partial value is the whole span it names under EVERY
+    operator: `=` is inside it, `<=` is before its end, `>` is from its end, `<` is before its start,
+    `>=` is from its start, `!=` is outside it.
     """
-    if isinstance(node, (AndNode, OrNode)):
+    parts = value.split("-")
+    if len(parts) == _FULL_DATE_PARTS:
+        return None
+    year = int(parts[0])
+    if len(parts) == 1:
+        return (f"{year:04d}-01-01", f"{year + 1:04d}-01-01")
+    month = int(parts[1])
+    if not 1 <= month <= _DECEMBER:
+        raise InvalidDateValueError(value, malformed_date=True)
+    lo = f"{year:04d}-{month:02d}-01"
+    hi = f"{year + 1:04d}-01-01" if month == _DECEMBER else f"{year:04d}-{month + 1:02d}-01"
+    return (lo, hi)
+
+
+def _expand_partial_date(leaf: BinaryOperatorNode, lo: str, hi: str) -> QueryNode:
+    """Rewrite `date <op> <year|month>` into full-day comparisons over the window `[lo, hi)`.
+
+    Full dates are all the SQL path and the Rust engine can compare: Postgres rejects `'2021'` as a
+    date literal outright, and the engine zero-pads `2021` to `20210000`, a day no printing has, so
+    `date:2021` matched nothing on one path and errored on the other. The leaf's concrete class is
+    kept (`type(leaf)(...)`, as `_swap_not_leaves` does) so the SQL and explanation it generates are
+    the ones a user-typed full date gets.
+    """
+
+    def cmp(op: str, iso: str) -> QueryNode:
+        return type(leaf)(leaf.lhs, op, StringValueNode(iso))
+
+    op = "=" if leaf.operator == ":" else leaf.operator
+    if op == "=":
+        return AndNode([cmp(">=", lo), cmp("<", hi)])
+    if op == "!=":
+        return NotNode(AndNode([cmp(">=", lo), cmp("<", hi)]))
+    if op == "<":
+        return cmp("<", lo)
+    if op == "<=":
+        return cmp("<", hi)
+    if op == ">":
+        return cmp(">=", hi)
+    if op == ">=":
+        return cmp(">=", lo)
+    msg = f"Unsupported date operator: {leaf.operator}"
+    raise ValueError(msg)
+
+
+def _resolve_date_leaves(node: QueryNode) -> tuple[QueryNode, bool]:
+    """Resolve every `date:` leaf's value to full days; return `(node, changed)`.
+
+    A set code becomes the set's ISO release date in place (only `rhs` changes, as
+    `_lower_regex_leaves` does, so the leaf keeps its concrete class). A bare year or month is a
+    WINDOW and becomes one or two full-day comparisons -- a new subtree, so the parent is rebuilt
+    the way `_swap_not_leaves` rebuilds it. A full `YYYY-MM-DD` is left exactly as delivered.
+    """
+    cls = node.__class__
+    if cls is AndNode or cls is OrNode:
+        changed = False
+        operands = []
         for op in node.operands:
-            _resolve_date_leaves(op)
-    elif isinstance(node, NotNode):
-        _resolve_date_leaves(node.operand)
-    elif (
+            new_op, op_changed = _resolve_date_leaves(op)
+            operands.append(new_op)
+            changed |= op_changed
+        return (cls(operands), True) if changed else (node, False)
+    if cls is NotNode:
+        new_op, changed = _resolve_date_leaves(node.operand)
+        return (NotNode(new_op), True) if changed else (node, False)
+    if (
         isinstance(node, BinaryOperatorNode)
         and isinstance(node.lhs, CardAttributeNode)
         and node.lhs.attribute_name == "released_at"
@@ -456,15 +529,20 @@ def _resolve_date_leaves(node: QueryNode) -> None:
     ):
         value = str(node.rhs.value)
         if _DATE_SHAPE_RE.fullmatch(value):
-            return
+            window = _partial_date_window(value)
+            if window is None:
+                return node, False
+            return _expand_partial_date(node, *window), True
         released_at = set_release_date(value)
         if released_at is None:
             raise InvalidDateValueError(value)
         node.rhs = StringValueNode(released_at)
+        return node, True
+    return node, False
 
 
 def resolve_set_code_dates(query: Query) -> Query:
-    """Rewrite `date:<set code>` leaves to `date:<that set's release date>`.
+    """Rewrite every `date:` leaf to full-day comparisons: set codes resolve, years and months widen.
 
     Scryfall resolves a set code in a `date:` value to the set's `released_at` and compares against
     it as a full day, not a window: `date>=hob` = `date>=2026-08-14` = 1200 cards, `date:hob` =
@@ -475,12 +553,20 @@ def resolve_set_code_dates(query: Query) -> Query:
     resolve; only a set's primary code does (`date>=dar`, Dominaria's arena code, is an error there
     even though `e:dar` is 265).
 
+    A bare year or month is a WINDOW under every operator (see `_partial_date_window` for the
+    measurements) and is widened to full-day comparisons here for the same reason a code resolves
+    here: both the SQL path and the Rust engine need literal full dates in the AST. Postgres rejects
+    `'2021'` as a date literal and the engine compared `date:2021` against the day `20210000`, so
+    `date:2021` -- documented syntax -- errored on one path and matched nothing on the other.
+
     Runs here, at the shared seam, because the parser has no database and both the SQL path and the
     Rust engine need a literal date in the AST -- the engine would otherwise fail the query with
     `bad date: hob`, and Postgres would be asked to compare a `date` column to `'hob'`.
     """
-    _resolve_date_leaves(query.root)
-    return query
+    root, changed = _resolve_date_leaves(query.root)
+    if not changed:
+        return query
+    return flatten_nested_operations(Query(root))
 
 
 # The post-parse rewrite pipeline, applied in order at the shared parse seam. Add future AST
