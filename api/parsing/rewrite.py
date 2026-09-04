@@ -299,6 +299,29 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     # The stored tag follows Scryfall's own syntax page (`is:judge_gift`); Scryfall accepts the
     # short spelling too, so it aliases on rather than storing the same rows twice.
     ("is", "judge"): "is:judge_gift",
+    # The concatenated spellings of six tags stored under their syntax-page key -- the `promo_types`
+    # member itself, which Scryfall accepts alongside the underscored form. Measured 2026-09-03,
+    # each the same count as its target: `is:setpromo` 1,381, `is:mediainsert` 586,
+    # `is:planeswalkerdeck` 180, `is:judgegift` 164, `is:arenaleague` 40, `is:intropack` 40 --
+    # every one a 200 there and a warned no-match here, because the table knew only the
+    # underscored key. Aliases rather than rows: the tag under either spelling is the same tag.
+    ("is", "arenaleague"): "is:arena_league",
+    ("is", "intropack"): "is:intro_pack",
+    ("is", "judgegift"): "is:judge_gift",
+    ("is", "mediainsert"): "is:media_insert",
+    ("is", "planeswalkerdeck"): "is:planeswalker_deck",
+    ("is", "setpromo"): "is:set_promo",
+    # `rainbow` is Scryfall's short spelling of the `rainbowfoil` promo type, not a member of its
+    # own: `is:rainbow` and `is:rainbowfoil` are both 183 and both set differences are empty
+    # (2026-09-03). It never appears in `promo_types`, so it can only ever be an alias.
+    ("is", "rainbow"): "is:rainbowfoil",
+    # Two `is:` spellings of columns this parser already has, exact in both directions on
+    # 2026-09-03. `is:borderless` = `border:borderless` (3,611, both set differences empty).
+    # `is:tombstone` = `frame:tombstone` (113): a frame EFFECT, the one `is:` value of the 78 the
+    # 2026-09-03 enumeration recovered that is not a promo type; the importer writes every
+    # frame_effects member into card_frame_data, so it reaches the column as the three above do.
+    ("is", "borderless"): "border:borderless",
+    ("is", "tombstone"): "frame:tombstone",
 }
 
 # Scryfall's `has:` family, which asks whether a field is PRESENT rather than what it holds. The
@@ -374,7 +397,19 @@ _DERIVED_EXPANSIONS.update({("has", value): dsl for value, dsl in _HAS_EXPANSION
 # with no `lang:` written -- so, like `localizedname`, its presence WIDENS the query to the annex.
 # Before it was listed here it parsed, reached the engine as a tag no row carries, and answered a
 # no-match for `clive is:flavorname` where Scryfall answers the three alternate-name Clives.
-ENGINE_IS_VALUES: frozenset[str] = frozenset({"localizedname", "unique", "vanilla", "flavorname"})
+#
+# `atypical` and `default` are the FRAME CLASS -- Scryfall's "atypical frame" and its complement,
+# "the default Magic frame". Not a stored tag and not a rewrite: the class is a rule over a
+# printing's border, frame effects, full-art/textless flags, promo treatments and finishes, and the
+# engine already evaluates exactly that rule for `prefer:atypical` (`printing_is_atypical`). PR #912
+# adds `FilterExpr::Atypical`, which calls the same function over the same bound ids, so `is:atypical`
+# is the predicate the prefer ranks by and the filter and the prefer cannot disagree about which
+# printings are the class; `is:default` is its `Not`. Measured 2026-09-03: `is:default` 33,267 and
+# `is:atypical` 10,423 over the default corpus, `is:atypical is:default` 0 and
+# `is:default -is:atypical` 33,267 -- exact complements per printing, which is what makes `default` a
+# `Not` rather than a second class table that could drift from this one. Both were the largest `is:`
+# values this parser called unsupported.
+ENGINE_IS_VALUES: frozenset[str] = frozenset({"localizedname", "unique", "vanilla", "flavorname", "atypical", "default"})
 
 
 # Every `is:` value this parser can answer at all: the derivable expansions above, the booleans the

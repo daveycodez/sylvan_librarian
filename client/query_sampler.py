@@ -167,13 +167,14 @@ STATIC_VALUES: dict[str, list[str]] = {
     # Anything outside this set parses but falls through to a `card_is_tags` lookup, and that column
     # carries only the booleans the import syncs from the bulk blob (db_info.BOOLEAN_IS_TAGS) —
     # `is:reserved` and `is:reprint` are the ones to reach for. Values with no key there match zero
-    # cards AND now raise a warning, as `is:token` does. All 74 are kept rather
+    # cards AND now raise a warning, as `is:token` does. All 84 are kept rather
     # than a token few: the family's share of traffic is set by its weight, not by how many values
     # it holds, and each expands to a genuinely different shape — layout lookups, type unions, an
     # oracle-text heuristic, a numeric conjunction.
     "tag": [
         "is:adventure",
         "is:alchemy",
+        "is:arenaleague",
         "is:artseries",
         "is:augmentation",
         "is:battleland",
@@ -181,6 +182,7 @@ STATIC_VALUES: dict[str, list[str]] = {
         "is:bicycleland",
         "is:bikeland",
         "is:bondland",
+        "is:borderless",
         "is:bounceland",
         "is:brawler",
         "is:canland",
@@ -209,12 +211,15 @@ STATIC_VALUES: dict[str, list[str]] = {
         "is:historic",
         "is:hybrid",
         "is:host",
+        "is:intropack",
         "is:judge",
+        "is:judgegift",
         "is:karoo",
         "is:leveler",
         "is:manland",
         "is:masterpiece",
         "is:mdfc",
+        "is:mediainsert",
         "is:meld",
         "is:modal",
         "is:new",
@@ -227,9 +232,12 @@ STATIC_VALUES: dict[str, list[str]] = {
         "is:permanent",
         "is:phyrexian",
         "is:planar",
+        "is:planeswalkerdeck",
         "is:promostamped",
+        "is:rainbow",
         "is:reversible",
         "is:scryland",
+        "is:setpromo",
         "is:shadowland",
         "is:shockland",
         "is:showcase",
@@ -242,6 +250,7 @@ STATIC_VALUES: dict[str, list[str]] = {
         "is:tangoland",
         "is:tdfc",
         "is:token",
+        "is:tombstone",
         "is:transform",
         "is:tricycleland",
         "is:triland",

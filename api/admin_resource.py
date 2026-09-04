@@ -100,6 +100,10 @@ _UPSERT_PAGE_SIZE = 3_000
 # api.parsing.db_info (imported above) because the parser reads it too.
 _BOOLEAN_IS_TAGS_SYNC_CHUNK_COUNT = 4
 
+# Key/value pairs per jsonb_build_object call in the sync statement: Postgres's FUNC_MAX_ARGS is
+# 100 arguments, and every pair is two. See _build_boolean_is_tags_sql.
+_JSONB_BUILD_OBJECT_MAX_PAIRS = 50
+
 
 def _build_boolean_is_tags_sql(tags: dict[str, str]) -> str:
     """Build a BOOLEAN_IS_TAGS sync statement from `tags`.
@@ -116,10 +120,19 @@ def _build_boolean_is_tags_sql(tags: dict[str, str]) -> str:
     Callers pass ``num_chunks`` and ``chunk_index`` as query parameters. Use
     ``num_chunks=1, chunk_index=0`` to scan the whole corpus; otherwise only cards whose
     ``hashtext(scryfall_id)`` falls in that slice are touched.
+
+    The object is built as several ``jsonb_build_object`` calls concatenated with ``||`` rather
+    than one: Postgres caps any function call at 100 arguments (FUNC_MAX_ARGS), which is 50
+    key/value pairs, and the table passed 50 when the 2026-09-03 enumeration of Scryfall's
+    ``promo_types`` vocabulary took it past 100 rows. As one call the statement failed every
+    import with "cannot pass more than 100 arguments to a function", so the cap is enforced here
+    rather than remembered.
     """
     managed = ", ".join(f"'{tag}'" for tag in tags)
-    object_entries = ",\n            ".join(
-        f"'{tag}', CASE WHEN ({expr}) THEN true END" for tag, expr in tags.items()
+    pairs = [f"'{tag}', CASE WHEN ({expr}) THEN true END" for tag, expr in tags.items()]
+    chunks = [pairs[i : i + _JSONB_BUILD_OBJECT_MAX_PAIRS] for i in range(0, max(len(pairs), 1), _JSONB_BUILD_OBJECT_MAX_PAIRS)]
+    built_objects = "\n                || ".join(
+        "jsonb_build_object(\n            " + ",\n            ".join(chunk) + "\n                )" for chunk in chunks
     )
     return f"""
 WITH proposed AS (
@@ -127,9 +140,7 @@ WITH proposed AS (
         cards.scryfall_id,
         (cards.card_is_tags - ARRAY[{managed}]::text[])
             || jsonb_strip_nulls(
-                jsonb_build_object(
-            {object_entries}
-                )
+                {built_objects}
             ) AS proposed_is_tags
     FROM magic.cards cards
     WHERE (abs(hashtext(cards.scryfall_id::text)) %% %(num_chunks)s) = %(chunk_index)s
@@ -141,6 +152,7 @@ WHERE
     cards.scryfall_id = proposed.scryfall_id AND
     cards.card_is_tags IS DISTINCT FROM proposed.proposed_is_tags
 """
+
 
 CUSTOM_IS_TAGS = [
     "historic",  # artifact, legendary, saga

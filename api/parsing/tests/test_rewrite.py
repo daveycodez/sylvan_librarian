@@ -43,8 +43,7 @@ EQUIVALENCES = [
     ("is:leveler", "layout:leveler"),
     (
         "is:dfc",
-        "layout:transform or layout:modal_dfc or layout:art_series or layout:double_faced_token or "
-        "layout:reversible_card",
+        "layout:transform or layout:modal_dfc or layout:art_series or layout:double_faced_token or layout:reversible_card",
     ),
     # The same predicate under two names, and neither of them is one layout: `is:host
     # -is:augmentation` and its converse are both empty on api.scryfall.com.
@@ -132,6 +131,16 @@ EQUIVALENCES = [
     # Spelling aliases of stored tags: the expansion is the OTHER is: value, which stays a leaf.
     ("is:full", "is:fullart"),
     ("is:promostamped", "is:stamped"),
+    ("is:arenaleague", "is:arena_league"),
+    ("is:intropack", "is:intro_pack"),
+    ("is:judgegift", "is:judge_gift"),
+    ("is:mediainsert", "is:media_insert"),
+    ("is:planeswalkerdeck", "is:planeswalker_deck"),
+    ("is:setpromo", "is:set_promo"),
+    ("is:rainbow", "is:rainbowfoil"),
+    # Columns this parser already has, under their `is:` spelling.
+    ("is:borderless", "border:borderless"),
+    ("is:tombstone", "frame:tombstone"),
     # Set types: `st:` is the operator these five turn out to BE.
     ("is:masterpiece", "st:masterpiece"),
     ("is:alchemy", "st:alchemy"),
@@ -395,6 +404,7 @@ def test_boolean_is_tag_expressions_read_the_row_they_are_correlated_against() -
     for tag, expr in BOOLEAN_IS_TAGS.items():
         assert any(col in expr for col in columns), (tag, expr)
 
+
 def test_every_stored_is_tag_is_a_supported_value() -> None:
     """A tag the importer writes must be one the parser reports as supported.
 
@@ -410,8 +420,8 @@ def test_engine_answered_is_values_are_supported_and_stored_nowhere() -> None:
 
     Two directions, and the second is the one that bites. Supported: a predicate that works and
     still warns is worse than one that does neither. Stored nowhere: if `localizedname`, `unique`,
-    `vanilla` or `flavorname` ever became an importer tag as well, the engine would keep intercepting the leaf and
-    the stored tag would be dead weight nobody could observe.
+    `vanilla`, `flavorname`, `atypical` or `default` ever became an importer tag as well, the engine
+    would keep intercepting the leaf and the stored tag would be dead weight nobody could observe.
     """
     assert ENGINE_IS_VALUES <= SUPPORTED_IS_VALUES
     assert not (ENGINE_IS_VALUES & frozenset(BOOLEAN_IS_TAGS))
@@ -440,15 +450,24 @@ def test_engine_answered_is_values_are_supported_and_stored_nowhere() -> None:
         "is:tdfc",
         "is:hybrid",
         "is:phyrexian",
+        # The 2026-09-03 vocabulary: a promo type the syntax page never lists, the concatenated
+        # spelling of a stored underscored key, the short spelling of a promo type, and a meld role.
+        "is:serialized",
+        "is:setpromo",
+        "is:rainbow",
+        "is:meldpart",
         # Neither expands nor names a stored tag: the engine reads a field for each. Warning about
         # them would be the exact defect SUPPORTED_IS_VALUES exists to remove, in reverse.
         "is:localizedname",
         "is:unique",
         "is:vanilla",
         "is:flavorname",
+        "is:atypical",
+        "is:default",
         # ...and through the `has:` alias, which resolves to the same engine leaf.
         "has:vanilla",
         "has:flavorname",
+        "has:atypical",
     ],
 )
 def test_supported_is_values_do_not_warn(query: str) -> None:
