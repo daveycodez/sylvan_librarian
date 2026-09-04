@@ -945,6 +945,62 @@ class TestCardProperties:
         total, _ = _run(engine, "border:borderless")
         assert total == 10
 
+    def test_is_atypical_and_is_default_partition_the_fixture(self, engine: QueryEngine) -> None:
+        # The fixture rows carry no compat blob, so only what the class reads OUTSIDE it can answer:
+        # the 10 borderless printings and Tarmogoyf's 3 future-frame ones (`card_frame_data`). The
+        # point here is the partition over every printing, not the count.
+        atypical, atypical_cards = _run(engine, "is:atypical", fields=["scryfall_id"])
+        default, default_cards = _run(engine, "is:default", fields=["scryfall_id"])
+        assert atypical == 13
+        assert atypical + default == 90
+        both, _ = _run(engine, "is:atypical is:default")
+        assert both == 0
+        ids = {c["scryfall_id"] for c in atypical_cards} | {c["scryfall_id"] for c in default_cards}
+        assert len(ids) == 90
+
+    def test_is_atypical_reads_the_printing_compat_fields(self, fresh_engine: Callable[[], QueryEngine]) -> None:
+        """`is:atypical` is the class `prefer:atypical` ranks by, read off each printing's own compat fields.
+
+        The fixture has no compat blobs, so this builds five printings of one card with every marker the class
+        reads set on exactly one printing each -- and the two look-alikes that must NOT count: a white border
+        and a bare `promo` flag (an FNM foil is the standard frame).
+        """
+        rows = json.loads(_FIXTURE.read_text())[:5]
+        assert {r["card_name"] for r in rows} == {"Black Lotus"}
+        blobs = [
+            # id 0: plain black border, nonfoil, a rules frame effect -- the default frame.
+            {"finishes": ["nonfoil"], "frame_effects": ["legendary"], "promo_types": []},
+            # id 1: a prerelease date stamp on the standard frame -- a promo TREATMENT, atypical.
+            {"finishes": ["foil"], "frame_effects": [], "promo_types": ["datestamped"]},
+            # id 2: white border and a bare promo flag -- neither counts.
+            {"finishes": ["nonfoil", "foil"], "frame_effects": [], "promo_types": [], "promo": True},
+            # id 3: showcase frame -- atypical.
+            {"finishes": ["nonfoil", "foil"], "frame_effects": ["showcase"], "promo_types": ["boosterfun"]},
+            # id 4: surge foil as the ONLY finish -- atypical; the same word on a nonfoil row would not be.
+            {"finishes": ["foil"], "frame_effects": [], "promo_types": ["surgefoil"]},
+        ]
+        for row, blob in zip(rows, blobs, strict=True):
+            row["card_compat_blob"] = blob
+            row["card_border"] = "black"
+        rows[2]["card_border"] = "white"
+        e = fresh_engine()
+        e.reload(rows)
+        fields = ["scryfall_id"]
+        _, atypical = _run(e, "is:atypical", fields=fields)
+        _, default = _run(e, "is:default", fields=fields)
+        by_id = {rows[i]["scryfall_id"]: i for i in range(5)}
+        assert sorted(by_id[str(c["scryfall_id"])] for c in atypical) == [1, 3, 4]
+        assert sorted(by_id[str(c["scryfall_id"])] for c in default) == [0, 2]
+        # Textless and full art each count alone; a nonfoil finish takes the surge-foil row out.
+        rows[0]["card_compat_blob"]["textless"] = True
+        rows[2]["card_compat_blob"]["full_art"] = True
+        rows[4]["card_compat_blob"]["finishes"] = ["nonfoil", "foil"]
+        e.reload(rows)
+        _, atypical = _run(e, "is:atypical", fields=fields)
+        _, default = _run(e, "is:default", fields=fields)
+        assert sorted(by_id[str(c["scryfall_id"])] for c in atypical) == [0, 1, 2, 3]
+        assert sorted(by_id[str(c["scryfall_id"])] for c in default) == [4]
+
     def test_layout_normal(self, engine: QueryEngine) -> None:
         # All fixture cards are normal layout
         total, _ = _run(engine, "layout:normal")
