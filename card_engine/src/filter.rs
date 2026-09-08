@@ -952,6 +952,23 @@ pub(crate) enum FilterExpr {
     /// Its presence WIDENS the query — see `widens_to_annex`, and the count that proves it.
     PrintedNamePresent,
 
+    /// `is:flavorname` — and `has:flavorname` — a PRINTING that carries a flavor name, Scryfall's
+    /// alternate SOLD-AS name (the Godzilla series, the Secret Lair crossovers). The presence twin
+    /// of `FlavorNameIn`: that leaf asks whether the flavor name satisfies a `name:` needle, this
+    /// one only whether there is one. Nothing is stored for it and nothing is bound.
+    ///
+    /// EITHER PLACE Scryfall puts the key counts. Measured against api.scryfall.com on
+    /// 2026-09-01: `is:flavorname` is 476 cards / 661 printings, 646 of them carrying the
+    /// top-level key and the other 15 carrying it on their FACES alone (`transform` and
+    /// `reversible_card` — vow/341 is "Dracula the Voyager" // "Casket of Native Earth", sld/1807
+    /// "Chucky" on the front face only), and none carrying neither. A printing-level read alone
+    /// would have answered 646 and called it the whole set.
+    ///
+    /// Its presence WIDENS the query, exactly as `PrintedNamePresent`'s does: 6 of the 661 are
+    /// Japanese rows (iko/387 ja prints "Mechagodzilla, the Weapon" over 結晶の巨人) and
+    /// api.scryfall.com returns them with no `lang:` term written.
+    FlavorNamePresent,
+
     /// A PRINTING whose `flavor_name` satisfies the `name:` predicate that produced this leaf.
     ///
     /// `name:` reaches a printing's alternate SOLD-AS name, not just its oracle name. Measured on
@@ -1169,9 +1186,11 @@ pub(crate) fn verify_cost_tier(f: &FilterExpr) -> u32 {
         | FilterExpr::LangMatch { .. }
         // ...and a SetTypeMatch is the same equality against a different id in the same vocab.
         | FilterExpr::SetTypeMatch { .. }
-        // A PrintedNamePresent is one u32 compare against a field already on the printing, and a
+        // A PrintedNamePresent is one u32 compare against a field already on the printing, a
+        // FlavorNamePresent the same compare plus a walk of the printing's few faces, and a
         // SingleSet one bool read off a field already on the card.
         | FilterExpr::PrintedNamePresent
+        | FilterExpr::FlavorNamePresent
         | FilterExpr::SingleSet
         // An OracleIdMatch is one 128-bit integer equality against a field already in the card.
         | FilterExpr::OracleIdMatch { .. }
@@ -1357,8 +1376,9 @@ fn leaf_compares_printing_field(f: &FilterExpr) -> bool {
         // row and its Japanese sibling answer differently.
         FilterExpr::PrintedNamePresent => true,
         // A flavor name is printed on the PRINTING; two printings of one card differ on it, which
-        // is the whole reason `name:croft` returns 2 of Command Tower's 112.
-        FilterExpr::FlavorNameIn { .. } => true,
+        // is the whole reason `name:croft` returns 2 of Command Tower's 112 — and the same reason
+        // `is:flavorname` matches Command Tower's sld/1864 row and none of its other 111.
+        FilterExpr::FlavorNameIn { .. } | FilterExpr::FlavorNamePresent => true,
         // Composites are composed by the two callers, which differ on `all` vs `any`; reaching here with
         // one is a bug in whichever caller forgot to handle it, not a case to answer silently.
         FilterExpr::And(_) | FilterExpr::Or(_) | FilterExpr::Not(_) => {
@@ -1659,7 +1679,6 @@ impl FilterExpr {
     pub(crate) fn bind(
         &mut self,
         vocab: &AStrings,
-        sorted_ids: &rkyv::Archived<Vec<u16>>,
         artist_vocab: &AStrings,
         // artist_vocab_collated: the same artists, `collate_name(fold_accents(...))` — the string
         // `a:word` matches against (see TextSearchField::ArtistCollated).
@@ -1671,10 +1690,10 @@ impl FilterExpr {
         match self {
             FilterExpr::And(children) | FilterExpr::Or(children) => {
                 for c in children {
-                    c.bind(vocab, sorted_ids, artist_vocab, artist_vocab_collated, mana_vocab, flavor, strings);
+                    c.bind(vocab, artist_vocab, artist_vocab_collated, mana_vocab, flavor, strings);
                 }
             }
-            FilterExpr::Not(inner) => inner.bind(vocab, sorted_ids, artist_vocab, artist_vocab_collated, mana_vocab, flavor, strings),
+            FilterExpr::Not(inner) => inner.bind(vocab, artist_vocab, artist_vocab_collated, mana_vocab, flavor, strings),
             // UNCONDITIONAL, unlike the other bind arms: the weights are read off the CARD's
             // hybrids, not the query's, so `m:{2}` against a twobrid card needs them even though
             // the query carries no hybrid symbol at all. Gating this on `!hybrids.is_empty()` —
@@ -1692,29 +1711,28 @@ impl FilterExpr {
                 *hybrid_colors = mana_vocab.iter().map(|s| devotion_color_mask(s.as_str())).collect();
             }
             FilterExpr::CollectionCmp { value, value_id, .. } => {
-                let i = sorted_ids.partition_point(|id| vocab[u16::from(*id) as usize].as_str() < value.as_str());
-                *value_id = sorted_ids
-                    .get(i)
-                    .map(|id| u16::from(*id))
-                    .filter(|&id| vocab[id as usize].as_str() == value.as_str());
+                // The vocab is renumbered into lexicographic order at load, so ids ARE the sorted
+                // order and the permutation this used to search through is gone.
+                let i = vocab.partition_point(|entry| entry.as_str() < value.as_str());
+                *value_id = u16::try_from(i)
+                    .ok()
+                    .filter(|&id| vocab.get(id as usize).is_some_and(|e| e.as_str() == value.as_str()));
             }
             // The language lives in the same vocab the collection values do (CompatFields.lang_id
             // interns into coll_vocab), so this is CollectionCmp's resolution verbatim.
             FilterExpr::LangMatch { value, vid, any: false } => {
-                let i = sorted_ids.partition_point(|id| vocab[u16::from(*id) as usize].as_str() < value.as_str());
-                *vid = sorted_ids
-                    .get(i)
-                    .map(|id| u16::from(*id))
-                    .filter(|&id| vocab[id as usize].as_str() == value.as_str());
+                let i = vocab.partition_point(|entry| entry.as_str() < value.as_str());
+                *vid = u16::try_from(i)
+                    .ok()
+                    .filter(|&id| vocab.get(id as usize).is_some_and(|e| e.as_str() == value.as_str()));
             }
             // The set type interns into that same vocab (CompatFields.set_type_id), so this is
             // the resolution above verbatim.
             FilterExpr::SetTypeMatch { value, vid } => {
-                let i = sorted_ids.partition_point(|id| vocab[u16::from(*id) as usize].as_str() < value.as_str());
-                *vid = sorted_ids
-                    .get(i)
-                    .map(|id| u16::from(*id))
-                    .filter(|&id| vocab[id as usize].as_str() == value.as_str());
+                let i = vocab.partition_point(|entry| entry.as_str() < value.as_str());
+                *vid = u16::try_from(i)
+                    .ok()
+                    .filter(|&id| vocab.get(id as usize).is_some_and(|e| e.as_str() == value.as_str()));
             }
             FilterExpr::TextContains { field: TextSearchField::ArtistLower, word } => {
                 // A QUOTED `a:"…"` reaches this arm, and it is collated too — Scryfall draws no
@@ -2124,14 +2142,16 @@ impl FilterExpr {
     /// `run_query_routed`. Detected here, on the compiled tree, so the operators and the
     /// `include_multilingual` flag cannot widen differently.
     ///
-    /// Two leaves qualify. `LangMatch` is the obvious one. `PrintedNamePresent` is the other, and
-    /// it is not a design choice — it is Scryfall's measured behaviour: `is:localizedname` with no
-    /// `lang:` term in sight answers 31,294 cards there, and `&unique=prints` shows the rows it
-    /// returns are German, French, Japanese… A canonical-only reading would answer 182 (the
-    /// English printings that carry a printed name) and call it the whole set.
+    /// Three leaves qualify. `LangMatch` is the obvious one. `PrintedNamePresent` is the second,
+    /// and it is not a design choice — it is Scryfall's measured behaviour: `is:localizedname`
+    /// with no `lang:` term in sight answers 31,294 cards there, and `&unique=prints` shows the
+    /// rows it returns are German, French, Japanese… A canonical-only reading would answer 182
+    /// (the English printings that carry a printed name) and call it the whole set.
+    /// `FlavorNamePresent` is the third, on the same measurement: `is:flavorname&unique=prints`
+    /// is 661 rows there and 6 of them are Japanese (2026-09-01).
     pub(crate) fn widens_to_annex(&self) -> bool {
         match self {
-            FilterExpr::LangMatch { .. } | FilterExpr::PrintedNamePresent => true,
+            FilterExpr::LangMatch { .. } | FilterExpr::PrintedNamePresent | FilterExpr::FlavorNamePresent => true,
             FilterExpr::And(children) | FilterExpr::Or(children) => children.iter().any(Self::widens_to_annex),
             FilterExpr::Not(inner) => inner.widens_to_annex(),
             _ => false,
@@ -2273,6 +2293,18 @@ impl FilterExpr {
                 tri_bool(id != super::NONE_STR && ids.binary_search(&id).is_ok())
             }
 
+            // Presence in EITHER place Scryfall puts the key: the printing's own top-level
+            // `flavor_name`, or a face's (`PrintingFace.flavor_name_id`, which the 15 transform /
+            // reversible printings carry INSTEAD of the top-level one — never both). NONE_STR on
+            // both is a real False, not an SQL NULL, for the same reason as PrintedNamePresent.
+            FilterExpr::FlavorNamePresent => {
+                let Some(p) = printing else { return Tri::PrintingDep };
+                tri_bool(
+                    u32::from(p.flavor_name_id) != super::NONE_STR
+                        || p.faces.iter().any(|f| u32::from(f.flavor_name_id) != super::NONE_STR),
+                )
+            }
+
             FilterExpr::SingleSet => tri_bool(card.single_set),
 
             // Two-valued: a card either has a silent creature front or it does not, and a card with
@@ -2399,7 +2431,8 @@ impl FilterExpr {
                     (None, _) => false,
                     // card_subtypes keeps the printed order, so it is not id-sorted.
                     (Some(id), CollField::Subtypes) => coll.iter().any(|x| u16::from(*x) == id),
-                    // The set-like collections are sorted by id at load.
+                    // The set-like collections are sorted by id at load, and since the vocab is
+                    // renumbered lexicographically that is also alphabetical order.
                     (Some(id), _) => coll.binary_search(&id.into()).is_ok(),
                 };
                 let all_equal = || match *value_id {
@@ -3062,7 +3095,7 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
             _                  => CollField::FrameData,
         };
         let value  = rhs.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        // Three `is:` values the importer stores no tag for, because fields already on the row
+        // Four `is:` values the importer stores no tag for, because fields already on the row
         // answer them (see `rewrite.ENGINE_IS_VALUES`, which is what keeps the parser from
         // reporting them unsupported). They arrive as `card_is_tags` membership like every other
         // `is:` value and turn into their own leaf HERE rather than in the parser, so the tag
@@ -3070,6 +3103,7 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
         if matches!(coll_field, CollField::IsTags) {
             match value.as_str() {
                 "localizedname" => return Ok(FilterExpr::PrintedNamePresent),
+                "flavorname" => return Ok(FilterExpr::FlavorNamePresent),
                 "unique" => return Ok(FilterExpr::SingleSet),
                 "vanilla" => return Ok(FilterExpr::VanillaFace),
                 _ => {}

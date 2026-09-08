@@ -1,4 +1,5 @@
 use super::{
+    renumber_coll_vocab,
     and_child_rank, AStrings, face_mana_cost, face_stat_nums, lane_get, mana_lane, ManaVocabInterner, assign_name_ranks,
     build_numeric_index, build_oracle_text_index, build_trigram_index,
     build_rarity_index, build_flavor_index, build_hybrid_tag_index, build_layout_hybrid_index, bitmap_beats_postings, HybridTagIndex, build_sort_permutations,
@@ -67,9 +68,19 @@ fn mode_only_params(mode: Mode) -> QueryParams {
 }
 
 /// String-sorted permutation of the vocab ids, as reload_commit builds it.
-fn sorted_vocab_ids(vocab: &[String]) -> Vec<u16> {
-    let mut ids: Vec<u16> = (0..vocab.len() as u16).collect();
-    ids.sort_unstable_by(|&a, &b| vocab[a as usize].cmp(&vocab[b as usize]));
+/// Resolve collection element strings against an already-renumbered (lexicographic) vocab, in the
+/// load-time shape: sorted, deduped ids.
+///
+/// Fixtures that assign collections AFTER `store_of` must resolve here rather than carrying ids
+/// across it: `renumber_coll_vocab` invalidates every id taken before it ran.
+fn coll_ids_in(vocab: &[String], items: &[&str]) -> Vec<u16> {
+    let mut ids: Vec<u16> = items
+        .iter()
+        .filter_map(|s| vocab.binary_search_by(|e| e.as_str().cmp(s)).ok())
+        .map(|i| i as u16)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
     ids
 }
 
@@ -287,7 +298,7 @@ fn usd_cmp(op: CmpOp, dollars: f64) -> FilterExpr {
 /// first printing of each range is the default-preferred one). Printings get
 /// sequential scryfall/illustration ids starting at 1, and released_at values
 /// that make the LAST printing of each range the oldest.
-fn store_of(cards: Vec<OracleCard>, printing_counts: &[usize], vocab: VocabInterner) -> CardData {
+fn store_of(mut cards: Vec<OracleCard>, printing_counts: &[usize], vocab: VocabInterner) -> CardData {
     assert_eq!(cards.len(), printing_counts.len());
     let mut printings = Vec::new();
     let mut offsets = vec![0u32];
@@ -310,6 +321,10 @@ fn store_of(cards: Vec<OracleCard>, printing_counts: &[usize], vocab: VocabInter
     // Same derivation reload_commit does, so a fixture store has the artwork-space offsets the
     // compose fastpath reads rather than an empty vec.
     let artwork_base = build_artwork_base_from(&artwork_groups);
+    // Establish the load path's invariant BEFORE any index is built from these ids: the vocab is
+    // renumbered lexicographically and every row's ids remapped (see `renumber_coll_vocab`). Index
+    // builders below read the ids, so renumbering after them would leave the indexes on old ids.
+    let coll_vocab = renumber_coll_vocab(&mut cards, &mut printings, &mut [], vocab.strings);
     // Real planes and bigrams so narrowing tests see the same store shape
     // reload_commit builds (type narrowing goes through the planes since #637).
     let indexes = CardIndexes {
@@ -340,8 +355,7 @@ fn store_of(cards: Vec<OracleCard>, printing_counts: &[usize], vocab: VocabInter
         foreign: vec![],
         foreign_offsets,
         strings: vec![],
-        coll_vocab_sorted: sorted_vocab_ids(&vocab.strings),
-        coll_vocab: vocab.strings,
+        coll_vocab,
         artist_vocab: vec![],
         artist_vocab_collated: vec![],
         mana_vocab: vec![],
@@ -1034,7 +1048,7 @@ fn collection_cmp_binds_vocab_ids_and_matches() {
             value: value.to_string(),
             value_id: None,
         };
-        f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+        f.bind(&archived.coll_vocab, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
         archived.cards.iter().map(|c| f.eval_card(c, &archived.strings) == Tri::True).collect()
     };
 
@@ -1064,7 +1078,7 @@ fn printing_level_predicates_are_printing_dep_in_card_pass() {
         value: "wolf".to_string(),
         value_id: None,
     };
-    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    f.bind(&archived.coll_vocab, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
 
     let card = &archived.cards[0];
     // Card pass can't decide an art-tag predicate...
@@ -2183,7 +2197,7 @@ fn fuzz_build_filter(spec: &FuzzSpec) -> FilterExpr {
 fn fuzz_bound_filter(spec: &FuzzSpec, archived: &Archived<CardData>) -> FilterExpr {
     let mut f = fuzz_build_filter(spec);
     f.bind(
-        &archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab,
+        &archived.coll_vocab, &archived.artist_vocab,
         &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings,
     );
     f
@@ -2321,9 +2335,12 @@ fn fuzz_store_n(rng: &mut rand::rngs::SmallRng, ncards: usize) -> CardData {
     // Printing-space collections + artist vid + flavor text id, same flat card/printing order as
     // pmeta. Interned here (while the vocabs/interner are in scope) but only applied to the printings
     // after store_of returns.
-    let mut art_meta: Vec<Vec<u16>> = Vec::new();
-    let mut is_meta: Vec<Vec<u16>> = Vec::new();
-    let mut frame_meta: Vec<Vec<u16>> = Vec::new();
+    // Element STRINGS, not ids. `store_of` renumbers the vocab lexicographically, which invalidates
+    // any vocab id taken before it ran -- and these are assigned to printings afterwards. They are
+    // still interned below so the vocab contains them; only the resolution is deferred.
+    let mut art_meta: Vec<Vec<&str>> = Vec::new();
+    let mut is_meta: Vec<Vec<&str>> = Vec::new();
+    let mut frame_meta: Vec<Vec<&str>> = Vec::new();
     let mut artist_meta: Vec<u16> = Vec::new();
     let mut flavor_meta: Vec<u32> = Vec::new();
 
@@ -2494,9 +2511,14 @@ fn fuzz_store_n(rng: &mut rand::rngs::SmallRng, ncards: usize) -> CardData {
             // (real data has no NULL artists). frame_data keeps "2015" dominant so the corpus-scale
             // store exercises the thresholded-index drop.
             let (na, ni, nf) = (rng.random_range(0..=4), rng.random_range(0..=2), rng.random_range(0..=2));
-            art_meta.push(vocab_ids(&mut vocab, &fuzz_collection_picks(rng, &FUZZ_ART_TAGS, na)));
-            is_meta.push(vocab_ids(&mut vocab, &fuzz_collection_picks(rng, &FUZZ_IS_TAGS, ni)));
-            frame_meta.push(vocab_ids(&mut vocab, &fuzz_collection_picks(rng, &FUZZ_FRAME_DATA, nf)));
+            for (meta, picks) in [
+                (&mut art_meta, fuzz_collection_picks(rng, &FUZZ_ART_TAGS, na)),
+                (&mut is_meta, fuzz_collection_picks(rng, &FUZZ_IS_TAGS, ni)),
+                (&mut frame_meta, fuzz_collection_picks(rng, &FUZZ_FRAME_DATA, nf)),
+            ] {
+                vocab_ids(&mut vocab, &picks); // intern now, resolve after the renumber
+                meta.push(picks);
+            }
             artist_meta.push(artist_vocab.intern(fuzz_weighted(rng, &FUZZ_ARTISTS).to_string()).unwrap());
             // Flavor is printing-varying (a fresh corpus draw per printing, ~half empty like the
             // corpus) so the printing-space FlavorMatch path selects among differing printings.
@@ -2517,9 +2539,9 @@ fn fuzz_store_n(rng: &mut rand::rngs::SmallRng, ncards: usize) -> CardData {
         data.printings[idx].price_eur = m.price_eur;
         data.printings[idx].price_tix = m.price_tix;
         data.printings[idx].released_at_int = Some(m.released_at);
-        data.printings[idx].card_art_tags = std::mem::take(&mut art_meta[idx]);
-        data.printings[idx].card_is_tags = std::mem::take(&mut is_meta[idx]);
-        data.printings[idx].card_frame_data = std::mem::take(&mut frame_meta[idx]);
+        data.printings[idx].card_art_tags = coll_ids_in(&data.coll_vocab, &art_meta[idx]);
+        data.printings[idx].card_is_tags = coll_ids_in(&data.coll_vocab, &is_meta[idx]);
+        data.printings[idx].card_frame_data = coll_ids_in(&data.coll_vocab, &frame_meta[idx]);
         data.printings[idx].card_artist_vid = artist_meta[idx];
         data.printings[idx].flavor_text_lower_id = flavor_meta[idx];
     }
@@ -3483,7 +3505,7 @@ fn a_dense_but_not_broad_frame_value_narrows_without_broad_ok() {
             value_id: None,
         };
         f.bind(
-            &archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab,
+            &archived.coll_vocab, &archived.artist_vocab,
             &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings,
         );
         let got = narrow_rec(&f, &archived.indexes, offsets, cards, &archived.strings, false);
@@ -3583,7 +3605,7 @@ fn value_totals_are_exact_in_all_three_spaces() {
     for (label, leaf) in &leaves {
         let mut f = leaf.clone();
         f.bind(
-            &archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab,
+            &archived.coll_vocab, &archived.artist_vocab,
             &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings,
         );
         for (mode_label, mode) in [("printing", Mode::Printing), ("card", Mode::Card), ("artwork", Mode::Artwork)] {
@@ -6755,7 +6777,6 @@ fn bench_checked_vs_unchecked_access() {
         foreign: vec![],
         foreign_offsets,
         strings,
-        coll_vocab_sorted: sorted_vocab_ids(&vocab.strings),
         coll_vocab: vocab.strings,
         artist_vocab: vec![],
         artist_vocab_collated: vec![],
@@ -6805,7 +6826,7 @@ fn card_pass_extracts_residual_and_matches() {
         value: "wolf".to_string(),
         value_id: None,
     };
-    wolf.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    wolf.bind(&archived.coll_vocab, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     let creature = || FilterExpr::TypeCmp { mask: TYPE_CREATURE, op: CmpOp::Ge };
 
     // And[t:creature, art:wolf]: the type check is proven at card level and
@@ -6833,7 +6854,7 @@ fn card_pass_extracts_residual_and_matches() {
         value: "wolf".to_string(),
         value_id: None,
     };
-    wolf2.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    wolf2.bind(&archived.coll_vocab, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     let or = FilterExpr::Or(vec![creature(), wolf2]);
     let t = or.card_pass(&archived.cards[0], &archived.strings, &mut residual, &mut is_or, 0);
     assert!(t == Tri::True && residual.is_empty());
@@ -6867,7 +6888,7 @@ fn artist_predicates_bind_to_vocab_ids_and_narrow() {
         field: super::TextSearchField::ArtistLower,
         word: "rebecca".to_string(),
     };
-    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    f.bind(&archived.coll_vocab, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     // bind rewrites the contains into an id-set match
     let FilterExpr::ArtistMatch { ref ids } = f else { panic!("expected ArtistMatch after bind") };
     assert_eq!(ids, &vec![rebecca]);
@@ -6890,7 +6911,7 @@ fn artist_predicates_bind_to_vocab_ids_and_narrow() {
         field: super::TextSearchField::ArtistLower,
         word: "zzz".to_string(),
     };
-    g.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    g.bind(&archived.coll_vocab, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     match narrow_candidates(&g, &archived.indexes, &archived.offsets, &archived.cards, &archived.strings) {
         Some(Candidates::Printings(v)) => assert!(v.is_empty()),
         _ => panic!("empty artist match must narrow to the empty set"),
@@ -6931,7 +6952,7 @@ fn every_artist_form_is_a_collated_contains() {
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
     let bind = |mut f: FilterExpr| -> Vec<u16> {
-        f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+        f.bind(&archived.coll_vocab, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
         let FilterExpr::ArtistMatch { ids } = f else { panic!("artist predicate must bind to ArtistMatch") };
         ids
     };
@@ -7019,7 +7040,7 @@ fn flavor_match_bind_eval_and_narrow() {
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
     let bound = |f: &mut FilterExpr| {
-        f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+        f.bind(&archived.coll_vocab, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     };
 
     let mut f = FilterExpr::TextContains {
@@ -8146,9 +8167,9 @@ fn collection_compose_leaves() {
     // compares the bound vocab *id* — so resolve `value_id` (the same partition_point `bind` runs), or
     // the reference would treat every value as unknown and match nothing.
     let coll = |field, op, value: &str| -> FilterExpr {
-        let (vocab, sorted) = (&archived.coll_vocab, &archived.coll_vocab_sorted);
-        let i = sorted.partition_point(|id| vocab[u16::from(*id) as usize].as_str() < value);
-        let value_id = sorted.get(i).map(|id| u16::from(*id)).filter(|&id| vocab[id as usize].as_str() == value);
+        let vocab = &archived.coll_vocab;
+        let i = vocab.partition_point(|entry| entry.as_str() < value);
+        let value_id = u16::try_from(i).ok().filter(|&id| vocab.get(id as usize).is_some_and(|e| e.as_str() == value));
         FilterExpr::CollectionCmp { field, op, value: value.to_string(), value_id }
     };
     let ge = |field, v: &str| coll(field, CmpOp::Ge, v);
@@ -9106,7 +9127,7 @@ fn usd_inside_arithmetic_evaluates_in_dollars_not_cents() {
         op: CmpOp::Lt,
         rhs: NumExpr::Field(NumField::Power),
     };
-    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    f.bind(&archived.coll_vocab, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     assert!(f.matches(card, printing, &archived.strings), "usd+1<power must evaluate in dollars: 50+1=51 < 52");
 }
 
@@ -9129,7 +9150,7 @@ fn usd_compared_directly_against_another_field_evaluates_in_dollars() {
 
     // usd<cmc: $2.00 < cmc(3) -- must match.
     let mut f = FilterExpr::NumericCmp { lhs: NumExpr::Field(NumField::PriceUsd), op: CmpOp::Lt, rhs: NumExpr::Field(NumField::Cmc) };
-    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    f.bind(&archived.coll_vocab, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     assert!(f.matches(card, printing, &archived.strings), "usd<cmc must evaluate in dollars: 2.00 < 3");
 }
 
@@ -10476,15 +10497,21 @@ fn name_bigrams_compose_and_memoize() {
 #[test]
 fn broad_tag_postings_scatter_or_decline() {
     let mut vocab = VocabInterner::new();
-    let spell = vocab.intern("spell".to_string()).unwrap();
-    let rare_tag = vocab.intern("etched".to_string()).unwrap();
+    vocab.intern("spell".to_string()).unwrap();
+    vocab.intern("etched".to_string()).unwrap();
     let cards: Vec<OracleCard> = (0..1200u32).map(|i| stub_card(u128::from(i) + 1, TYPE_CREATURE, &[], &mut vocab)).collect();
     let mut data = store_of(cards, &vec![4usize; 1200], vocab); // 4,800 printings
+    // Resolved AFTER store_of: it renumbers the vocab lexicographically, so ids taken before it are
+    // stale. That also reorders these two -- "etched" now sorts before "spell" -- so each vector is
+    // sorted after the pushes, which is the invariant `filter.rs`'s binary_search containment needs.
+    let id_of = |v: &str| coll_ids_in(&data.coll_vocab, &[v])[0];
+    let (spell, rare_tag) = (id_of("spell"), id_of("etched"));
     for (i, p) in data.printings.iter_mut().enumerate() {
         // "spell" on half of all printings (2,400 = 50% > MAX_NARROW_FRACTION);
         // "etched" on 1 in 100 (48, sparse).
         if i % 2 == 0 { p.card_is_tags.push(spell); }
         if i % 100 == 0 { p.card_is_tags.push(rare_tag); }
+        p.card_is_tags.sort_unstable();
     }
     data.indexes.is_tags = build_hybrid_tag_index(&data.printings, &data.coll_vocab, |p| &p.card_is_tags);
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
@@ -10620,7 +10647,6 @@ fn devotion_counts_distinct_pips_not_summed_lanes() {
         let mut f = FilterExpr::Devotion { op, pips: packed_pips(pips), hybrid_colors: Vec::new() };
         f.bind(
             &archived.coll_vocab,
-            &archived.coll_vocab_sorted,
             &archived.artist_vocab,
             &archived.artist_vocab_collated,
             &archived.mana_vocab,
@@ -11551,7 +11577,6 @@ fn a_twobrid_pip_weighs_two_against_generic() {
         let mut f = mana_cmp_of(op, pips, cmc, &mv);
         f.bind(
             &archived.coll_vocab,
-            &archived.coll_vocab_sorted,
             &archived.artist_vocab,
             &archived.artist_vocab_collated,
             &archived.mana_vocab,
@@ -14455,15 +14480,17 @@ fn set_type_matches_through_the_compat_vocab() {
 
     // Evaluation, against a printing that carries a set type and one that does not.
     let mut vocab = VocabInterner::new();
-    let masterpiece = vocab.intern("masterpiece".to_string()).unwrap();
+    vocab.intern("masterpiece".to_string()).unwrap();
     let mut card = stub_card(1, TYPE_CREATURE, &[], &mut vocab);
     card.card_name_lower = InlineStr::from_str("kozilek");
     let mut data = store_of(vec![card], &[2], vocab);
+    // Resolved AFTER store_of, which renumbers the vocab (see `coll_ids_in`).
+    let masterpiece = coll_ids_in(&data.coll_vocab, &["masterpiece"])[0];
     data.printings[0].compat.set_type_id = masterpiece;
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
     let bind = |f: &mut FilterExpr| {
-        f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+        f.bind(&archived.coll_vocab, &archived.artist_vocab, &archived.artist_vocab_collated, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     };
 
     let mut hit = leaf("masterpiece");
@@ -15210,14 +15237,17 @@ fn annex_artwork_groups_share_canonical_ids_and_extend_past_them() {
 /// foreign fuzzy pass's minimal fixture.
 fn bilingual_store() -> (CardData, u16, u16) {
     let mut vocab = VocabInterner::new();
-    let en = vocab.intern("en".to_string()).expect("intern en");
-    let fr = vocab.intern("fr".to_string()).expect("intern fr");
+    vocab.intern("en".to_string()).expect("intern en");
+    vocab.intern("fr".to_string()).expect("intern fr");
     let mut card = stub_card(1, 0, &[], &mut vocab);
     // `card_name_folded_id` stays NONE_STR: the name carries no diacritic, so folded == lower and
     // `folded_name` reads `card_name_lower` — which also keeps the interned id from colliding with
     // the strings table this fixture replaces below.
     card.card_name_lower = InlineStr::from_str("lightning bolt");
     let mut data = store_of(vec![card], &[1], vocab);
+    // Resolved AFTER store_of, which renumbers the vocab (see `coll_ids_in`).
+    let en = coll_ids_in(&data.coll_vocab, &["en"])[0];
+    let fr = coll_ids_in(&data.coll_vocab, &["fr"])[0];
     data.printings[0].compat.lang_id = en;
 
     let mut foreign = stub_printing(2, 2, None);
@@ -15268,6 +15298,95 @@ fn include_multilingual_rolls_up_to_the_canonical_row() {
     assert_eq!(total, 2);
     assert_eq!(u128::from(page[0].1.scryfall_id), 1);
     assert_eq!(u128::from(page[1].1.scryfall_id), 2);
+}
+
+/// `is:flavorname` reads the printing's flavor name — top-level OR on a face — and WIDENS.
+///
+/// api.scryfall.com, 2026-09-01: 476 cards / 661 printings. 6 of the 661 are Japanese rows
+/// returned with no `lang:` written (iko/387 ja prints "Mechagodzilla, the Weapon" over
+/// 結晶の巨人), and 15 carry the key on their FACES alone and never at the top level (vow/341
+/// is "Dracula the Voyager" // "Casket of Native Earth"). One printing per shape here, plus
+/// an English sibling and a plain card that must both stay out.
+#[test]
+fn is_flavorname_reads_either_place_the_key_lives_and_widens() {
+    let mut vocab = VocabInterner::new();
+    vocab.intern("en".to_string()).expect("intern en");
+    vocab.intern("ja".to_string()).expect("intern ja");
+    // Four cards, one canonical printing each (scryfall ids 1..=4): Vial Smasher the Fierce with
+    // the top-level key (sld/1864's shape), Crystalline Giant whose English row carries nothing
+    // and whose Japanese ANNEX row (id 5) does, Edgar, Charmed Groom with the key on its faces
+    // alone, and a plain card.
+    let (oracle_faces, mut printing_faces) = two_faces();
+    let mut cards: Vec<OracleCard> = (1..=4).map(|i| stub_card(i, 0, &[], &mut vocab)).collect();
+    cards[2].faces = oracle_faces;
+    let mut data = store_of(cards, &[1, 1, 1, 1], vocab);
+    // Resolved AFTER store_of, which renumbers the vocab (see `coll_ids_in`).
+    let en = coll_ids_in(&data.coll_vocab, &["en"])[0];
+    let ja = coll_ids_in(&data.coll_vocab, &["ja"])[0];
+    // Padded past the largest interned id `two_faces` hands out, so no face field dangles.
+    let mut strings: Vec<String> = (0..20).map(|i| format!("s{i}")).collect();
+    strings[0] = "Clive Rosfield".to_string();
+    strings[1] = "Mechagodzilla, the Weapon".to_string();
+    strings[2] = "Dracula the Voyager".to_string();
+    strings[3] = "Casket of Native Earth".to_string();
+    data.strings = strings;
+    for p in &mut data.printings {
+        p.compat.lang_id = en;
+    }
+    data.printings[0].flavor_name_id = 0;
+    printing_faces[0].flavor_name_id = 2;
+    printing_faces[1].flavor_name_id = 3;
+    data.printings[2].faces = printing_faces;
+    assert_eq!(data.printings[2].flavor_name_id, NONE_STR, "face-only: Scryfall emits no top-level key there");
+
+    let mut foreign = stub_printing(5, 5, None);
+    foreign.compat.lang_id = ja;
+    foreign.flavor_name_id = 1;
+    data.foreign = vec![foreign];
+    data.foreign_offsets = vec![0, 0, 1, 1, 1];
+    data.indexes.langs = build_lang_index(&data.printings, &data.coll_vocab);
+    data.indexes.foreign_langs = build_lang_index(&data.foreign, &data.coll_vocab);
+    data.indexes.foreign_to_card = build_printing_to_card(&data.foreign_offsets);
+    data.indexes.printed_names = build_printed_name_index(&data.printings, &data.foreign, &data.strings, |p| p.printed_name_folded_id);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+
+    // The tag arrives as `card_is_tags` membership like every other `is:` value and becomes its
+    // own leaf here, beside `localizedname` — nothing is stored for it.
+    let filter = super::build_filter(&serde_json::json!({
+        "node_type": "CardBinaryOperatorNode",
+        "kwargs": {
+            "op": ":",
+            "lhs": {"node_type": "CardAttributeNode", "kwargs": {"attribute_name": "card_is_tags", "original_attribute": "is"}},
+            "rhs": ["flavorname"],
+        }
+    }))
+    .expect("is:flavorname must build");
+    assert!(matches!(filter, FilterExpr::FlavorNamePresent), "is:flavorname must build its own leaf");
+    assert!(filter.widens_to_annex(), "its presence reaches the annex with no lang: written");
+
+    let ids_of = |page: &[(&crate::AOracleCard, &crate::APrinting)]| {
+        let mut ids: Vec<u128> = page.iter().map(|(_, p)| u128::from(p.scryfall_id)).collect();
+        ids.sort_unstable();
+        ids
+    };
+    let prints = QueryParams::from_strs("printing", "default", "edhrec", "asc", 100, 0);
+    let (total, page) = run_query_widened(a, &prints, &filter);
+    assert_eq!(total, 3, "the top-level English row, the Japanese annex row, and the face-only transform");
+    assert_eq!(ids_of(&page), [1, 3, 5], "the English Giant (2) carries no flavor name and stays out");
+
+    // Per PRINTING under unique=prints, and still three CARDS under unique=cards: the Giant is
+    // answered through its Japanese row, the way `clive is:flavorname` is three cards there.
+    let cards = QueryParams::from_strs("card", "default", "edhrec", "asc", 100, 0);
+    let (total, page) = run_query_widened(a, &cards, &filter);
+    assert_eq!(total, 3);
+    assert_eq!(ids_of(&page), [1, 3, 5]);
+
+    // The complement, over the same widened space: the English Giant and the plain card.
+    let negated = FilterExpr::Not(Box::new(FilterExpr::FlavorNamePresent));
+    let (total, page) = run_query_widened(a, &prints, &negated);
+    assert_eq!(total, 2);
+    assert_eq!(ids_of(&page), [2, 4]);
 }
 
 /// `order=set`'s second key is the collector number, by Scryfall's own (int, string) rule.
@@ -15373,8 +15492,8 @@ fn assign_collector_ranks_follows_scryfalls_number_then_string() {
 /// #240 (better) and #369 (extended art), and the two Japanese rows sit at those same two slots.
 fn cross_set_language_store() -> (CardData, u16, u16) {
     let mut vocab = VocabInterner::new();
-    let en = vocab.intern("en".to_string()).expect("intern en");
-    let ja = vocab.intern("ja".to_string()).expect("intern ja");
+    vocab.intern("en".to_string()).expect("intern en");
+    vocab.intern("ja".to_string()).expect("intern ja");
     let mut card = stub_card(1, 0, &[], &mut vocab);
     // `card_name_folded_id` stays NONE_STR, which is how the archive spells "read card_name_lower"
     // — the two are identical for an unaccented name like this one.
@@ -15389,9 +15508,13 @@ fn cross_set_language_store() -> (CardData, u16, u16) {
         p.compat.lang_id = lang;
         p
     };
+    let mut data = store_of(vec![card], &[3], vocab);
+    // Resolved AFTER store_of, which renumbers the vocab (see `coll_ids_in`); the rows below
+    // carry these ids, so they are built after it too.
+    let en = coll_ids_in(&data.coll_vocab, &["en"])[0];
+    let ja = coll_ids_in(&data.coll_vocab, &["ja"])[0];
     let canonical =
         vec![row(1, "clb", 0, 240.0, en), row(2, "khm", 1, 197.36, en), row(3, "khm", 2, 191.36, en)];
-    let mut data = store_of(vec![card], &[3], vocab);
     data.printings = canonical;
     data.strings = numbers.iter().map(|s| (*s).to_string()).collect();
     // The two Japanese rows, and the WRONG one scores higher — Scryfall's data gives the ja
@@ -15703,7 +15826,6 @@ fn a_hybrid_pip_of_the_queried_pair_counts_once() {
         let mut f = FilterExpr::Devotion { op: CmpOp::Ge, pips: packed_pips(pips), hybrid_colors: Vec::new() };
         f.bind(
             &archived.coll_vocab,
-            &archived.coll_vocab_sorted,
             &archived.artist_vocab,
             &archived.artist_vocab_collated,
             &archived.mana_vocab,

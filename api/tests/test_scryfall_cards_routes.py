@@ -58,6 +58,19 @@ VAULT_ID = "66666666-6666-4666-8666-666666666666"
 WHO_NAME = "Cw Who // Cw What // Cw When // Cw Where // Cw Why"
 VAULT_NAME = "Compat Lim-Dûl's Vault"
 
+# The by-name key rule wants two more shapes -- a name with FIVE halves and a punctuated, accented
+# one -- and they live in a set of their own so the `s:sfc` paging tests keep asserting three cards.
+NAME_SET_CODE = "sfn"
+WHO_ID = "55555555-5555-4555-8555-555555555555"
+VAULT_ID = "66666666-6666-4666-8666-666666666666"
+# 50 bytes, and deliberately short: the engine stores a card's folded name in an `InlineStr<61>`
+# and TRUNCATES anything longer, so a five-part name spelled "Compat ..." five times (70 bytes) is
+# unreachable through the engine while the SQL fallback still finds it. That is a pre-existing bug
+# in its own right -- 36 names in the real corpus are over the limit -- and not the one under test
+# here, so this name stays inside the bound rather than pinning the wrong divergence.
+WHO_NAME = "Cw Who // Cw What // Cw When // Cw Where // Cw Why"
+VAULT_NAME = "Compat Lim-Dûl's Vault"
+
 
 def _bolt() -> dict:
     card = make_raw_card(card_id=BOLT_ID, name="Compat Bolt")
