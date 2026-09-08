@@ -1336,8 +1336,10 @@ class TestFieldSelection:
         assert card["layout"] == "normal"
         assert card["cmc"] == 1
         assert card["rarity"] == "common"
-        # A letter list, not the raw JSONB object.
-        assert card["color_identity"] == ["R"]
+        # WUBRG-ordered letter tuple, not the raw JSONB object. A tuple because the engine serves
+        # this field from one cached object per color mask, which only an immutable type allows;
+        # the SQL path's _identity_letters matches it, and orjson writes either as a JSON array.
+        assert card["color_identity"] == ("R",)
         legalities = card["legalities"]
         assert legalities["modern"] == "legal"
         assert set(legalities.values()) <= {"legal", "not_legal", "restricted", "banned"}
@@ -1354,7 +1356,7 @@ class TestFieldSelection:
         _, cards = _run(engine, "id>=rg", unique="card", limit=5, fields=["name", "color_identity"])
         for card in cards:
             letters = card["color_identity"]
-            assert letters == sorted(letters)
+            assert letters == tuple(sorted(letters))
             assert {"R", "G"} <= set(letters)
 
 

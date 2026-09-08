@@ -76,6 +76,95 @@ _CARD_COLUMNS = (
     "card_compat_blob, card_faces"
 )
 
+# ------------------------------------------------------------------ the by-name key rule
+#
+# `named?exact=` and a `POST /cards/collection` `{"name"}` identifier are two lookups over one set
+# of keys, and they are NOT the same lookup. Measured against api.scryfall.com on 2026-08-31, ONE
+# IDENTIFIER PER REQUEST -- a collection response's `data` is not in identifier order, and a batched
+# probe silently attributes its answers to the wrong needles:
+#
+#   {"name":"Delver of Secrets"}                   -> Delver of Secrets // Insectile Aberration
+#   {"name":"Insectile Aberration"}                -> the same card (a BACK face names it)
+#   {"name":"Delver of Secrets // Insectile ..."}  -> not_found   <- `exact=` answers the card
+#   {"name":"Fire // Ice"}                         -> not_found
+#   {"name":"Wear // Tear"}                        -> not_found
+#   {"name":"Bonecrusher Giant // Stomp"}          -> not_found
+#   {"name":"Who // What // When // Where // Why"} -> und/75 (a FIVE-part name IS a key)
+#   {"name":"Who"}                                 -> not_found (so is `exact=Who`)
+#   {"name":"Elves"}                               -> Elves (ffdn/9), the card named that and not
+#                                                     one of the hundreds containing the word
+#   {"name":"limduls vault"}                       -> Lim-Dul's Vault (collated)
+#   {"name":"Delver of Secrets","set":"mid"}       -> mid/47 (set FILTERS the lookup)
+#
+# So a card answers to its two FACE names when its name splits in EXACTLY two, and to its whole name
+# otherwise -- never both. `exact=` adds the joined name of a two-faced card, and that is the only
+# key the two surfaces disagree about.
+#
+# These fragments ARE the path on this branch: the engine's `name_key_tier` scan arrives with the
+# by-name engine work in #912, and until it does every by-name lookup here is answered in SQL. They
+# are written to say exactly what that scan says, expression for expression, so neither surface
+# changes its answer on the day the engine path lands beside them.
+
+
+def _collate_name(value: str) -> str:
+    """Collate a name: accent-folded, lowercased, every non-alphanumeric character removed.
+
+    This is what Scryfall compares on both name surfaces. Measured on api.scryfall.com, 2026-08-31:
+    `exact=delverofsecrets`, `exact=Lightning-Bolt`, `exact=limduls vault`,
+    `exact=Kongming Sleeping Dragon` and `exact=whowhatwhenwherewhy` all resolve, as do the same
+    spellings as collection identifiers -- and the folded comparison both routes used before
+    answered 404 to every one of them. It subsumes trimming: `{"name":"  Lightning Bolt  "}`
+    resolves there and did not here, because the collection route compared the string as posted.
+
+    `str.isalnum` per character rather than an ASCII class, matching the engine's
+    `char::is_alphanumeric`: the value is accent-folded first, so a character still non-ASCII at
+    this point is one NFKD had no base letter for and must be kept, not dropped.
+
+    Args:
+        value: A name as the client spelled it.
+
+    Returns:
+        Its collated form, which is "" for a value carrying no alphanumeric character at all.
+    """
+    return "".join(char for char in fold_accents(value.lower()) if char.isalnum())
+
+
+def _collated_sql(expr: str) -> str:
+    """The SQL that collates `expr` the way `_collate_name` collates the needle.
+
+    `[:alnum:]` is the server's character class where the engine uses Rust's
+    `char::is_alphanumeric`. The two agree over ASCII, which is all `card_name_folded` holds on this
+    corpus -- it is written by `fold_accents` at import. That is the one place this can drift from
+    #912's engine scan, and it needs a name NFKD cannot reduce to ASCII to do it.
+    """
+    return f"regexp_replace(lower({expr}), '[^[:alnum:]]', '', 'g')"
+
+
+_NAME_FRONT = "split_part(card_name_folded, ' // ', 1)"
+_NAME_BACK = "split_part(card_name_folded, ' // ', 2)"
+
+# EXACTLY two halves, which is the load-bearing word: a name with more of them has no face keys at
+# all. `exact=Who`, `exact=What` and `{"name":"Who"}` are each not_found on api.scryfall.com while
+# `Who // What // When // Where // Why` answers und/75 on both surfaces -- the five-part name is the
+# key and its parts are not. Part 3 being empty is what distinguishes the two cases.
+_NAME_SPLITS_IN_TWO = f"({_NAME_BACK} <> '' AND split_part(card_name_folded, ' // ', 3) = '')"
+
+_FACE_NAME_MATCH = f"(%(collated)s IN ({_collated_sql(_NAME_FRONT)}, {_collated_sql(_NAME_BACK)}))"
+_WHOLE_NAME_MATCH = f"({_collated_sql('card_name_folded')} = %(collated)s)"
+
+# A collection identifier's keys: the faces, or the whole name, never both.
+_COLLECTION_NAME_MATCH = f"(CASE WHEN {_NAME_SPLITS_IN_TWO} THEN {_FACE_NAME_MATCH} ELSE {_WHOLE_NAME_MATCH} END)"
+
+# `exact=`'s keys: the same set, plus the JOINED name of a two-faced card.
+_EXACT_NAME_MATCH = f"({_WHOLE_NAME_MATCH} OR ({_NAME_SPLITS_IN_TWO} AND {_FACE_NAME_MATCH}))"
+
+# A WHOLE-name match beats a FACE match on both surfaces, ahead of prefer_score rather than beside
+# it. Without it a needle that is one card's whole name and another's face answers whichever scores
+# higher: on this corpus `Lightning Bolt` would resolve "Emeritus of Conflict // Lightning Bolt".
+# One expression for both scopes -- a two-faced card matched by a face cannot also carry the needle
+# as its whole collated name.
+_WHOLE_NAME_FIRST = f"{_WHOLE_NAME_MATCH} DESC, "
+
 # Path segments that name an external id namespace rather than a set code.
 _EXTERNAL_ID_NAMESPACES = ("multiverse", "mtgo", "arena", "tcgplayer", "cardmarket")
 
