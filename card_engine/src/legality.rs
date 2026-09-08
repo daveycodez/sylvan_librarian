@@ -6,8 +6,9 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
+use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyString};
 use rkyv::Archived;
 
 const LEGALITY_NOT_LEGAL: u64 = 0;
@@ -112,18 +113,105 @@ pub(crate) fn jsonb_obj_to_legality_bits(d: &Bound<PyDict>, key: &str) -> u64 {
 /// format the registry knows, alphabetically — the field-extraction counterpart of
 /// `jsonb_obj_to_legality_bits`. A format absent from the imported JSONB round-trips
 /// as "not_legal", exactly as the encoder treated it.
-pub(crate) fn legality_bits_to_pydict<'a>(py: Python<'a>, bits: u64) -> PyResult<pyo3::Bound<'a, PyDict>> {
-    let dict = PyDict::new(py);
-    for (format, shift) in format_shifts_sorted().iter() {
-        let word = match (bits >> shift) & 0b11 {
-            LEGALITY_LEGAL => "legal",
-            LEGALITY_RESTRICTED => "restricted",
-            LEGALITY_BANNED => "banned",
-            _ => "not_legal",
-        };
-        dict.set_item(format.as_str(), word)?;
+/// The format names as interned `PyString` keys, parallel to a `SortedFormats` snapshot.
+type FormatKeys = Arc<[Py<PyString>]>;
+
+/// The format names as interned `PyString` keys, positionally parallel to a
+/// `format_shifts_sorted()` snapshot of the same length.
+///
+/// Keyed on the snapshot's LENGTH rather than `FORMAT_COUNT` on purpose. The registry is
+/// append-only in its *shift* assignments, but `format_shifts_sorted()` is sorted
+/// ALPHABETICALLY, so a new format lands in the middle and moves every later entry's index.
+/// Positional correspondence therefore only holds against a snapshot of the same length --
+/// and because the registry is append-only, a given length pins a unique format set and so a
+/// unique sorted order. Matching lengths is exactly the condition under which `keys[i]`
+/// describes `entries[i]`.
+fn format_keys(py: Python<'_>, entries: &SortedFormats) -> FormatKeys {
+    static KEYS: OnceLock<RwLock<(usize, FormatKeys)>> = OnceLock::new();
+    let cache = KEYS.get_or_init(|| RwLock::new((usize::MAX, Arc::from([] as [Py<PyString>; 0]))));
+
+    if let Ok(guard) = cache.read()
+        && guard.0 == entries.len()
+    {
+        return guard.1.clone();
     }
-    Ok(dict)
+    let Ok(mut guard) = cache.write() else { return Arc::from([]) };
+    if guard.0 == entries.len() {
+        return guard.1.clone(); // rebuilt by another thread while we waited for the write lock
+    }
+    let built: FormatKeys =
+        entries.iter().map(|(format, _)| PyString::intern(py, format.as_str()).unbind()).collect();
+    *guard = (entries.len(), built.clone());
+    built
+}
+
+/// Cap on distinct legality words held as template dicts.
+///
+/// The real corpus has 591 distinct combinations across 97,812 printings, so this is ~7x headroom
+/// and exists only so a pathological corpus cannot grow the map without bound. Past the cap the
+/// builder still returns correct dicts, just uncached.
+const MAX_CACHED_LEGALITY_WORDS: usize = 4096;
+
+/// Template dicts by legality word, valid for a `SortedFormats` snapshot of the recorded length.
+type LegalityTemplates = (usize, HashMap<u64, Py<PyDict>>);
+
+fn legality_templates() -> &'static RwLock<LegalityTemplates> {
+    static DICTS: OnceLock<RwLock<LegalityTemplates>> = OnceLock::new();
+    DICTS.get_or_init(|| RwLock::new((usize::MAX, HashMap::new())))
+}
+
+/// Build one row's `{format: status}` dict.
+///
+/// The whole dict is memoized on the legality word, not just its pieces: the corpus has 591
+/// distinct combinations over 97,812 printings, and `{format: status}` is a pure function of the
+/// word and the format snapshot. Rebuilding it per row costs 23 dict inserts; copying a template
+/// costs one `PyDict_Copy`, measured at 64 ns against 429 ns to rebuild.
+///
+/// A COPY, not the template itself. Returning the shared dict would be a further ~20x, but two rows
+/// with the same legalities would then be the same object: a caller mutating one row's dict would
+/// silently change every other row carrying that word, and corrupt the template for the rest of the
+/// process. Each row keeping its own mutable dict is the behavior callers have today.
+pub(crate) fn legality_bits_to_pydict<'a>(py: Python<'a>, bits: u64) -> PyResult<pyo3::Bound<'a, PyDict>> {
+    let entries = format_shifts_sorted();
+
+    if let Ok(guard) = legality_templates().read()
+        && guard.0 == entries.len()
+        && let Some(template) = guard.1.get(&bits)
+    {
+        return template.bind(py).copy();
+    }
+
+    let keys = format_keys(py, &entries);
+    debug_assert_eq!(keys.len(), entries.len(), "format_keys snapshot is not parallel to entries");
+    let dict = PyDict::new(py);
+    for ((_, shift), key) in entries.iter().zip(keys.iter()) {
+        let word = match (bits >> shift) & 0b11 {
+            LEGALITY_LEGAL => intern!(py, "legal"),
+            LEGALITY_RESTRICTED => intern!(py, "restricted"),
+            LEGALITY_BANNED => intern!(py, "banned"),
+            _ => intern!(py, "not_legal"),
+        };
+        dict.set_item(key.bind(py), word)?;
+    }
+
+    let mut cached = false;
+    if let Ok(mut guard) = legality_templates().write() {
+        // A snapshot of a different length means a format was registered since these templates were
+        // built, so every one of them is missing a key. Drop the lot rather than serve short dicts.
+        if guard.0 != entries.len() {
+            guard.1.clear();
+            guard.0 = entries.len();
+        }
+        if guard.1.len() < MAX_CACHED_LEGALITY_WORDS {
+            guard.1.insert(bits, dict.clone().unbind());
+            cached = true;
+        }
+    }
+    // `dict` is now the TEMPLATE, not a row's dict -- `Bound::clone` increfs the same object rather
+    // than copying it. Handing it back would let the caller's first mutation rewrite the template
+    // and every later row built from it, which is the exact aliasing this function copies to avoid.
+    // Only the uncached path, whose dict no one else holds, may return it directly.
+    if cached { dict.copy() } else { Ok(dict) }
 }
 
 /// Adopt the archive's format→shift assignments into this process's registry.
