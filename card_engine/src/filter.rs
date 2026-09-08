@@ -1677,7 +1677,6 @@ impl FilterExpr {
     pub(crate) fn bind(
         &mut self,
         vocab: &AStrings,
-        sorted_ids: &rkyv::Archived<Vec<u16>>,
         artist_vocab: &AStrings,
         // artist_vocab_collated: the same artists, `collate_name(fold_accents(...))` — the string
         // `a:word` matches against (see TextSearchField::ArtistCollated).
@@ -1689,10 +1688,10 @@ impl FilterExpr {
         match self {
             FilterExpr::And(children) | FilterExpr::Or(children) => {
                 for c in children {
-                    c.bind(vocab, sorted_ids, artist_vocab, artist_vocab_collated, mana_vocab, flavor, strings);
+                    c.bind(vocab, artist_vocab, artist_vocab_collated, mana_vocab, flavor, strings);
                 }
             }
-            FilterExpr::Not(inner) => inner.bind(vocab, sorted_ids, artist_vocab, artist_vocab_collated, mana_vocab, flavor, strings),
+            FilterExpr::Not(inner) => inner.bind(vocab, artist_vocab, artist_vocab_collated, mana_vocab, flavor, strings),
             // UNCONDITIONAL, unlike the other bind arms: the weights are read off the CARD's
             // hybrids, not the query's, so `m:{2}` against a twobrid card needs them even though
             // the query carries no hybrid symbol at all. Gating this on `!hybrids.is_empty()` —
@@ -1710,29 +1709,28 @@ impl FilterExpr {
                 *hybrid_colors = mana_vocab.iter().map(|s| devotion_color_mask(s.as_str())).collect();
             }
             FilterExpr::CollectionCmp { value, value_id, .. } => {
-                let i = sorted_ids.partition_point(|id| vocab[u16::from(*id) as usize].as_str() < value.as_str());
-                *value_id = sorted_ids
-                    .get(i)
-                    .map(|id| u16::from(*id))
-                    .filter(|&id| vocab[id as usize].as_str() == value.as_str());
+                // The vocab is renumbered into lexicographic order at load, so ids ARE the sorted
+                // order and the permutation this used to search through is gone.
+                let i = vocab.partition_point(|entry| entry.as_str() < value.as_str());
+                *value_id = u16::try_from(i)
+                    .ok()
+                    .filter(|&id| vocab.get(id as usize).is_some_and(|e| e.as_str() == value.as_str()));
             }
             // The language lives in the same vocab the collection values do (CompatFields.lang_id
             // interns into coll_vocab), so this is CollectionCmp's resolution verbatim.
             FilterExpr::LangMatch { value, vid, any: false } => {
-                let i = sorted_ids.partition_point(|id| vocab[u16::from(*id) as usize].as_str() < value.as_str());
-                *vid = sorted_ids
-                    .get(i)
-                    .map(|id| u16::from(*id))
-                    .filter(|&id| vocab[id as usize].as_str() == value.as_str());
+                let i = vocab.partition_point(|entry| entry.as_str() < value.as_str());
+                *vid = u16::try_from(i)
+                    .ok()
+                    .filter(|&id| vocab.get(id as usize).is_some_and(|e| e.as_str() == value.as_str()));
             }
             // The set type interns into that same vocab (CompatFields.set_type_id), so this is
             // the resolution above verbatim.
             FilterExpr::SetTypeMatch { value, vid } => {
-                let i = sorted_ids.partition_point(|id| vocab[u16::from(*id) as usize].as_str() < value.as_str());
-                *vid = sorted_ids
-                    .get(i)
-                    .map(|id| u16::from(*id))
-                    .filter(|&id| vocab[id as usize].as_str() == value.as_str());
+                let i = vocab.partition_point(|entry| entry.as_str() < value.as_str());
+                *vid = u16::try_from(i)
+                    .ok()
+                    .filter(|&id| vocab.get(id as usize).is_some_and(|e| e.as_str() == value.as_str()));
             }
             FilterExpr::TextContains { field: TextSearchField::ArtistLower, word } => {
                 // A QUOTED `a:"…"` reaches this arm, and it is collated too — Scryfall draws no
@@ -2431,7 +2429,8 @@ impl FilterExpr {
                     (None, _) => false,
                     // card_subtypes keeps the printed order, so it is not id-sorted.
                     (Some(id), CollField::Subtypes) => coll.iter().any(|x| u16::from(*x) == id),
-                    // The set-like collections are sorted by id at load.
+                    // The set-like collections are sorted by id at load, and since the vocab is
+                    // renumbered lexicographically that is also alphabetical order.
                     (Some(id), _) => coll.binary_search(&id.into()).is_ok(),
                 };
                 let all_equal = || match *value_id {
