@@ -1,7 +1,9 @@
+use std::sync::OnceLock;
 use pyo3::create_exception;
+use pyo3::intern;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDate, PyDateAccess, PyDict, PyList, PyTuple};
+use pyo3::types::{PyDate, PyDateAccess, PyDict, PyList, PyString, PyTuple};
 use rkyv::{Archive, Archived, Deserialize, Serialize};
 use rkyv::niche::niching::Zero;
 use rkyv::with::NicheInto;
@@ -282,6 +284,16 @@ struct PrintingFace {
     illustration_id: u128,
     card_artist_vid: u16,
     flavor_text_id: u32,
+    // Scryfall's FACE-level `flavor_name`, interned (NONE_STR = absent). The card-level twin is
+    // `Printing.flavor_name_id`, and a printing carries one or the other, never both: 28 face
+    // occurrences on 15 printings in the 2026-08-16 all_cards bulk, all `transform` or
+    // `reversible_card` (vow/338 "Dracula, Lord of Blood" // "Dracula, Lord of Bats").
+    //
+    // NOT INDEXED, and that is Scryfall's own split rather than a shortcut:
+    // `exact=Dracula, Lord of Blood` answers 404 there while `exact=Godzilla, Primeval Champion`
+    // (a card-level flavor name) answers prm/80925. Only the card-level one reaches the name
+    // routes; this one is emission-only, like `flavor_text` beside it.
+    flavor_name_id: u32,
 }
 
 // Bit positions in `CompatFields.flags`. Twelve booleans Scryfall sends on every card object; a
@@ -407,10 +419,37 @@ impl Default for CompatFields {
 #[derive(Archive, Serialize, Deserialize)]
 struct OracleCard {
     // Hot fields first — fits in the first cache lines for fast filter short-circuiting.
-    card_name_lower: InlineStr<61>, // 61 bytes covers every card name in the Scryfall dataset
+    //
+    // The first NAME_INLINE bytes of the lowercase name, and NOT NECESSARILY ALL OF IT. The
+    // comment that used to sit here said "61 bytes covers every card name in the Scryfall
+    // dataset"; it does not, and `InlineStr::from_str` cuts what does not fit in SILENCE. 36 names
+    // in `all_cards` are longer -- 34 doubled `X // X` art-series and reversible names,
+    // "Curse of the Fire Penguin // Curse of the Fire Penguin Creature" (63 bytes), and the
+    // 141-character Unhinged elemental -- so `card_name_lower_id` below carries the whole string
+    // whenever this field does not. RESOLVE WITH `lower_name`, never by reading this field.
+    card_name_lower: InlineStr<NAME_INLINE>,
+    // The whole lowercase name when it does not fit inline above, `NONE_STR` when it does -- the
+    // same shape as `card_name_folded_id` below, and NONE_STR on all but 36 of 31,724 cards.
+    //
+    // THE ROW DOES NOT GROW FOR IT, and the width above does not shrink to pay either: measured
+    // with `size_of::<Archived<OracleCard>>()`, the row was 256 bytes before this field and is 256
+    // with it. `oracle_id` gives the struct 16-byte alignment, and the trailing round-up already
+    // held more than four spare bytes -- the same sweep puts the cliff at `InlineStr<65>`, where
+    // the row goes to 272. So the id is free here, unlike on a row with no slack, where it would
+    // have had to come out of the inline. Nothing is gained by widening the inline to swallow the
+    // 36 instead: "wide enough for the corpus I looked at" is the assumption this commit is
+    // deleting, and a spilled name costs one interned string.
+    //
+    // WHAT IT BOUGHT, measured on a deployment of this engine 2026-08-31 against api.scryfall.com,
+    // which answers all four: `!"Curse of the Fire Penguin Creature"`,
+    // `name:"fire penguin creature"` and `/cards/named?exact=` of the same string answered NOTHING
+    // here, while `!"Curse of the Fire Penguin Creatu"` -- the 61-byte cut -- answered the card.
+    // One truncation reached every name surface at once, because the folded name and both name
+    // routes are DERIVED from this field.
+    card_name_lower_id: u32,
     // Accent-folded card_name_lower (e.g. "éowyn" -> "eowyn"), precomputed in Python via
     // fold_accents() (#649). Backs fuzzy name: search (name_trigram/name_bigrams/TextContains)
-    // so "eowyn" matches "Éowyn"; exact-match paths deliberately keep using card_name_lower.
+    // so "eowyn" matches "Éowyn"; exact-match paths deliberately keep using the unfolded name.
     //
     // An INTERNED ID, not a second inline copy. It differs from `card_name_lower` only where a name
     // carries a diacritic -- 88 of 31,724 cards on the current corpus -- so 61 bytes a card stored
@@ -450,10 +489,17 @@ struct OracleCard {
     planeswalker_loyalty: Option<u8>, // always 1-12
     edhrec_rank: Option<u32>,         // up to ~30k unique cards
     cubecobra_score: Option<f32>,
-    // Dense rank of card_name_lower in byte order (equal names share a rank so
+    // Dense rank of the INLINE card_name_lower in byte order (equal names share a rank so
     // sort secondaries break their ties). Assigned post-load by
     // assign_name_ranks; the sort key for SortCol::Name. Ranks stay below 2^24
     // so the f32 sort-key conversion is exact.
+    //
+    // The inline field and not `lower_name`, deliberately: this rank is also the KEY OF THE
+    // ASCENDING NAME PERMUTATION that `narrow_rec`'s `ExactName` arm binary-searches, and the two
+    // have to order by the same string or the search reads a permutation sorted by something else.
+    // What it leaves is that the 36 over-long names ORDER by their inline prefix -- unchanged from
+    // before this field existed, and a tie the sort secondaries already break. It is not a
+    // MEMBERSHIP question: that one is answered exactly, by the spill filter in that arm.
     name_rank: u32,
 
     // Collection elements interned as u16 ids into CardData.coll_vocab (see
@@ -544,6 +590,18 @@ struct Printing {
     // single-faced cards, and empty when a multi-face card's printing carries no per-face art.
     faces: Vec<PrintingFace>,
 
+    // Scryfall's top-level `flavor_name`: the alternate name a printing is SOLD under (the
+    // Godzilla series, Stranger Things, the Secret Lair crossovers). Printing-level and quite
+    // separate from the printed triple above — a printing may carry both, and 669 of the
+    // 540,484 all_cards rows carry this one, 609 of them English. `_folded_id` is the search
+    // key, indexed by `CardIndexes.flavor_names`; `_id` is what the card object emits.
+    //
+    // The FACE-level variant (28 face occurrences on 15 printings, `transform` and
+    // `reversible_card` only, and never on a printing that also has the top-level key) rides
+    // `PrintingFace` instead, because that is where Scryfall puts it.
+    flavor_name_id: u32,
+    flavor_name_folded_id: u32,
+
     // The card_compat_blob residue, packed. Printing-level: every field here varies by printing
     // (ids, prices, finishes) or is set-level and therefore constant across a set's printings.
     compat: CompatFields,
@@ -553,8 +611,15 @@ struct Printing {
 /// commit pass groups rows by oracle_id and splits them into OracleCard +
 /// Printing. Never archived.
 struct CardRow {
-    card_name_lower: InlineStr<61>,
-    card_name_folded: InlineStr<61>,
+    // FULL strings, not the `InlineStr` the archived twin stores. A parse-time row is never
+    // archived, so the only thing an inline bought here was TRUNCATION: `InlineStr::from_str` cuts
+    // at its bound in silence, and 36 names in `all_cards` are longer than the 61 bytes this used
+    // to be. The archived folded id is DERIVED from these two by comparing them, so the cut
+    // reached the strings table as well as the inline, and a back face nobody could search for
+    // (`!"Curse of the Fire Penguin Creature"` answered nothing while
+    // `!"Curse of the Fire Penguin Creatu"` answered the card) started right here.
+    card_name_lower: String,
+    card_name_folded: String,
     card_colors: u8,
     card_color_identity: u8,
     produced_mana: u8,
@@ -607,6 +672,8 @@ struct CardRow {
     creature_toughness_text_id: u32,
     planeswalker_loyalty_text_id: u32,
 
+    flavor_name_id: u32,
+    flavor_name_folded_id: u32,
     // Both halves of each face, together, until the commit pass splits them the same way it splits
     // the row itself: text to the OracleCard, art to the Printing.
     card_faces: Vec<FaceRow>,
@@ -633,6 +700,7 @@ struct FaceRow {
     illustration_id: u128,
     card_artist_vid: u16,
     flavor_text_id: u32,
+    flavor_name_id: u32,
 }
 
 // Type aliases for the archived (mmap-backed) store types
@@ -646,25 +714,73 @@ pub(crate) type AOffsets = Archived<Vec<u32>>;
 /// Sentinel id for absent optional strings (a card never has 4 billion distinct strings).
 const NONE_STR: u32 = u32::MAX;
 
-/// A card's accent-folded lowercase name.
+/// How much of a lowercase card name `OracleCard` stores inline; the rest spills to `strings`.
 ///
-/// `NONE_STR` in `card_name_folded_id` means "identical to `card_name_lower`", which is every card
-/// whose name carries no diacritic, so this is an inline read on the overwhelming majority and a
-/// `strings` lookup only for the handful that need one.
-fn folded_name<'a>(card: &'a AOracleCard, strings: &'a AStrings) -> &'a str {
-    let id = u32::from(card.card_name_folded_id);
+/// Named rather than spelled `61` at each site because three of them have to agree: the field's own
+/// width, the builder's "does it fit" test, and `narrow_rec`'s `ExactName` arm, which declines the
+/// name permutation for any needle this bound cuts. The value is unchanged -- it is the SILENT
+/// truncation past it that this constant now makes checkable.
+pub(crate) const NAME_INLINE: usize = 61;
+
+/// A card's LOWERCASE name, WHOLE — the inline field holds only its first `NAME_INLINE` bytes.
+///
+/// `NONE_STR` in `card_name_lower_id` means "the inline field is the whole of it", true for all but
+/// 36 cards, so this is an inline read on 99.9% of the corpus and a `strings` lookup only for a
+/// name too long to fit. Every reader goes through here; reading `card_name_lower` directly is how
+/// a back face became unsearchable (see the field's own note). The two deliberate exceptions are
+/// `assign_name_ranks` and the permutation search it keys, which order by the inline BY DESIGN.
+pub(crate) fn lower_name<'a>(card: &'a AOracleCard, strings: &'a AStrings) -> &'a str {
+    let id = u32::from(card.card_name_lower_id);
     if id == NONE_STR {
         return card.card_name_lower.as_str();
     }
     str_at(strings, id).unwrap_or_else(|| card.card_name_lower.as_str())
 }
 
+/// The two fields a lowercase card name occupies on `OracleCard`: the inline prefix, and the id of
+/// the whole string for a name the prefix is not the whole of (`NONE_STR` when it is).
+///
+/// ONE function because the bound has to be agreed on in more than one place, and the bug this
+/// exists to close is what happens when a place forgets it: the builder writes the pair, the
+/// fixtures build stores with the same shape, and `narrow_rec` declines a needle the bound cuts.
+/// `push` interns or appends, whichever the caller's table is.
+pub(crate) fn split_lower_name(name: &str, push: impl FnOnce(String) -> u32) -> (InlineStr<NAME_INLINE>, u32) {
+    let id = if name.len() <= NAME_INLINE { NONE_STR } else { push(name.to_owned()) };
+    (InlineStr::from_str(name), id)
+}
+
+/// Build-time twin of `lower_name`, over unarchived rows and the interner's plain `Vec<String>`.
+fn lower_name_of<'a>(card: &'a OracleCard, strings: &'a [String]) -> &'a str {
+    if card.card_name_lower_id == NONE_STR {
+        return card.card_name_lower.as_str();
+    }
+    strings.get(card.card_name_lower_id as usize).map_or_else(|| card.card_name_lower.as_str(), String::as_str)
+}
+
+/// A card's accent-folded lowercase name.
+///
+/// `NONE_STR` in `card_name_folded_id` means "identical to `card_name_lower`", which is every card
+/// whose name carries no diacritic, so this is an inline read on the overwhelming majority and a
+/// `strings` lookup only for the handful that need one.
+///
+/// The fallback is `lower_name` and NOT the inline field: an over-long name folds to itself on the
+/// overwhelming majority (no diacritic), so it takes exactly this branch, and returning the inline
+/// here would hand the 61-byte cut to `name:`, both name routes and the autocomplete catalog --
+/// which is what they were all answering with.
+fn folded_name<'a>(card: &'a AOracleCard, strings: &'a AStrings) -> &'a str {
+    let id = u32::from(card.card_name_folded_id);
+    if id == NONE_STR {
+        return lower_name(card, strings);
+    }
+    str_at(strings, id).unwrap_or_else(|| lower_name(card, strings))
+}
+
 /// Build-time twin of `folded_name`, over unarchived rows and the interner's plain `Vec<String>`.
 fn folded_name_of<'a>(card: &'a OracleCard, strings: &'a [String]) -> &'a str {
     if card.card_name_folded_id == NONE_STR {
-        return card.card_name_lower.as_str();
+        return lower_name_of(card, strings);
     }
-    strings.get(card.card_name_folded_id as usize).map_or_else(|| card.card_name_lower.as_str(), String::as_str)
+    strings.get(card.card_name_folded_id as usize).map_or_else(|| lower_name_of(card, strings), String::as_str)
 }
 
 /// Sentinel for a printing with no artist (see Printing.card_artist_vid).
@@ -838,6 +954,74 @@ fn opt_uuid(d: &Bound<PyDict>, key: &str) -> u128 {
 /// meaningful for real UUID input — non-UUID strings went through the FNV-1a fallback in
 /// `parse_uuid_or_hash` and can't be recovered from their hash, which matters only for
 /// hand-built test ids, never real card data.
+/// Handles for building a `uuid.UUID` without running its Python constructor.
+///
+/// pyo3's `uuid` conversion calls `UUID(int=...)`, whose `__init__` parses and validates every
+/// alternative spelling (hex/bytes/bytes_le/fields/int), checks the variant and version, and only
+/// then assigns the two slots. Measured at 243 ns against 91 ns for assigning the slots directly.
+///
+/// This is not reaching past a supported boundary: `UUID.__init__` itself ends with exactly these
+/// two `object.__setattr__` calls, and `UUID.__setstate__` — the unpickling path — builds a UUID
+/// the same way, without `__init__`. Any reimplementation has to keep unpickling working.
+///
+/// Still guarded. `install()` proves the fast path reproduces the constructor's object on a probe
+/// value before it is used at all; if anything about `uuid` changes shape, `None` is cached and
+/// every call falls back to the constructor.
+struct UuidFastPath {
+    uuid_type: Py<PyAny>,
+    object_new: Py<PyAny>,
+    object_setattr: Py<PyAny>,
+    safe_unknown: Py<PyAny>,
+}
+
+impl UuidFastPath {
+    fn build<'py>(&self, py: Python<'py>, v: u128) -> PyResult<Bound<'py, PyAny>> {
+        let obj = self.object_new.bind(py).call1((self.uuid_type.bind(py),))?;
+        self.object_setattr.bind(py).call1((&obj, intern!(py, "int"), v))?;
+        self.object_setattr.bind(py).call1((&obj, intern!(py, "is_safe"), self.safe_unknown.bind(py)))?;
+        Ok(obj)
+    }
+
+    /// Resolve the handles and verify they reproduce `UUID(int=..)` exactly. Any failure disables
+    /// the fast path rather than propagating: emitting a row must not depend on `uuid`'s internals.
+    fn install(py: Python<'_>) -> Option<Self> {
+        let uuid_mod = py.import("uuid").ok()?;
+        let builtins = py.import("builtins").ok()?;
+        let object_ty = builtins.getattr("object").ok()?;
+        let fast = Self {
+            uuid_type: uuid_mod.getattr("UUID").ok()?.unbind(),
+            object_new: object_ty.getattr("__new__").ok()?.unbind(),
+            object_setattr: object_ty.getattr("__setattr__").ok()?.unbind(),
+            safe_unknown: uuid_mod.getattr("SafeUUID").ok()?.getattr("unknown").ok()?.unbind(),
+        };
+        // Two different bit patterns, so a path that ignored its argument could not pass.
+        for probe in [0x1234_5678_90ab_cdef_1234_5678_90ab_cdefu128, u128::MAX] {
+            let built = fast.build(py, probe).ok()?;
+            let reference = uuid::Uuid::from_u128(probe).into_pyobject(py).ok()?;
+            if !built.eq(&reference).ok()? {
+                return None;
+            }
+            if built.str().ok()?.to_str().ok()? != reference.str().ok()?.to_str().ok()? {
+                return None;
+            }
+        }
+        Some(fast)
+    }
+}
+
+/// A `uuid.UUID` for a nonzero id, `None` for the absent sentinel — the shape
+/// `uuid_from_u128` + pyo3's conversion produced before the fast path existed.
+fn uuid_to_pyobject<'py>(py: Python<'py>, v: u128) -> PyResult<Bound<'py, PyAny>> {
+    static FAST: OnceLock<Option<UuidFastPath>> = OnceLock::new();
+    let Some(id) = uuid_from_u128(v) else {
+        return Ok(py.None().into_bound(py));
+    };
+    match FAST.get_or_init(|| UuidFastPath::install(py)) {
+        Some(fast) => fast.build(py, v),
+        None => Ok(id.into_pyobject(py)?.into_any()),
+    }
+}
+
 fn uuid_from_u128(v: u128) -> Option<uuid::Uuid> {
     if v == 0 {
         None
@@ -919,6 +1103,82 @@ fn str_list_to_ids(d: &Bound<PyDict>, key: &str, vocab: &mut VocabInterner) -> P
 
 /// Interned vocab ids of a JSONB object's keys, sorted and deduped — the set-like
 /// collections (keywords, tags, frame data) as sorted `Vec<u16>`.
+/// Renumber the collection vocab into lexicographic order, remapping every row's ids, and return
+/// the sorted vocab. Called once at load, before any index is built from those ids.
+///
+/// `VocabInterner` hands out ids first-seen, which used to force two separate things: a
+/// string-sorted permutation for `bind` to binary-search, and a lexicographic re-sort of every
+/// row's strings at emit. Making id order BE string order retires both.
+///
+/// Three properties this establishes, each relied on downstream:
+///  - `coll_vocab` is alphabetically sorted, so `FilterExpr::bind` binary-searches it directly.
+///  - every set-like row vector stays sorted BY ID -- `jsonb_obj_to_ids` sorted and deduped it, and
+///    a remap plus re-sort preserves that -- which is what `filter.rs`'s `binary_search`
+///    containment test requires.
+///  - because id order is now string order, that same vector is ALSO alphabetically sorted, so
+///    emit returns a deterministic order without sorting anything (see `EmitStrCache::coll_list`).
+///
+/// `card_subtypes` is remapped but deliberately NOT re-sorted: it carries the printed order, which
+/// is why `filter.rs` linear-scans it instead of binary-searching.
+fn renumber_coll_vocab(cards: &mut [OracleCard], printings: &mut [Printing], coll_vocab: Vec<String>) -> Vec<String> {
+    let mut order: Vec<u16> = (0..coll_vocab.len() as u16).collect();
+    order.sort_unstable_by(|&a, &b| coll_vocab[a as usize].cmp(&coll_vocab[b as usize]));
+    // remap[old] = new. VocabInterner caps the vocab at u16::MAX so the cast cannot truncate.
+    let mut remap: Vec<u16> = vec![0; coll_vocab.len()];
+    for (new_id, &old_id) in order.iter().enumerate() {
+        remap[old_id as usize] = new_id as u16;
+    }
+    let sorted_vocab: Vec<String> = order.iter().map(|&old| coll_vocab[old as usize].clone()).collect();
+    let resort = |ids: &mut Vec<u16>| {
+        for id in ids.iter_mut() {
+            *id = remap[*id as usize];
+        }
+        ids.sort_unstable();
+    };
+    // The compat residue interns into the SAME vocab, so every id it holds is renumbered too.
+    // Two shapes, neither of which is the set-like one above:
+    //  - the scalar ids (`set_vid`, `lang_id`, ...) and `RelatedCard.component_id` carry
+    //    `VOCAB_NONE` for absent, which is not a vocab slot and must pass through untouched;
+    //  - `promo_types` / `frame_effects` come from `str_list_to_ids`, which keeps Scryfall's list
+    //    order and does not dedup, so they are remapped in place and NOT re-sorted -- like
+    //    `card_subtypes`. `sorted_strs` orders them at emit and `PreferClassIds` linear-scans them,
+    //    so nothing reads them as id-sorted.
+    // A remap missed here compiles and serves the wrong string for every row: the id still lands
+    // inside the vocab, just on a different word.
+    let remap_opt = |id: &mut u16| {
+        if *id != VOCAB_NONE {
+            *id = remap[*id as usize];
+        }
+    };
+    let remap_keep_order = |ids: &mut Vec<u16>| {
+        for id in ids.iter_mut() {
+            *id = remap[*id as usize];
+        }
+    };
+    for card in cards.iter_mut() {
+        remap_keep_order(&mut card.card_subtypes);
+        resort(&mut card.card_keywords);
+        resort(&mut card.card_oracle_tags);
+        for part in card.all_parts.iter_mut() {
+            remap_opt(&mut part.component_id);
+        }
+    }
+    for printing in printings.iter_mut() {
+        resort(&mut printing.card_art_tags);
+        resort(&mut printing.card_is_tags);
+        resort(&mut printing.card_frame_data);
+        let compat = &mut printing.compat;
+        remap_opt(&mut compat.set_vid);
+        remap_opt(&mut compat.lang_id);
+        remap_opt(&mut compat.image_status_id);
+        remap_opt(&mut compat.set_type_id);
+        remap_opt(&mut compat.security_stamp_id);
+        remap_keep_order(&mut compat.promo_types);
+        remap_keep_order(&mut compat.frame_effects);
+    }
+    sorted_vocab
+}
+
 fn jsonb_obj_to_ids(d: &Bound<PyDict>, key: &str, vocab: &mut VocabInterner) -> PyResult<Vec<u16>> {
     let mut ids: Vec<u16> = d
         .get_item(key)
@@ -1154,6 +1414,7 @@ fn faces_from_pydict(d: &Bound<PyDict>, it: &mut Interner, artists: &mut VocabIn
             illustration_id: opt_str(face, "illustration_id").map_or(0, |s| parse_uuid_or_hash(&s)),
             card_artist_vid,
             flavor_text_id: it.intern_opt(opt_str(face, "flavor_text")),
+            flavor_name_id: it.intern_opt(opt_str(face, "flavor_name")),
         });
     }
     Ok(faces)
@@ -1164,9 +1425,9 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
     let released_at_int: Option<u32> = released_at.replace('-', "").parse().ok();
     // Raw strings from the dict; interned to ids as the struct is built below.
     let card_name = opt_str(d, "card_name").unwrap_or_default();
-    let card_name_lower = InlineStr::<61>::from_str(&card_name.to_lowercase());
+    let card_name_lower = card_name.to_lowercase();
     // Already lowercased + accent-folded in Python (fold_accents(), #649); read as-is.
-    let card_name_folded = InlineStr::<61>::from_str(&opt_str(d, "card_name_folded").unwrap_or_default());
+    let card_name_folded = opt_str(d, "card_name_folded").unwrap_or_default();
     let oracle_text = opt_str(d, "oracle_text").unwrap_or_default();
     let oracle_text_lower_id = it.intern(oracle_text.to_lowercase());
     let flavor_text = opt_str(d, "flavor_text").unwrap_or_default();
@@ -1232,6 +1493,9 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
         creature_toughness_text_id: it.intern_opt(opt_str(d, "creature_toughness_text")),
         planeswalker_loyalty_text_id: it.intern_opt(opt_str(d, "planeswalker_loyalty_text")),
 
+        flavor_name_id: it.intern_opt(opt_str(d, "flavor_name")),
+        // Already lowercased + accent-folded by the importer, like the two above.
+        flavor_name_folded_id: it.intern_opt(opt_str(d, "flavor_name_folded")),
         card_faces: faces_from_pydict(d, it, artists)?,
         all_parts: all_parts_from_pydict(d, it, vocab)?,
         compat: compat_from_pydict(d, vocab)?,
@@ -3275,6 +3539,37 @@ pub(crate) enum NameScope {
     Collection,
 }
 
+/// The `?q=` of a `POST /cards/collection`, bound against one store and applied to every `{name}`
+/// and `{name, set}` identifier in the batch.
+///
+/// Two halves, both optional. A FILTER every candidate printing must pass (`-is:datestamped`,
+/// `-is:promo`, `e:sld` -- the full query syntax, compiled by the same binder `/cards/search`
+/// uses), and a PREFER that picks among the printings that pass (`prefer:atypical`, the same
+/// `prefer_score` a `unique=cards` search picks its representative with). Without a scope the
+/// lookup is what it always was: the name record's first printing in default order, the default
+/// pick. Identifiers that already name ONE printing (id, oracle id, set+number, ...) never
+/// consult it, and a name none of whose printings pass is None, exactly as a name that does not
+/// exist.
+///
+/// Why it exists: `prefer:atypical` alone answers Clive, Ifrit's Dominant with the date-stamped
+/// prerelease promo pfin/133s, on api.scryfall.com's search and here alike, because the date
+/// stamp is an atypical treatment and that printing ranks first among the atypical ones by
+/// collector number. A client that wants the borderless printing says so --
+/// `-is:datestamped prefer:atypical` -- and gets fin/318.
+///
+/// Bound ONCE per batch (`QueryEngine::bind_collection_scope`), not once per identifier. Measured
+/// in the Cloudflare port on a 75-identifier batch before its batch entry point existed: binding
+/// per identifier cost ~45ms with a tag scope and ~140ms with a regex in the scope (75 regex
+/// compiles), against 25ms unscoped; batched, 31ms and 29ms.
+struct CollectionScope {
+    prefer: Prefer,
+    /// `None` for a query that was only directives, or no query at all: no filter.
+    filter: Option<FilterExpr>,
+    /// The `extra` `is:` tag's vocab id, or None when this store never interned it (a fixture, a
+    /// corpus with no extras). See `best_printing_in_scope` for what it excludes.
+    extra_vid: Option<u16>,
+}
+
 /// A name COLLATED: every non-alphanumeric character removed. The needle side of the comparison.
 ///
 /// Scryfall compares names this way, on both name surfaces. Measured on api.scryfall.com,
@@ -3290,6 +3585,11 @@ pub(crate) enum NameScope {
 fn collate_name(folded: &str) -> String {
     folded.chars().filter(|c| c.is_alphanumeric()).collect()
 }
+
+/// The `is:` value that carries the extras class, as `preprocess_card`'s `_is_extra` writes it.
+/// Spelled once there, once in the TypeScript parser's COMPUTED_IS_TAGS, and once here, where
+/// `sets_with_extras` folds it; the three must agree or the fold silently comes back empty.
+pub(crate) const EXTRA_IS_TAG: &str = "extra";
 
 /// Whether `stored` COLLATES to `collated_needle`, without collating `stored` into a `String`.
 ///
@@ -3360,6 +3660,52 @@ fn prefer_of(data: &Archived<CardData>, pid: usize) -> f32 {
     data.printings[pid].prefer_score.as_ref().map_or(f32::MIN, |v| v.to_native())
 }
 
+/// `best_printing_in_set` under a collection scope: the best printing that passes the set filter
+/// AND the scope's filter, "best" being the scope's prefer over the printings that pass -- the
+/// same `prefer_score` `unique=cards` picks a representative with, so `?q=prefer:atypical` on a
+/// collection answers the printing `prefer:atypical` answers on a search. No scope is exactly
+/// `best_printing_in_set`, scored by the default order.
+///
+/// THE POOL EXCLUDES EXTRAS, the default exclusion `/cards/search` ANDs into every query on
+/// Scryfall (`-is:extra` unless `include_extras`): art-series cards, tokens and the rest of the
+/// memorabilia are never a preference's answer. Without it, Birgi, God of Storytelling under
+/// `prefer:borderless` answered akhm/31 — her ART-SERIES card, which is borderless, carries no
+/// flavor name and is in-universe, so it won the top tier over every real printing — and
+/// `prefer:atypical` the same, since borderless is atypical; `prefer:oldest` on Coruscation Mage
+/// answered the token tblb/17. A scope that names no extras term cannot mean "prefer the
+/// art-series card", so the exclusion is unconditional here. The tag is `EXTRA_IS_TAG`, resolved
+/// once per batch in `bind_collection_scope`; this corpus imports no extras today (the importer
+/// drops never-legal and funny-set cards), so the id is None and the check is free until the
+/// multilingual import (#927) writes the tag, at which point it is what keeps them out.
+fn best_printing_in_scope(
+    data: &Archived<CardData>,
+    cid: usize,
+    set_code: Option<&str>,
+    scope: Option<&CollectionScope>,
+) -> Option<(usize, f64)> {
+    let Some(scope) = scope else {
+        return best_printing_in_set(data, cid, set_code).map(|pid| (pid, f64::from(prefer_of(data, pid))));
+    };
+    let card = &data.cards[cid];
+    let (from, to) = (u32::from(data.offsets[cid]) as usize, u32::from(data.offsets[cid + 1]) as usize);
+    let passes = |pid: usize| {
+        let p = &data.printings[pid];
+        set_code.is_none_or(|code| p.card_set_code.as_str().eq_ignore_ascii_case(code))
+            && scope.extra_vid.is_none_or(|vid| !p.card_is_tags.iter().any(|t| u16::from(*t) == vid))
+            && scope.filter.as_ref().is_none_or(|f| FilterExpr::residual_matches(card, p, &data.strings, &[f], false))
+    };
+    let mut best: Option<(usize, f64)> = None;
+    for pid in (from..to).filter(|&pid| passes(pid)) {
+        let score = prefer_score(card, &data.printings[pid], scope.prefer, &data.strings);
+        // Strict >, so the first printing in store order (the default pick) wins a tie -- the
+        // rule every representative choice in the engine uses.
+        if best.is_none_or(|(_, s)| score > s) {
+            best = Some((pid, score));
+        }
+    }
+    best
+}
+
 /// `named?exact=`: the best printing of the card the needle NAMES, `exact=`'s keys.
 ///
 /// `name_key_tier`'s keys plus the JOINED name of a two-faced card -- Scryfall answers
@@ -3377,7 +3723,7 @@ fn prefer_of(data: &Archived<CardData>, pid: usize) -> f32 {
 /// scope split opens -- and it happens to leave the COLLECTION surface right, since a flavor name
 /// is not a collection identifier's key either.
 pub(crate) fn exact_name_match(data: &Archived<CardData>, folded: &str, set_code: Option<&str>) -> Option<(usize, usize)> {
-    name_best(data, folded, set_code, NameScope::Exact)
+    name_best(data, folded, set_code, NameScope::Exact, None)
 }
 
 /// `POST /cards/collection`'s `{"name": ...}` identifier: the best printing it names, within `set`.
@@ -3389,8 +3735,12 @@ pub(crate) fn exact_name_match(data: &Archived<CardData>, folded: &str, set_code
 ///
 /// Everything past the key rule is `exact=`'s: same tier ranking, same set filter, same printing
 /// chosen. Every needle both surfaces accept answers the same card on both.
+///
+/// The route reaches this scan through `QueryEngine::collection_cards_by_names`, which passes a
+/// `CollectionScope`; this scope-free form is what the differential index test compares.
+#[cfg(test)]
 pub(crate) fn collection_name_match(data: &Archived<CardData>, folded: &str, set_code: Option<&str>) -> Option<(usize, usize)> {
-    name_best(data, folded, set_code, NameScope::Collection)
+    name_best(data, folded, set_code, NameScope::Collection, None)
 }
 
 /// The shared scan behind both name surfaces: the best `(cid, pid)` for `folded` under `scope`.
@@ -3408,11 +3758,15 @@ pub(crate) fn collection_name_match(data: &Archived<CardData>, folded: &str, set
 /// prefer_score the narrowed pass answers the lower-ranked card. Closing it needs the index rebuilt
 /// over a collated name, which is an archive-format change and not this commit's; whether the
 /// corpus holds such a pair at all is not something this commit measured.
+///
+/// `restrict` is a collection batch's `?q=` -- see `CollectionScope`. With one, the printing
+/// answered is the best of those passing its filter under its prefer; `exact=` never passes one.
 fn name_best(
     data: &Archived<CardData>,
     folded: &str,
     set_code: Option<&str>,
     scope: NameScope,
+    restrict: Option<&CollectionScope>,
 ) -> Option<(usize, usize)> {
     let needle = collate_name(folded);
     // Nobody's name. Worth its own line because the alternative is a full scan of every card for a
@@ -3422,28 +3776,31 @@ fn name_best(
     }
     let candidates = name_scan_candidates(data, folded);
     let narrowed = candidates.len() < data.cards.len();
-    let best = name_best_over(data, candidates.into_iter(), &needle, set_code, scope);
+    let best = name_best_over(data, candidates.into_iter(), &needle, set_code, scope, restrict);
     if best.is_none() && narrowed {
-        return name_best_over(data, 0..data.cards.len() as u32, &needle, set_code, scope);
+        return name_best_over(data, 0..data.cards.len() as u32, &needle, set_code, scope, restrict);
     }
     best
 }
 
 /// `name_best`'s inner loop over one candidate set. `needle` is already collated.
+///
+/// Ranked on (tier, score), the score being the SCOPE's prefer score when there is one, so two
+/// cards of one name are ranked by the same key the winner's printing was chosen by.
 fn name_best_over(
     data: &Archived<CardData>,
     candidates: impl Iterator<Item = u32>,
     needle: &str,
     set_code: Option<&str>,
     scope: NameScope,
+    restrict: Option<&CollectionScope>,
 ) -> Option<(usize, usize)> {
-    let mut best: Option<(u8, f32, usize, usize)> = None;
+    let mut best: Option<(u8, f64, usize, usize)> = None;
     for cid in candidates {
         let cid = cid as usize;
         let stored = folded_name(&data.cards[cid], &data.strings);
         let Some(tier) = name_key_tier(stored, needle, scope) else { continue };
-        let Some(pid) = best_printing_in_set(data, cid, set_code) else { continue };
-        let score = prefer_of(data, pid);
+        let Some((pid, score)) = best_printing_in_scope(data, cid, set_code, restrict) else { continue };
         if best.is_none_or(|(bt, bs, _, _)| (tier, score) > (bt, bs)) {
             best = Some((tier, score, cid, pid));
         }
@@ -5045,9 +5402,6 @@ struct CardData {
     // Vocab table for the collection fields, indexed by their u16 ids
     // (see VocabInterner). ~16k entries / ~200 KB.
     coll_vocab: Vec<String>,
-    // Permutation of 0..coll_vocab.len() sorted by string, so query values
-    // resolve to vocab ids by binary search (FilterExpr::bind).
-    coll_vocab_sorted: Vec<u16>,
     // Distinct lowercase artist names, indexed by Printing.card_artist_vid.
     // Artist predicates (contains/exact/regex) evaluate against these ~2.2k
     // strings once per query instead of per printing.
@@ -5930,14 +6284,36 @@ fn narrow_rec(
             // card_name_lower byte order — so equal-name blocks are contiguous
             // and equality is a binary-searched range: an exact, tight card
             // set. A miss proves the empty set (names are never null).
+            //
+            // THE KEY IS THE INLINE FIELD, WHICH IS A CUT for the 36 names past `NAME_INLINE`, and
+            // both halves of that have to be handled or this arm answers the wrong set TIGHTLY —
+            // which is worse than not narrowing, because a tight set is never verified:
+            //
+            //   - A needle the bound would cut is not in the permutation under its own spelling,
+            //     so the search would answer the empty set for a name that exists. Decline
+            //     instead: the walk then verifies every card through `lower_name` and finds it.
+            //     This is what `!"Curse of the Fire Penguin // Curse of the Fire Penguin Creature"`
+            //     needs, and it answered nothing before.
+            //   - A SPILLED card inside the block matched on its cut, not on its name — the needle
+            //     is a strict prefix of what the card is called — so it is dropped here.
+            //     `!"Curse of the Fire Penguin Creatu"`, the 61-byte cut, answered that card on
+            //     production 2026-08-31 where api.scryfall.com answers nothing; this is the line
+            //     that stops it.
             let perm = &indexes.sort_perms.name[0];
             if perm.len() != n_cards || cards.len() != n_cards || n_cards == 0 {
                 return None; // store without name permutations
             }
+            if InlineStr::<NAME_INLINE>::from_str(needle).as_str() != needle.as_str() {
+                return None; // longer than the key this permutation is sorted on
+            }
             let name_of = |cid: &Archived<u32>| cards[u32::from(*cid) as usize].card_name_lower.as_str();
             let lo = perm.partition_point(|cid| name_of(cid) < needle.as_str());
             let width = perm[lo..].partition_point(|cid| name_of(cid) == needle.as_str());
-            let ids: Vec<u32> = perm[lo..lo + width].iter().map(|x| u32::from(*x)).collect();
+            let ids: Vec<u32> = perm[lo..lo + width]
+                .iter()
+                .map(|x| u32::from(*x))
+                .filter(|&cid| u32::from(cards[cid as usize].card_name_lower_id) == NONE_STR)
+                .collect();
             Narrowed::tight(Candidates::Cards(ids))
         }
 
@@ -6758,11 +7134,181 @@ fn narrow_rec(
 
 // ─── Sort / select / limit ────────────────────────────────────────────────────
 
-/// `EurLow`/`TixLow` have no `prefer=` spelling — they are not user-selectable, and
-/// `prefer_from_str` cannot produce them. They exist only so `prefer_for_sort` can
-/// express "cheapest printing" for the two price columns that have no `usd_low` twin.
+/// The vocabulary ids a CLASS-shaped prefer reads off a printing, resolved once per query by
+/// `QueryParams::bind_prefer` rather than by a string compare per printing. `VOCAB_NONE` for a
+/// word the store's vocab does not hold (a corpus with no showcase printing, a fixture), which
+/// simply never matches. Unbound — `from_strs` without a `bind_prefer` — every id is `VOCAB_NONE`,
+/// so a class prefer degrades to the default order rather than misfiring.
+///
+/// THE CLASS IS SCRYFALL'S, MEASURED, NOT GUESSED. `prefer:atypical` ("atypical Magic frames")
+/// and `prefer:default` ("default Magic frame") were probed on api.scryfall.com on 2026-09-02
+/// over 450 cards with six or more printings (100 red instants, 175 legendary creatures, 175
+/// non-creature enchantments), each card's chosen printing compared against every printing of
+/// it in this store, and every candidate rule scored as "the first printing in default order
+/// that is in the class, else the default printing". What survives, and what does not:
+///
+///   - frame effects `inverted`, `showcase`, `extendedart`, `etched`, `shatteredglass` count;
+///     `legendary`, `enchantment`, `spree`, `companion` do NOT (166 `prefer:default` picks carry
+///     the legendary frame — it is a rules frame, not a variant). Return the Favor's otj/142
+///     `spree` printing survives `prefer:default` there.
+///   - `border_color: borderless` counts; WHITE does not (29 `prefer:default` picks are white-
+///     bordered, and Ancient Grudge's white mb2 playtest printing loses to tsr/151).
+///   - `full_art`, `textless`, and the `future` frame count (Chaos Warp's mbc/72 is the one
+///     card in 450 whose no-prefer pick and `prefer:default` pick DIFFER there — the future
+///     frame is atypical, and only `prefer:default` demotes it).
+///   - `promo` alone does NOT count: FNM, player-rewards, judge, media-insert, arena-league and
+///     game-day promos are the standard frame in foil, and Scryfall keeps the set printing over
+///     every one of them (Fiery Temper inr/154 over f16/11, Feldon moc/277 over j15/7). What
+///     counts is the promo TREATMENT: `datestamped` (prerelease), `stamped` (promo pack),
+///     `boosterfun` (retro, showcase and extended variants), `embossed`, and `surgefoil` when
+///     the printing is FOIL-ONLY (the 40k/pip ★ variants — the same word on a set's ordinary
+///     nonfoil rows is not a variant, and 6 `prefer:default` picks carry it).
+///   - `digital` is neither in nor out: me3/88 is a `prefer:default` pick and prm/35122 (full
+///     art) an `atypical` one.
+///
+/// 435 of the 450 `atypical` picks and 448 of the 450 `prefer:default` picks agree under this
+/// rule; the 15 and 2 that remain are ORDER differences inside the class (the same printing is
+/// atypical on both sides, the store ranks another atypical one above it), not class errors —
+/// the two `prefer:default` misses are the two no-prefer misses, Lightning Bolt and Seething
+/// Song, where this store's default order already differs from Scryfall's.
+///
+/// `prefer:universesbeyond` / `notuniversesbeyond` read the `universesbeyond` `is:` tag, which
+/// the importer writes from `promo_types` membership (the managed tags in api/admin_resource.py):
+/// 99 and 94 of 100 red instants agree, the misses again order differences inside the class.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct PreferClassIds {
+    /// `CompatFields.frame_effects` members: inverted, showcase, extendedart, etched, shatteredglass.
+    frame_effects: [u16; 5],
+    /// `CompatFields.promo_types` members: boosterfun, datestamped, stamped, embossed.
+    promo_types: [u16; 4],
+    /// `promo_types` member that counts only on a foil-only printing.
+    surgefoil: u16,
+    /// `Printing.card_frame_data` member "Future" (the builder title-cases the frame).
+    future_frame: u16,
+    /// `Printing.card_is_tags` member `universesbeyond`.
+    universesbeyond: u16,
+    /// `CompatFields.lang_id` for English — `prefer:borderless` ranks every English printing
+    /// above every non-English one, so a Japanese-only promo answers only under `lang:ja`.
+    lang_en: u16,
+}
+
+impl PreferClassIds {
+    pub(crate) const UNBOUND: PreferClassIds = PreferClassIds {
+        frame_effects: [VOCAB_NONE; 5],
+        promo_types: [VOCAB_NONE; 4],
+        surgefoil: VOCAB_NONE,
+        future_frame: VOCAB_NONE,
+        universesbeyond: VOCAB_NONE,
+        lang_en: VOCAB_NONE,
+    };
+
+    pub(crate) fn bind(coll_vocab: &AStrings) -> Self {
+        let id = |word: &str| -> u16 {
+            coll_vocab.iter().position(|s| s.as_str() == word).map_or(VOCAB_NONE, |i| i as u16)
+        };
+        PreferClassIds {
+            frame_effects: [id("inverted"), id("showcase"), id("extendedart"), id("etched"), id("shatteredglass")],
+            promo_types: [id("boosterfun"), id("datestamped"), id("stamped"), id("embossed")],
+            surgefoil: id("surgefoil"),
+            future_frame: id("Future"),
+            universesbeyond: id("universesbeyond"),
+            lang_en: id("en"),
+        }
+    }
+}
+
+/// Is this printing an ATYPICAL frame in Scryfall's sense? See `PreferClassIds` for the measured
+/// rule; `strings` is for the border, which is an interned string rather than a vocab id. Two
+/// halves: the FRAME variants (`printing_is_frame_variant`) and the promo TREATMENTS.
+pub(crate) fn printing_is_atypical(p: &APrinting, ids: &PreferClassIds, strings: &AStrings) -> bool {
+    let has = |list: &Archived<Vec<u16>>, want: u16| want != VOCAB_NONE && list.iter().any(|v| u16::from(*v) == want);
+    if printing_is_frame_variant(p, ids, strings) {
+        return true;
+    }
+    if ids.promo_types.iter().any(|&pt| has(&p.compat.promo_types, pt)) {
+        return true;
+    }
+    // Surge foil is a variant only where it is the printing's ONLY finish — a set's ordinary
+    // nonfoil rows carry the same promo_type and are the default frame.
+    p.compat.finishes == FINISH_FOIL && has(&p.compat.promo_types, ids.surgefoil)
+}
+
+/// The FRAME half of the atypical class: a border, a frame effect, full art, textless or the
+/// future frame — what makes a printing LOOK different, as opposed to a promo treatment (a date
+/// stamp, a promo-pack stamp) that decorates the standard frame. `prefer:borderless`'s second tier.
+fn printing_is_frame_variant(p: &APrinting, ids: &PreferClassIds, strings: &AStrings) -> bool {
+    let has = |list: &Archived<Vec<u16>>, want: u16| want != VOCAB_NONE && list.iter().any(|v| u16::from(*v) == want);
+    compat_flag(p, COMPAT_FULL_ART)
+        || compat_flag(p, COMPAT_TEXTLESS)
+        || printing_is_borderless(p, strings)
+        || ids.frame_effects.iter().any(|&fx| has(&p.compat.frame_effects, fx))
+        || has(&p.card_frame_data, ids.future_frame)
+}
+
+fn printing_is_borderless(p: &APrinting, strings: &AStrings) -> bool {
+    str_at(strings, u32::from(p.card_border_id)) == Some("borderless")
+}
+
+/// Does this printing carry a flavor name — is it SOLD as someone else (Godzilla, Tidus,
+/// Spider-Gwen)? Either place Scryfall puts the key counts.
+fn printing_has_flavor_name(p: &APrinting) -> bool {
+    u32::from(p.flavor_name_id) != NONE_STR || p.faces.iter().any(|f| u32::from(f.flavor_name_id) != NONE_STR)
+}
+
+/// Is this printing a Universes Beyond one — does it carry the `universesbeyond` `is:` tag?
+fn printing_is_universes_beyond(p: &APrinting, ids: &PreferClassIds) -> bool {
+    ids.universesbeyond != VOCAB_NONE && p.card_is_tags.iter().any(|v| u16::from(*v) == ids.universesbeyond)
+}
+
+/// Every `prefer=` Scryfall's syntax page lists, plus `Default` for "no preference" and
+/// `Borderless`, THIS API'S OWN: "the best-looking printing that is still this card". Over the
+/// printings that carry NO flavor name, in-universe printings rank above Universes Beyond ones
+/// outright, and inside each of those halves four tiers — borderless, then any other frame
+/// variant, then the plain printings, then the TEXTLESS ones — default order inside each. A
+/// textless printing prints no rules text, so it is the one variant that cannot be read;
+/// Moonshaker Cavalry's Store Championship full-art sch/17 outranked its extended-art woe/325
+/// on default order and answered a card nobody could read. `textless` is the signal and
+/// `full_art` is not: 1,797 of the corpus's 2,063 full-art printings carry their text (the
+/// Secret Lair posters, the Booster Fun full-arts), and 266 of its 267 textless ones are
+/// full-art. ENGLISH FIRST, above all of that: a printing in another language ranks below every
+/// English one whatever its frame, so Aven Interrupter answers its extended-art otj/309 and
+/// the Japanese-only borderless pwcs/2024-08 only under `lang:ja` (there the pool is Japanese
+/// and the tiers decide as usual). Scryfall's own `prefer:atypical` answers the Japanese
+/// promo, which is why that prefer keeps it. A flavor-named printing is
+/// never a candidate, because it is drawn and sold as someone else (Najeela's four borderless
+/// printings are Spider-Gwen, Cloud Strife, Eivor and Archaeon; Thrasios's fca/58 is Tidus).
+/// A Universes Beyond printing under the card's OWN name is a candidate, ranked below every
+/// in-universe one: Force of Negation answers the Hildebrandt borderless 2x2/346 over the
+/// Avatar tle/13, and a card whose only variants are Universes Beyond answers its plain
+/// printing. Najeela answers her etched cmr/514, Thrasios his Special Guests spg/16. A card's
+/// original printing never carries a flavor name, so a candidate always exists. `EurLow`,
+/// `EurHigh`, `TixLow` and `TixHigh` are the eur/tix twins of the usd pair; `prefer_for_sort`
+/// also reaches for the `*Low` ones to express "cheapest printing" under a price ordering.
+///
+/// The CLASS prefers carry their vocabulary ids — see `PreferClassIds` for the measured
+/// class and `QueryParams::bind_prefer` for where the ids come from. `DefaultFrame` is Scryfall's
+/// `prefer:default` ("default Magic frame"), the complement of `Atypical`; it is NOT `Default`,
+/// which is this API's "no preference" and reproduces Scryfall's ordering when no prefer is
+/// written — the two differ on exactly the cards whose default pick is an atypical frame (Chaos
+/// Warp, 1 in 450), which is where Scryfall's own no-prefer and `prefer:default` differ too.
 #[derive(Clone, Copy)]
-enum Prefer { Oldest, Newest, UsdLow, UsdHigh, EurLow, TixLow, Promo, Default }
+enum Prefer {
+    Oldest,
+    Newest,
+    UsdLow,
+    UsdHigh,
+    EurLow,
+    EurHigh,
+    TixLow,
+    TixHigh,
+    Promo,
+    Default,
+    DefaultFrame(PreferClassIds),
+    Atypical(PreferClassIds),
+    UniversesBeyond(PreferClassIds),
+    NotUniversesBeyond(PreferClassIds),
+    Borderless(PreferClassIds),
+}
 
 fn prefer_from_str(s: &str) -> Prefer {
     match s {
@@ -6770,7 +7316,16 @@ fn prefer_from_str(s: &str) -> Prefer {
         "newest"   => Prefer::Newest,
         "usd_low"  => Prefer::UsdLow,
         "usd_high" => Prefer::UsdHigh,
+        "eur_low"  => Prefer::EurLow,
+        "eur_high" => Prefer::EurHigh,
+        "tix_low"  => Prefer::TixLow,
+        "tix_high" => Prefer::TixHigh,
         "promo"    => Prefer::Promo,
+        "default_frame"      => Prefer::DefaultFrame(PreferClassIds::UNBOUND),
+        "atypical"           => Prefer::Atypical(PreferClassIds::UNBOUND),
+        "universesbeyond"    => Prefer::UniversesBeyond(PreferClassIds::UNBOUND),
+        "notuniversesbeyond" => Prefer::NotUniversesBeyond(PreferClassIds::UNBOUND),
+        "borderless"         => Prefer::Borderless(PreferClassIds::UNBOUND),
         _          => Prefer::Default,
     }
 }
@@ -6824,7 +7379,13 @@ fn mode_from_unique(unique: &str) -> Mode {
 /// Prefer score for one printing of a card; higher wins, and selection uses a
 /// strict > so the first-in-store-order printing wins ties (matching the tie
 /// behavior of the dedup paths this replaced).
-fn prefer_score(card: &AOracleCard, p: &APrinting, prefer: Prefer) -> f64 {
+fn prefer_score(card: &AOracleCard, p: &APrinting, prefer: Prefer, strings: &AStrings) -> f64 {
+    // A class prefer is "the class first, then the default order": every member outscores every
+    // non-member, and inside each half the store's own prefer_score decides — which is what makes
+    // `prefer:atypical` answer the store's BEST atypical printing rather than its first one.
+    const CLASS_BONUS: f64 = 1.0e9;
+    let default_score = || p.prefer_score.as_ref().map(|v| f32::from(*v)).unwrap_or(0.0) as f64;
+    let class_score = |member: bool| if member { CLASS_BONUS + default_score() } else { default_score() };
     match prefer {
         Prefer::Oldest  => -(p.released_at_int.as_ref().map(|v| u32::from(*v)).unwrap_or(99_999_999) as f64),
         Prefer::Newest  => p.released_at_int.as_ref().map(|v| u32::from(*v)).unwrap_or(0) as f64,
@@ -6834,11 +7395,46 @@ fn prefer_score(card: &AOracleCard, p: &APrinting, prefer: Prefer) -> f64 {
         Prefer::UsdLow  => -p.price_usd.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).unwrap_or(f64::INFINITY),
         Prefer::UsdHigh => p.price_usd.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).unwrap_or(0.0),
         Prefer::EurLow  => -p.price_eur.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).unwrap_or(f64::INFINITY),
+        Prefer::EurHigh => p.price_eur.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).unwrap_or(0.0),
         Prefer::TixLow  => -p.price_tix.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).unwrap_or(f64::INFINITY),
+        Prefer::TixHigh => p.price_tix.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).unwrap_or(0.0),
         // Card-level (edhrec is oracle-scoped): every printing ties, so the
         // first printing in store order is chosen — same as before the split.
         Prefer::Promo   => -(card.edhrec_rank.as_ref().map(|r| u32::from(*r) as f64).unwrap_or(f64::INFINITY)),
-        Prefer::Default => p.prefer_score.as_ref().map(|v| f32::from(*v)).unwrap_or(0.0) as f64,
+        Prefer::Default => default_score(),
+        Prefer::Atypical(ids) => class_score(printing_is_atypical(p, &ids, strings)),
+        Prefer::DefaultFrame(ids) => class_score(!printing_is_atypical(p, &ids, strings)),
+        Prefer::UniversesBeyond(ids) => class_score(printing_is_universes_beyond(p, &ids)),
+        Prefer::NotUniversesBeyond(ids) => class_score(!printing_is_universes_beyond(p, &ids)),
+        // Eight steps: in-universe {borderless, variant, plain, textless} above Universes Beyond
+        // {the same four}, and a flavor-named printing below all of them — with at least one
+        // same-named printing on every card, it can never be the answer. Textless is checked
+        // FIRST: it is a frame variant to the atypical class, and the one variant nobody can read.
+        Prefer::Borderless(ids) => {
+            // Below every same-named printing in EVERY language — a `lang:ja` pool must still put
+            // its own crossovers last — hence further down than the language offset reaches.
+            if printing_has_flavor_name(p) {
+                return default_score() - 32.0 * CLASS_BONUS;
+            }
+            let frame_tier = if compat_flag(p, COMPAT_TEXTLESS) {
+                0.0
+            } else if printing_is_borderless(p, strings) {
+                3.0
+            } else if printing_is_frame_variant(p, &ids, strings) {
+                2.0
+            } else {
+                1.0
+            };
+            let universe_tier = if printing_is_universes_beyond(p, &ids) { 0.0 } else { 4.0 };
+            // A row with no language recorded (a fixture) is not demoted; only a KNOWN other
+            // language is. Sixteen steps down puts every non-English printing below every
+            // English one — flavor-named ones included — while the tiers still order the
+            // non-English rows among themselves for a `lang:` query.
+            let lang = u16::from(p.compat.lang_id);
+            let foreign = ids.lang_en != VOCAB_NONE && lang != VOCAB_NONE && lang != ids.lang_en;
+            let language_offset = if foreign { -16.0 } else { 0.0 };
+            (universe_tier + frame_tier + language_offset) * CLASS_BONUS + default_score()
+        }
     }
 }
 
@@ -7123,6 +7719,11 @@ struct QueryCtx<'a> {
     offsets: &'a AOffsets,
     strings: &'a AStrings,
     indexes: &'a Archived<CardIndexes>,
+    /// The collection vocab, for `QueryParams::bind_prefer` — a class prefer resolves its words
+    /// against it once per query. Test-only because only the test driver `run_query` binds from
+    /// the ctx; every production entry point binds at the PyO3 boundary, where `data` is in hand.
+    #[cfg(test)]
+    coll_vocab: &'a AStrings,
 }
 
 impl<'a> From<&'a Archived<CardData>> for QueryCtx<'a> {
@@ -7133,6 +7734,8 @@ impl<'a> From<&'a Archived<CardData>> for QueryCtx<'a> {
             offsets: &data.offsets,
             strings: &data.strings,
             indexes: &data.indexes,
+            #[cfg(test)]
+            coll_vocab: &data.coll_vocab,
         }
     }
 }
@@ -7205,6 +7808,21 @@ impl QueryParams {
             page_offset,
             sort_bound: SortBound::UNBOUNDED,
         }
+    }
+
+    /// Resolve a class prefer's words against this store's vocab. Every production entry point
+    /// calls this after `from_strs`; a caller that does not gets `PreferClassIds::UNBOUND`, under
+    /// which a class prefer is the default order rather than a wrong one.
+    fn bind_prefer(mut self, coll_vocab: &AStrings) -> Self {
+        self.prefer = match self.prefer {
+            Prefer::DefaultFrame(_) => Prefer::DefaultFrame(PreferClassIds::bind(coll_vocab)),
+            Prefer::Atypical(_) => Prefer::Atypical(PreferClassIds::bind(coll_vocab)),
+            Prefer::UniversesBeyond(_) => Prefer::UniversesBeyond(PreferClassIds::bind(coll_vocab)),
+            Prefer::NotUniversesBeyond(_) => Prefer::NotUniversesBeyond(PreferClassIds::bind(coll_vocab)),
+            Prefer::Borderless(_) => Prefer::Borderless(PreferClassIds::bind(coll_vocab)),
+            other => other,
+        };
+        self
     }
 
     /// Attach the filter's interval on the sort column. Called at the PyO3 boundary, next to
@@ -7493,7 +8111,7 @@ fn push_card_matches(
                         if !satisfies(pid) {
                             continue;
                         }
-                        let score = prefer_score(card, &printings[pid], prefer);
+                        let score = prefer_score(card, &printings[pid], prefer, strings);
                         if chosen.is_none_or(|(_, s)| score > s) {
                             chosen = Some((pid as u32, score));
                         }
@@ -7516,7 +8134,7 @@ fn push_card_matches(
                     if !all_match && !FilterExpr::residual_matches(card, p, strings, residual, residual_is_or) {
                         continue;
                     }
-                    let score = prefer_score(card, p, prefer);
+                    let score = prefer_score(card, p, prefer, strings);
                     if chosen.is_none_or(|(_, s)| score > s) {
                         chosen = Some((pid as u32, score));
                     }
@@ -7576,7 +8194,7 @@ fn push_card_matches(
                     if !all_match && !FilterExpr::residual_matches(card, p, strings, residual, residual_is_or) { continue; }
                     let gid = u16::from(p.artwork_group_id) as usize;
                     debug_assert!(gid < group_best.len(), "group_best must be pre-sized to max_artwork_groups");
-                    let score = prefer_score(card, p, prefer);
+                    let score = prefer_score(card, p, prefer, strings);
                     match &group_best[gid] {
                         None => {
                             group_best[gid] = Some((pid as u32, score));
@@ -9488,6 +10106,7 @@ fn group_representative(
     cid: usize,
     pid: usize,
     probes: &mut u64,
+    strings: &AStrings,
 ) -> usize {
     if matches!(mode, Mode::Printing) {
         return pid;
@@ -9517,7 +10136,7 @@ fn group_representative(
         if first_match_wins {
             return q;
         }
-        let score = prefer_score(card, &printings[q], prefer);
+        let score = prefer_score(card, &printings[q], prefer, strings);
         match best {
             // `score <= b` keeps the incumbent, so equal scores leave the LOWEST pid in place -- the
             // same tie resolution `walk_grouped_page`'s strict `score > *best` produces.
@@ -9574,7 +10193,7 @@ fn walk_value_orderby_page<'a>(
     pbits: &[u64],
     total: usize,
 ) -> Option<(Vec<(&'a AOracleCard, &'a APrinting)>, ComposePageWork)> {
-    let QueryCtx { cards, printings, offsets, indexes, .. } = *ctx;
+    let QueryCtx { cards, printings, offsets, strings, indexes, .. } = *ctx;
     let QueryParams { mode, prefer, descending, limit, page_offset, .. } = *params;
     let printing_to_card = &indexes.printing_to_card;
     let want = page_offset + limit;
@@ -9597,7 +10216,7 @@ fn walk_value_orderby_page<'a>(
             let cid = u32::from(printing_to_card[pid]) as usize;
             if grouped {
                 resolutions += 1;
-                if group_representative(cards, printings, offsets, pbits, mode, prefer, cid, pid, &mut examined) != pid {
+                if group_representative(cards, printings, offsets, pbits, mode, prefer, cid, pid, &mut examined, strings) != pid {
                     continue;
                 }
             }
@@ -10974,7 +11593,7 @@ fn walk_grouped_page<'a>(
     pbits: &[u64],
     perm: &Archived<Vec<u32>>,
 ) -> (Vec<(&'a AOracleCard, &'a APrinting)>, ComposePageWork) {
-    let QueryCtx { cards, printings, offsets, indexes, .. } = *ctx;
+    let QueryCtx { cards, printings, offsets, strings, indexes, .. } = *ctx;
     let QueryParams { mode, prefer, sort_col, descending, limit, page_offset, .. } = *params;
     let max_artwork_groups = u16::from(indexes.max_artwork_groups);
     let is_set = |pid: usize| pbits[pid >> 6] & (1u64 << (pid & 63)) != 0;
@@ -11025,7 +11644,7 @@ fn walk_grouped_page<'a>(
                         _ => 0, // Card: everything collapses into one group
                     };
                     debug_assert!(gid < group_best.len(), "group_best must be pre-sized to max_artwork_groups");
-                    let score = prefer_score(card, &printings[pid], prefer);
+                    let score = prefer_score(card, &printings[pid], prefer, strings);
                     match &group_best[gid] {
                         None => {
                             group_best[gid] = Some((pid as u32, score));
@@ -11097,7 +11716,7 @@ fn walk_card_page_via_popcount_skip<'a>(
     order: SortOrder<'_>,
 ) -> (Vec<(&'a AOracleCard, &'a APrinting)>, ComposePageWork) {
     debug_assert!(matches!(params.mode, Mode::Card), "prototype is Mode::Card only");
-    let QueryCtx { cards, printings, offsets, indexes, .. } = *ctx;
+    let QueryCtx { cards, printings, offsets, strings, indexes, .. } = *ctx;
     let QueryParams { prefer, limit, page_offset, .. } = *params;
     let n_cards = cards.len();
     let mut work = ComposePageWork::default();
@@ -11170,7 +11789,7 @@ fn walk_card_page_via_popcount_skip<'a>(
                 if !is_set(pid) {
                     continue;
                 }
-                let score = prefer_score(card, &printings[pid], prefer);
+                let score = prefer_score(card, &printings[pid], prefer, strings);
                 if best.is_none_or(|(_, s)| score > s) {
                     best = Some((pid as u32, score));
                 }
@@ -11320,7 +11939,7 @@ fn walk_artwork_page_via_popcount_skip<'a>(
     order: SortOrder<'_>,
 ) -> (Vec<(&'a AOracleCard, &'a APrinting)>, ComposePageWork) {
     debug_assert!(matches!(params.mode, Mode::Artwork), "prototype is Mode::Artwork only");
-    let QueryCtx { cards, printings, offsets, indexes, .. } = *ctx;
+    let QueryCtx { cards, printings, offsets, strings, indexes, .. } = *ctx;
     let QueryParams { prefer, sort_col, descending, limit, page_offset, .. } = *params;
     let n_cards = cards.len();
     let max_artwork_groups = usize::from(u16::from(indexes.max_artwork_groups));
@@ -11400,7 +12019,7 @@ fn walk_artwork_page_via_popcount_skip<'a>(
             }
             let gid = u16::from(printings[pid].artwork_group_id) as usize;
             debug_assert!(gid < group_best.len(), "group_best must be pre-sized to max_artwork_groups");
-            let score = prefer_score(card, &printings[pid], prefer);
+            let score = prefer_score(card, &printings[pid], prefer, strings);
             match &group_best[gid] {
                 None => {
                     group_best[gid] = Some((pid as u32, score));
@@ -11451,7 +12070,7 @@ fn gather_composed_page<'a>(
     pbits: &[u64],
     card_bits: Option<&[u64]>,
 ) -> (Vec<(&'a AOracleCard, &'a APrinting)>, ComposePageWork) {
-    let QueryCtx { cards, printings, offsets, indexes, .. } = *ctx;
+    let QueryCtx { cards, printings, offsets, strings, indexes, .. } = *ctx;
     let QueryParams { mode, prefer, sort_col, descending, limit, page_offset, .. } = *params;
     let max_artwork_groups = u16::from(indexes.max_artwork_groups);
     let is_set = |pid: usize| pbits[pid >> 6] & (1u64 << (pid & 63)) != 0;
@@ -11532,7 +12151,7 @@ fn gather_composed_page<'a>(
                         _ => 0, // Card: everything collapses into one group
                     };
                     debug_assert!(gid < group_best.len(), "group_best must be pre-sized to max_artwork_groups");
-                    let score = prefer_score(card, &printings[pid], prefer);
+                    let score = prefer_score(card, &printings[pid], prefer, strings);
                     match &group_best[gid] {
                         None => {
                             group_best[gid] = Some((pid as u32, score));
@@ -12055,7 +12674,7 @@ fn exec_gathered_scan<'a>(
 ) -> (usize, Vec<(&'a AOracleCard, &'a APrinting)>) {
     // First of the three phase boundaries — everything down to the match loop is `ns_setup`.
     let t_start = std::time::Instant::now();
-    let QueryCtx { cards, printings, offsets, strings, indexes } = *ctx;
+    let QueryCtx { cards, printings, offsets, strings, indexes, .. } = *ctx;
     let QueryParams { mode, prefer, sort_col, descending, limit, page_offset, .. } = *params;
     let all_match_known = prep.all_match_known;
     let existential_plane = existential_plane_for(mode, plane, indexes);
@@ -12159,7 +12778,7 @@ fn run_query<'a>(
 ) -> (usize, Vec<(&'a AOracleCard, &'a APrinting)>) {
     // #702: plan selection is one cost-based routing layer (`run_query_routed`,
     // `argmin cost::plan_cost` over the applicable plans), not a hand-tuned decision tree.
-    let params = QueryParams::from_strs(unique, prefer, orderby, direction, limit, page_offset);
+    let params = QueryParams::from_strs(unique, prefer, orderby, direction, limit, page_offset).bind_prefer(ctx.coll_vocab);
     // `None`: this wrapper receives an already-split filter and has no unsplit form to offer, so compose
     // is costed exactly as it was before the split became non-destructive. See `bind_and_split_filter`.
     run_query_routed(ctx, &params, filter, None, plane)
@@ -13850,7 +14469,7 @@ fn run_query_streamed_popcount<'a>(
     // `ns_loop`, the emit walk is `ns_finish`. Shared by BOTH popcount plans, so instrumenting here
     // covers `PlanePopcountOrder` and `CardRangePopcount` at once.
     let t_start = std::time::Instant::now();
-    let QueryCtx { cards, printings, offsets, strings, indexes } = *ctx;
+    let QueryCtx { cards, printings, offsets, strings, indexes, .. } = *ctx;
     let QueryParams { prefer, limit, page_offset, .. } = *params;
     let SortOrder { perm, inv: inv_perm } = order;
     let planes = &indexes.planes;
@@ -13952,7 +14571,7 @@ fn run_query_streamed_popcount<'a>(
                         if !satisfies(pid) {
                             continue;
                         }
-                        let score = prefer_score(card, &printings[pid], prefer);
+                        let score = prefer_score(card, &printings[pid], prefer, strings);
                         if best.is_none_or(|(_, s)| score > s) {
                             best = Some((pid as u32, score));
                         }
@@ -14011,7 +14630,7 @@ fn run_query_streamed<'a>(
     // First of the three phase boundaries — everything down to the match loop is `ns_setup`, which
     // for this executor is dominated by the `counts` zeroing below. See `PhaseStats::ns_setup`.
     let t_start = std::time::Instant::now();
-    let QueryCtx { cards, printings, offsets, strings, indexes } = *ctx;
+    let QueryCtx { cards, printings, offsets, strings, indexes, .. } = *ctx;
     let QueryParams { mode, prefer, sort_col, descending, limit, page_offset, .. } = *params;
     let artwork_groups = &indexes.artwork_groups;
     let artwork_group_col = &indexes.artwork_group_col;
@@ -14245,50 +14864,121 @@ fn run_query_streamed<'a>(
 type FieldExtractor =
     for<'a> fn(Python<'a>, &'a AOracleCard, &'a APrinting, &'a AStrings, &'a AStrings) -> PyResult<Bound<'a, PyAny>>;
 
-const FIELD_TABLE: &[(&str, FieldExtractor)] = &[
-    ("name", |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.card_name_id)).into_pyobject(py)?.into_any())),
-    ("set_code", |py, _c, p, _s, _v| Ok(p.card_set_code.as_str().into_pyobject(py)?.into_any())),
-    ("collector_number", |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.collector_number_id)).into_pyobject(py)?.into_any())),
-    ("power", |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.creature_power_text_id)).into_pyobject(py)?.into_any())),
-    ("toughness", |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.creature_toughness_text_id)).into_pyobject(py)?.into_any())),
-    ("loyalty", |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.planeswalker_loyalty_text_id)).into_pyobject(py)?.into_any())),
-    ("mana_cost", |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.mana_cost_text_id)).into_pyobject(py)?.into_any())),
-    ("oracle_text", |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.oracle_text_id)).into_pyobject(py)?.into_any())),
-    ("set_name", |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.set_name_id)).into_pyobject(py)?.into_any())),
-    ("type_line", |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.type_line_id)).into_pyobject(py)?.into_any())),
-    ("illustration_id", |py, _c, p, _s, _v| Ok(uuid_from_u128(u128::from(p.illustration_id)).into_pyobject(py)?.into_any())),
-    ("scryfall_id", |py, _c, p, _s, _v| Ok(uuid_from_u128(u128::from(p.scryfall_id)).into_pyobject(py)?.into_any())),
+/// The field's dict key, as the interpreter's one interned `PyString`.
+///
+/// `set_item` with a `&str` key builds a FRESH `PyUnicode` on every call: 9 allocations per row and
+/// 900 per 100-row page, for 9 constant strings, none of them shared -- measured 0 of 9 key objects
+/// identical across rows before this change, 24 of 24 after. `intern!` resolves through a static
+/// `GILOnceCell`, so the per-row cost is a cell read plus an incref.
+///
+/// The key fn belongs in the table rather than being interned once per query into a `Vec`: that
+/// revision was measured too, and it won the same ~12-16 ns/field on pages but cost +0.17-0.25 us on
+/// the 0-row and 1-row shapes, which is where most real traffic lands. Per-query setup has nowhere
+/// to amortize when the page holds one row.
+type FieldKey = for<'a> fn(Python<'a>) -> &'a Bound<'a, PyString>;
+
+/// Yields the interned string id a cacheable field reads, for `EmitStrCache`.
+type CachedStrId = for<'a> fn(&'a AOracleCard, &'a APrinting) -> u32;
+
+/// Yields the `coll_vocab` id vector a collection field reads.
+type CollIds = for<'a> fn(&'a AOracleCard, &'a APrinting) -> &'a Archived<Vec<u16>>;
+
+/// Where a resolved field's value comes from.
+#[derive(Clone, Copy)]
+enum CachedSource {
+    /// Not cacheable; the table's own extractor runs.
+    Extractor,
+    /// A `CardData.strings` id, served as one cached `PyString`.
+    Str(CachedStrId),
+    /// A `coll_vocab` id vector, served as a list of cached `PyString`s.
+    Coll(CollIds),
+}
+
+/// The collection fields, and the id vector each one emits.
+///
+/// All six are cached: their elements come from `coll_vocab` (~16k entries), a bounded vocabulary
+/// that repeats heavily across rows -- 11,278 elements over 1,946 distinct values in one 500-row
+/// sample, with no sharing at all before this. None of them needs a sort any more; see `coll_list`.
+const CACHED_COLL_FIELDS: &[(&str, CollIds)] = &[
+    ("card_subtypes", |c, _p| &c.card_subtypes),
+    ("card_keywords", |c, _p| &c.card_keywords),
+    ("card_oracle_tags", |c, _p| &c.card_oracle_tags),
+    ("card_art_tags", |_c, p| &p.card_art_tags),
+    ("card_is_tags", |_c, p| &p.card_is_tags),
+    ("card_frame_data", |_c, p| &p.card_frame_data),
+];
+
+/// The result fields served from `EmitStrCache`, and the id each one caches on.
+///
+/// Membership is decided by measured distinct-values-per-row over 100-row pages, not by type: a
+/// field earns a slot by repeating within a page. `name` (1.00 distinct/row) and `oracle_text`
+/// (0.96) are absent deliberately — a cache never hits for them, and admitting them would hold the
+/// whole string payload live as Python objects. `set_code` is absent for a different reason: it is
+/// an `InlineStr` on the printing, not an interned id, so there is no id to key on.
+///
+/// Every entry here must read a field that `str_at` resolves against `CardData.strings`; an id from
+/// any other table would cache the wrong text.
+/// One resolved result field: its name, its interned dict key, its extractor, and — for a field
+/// served from `EmitStrCache` — the id to cache on.
+type ResolvedField = (&'static str, FieldKey, FieldExtractor, CachedSource);
+
+const CACHED_STR_FIELDS: &[(&str, CachedStrId)] = &[
+    ("type_line", |c, _p| u32::from(c.type_line_id)),
+    ("set_name", |_c, p| u32::from(p.set_name_id)),
+    ("collector_number", |_c, p| u32::from(p.collector_number_id)),
+    ("power", |c, _p| u32::from(c.creature_power_text_id)),
+    ("toughness", |c, _p| u32::from(c.creature_toughness_text_id)),
+    ("mana_cost", |c, _p| u32::from(c.mana_cost_text_id)),
+    ("layout", |c, _p| u32::from(c.card_layout_id)),
+];
+
+const FIELD_TABLE: &[(&str, FieldKey, FieldExtractor)] = &[
+    ("name", |py| intern!(py, "name"), |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.card_name_id)).into_pyobject(py)?.into_any())),
+    ("set_code", |py| intern!(py, "set_code"), |py, _c, p, _s, _v| Ok(p.card_set_code.as_str().into_pyobject(py)?.into_any())),
+    ("collector_number", |py| intern!(py, "collector_number"), |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.collector_number_id)).into_pyobject(py)?.into_any())),
+    ("power", |py| intern!(py, "power"), |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.creature_power_text_id)).into_pyobject(py)?.into_any())),
+    ("toughness", |py| intern!(py, "toughness"), |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.creature_toughness_text_id)).into_pyobject(py)?.into_any())),
+    ("loyalty", |py| intern!(py, "loyalty"), |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.planeswalker_loyalty_text_id)).into_pyobject(py)?.into_any())),
+    ("mana_cost", |py| intern!(py, "mana_cost"), |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.mana_cost_text_id)).into_pyobject(py)?.into_any())),
+    ("oracle_text", |py| intern!(py, "oracle_text"), |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.oracle_text_id)).into_pyobject(py)?.into_any())),
+    ("set_name", |py| intern!(py, "set_name"), |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.set_name_id)).into_pyobject(py)?.into_any())),
+    ("type_line", |py| intern!(py, "type_line"), |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.type_line_id)).into_pyobject(py)?.into_any())),
+    ("illustration_id", |py| intern!(py, "illustration_id"), |py, _c, p, _s, _v| uuid_to_pyobject(py, u128::from(p.illustration_id))),
+    ("scryfall_id", |py| intern!(py, "scryfall_id"), |py, _c, p, _s, _v| uuid_to_pyobject(py, u128::from(p.scryfall_id))),
     // Exact f64 dollars from the stored integer cents, not the old lossy f32 -- API consumers
     // now see the true price (e.g. 1.47, not the nearest f32 to 1.47) instead of an
     // approximation.
-    ("price_usd", |py, _c, p, _s, _v| Ok(p.price_usd.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).into_pyobject(py)?.into_any())),
+    ("price_usd", |py| intern!(py, "price_usd"), |py, _c, p, _s, _v| Ok(p.price_usd.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).into_pyobject(py)?.into_any())),
     // The other two currencies `order=` already sorts by. Without these a caller can rank a
     // page by EUR or TIX and then have no way to read the number it was ranked on.
-    ("price_eur", |py, _c, p, _s, _v| Ok(p.price_eur.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).into_pyobject(py)?.into_any())),
-    ("price_tix", |py, _c, p, _s, _v| Ok(p.price_tix.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).into_pyobject(py)?.into_any())),
-    ("prefer_score", |py, _c, p, _s, _v| Ok(p.prefer_score.as_ref().map(|v| f32::from(*v)).into_pyobject(py)?.into_any())),
+    ("price_eur", |py| intern!(py, "price_eur"), |py, _c, p, _s, _v| Ok(p.price_eur.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).into_pyobject(py)?.into_any())),
+    ("price_tix", |py| intern!(py, "price_tix"), |py, _c, p, _s, _v| Ok(p.price_tix.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).into_pyobject(py)?.into_any())),
+    ("prefer_score", |py| intern!(py, "prefer_score"), |py, _c, p, _s, _v| Ok(p.prefer_score.as_ref().map(|v| f32::from(*v)).into_pyobject(py)?.into_any())),
     // card_subtypes preserves the printed order; the set-like collections are stored
     // sorted by vocab id (first-seen order), so they get re-sorted lexicographically
     // for deterministic output.
-    ("card_subtypes", |py, c, _p, _s, v| {
+    ("card_subtypes", |py| intern!(py, "card_subtypes"), |py, c, _p, _s, v| {
         let items: Vec<&str> = c.card_subtypes.iter().map(|id| coll_str(v, u16::from(*id))).collect();
         Ok(items.into_pyobject(py)?.into_any())
     }),
-    ("card_keywords", |py, c, _p, _s, v| Ok(sorted_strs(v, &c.card_keywords).into_pyobject(py)?.into_any())),
-    ("card_oracle_tags", |py, c, _p, _s, v| Ok(sorted_strs(v, &c.card_oracle_tags).into_pyobject(py)?.into_any())),
-    ("card_art_tags", |py, _c, p, _s, v| Ok(sorted_strs(v, &p.card_art_tags).into_pyobject(py)?.into_any())),
-    ("card_is_tags", |py, _c, p, _s, v| Ok(sorted_strs(v, &p.card_is_tags).into_pyobject(py)?.into_any())),
-    ("card_frame_data", |py, _c, p, _s, v| Ok(sorted_strs(v, &p.card_frame_data).into_pyobject(py)?.into_any())),
+    ("card_keywords", |py| intern!(py, "card_keywords"), |py, c, _p, _s, v| Ok(sorted_strs(v, &c.card_keywords).into_pyobject(py)?.into_any())),
+    ("card_oracle_tags", |py| intern!(py, "card_oracle_tags"), |py, c, _p, _s, v| Ok(sorted_strs(v, &c.card_oracle_tags).into_pyobject(py)?.into_any())),
+    ("card_art_tags", |py| intern!(py, "card_art_tags"), |py, _c, p, _s, v| Ok(sorted_strs(v, &p.card_art_tags).into_pyobject(py)?.into_any())),
+    ("card_is_tags", |py| intern!(py, "card_is_tags"), |py, _c, p, _s, v| Ok(sorted_strs(v, &p.card_is_tags).into_pyobject(py)?.into_any())),
+    ("card_frame_data", |py| intern!(py, "card_frame_data"), |py, _c, p, _s, v| Ok(sorted_strs(v, &p.card_frame_data).into_pyobject(py)?.into_any())),
     // Card-data fields for downstream filtering, in Scryfall JSON shapes (names and value
     // shapes match RESULT_FIELD_COLUMNS in api/api_resource.py, which reshapes the SQL
     // path's raw columns to agree with these).
-    ("layout", |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.card_layout_id)).into_pyobject(py)?.into_any())),
-    ("cmc", |py, c, _p, _s, _v| Ok(c.cmc.as_ref().copied().into_pyobject(py)?.into_any())),
-    ("rarity", |py, _c, p, _s, _v| {
-        Ok(p.card_rarity_int.as_ref().and_then(|v| rarity_int_to_text(*v)).into_pyobject(py)?.into_any())
+    ("layout", |py| intern!(py, "layout"), |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.card_layout_id)).into_pyobject(py)?.into_any())),
+    ("cmc", |py| intern!(py, "cmc"), |py, c, _p, _s, _v| Ok(c.cmc.as_ref().copied().into_pyobject(py)?.into_any())),
+    ("rarity", |py| intern!(py, "rarity"), |py, _c, p, _s, _v| {
+        Ok(match p.card_rarity_int.as_ref().and_then(|v| rarity_pystring(py, *v)) {
+            Some(word) => word.bind(py).clone().into_any(),
+            None => py.None().into_bound(py),
+        })
     }),
-    ("color_identity", |py, c, _p, _s, _v| Ok(identity_letters(c.card_color_identity).into_pyobject(py)?.into_any())),
-    ("legalities", |py, c, p, _s, _v| {
+    ("color_identity", |py| intern!(py, "color_identity"), |py, c, _p, _s, _v| color_identity_tuple(py, c.card_color_identity)),
+    ("legalities", |py| intern!(py, "legalities"), |py, c, p, _s, _v| {
         // Printing-level word only for the ~556 divergence cards, same rule the filters use.
         let bits = if c.legality_divergent { u64::from(p.card_legalities) } else { u64::from(c.card_legalities) };
         Ok(legality_bits_to_pydict(py, bits)?.into_any())
@@ -14299,49 +14989,49 @@ const FIELD_TABLE: &[(&str, FieldExtractor)] = &[
     // absent: these emit None rather than a zero value, because Scryfall OMITS a key it has no
     // value for, and a card that sprouts nulls Scryfall never sent differs from Scryfall on
     // every row.
-    ("lang", |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.lang_id)).into_pyobject(py)?.into_any())),
-    ("image_status", |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.image_status_id)).into_pyobject(py)?.into_any())),
-    ("set_type", |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.set_type_id)).into_pyobject(py)?.into_any())),
-    ("security_stamp", |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.security_stamp_id)).into_pyobject(py)?.into_any())),
-    ("set_id", |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.set_vid)).into_pyobject(py)?.into_any())),
-    ("arena_id", |py, _c, p, _s, _v| Ok(p.compat.arena_id.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
-    ("mtgo_id", |py, _c, p, _s, _v| Ok(p.compat.mtgo_id.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
-    ("mtgo_foil_id", |py, _c, p, _s, _v| Ok(p.compat.mtgo_foil_id.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
-    ("tcgplayer_id", |py, _c, p, _s, _v| Ok(p.compat.tcgplayer_id.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
-    ("tcgplayer_etched_id", |py, _c, p, _s, _v| Ok(p.compat.tcgplayer_etched_id.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
-    ("cardmarket_id", |py, _c, p, _s, _v| Ok(p.compat.cardmarket_id.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
-    ("penny_rank", |py, _c, p, _s, _v| Ok(p.compat.penny_rank.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
-    ("image_updated_at", |py, _c, p, _s, _v| Ok(p.compat.image_updated_at.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
+    ("lang", |py| intern!(py, "lang"), |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.lang_id)).into_pyobject(py)?.into_any())),
+    ("image_status", |py| intern!(py, "image_status"), |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.image_status_id)).into_pyobject(py)?.into_any())),
+    ("set_type", |py| intern!(py, "set_type"), |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.set_type_id)).into_pyobject(py)?.into_any())),
+    ("security_stamp", |py| intern!(py, "security_stamp"), |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.security_stamp_id)).into_pyobject(py)?.into_any())),
+    ("set_id", |py| intern!(py, "set_id"), |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.set_vid)).into_pyobject(py)?.into_any())),
+    ("arena_id", |py| intern!(py, "arena_id"), |py, _c, p, _s, _v| Ok(p.compat.arena_id.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
+    ("mtgo_id", |py| intern!(py, "mtgo_id"), |py, _c, p, _s, _v| Ok(p.compat.mtgo_id.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
+    ("mtgo_foil_id", |py| intern!(py, "mtgo_foil_id"), |py, _c, p, _s, _v| Ok(p.compat.mtgo_foil_id.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
+    ("tcgplayer_id", |py| intern!(py, "tcgplayer_id"), |py, _c, p, _s, _v| Ok(p.compat.tcgplayer_id.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
+    ("tcgplayer_etched_id", |py| intern!(py, "tcgplayer_etched_id"), |py, _c, p, _s, _v| Ok(p.compat.tcgplayer_etched_id.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
+    ("cardmarket_id", |py| intern!(py, "cardmarket_id"), |py, _c, p, _s, _v| Ok(p.compat.cardmarket_id.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
+    ("penny_rank", |py| intern!(py, "penny_rank"), |py, _c, p, _s, _v| Ok(p.compat.penny_rank.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
+    ("image_updated_at", |py| intern!(py, "image_updated_at"), |py, _c, p, _s, _v| Ok(p.compat.image_updated_at.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
     // Dollars from integer cents, the same conversion price_usd uses.
-    ("price_usd_foil", |py, _c, p, _s, _v| Ok(p.compat.price_usd_foil.as_ref().map(|v| f64::from(v.get()) / 100.0).into_pyobject(py)?.into_any())),
-    ("price_usd_etched", |py, _c, p, _s, _v| Ok(p.compat.price_usd_etched.as_ref().map(|v| f64::from(v.get()) / 100.0).into_pyobject(py)?.into_any())),
-    ("price_eur_foil", |py, _c, p, _s, _v| Ok(p.compat.price_eur_foil.as_ref().map(|v| f64::from(v.get()) / 100.0).into_pyobject(py)?.into_any())),
-    ("multiverse_ids", |py, _c, p, _s, _v| {
+    ("price_usd_foil", |py| intern!(py, "price_usd_foil"), |py, _c, p, _s, _v| Ok(p.compat.price_usd_foil.as_ref().map(|v| f64::from(v.get()) / 100.0).into_pyobject(py)?.into_any())),
+    ("price_usd_etched", |py| intern!(py, "price_usd_etched"), |py, _c, p, _s, _v| Ok(p.compat.price_usd_etched.as_ref().map(|v| f64::from(v.get()) / 100.0).into_pyobject(py)?.into_any())),
+    ("price_eur_foil", |py| intern!(py, "price_eur_foil"), |py, _c, p, _s, _v| Ok(p.compat.price_eur_foil.as_ref().map(|v| f64::from(v.get()) / 100.0).into_pyobject(py)?.into_any())),
+    ("multiverse_ids", |py| intern!(py, "multiverse_ids"), |py, _c, p, _s, _v| {
         let ids: Vec<u32> = p.compat.multiverse_ids.iter().map(|v| u32::from(*v)).collect();
         Ok(ids.into_pyobject(py)?.into_any())
     }),
-    ("promo_types", |py, _c, p, _s, v| Ok(sorted_strs(v, &p.compat.promo_types).into_pyobject(py)?.into_any())),
-    ("frame_effects", |py, _c, p, _s, v| Ok(sorted_strs(v, &p.compat.frame_effects).into_pyobject(py)?.into_any())),
-    ("games", |py, _c, p, _s, _v| Ok(bits_to_names(p.compat.games, GAME_NAMES).into_pyobject(py)?.into_any())),
-    ("finishes", |py, _c, p, _s, _v| Ok(bits_to_names(p.compat.finishes, FINISH_NAMES).into_pyobject(py)?.into_any())),
-    ("booster", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_BOOSTER).into_pyobject(py)?.to_owned().into_any())),
-    ("digital", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_DIGITAL).into_pyobject(py)?.to_owned().into_any())),
-    ("foil", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_FOIL).into_pyobject(py)?.to_owned().into_any())),
-    ("nonfoil", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_NONFOIL).into_pyobject(py)?.to_owned().into_any())),
-    ("full_art", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_FULL_ART).into_pyobject(py)?.to_owned().into_any())),
-    ("highres_image", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_HIGHRES_IMAGE).into_pyobject(py)?.to_owned().into_any())),
-    ("oversized", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_OVERSIZED).into_pyobject(py)?.to_owned().into_any())),
-    ("promo", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_PROMO).into_pyobject(py)?.to_owned().into_any())),
-    ("reprint", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_REPRINT).into_pyobject(py)?.to_owned().into_any())),
-    ("story_spotlight", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_STORY_SPOTLIGHT).into_pyobject(py)?.to_owned().into_any())),
-    ("textless", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_TEXTLESS).into_pyobject(py)?.to_owned().into_any())),
-    ("variation", |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_VARIATION).into_pyobject(py)?.to_owned().into_any())),
+    ("promo_types", |py| intern!(py, "promo_types"), |py, _c, p, _s, v| Ok(sorted_strs(v, &p.compat.promo_types).into_pyobject(py)?.into_any())),
+    ("frame_effects", |py| intern!(py, "frame_effects"), |py, _c, p, _s, v| Ok(sorted_strs(v, &p.compat.frame_effects).into_pyobject(py)?.into_any())),
+    ("games", |py| intern!(py, "games"), |py, _c, p, _s, _v| Ok(bits_to_names(p.compat.games, GAME_NAMES).into_pyobject(py)?.into_any())),
+    ("finishes", |py| intern!(py, "finishes"), |py, _c, p, _s, _v| Ok(bits_to_names(p.compat.finishes, FINISH_NAMES).into_pyobject(py)?.into_any())),
+    ("booster", |py| intern!(py, "booster"), |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_BOOSTER).into_pyobject(py)?.to_owned().into_any())),
+    ("digital", |py| intern!(py, "digital"), |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_DIGITAL).into_pyobject(py)?.to_owned().into_any())),
+    ("foil", |py| intern!(py, "foil"), |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_FOIL).into_pyobject(py)?.to_owned().into_any())),
+    ("nonfoil", |py| intern!(py, "nonfoil"), |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_NONFOIL).into_pyobject(py)?.to_owned().into_any())),
+    ("full_art", |py| intern!(py, "full_art"), |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_FULL_ART).into_pyobject(py)?.to_owned().into_any())),
+    ("highres_image", |py| intern!(py, "highres_image"), |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_HIGHRES_IMAGE).into_pyobject(py)?.to_owned().into_any())),
+    ("oversized", |py| intern!(py, "oversized"), |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_OVERSIZED).into_pyobject(py)?.to_owned().into_any())),
+    ("promo", |py| intern!(py, "promo"), |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_PROMO).into_pyobject(py)?.to_owned().into_any())),
+    ("reprint", |py| intern!(py, "reprint"), |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_REPRINT).into_pyobject(py)?.to_owned().into_any())),
+    ("story_spotlight", |py| intern!(py, "story_spotlight"), |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_STORY_SPOTLIGHT).into_pyobject(py)?.to_owned().into_any())),
+    ("textless", |py| intern!(py, "textless"), |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_TEXTLESS).into_pyobject(py)?.to_owned().into_any())),
+    ("variation", |py| intern!(py, "variation"), |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_VARIATION).into_pyobject(py)?.to_owned().into_any())),
     // Each face as its own dict, front first, in Scryfall's key names. Empty list for a
     // single-faced card, which is how Scryfall omits card_faces entirely.
-    ("card_faces", |py, c, p, s, v| Ok(faces_to_pylist(py, c, p, s, v)?.into_any())),
+    ("card_faces", |py| intern!(py, "card_faces"), |py, c, p, s, v| Ok(faces_to_pylist(py, c, p, s, v)?.into_any())),
     // Scryfall's related-card list. Each entry carries its own id/name/type_line because most
     // point outside the corpus -- a `token` component references a card the import filters out.
-    ("all_parts", |py, c, _p, s, v| {
+    ("all_parts", |py| intern!(py, "all_parts"), |py, c, _p, s, v| {
         let mut out: Vec<Bound<PyDict>> = Vec::with_capacity(c.all_parts.len());
         for part in c.all_parts.iter() {
             let d = PyDict::new(py);
@@ -14356,37 +15046,66 @@ const FIELD_TABLE: &[(&str, FieldExtractor)] = &[
     }),
     // `colors` is this PR's addition; #877 already supplies layout, cmc, rarity,
     // color_identity and legalities, so those are not repeated here.
-    ("colors", |py, c, _p, _s, _v| Ok(identity_letters(c.card_colors).into_pyobject(py)?.into_any())),
+    ("colors", |py| intern!(py, "colors"), |py, c, _p, _s, _v| Ok(identity_letters(c.card_colors).into_pyobject(py)?.into_any())),
     // `to_scryfall_card` reads both of these, and neither had an entry here or a place in
     // CARD_OBJECT_FIELDS -- so on the ENGINE path every card object carried `border_color: null`
     // and no `frame` at all, where Scryfall always sends both. Only the accessors were missing;
     // both values were already stored.
-    ("border_color", |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.card_border_id)).into_pyobject(py)?.into_any())),
-    ("frame", |py, _c, p, _s, v| Ok(frame_of(p, v).into_pyobject(py)?.into_any())),
+    ("border_color", |py| intern!(py, "border_color"), |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.card_border_id)).into_pyobject(py)?.into_any())),
+    ("frame", |py| intern!(py, "frame"), |py, _c, p, _s, v| Ok(frame_of(p, v).into_pyobject(py)?.into_any())),
     // ── The remaining fields a card object needs ─────────────────────────────────────────────
-    ("oracle_id", |py, c, _p, _s, _v| Ok(uuid_from_u128(u128::from(c.oracle_id)).into_pyobject(py)?.into_any())),
-    ("flavor_text", |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.flavor_text_id)).into_pyobject(py)?.into_any())),
-    ("artist", |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.card_artist_vid)).into_pyobject(py)?.into_any())),
-    ("watermark", |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.card_watermark_id)).into_pyobject(py)?.into_any())),
-    ("edhrec_rank", |py, c, _p, _s, _v| Ok(c.edhrec_rank.as_ref().copied().map(u32::from).into_pyobject(py)?.into_any())),
-    ("price_eur", |py, _c, p, _s, _v| Ok(p.price_eur.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).into_pyobject(py)?.into_any())),
-    ("price_tix", |py, _c, p, _s, _v| Ok(p.price_tix.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).into_pyobject(py)?.into_any())),
+    ("oracle_id", |py| intern!(py, "oracle_id"), |py, c, _p, _s, _v| Ok(uuid_from_u128(u128::from(c.oracle_id)).into_pyobject(py)?.into_any())),
+    ("flavor_text", |py| intern!(py, "flavor_text"), |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.flavor_text_id)).into_pyobject(py)?.into_any())),
+    ("artist", |py| intern!(py, "artist"), |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.card_artist_vid)).into_pyobject(py)?.into_any())),
+    ("watermark", |py| intern!(py, "watermark"), |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.card_watermark_id)).into_pyobject(py)?.into_any())),
+    ("edhrec_rank", |py| intern!(py, "edhrec_rank"), |py, c, _p, _s, _v| Ok(c.edhrec_rank.as_ref().copied().map(u32::from).into_pyobject(py)?.into_any())),
     // ISO date, the shape Scryfall sends and JSON can carry. The store holds it as an int.
-    ("released_at", |py, _c, p, _s, _v| {
+    ("released_at", |py| intern!(py, "released_at"), |py, _c, p, _s, _v| {
         Ok(p.released_at_int.as_ref().copied().map(u32::from).map(released_int_to_iso).into_pyobject(py)?.into_any())
     }),
 ];
 
 /// Mirror of magic.rarity_int_to_text -- the import stores 0-5, Scryfall speaks words.
-fn rarity_int_to_text(value: u8) -> Option<&'static str> {
-    match value {
-        0 => Some("common"),
-        1 => Some("uncommon"),
-        2 => Some("rare"),
-        3 => Some("mythic"),
-        4 => Some("special"),
-        5 => Some("bonus"),
-        _ => None,
+const RARITY_NAMES: [&str; 6] = ["common", "uncommon", "rare", "mythic", "special", "bonus"];
+
+/// One rarity word as an interned `PyString`, or `None` for an int outside `RARITY_NAMES`.
+///
+/// Six values, so the words are interned once rather than rebuilt per row -- the same argument as
+/// the legality status words, and cheaper still because there is nothing to invalidate. Built FROM
+/// `RARITY_NAMES` so the spellings exist in exactly one place; an `intern!` arm per word would be a
+/// second copy of the table with nothing checking the two agree.
+fn rarity_pystring(py: Python<'_>, value: u8) -> Option<&'static Py<PyString>> {
+    static WORDS: OnceLock<Vec<Py<PyString>>> = OnceLock::new();
+    WORDS.get_or_init(|| RARITY_NAMES.iter().map(|name| PyString::intern(py, name).unbind()).collect())
+        .get(value as usize)
+}
+
+/// The WUBRG-ordered letters for a colour mask, as one shared tuple per mask.
+///
+/// The value is a pure function of the mask and there are six colour bits (`color_to_bit`: W=1 to
+/// C=32), so 64 tuples cover every value the field can hold. Building them once turns the field
+/// into an incref: `identity_letters` used to `collect()` into a Rust `Vec` and then build a
+/// `PyList`, two allocations on every emitted row, for one of 32 answers the corpus actually uses.
+///
+/// A tuple rather than a list, and that is the point rather than an incidental detail. A list
+/// cannot be shared -- one caller mutating a row's colour identity would change every other row
+/// carrying the same colours -- so a cache is only safe for an immutable type. Tuples also carry a
+/// GC property lists do not: CPython untracks a tuple whose items are all untracked, and a dict
+/// holding only untracked values stays untracked itself, so a row keeping this field out of GC
+/// tracking is possible where a list would force it in.
+///
+/// This is the first result field to return a tuple; the collection fields still return lists.
+fn color_identity_tuple<'py>(py: Python<'py>, mask: u8) -> PyResult<Bound<'py, PyAny>> {
+    /// Six colour bits, so every mask this field can hold indexes into the table.
+    const N_MASKS: u8 = 64;
+    static TUPLES: OnceLock<Vec<Py<PyTuple>>> = OnceLock::new();
+    let tuples = TUPLES.get_or_init(|| {
+        (0..N_MASKS).filter_map(|m| PyTuple::new(py, identity_letters(m)).ok().map(|t| t.unbind())).collect()
+    });
+    match tuples.get(mask as usize) {
+        Some(cached) => Ok(cached.bind(py).clone().into_any()),
+        // Only reachable if the one-time build above failed partway; correct, just uncached.
+        None => Ok(PyTuple::new(py, identity_letters(mask))?.into_any()),
     }
 }
 
@@ -14475,6 +15194,9 @@ fn faces_to_pylist<'py>(
             d.set_item("artist", coll_str_opt(vocab, u16::from(art.card_artist_vid)))?;
             d.set_item("illustration_id", uuid_from_u128(u128::from(art.illustration_id)))?;
             d.set_item("flavor_text", str_at(strings, u32::from(art.flavor_text_id)))?;
+            if let Some(v) = str_at(strings, u32::from(art.flavor_name_id)) {
+                d.set_item("flavor_name", v)?;
+            }
         }
         out.push(d);
     }
@@ -14502,7 +15224,7 @@ const DEFAULT_FIELDS: &[&str] =
 /// requested twice is only fetched/emitted once) and rejecting anything outside the vocabulary.
 /// `None` resolves to DEFAULT_FIELDS. Called once per query, before the per-row loop, so the
 /// per-row cost is a flat list of closure calls rather than a name comparison per field per card.
-fn resolve_fields(fields: Option<Vec<String>>) -> PyResult<Vec<(&'static str, FieldExtractor)>> {
+fn resolve_fields(fields: Option<Vec<String>>) -> PyResult<Vec<ResolvedField>> {
     let requested: Vec<&str> = match &fields {
         Some(v) => v.iter().map(String::as_str).collect(),
         None => DEFAULT_FIELDS.to_vec(),
@@ -14513,8 +15235,18 @@ fn resolve_fields(fields: Option<Vec<String>>) -> PyResult<Vec<(&'static str, Fi
         if !seen.insert(name) {
             continue;
         }
-        match FIELD_TABLE.iter().find(|(n, _)| *n == name) {
-            Some(entry) => resolved.push(*entry),
+        match FIELD_TABLE.iter().find(|(n, _, _)| *n == name) {
+            Some((n, key, extractor)) => {
+                let cached = CACHED_STR_FIELDS
+                    .iter()
+                    .find(|(cn, _)| cn == n)
+                    .map(|(_, id_of)| CachedSource::Str(*id_of))
+                    .or_else(|| {
+                        CACHED_COLL_FIELDS.iter().find(|(cn, _)| cn == n).map(|(_, ids_of)| CachedSource::Coll(*ids_of))
+                    })
+                    .unwrap_or(CachedSource::Extractor);
+                resolved.push((*n, *key, *extractor, cached));
+            }
             None => return Err(UnknownFieldError::new_err(format!("unknown field: {name:?}"))),
         }
     }
@@ -14527,11 +15259,17 @@ fn card_to_pydict<'py>(
     printing: &APrinting,
     strings: &AStrings,
     vocab: &AStrings,
-    fields: &[(&'static str, FieldExtractor)],
+    fields: &[ResolvedField],
+    str_cache: &EmitStrCache,
 ) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
-    for (name, extractor) in fields {
-        d.set_item(*name, extractor(py, card, printing, strings, vocab)?)?;
+    for (_, key, extractor, cached) in fields {
+        let value = match cached {
+            CachedSource::Str(id_of) => str_cache.get(py, strings, id_of(card, printing))?,
+            CachedSource::Coll(ids_of) => str_cache.coll_list(py, vocab, ids_of(card, printing))?.into_any(),
+            CachedSource::Extractor => extractor(py, card, printing, strings, vocab)?,
+        };
+        d.set_item(key(py), value)?;
     }
     Ok(d)
 }
@@ -14583,7 +15321,45 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 // are already spent the same way by two sibling branches (#920's `scryfall_prefer_score`, #913's
 // own re-pin of the rank fields) — three open branches, three distinct values, so no pair can
 // merge textually clean into one value meaning two layouts.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026082703;
+//
+// 2026083101 — `OracleCard` GAINS `card_name_lower_id`, the whole lowercase name for the 36 cards
+// whose name does not fit `card_name_lower`'s 61 inline bytes. The row does not grow for it (256
+// before, 256 after — the trailing round-up under 16-byte alignment already had the four bytes),
+// but every field after the inline MOVES. The inline cut names in silence, so the folded name
+// derived from it was cut too: measured on a deployment of this engine 2026-08-31,
+// `!"Curse of the Fire Penguin Creature"`, `name:"fire penguin creature"` and
+// `/cards/named?exact=` of the same string all answered nothing, while
+// `!"Curse of the Fire Penguin Creatu"` — the 61-byte cut — answered the card.
+//
+// The date is ahead of every sibling branch's value (…708 on #929, …707 on #927/#928, …703 on
+// #912/#922 before this), which is the point — the never-reuse invariant is satisfied by the
+// highest value winning at merge, and a value dated today is above all four whichever order they
+// land in.
+//
+// 2026090201 — `Printing` GAINS `flavor_name_id` + `flavor_name_folded_id` and `PrintingFace`
+// GAINS `flavor_name_id`: multilingual-store's (#927) flavor-name storage, carried here line for
+// line (its 9424ede5 and 7cbfc505) because `prefer:borderless` excludes a flavor-named printing
+// — a picture of someone else — and needs the fact in the row. The `flavor_names` index those
+// commits also build stays with the annex on #927. `Printing` grows after `faces` and every
+// `PrintingFace` field after `flavor_text_id` moves, so the header would catch this on its own;
+// the value is dated ahead of every sibling branch's for the same never-reuse reason as
+// 2026083101, and #927 spends its own stake on the same layout.
+//
+// 2026090801 — `CardData` drops `coll_vocab_sorted`: the collection vocab is renumbered into
+// lexicographic order at load (`renumber_coll_vocab`), so ids ARE the sorted order. Every stored
+// collection id vector changes meaning, and `CardData`'s own layout moves without either header
+// size moving.
+//
+// 2026090803 — #913's re-pin onto that: `set_rank` / `artist_rank` on `Printing`, over the
+// renumbered vocab.
+//
+// 2026090804 — this branch's re-pin onto 2026090803. Same struct layout as 2026090201, but every
+// coll_vocab id the compat fields hold (`set_vid`, `lang_id`, `image_status_id`, `set_type_id`,
+// `security_stamp_id`, `promo_types`, `frame_effects`, `RelatedCard.component_id`) is now written
+// in the renumbered id space — an archive from before the renumber would resolve each to the
+// wrong string, so it must not be read by this build. Value dated ahead of #913's for the same
+// never-reuse reason as every entry above.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026090804;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -14605,6 +15381,83 @@ fn archive_payload(mmap: &Mmap) -> &[u8] {
 struct CachedMmap {
     mmap: Arc<Mmap>,
     inode: u64,
+    /// Emit-path `PyString` cache for this mapping. Rebuilt with the mapping, which is what makes
+    /// it safe: interned string ids are archive-relative, so a cache outliving its archive would
+    /// hand out the wrong text.
+    str_cache: Arc<EmitStrCache>,
+}
+
+/// One `PyString` per interned string id, for the result fields whose values repeat within a page.
+///
+/// Measured over 100-row pages of real queries, distinct values per row: `layout` 0.02, `rarity`
+/// 0.04, `power` 0.07, `toughness` 0.09, `mana_cost` 0.42, `set_code`/`set_name` 0.58, `type_line`
+/// 0.63 — against `name` 1.00 and `oracle_text` 0.96. The low-cardinality ones are rebuilt from
+/// UTF-8 on nearly every row for a vocabulary in the hundreds or low thousands, so one `PyString`
+/// per distinct value converges to a ~100% hit rate for a few hundred KB. `name` and `oracle_text`
+/// are deliberately NOT routed here (see `FieldSource`): at ~1.0 distinct per row a cache never
+/// hits, and covering all 160k interned strings would hold the entire string payload live as
+/// Python objects.
+///
+/// `type_line` is the single biggest entry and the reason this exists: every MTG type line carries
+/// an em dash ("Creature — Bird"), so it is 100% non-ASCII and CPython cannot use its compact ASCII
+/// representation — 39.5 ns of value construction for 25 characters, against 14.5 ns for
+/// `set_name`'s 20 ASCII ones.
+///
+/// `OnceLock` per slot rather than a `Mutex` over the whole table: a hit is one atomic load, and a
+/// race on a miss just builds the string twice and keeps the first.
+#[derive(Default)]
+struct EmitStrCache {
+    /// Sized on first use, when the archive's string count is known.
+    cells: OnceLock<Box<[OnceLock<Py<PyString>>]>>,
+    /// The same, keyed by `coll_vocab` id, for the collection fields. A separate array because it
+    /// is a different id space and far smaller -- ~16k entries against ~160k.
+    coll_cells: OnceLock<Box<[OnceLock<Py<PyString>>]>>,
+}
+
+impl EmitStrCache {
+    fn get<'py>(&self, py: Python<'py>, strings: &AStrings, id: u32) -> PyResult<Bound<'py, PyAny>> {
+        let Some(text) = str_at(strings, id) else {
+            return Ok(py.None().into_bound(py));
+        };
+        let cells = self.cells.get_or_init(|| (0..strings.len()).map(|_| OnceLock::new()).collect());
+        // An id past the table can only mean a cache built against a different archive, which the
+        // per-mapping lifetime rules out. Fall back rather than panic.
+        let Some(cell) = cells.get(id as usize) else {
+            return Ok(text.into_pyobject(py)?.into_any());
+        };
+        if let Some(hit) = cell.get() {
+            return Ok(hit.bind(py).clone().into_any());
+        }
+        let built = PyString::new(py, text);
+        let _ = cell.set(built.clone().unbind());
+        Ok(built.into_any())
+    }
+
+    /// One collection field as a list of cached `PyString`s, in stored order.
+    ///
+    /// No sort. The vocab is renumbered lexicographically at load, so a set-like collection's
+    /// id-sorted vector is already in alphabetical order -- the order this used to produce by
+    /// re-sorting every row's strings at emit. `card_subtypes` keeps its printed order for the same
+    /// reason it always did, and reaches this function the same way.
+    fn coll_list<'py>(&self, py: Python<'py>, vocab: &AStrings, ids: &Archived<Vec<u16>>) -> PyResult<Bound<'py, PyList>> {
+        let cells = self.coll_cells.get_or_init(|| (0..vocab.len()).map(|_| OnceLock::new()).collect());
+        let mut items: Vec<Bound<'py, PyString>> = Vec::with_capacity(ids.len());
+        for id in ids.iter() {
+            let idx = u16::from(*id) as usize;
+            let Some(text) = vocab.get(idx) else { continue };
+            match cells.get(idx).and_then(|cell| cell.get()) {
+                Some(hit) => items.push(hit.bind(py).clone()),
+                None => {
+                    let built = PyString::new(py, text.as_str());
+                    if let Some(cell) = cells.get(idx) {
+                        let _ = cell.set(built.clone().unbind());
+                    }
+                    items.push(built);
+                }
+            }
+        }
+        PyList::new(py, items)
+    }
 }
 
 /// In-progress staged reload: cards accumulated across add_batch() calls plus
@@ -14740,7 +15593,7 @@ fn bind_and_split_filter(
     sync_format_shifts(&data.format_shifts);
     clear_regex_match_failed();
     let mut filter_expr = build_filter(&json_val).map_err(map_build_filter_err)?;
-    filter_expr.bind(&data.coll_vocab, &data.coll_vocab_sorted, &data.artist_vocab, &data.mana_vocab, &data.indexes.flavor, &data.strings);
+    filter_expr.bind(&data.coll_vocab, &data.artist_vocab, &data.mana_vocab, &data.indexes.flavor, &data.strings);
     check_regex_match_failed()?;
 
     // Read before the split consumes the tree.
@@ -14857,6 +15710,12 @@ impl QueryEngine {
     // the last remap (i.e. another worker wrote a new archive via rename).
     // One stat(2) per query; remap only when the inode actually changes.
     fn get_mmap(&self) -> PyResult<Arc<Mmap>> {
+        Ok(self.get_mapping()?.0)
+    }
+
+    /// The mapping plus its emit cache. Both come from the same `CachedMmap`, so a remap replaces
+    /// them together and a cache can never be read against an archive it was not built for.
+    fn get_mapping(&self) -> PyResult<(Arc<Mmap>, Arc<EmitStrCache>)> {
         let path_inode = std::fs::metadata(&self.shm_path)
             .map(|m| m.ino())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("stat shm: {e}")))?;
@@ -14865,7 +15724,7 @@ impl QueryEngine {
         if let Some(ref c) = *guard
             && c.inode == path_inode
         {
-            return Ok(Arc::clone(&c.mmap));
+            return Ok((Arc::clone(&c.mmap), Arc::clone(&c.str_cache)));
         }
         // Inode changed (new reload) or first call: open and map the current file.
         let file = std::fs::File::open(&self.shm_path)
@@ -14904,15 +15763,39 @@ impl QueryEngine {
         // modified in place while mapped.
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
         sync_format_shifts(&data.format_shifts);
-        *guard = Some(CachedMmap { mmap: Arc::clone(&mmap), inode });
-        Ok(mmap)
+        let str_cache = Arc::new(EmitStrCache::default());
+        *guard = Some(CachedMmap { mmap: Arc::clone(&mmap), inode, str_cache: Arc::clone(&str_cache) });
+        Ok((mmap, str_cache))
     }
 
-    /// The body shared by `exact_card_by_name` and `collection_card_by_name`.
+    /// `CollectionScope` bound against the mapped store: the filter compiled by the same binder
+    /// `query` uses (`bind_and_split_filter`, whose UNSPLIT form is what a per-printing check
+    /// wants), the prefer's vocabulary ids resolved through `bind_prefer`. Built once per batch
+    /// rather than once per identifier -- a regex in the scope is compiled here, not in the scan.
+    fn bind_collection_scope(
+        py: Python<'_>,
+        data: &Archived<CardData>,
+        prefer: &str,
+        filters: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<CollectionScope> {
+        let filter = match filters {
+            Some(filters) => {
+                let (_, _, _, unsplit) = bind_and_split_filter(py, filters, "printing", data, SortCol::Name)?;
+                // A query that was only directives leaves a TrueNode behind, which is no filter.
+                (!matches!(unsplit, FilterExpr::True)).then_some(unsplit)
+            }
+            None => None,
+        };
+        let prefer = QueryParams::from_strs("printing", prefer, "name", "asc", 1, 0).bind_prefer(&data.coll_vocab).prefer;
+        let extra_vid = data.coll_vocab.iter().position(|s| s.as_str() == EXTRA_IS_TAG).map(|p| p as u16);
+        Ok(CollectionScope { prefer, filter, extra_vid })
+    }
+
+    /// The body of `exact_card_by_name`, and of `collection_card_by_name` before it grew a scope.
     ///
     /// Off the `#[pymethods]` block on purpose: everything in there is exported to Python, and the
-    /// two name routes differ only by which lookup they hand in -- a Rust function with no Python
-    /// spelling, so this is not a signature a caller could reach.
+    /// name routes differ by which lookup they hand in -- a Rust function with no Python spelling,
+    /// so this is not a signature a caller could reach.
     fn card_by_name<'py>(
         &self,
         py: Python<'py>,
@@ -14922,7 +15805,7 @@ impl QueryEngine {
         lookup: NameLookup,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
         let resolved_fields = resolve_fields(fields)?;
-        let mmap = self.get_mmap()?;
+        let (mmap, str_cache) = self.get_mapping()?;
         // Safety: see the access_unchecked justification in query().
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
         let Some((cid, pid)) = lookup(data, folded, set_code) else { return Ok(None) };
@@ -14933,6 +15816,7 @@ impl QueryEngine {
             &data.strings,
             &data.coll_vocab,
             &resolved_fields,
+            &str_cache,
         )?))
     }
 }
@@ -15087,16 +15971,27 @@ impl QueryEngine {
             let is_new = cards.last().is_none_or(|c| c.oracle_id != row.oracle_id);
             if is_new {
                 offsets.push(printings.len() as u32);
+                // The inline field takes the first NAME_INLINE bytes; the id beside it takes the
+                // whole string when there are more. EVERY DERIVATION BELOW READS THE ROW, NOT THE
+                // INLINE -- that is the bug this shape fixes. `card_name_folded_id` used to be
+                // decided by comparing two already-truncated `InlineStr<61>`s, so for an over-long
+                // name the comparison was between two cuts and whichever answer it gave was about
+                // a string neither field held.
+                let (card_name_lower, card_name_lower_id) =
+                    split_lower_name(&row.card_name_lower, |s| interner.intern(s));
                 cards.push(OracleCard {
-                    card_name_lower: row.card_name_lower,
+                    card_name_lower,
+                    card_name_lower_id,
                     // Only names that actually fold differently reach the table; the rest carry
-                    // NONE_STR, meaning "identical to card_name_lower". Interned rather than
+                    // NONE_STR, meaning "identical to card_name_lower" -- which now resolves
+                    // through `lower_name`, so an over-long name's fallback is the whole string
+                    // rather than the inline prefix. Interned rather than
                     // appended because the interner is still whole here, so the handful of
                     // exceptions dedupe against strings the corpus already holds.
-                    card_name_folded_id: if row.card_name_folded.as_str() == row.card_name_lower.as_str() {
+                    card_name_folded_id: if row.card_name_folded == row.card_name_lower {
                         NONE_STR
                     } else {
-                        interner.intern(row.card_name_folded.as_str().to_owned())
+                        interner.intern(row.card_name_folded.clone())
                     },
                     card_colors: row.card_colors,
                     card_color_identity: row.card_color_identity,
@@ -15186,8 +16081,11 @@ impl QueryEngine {
                         illustration_id: f.illustration_id,
                         card_artist_vid: f.card_artist_vid,
                         flavor_text_id: f.flavor_text_id,
+                        flavor_name_id: f.flavor_name_id,
                     })
                     .collect(),
+            flavor_name_id: row.flavor_name_id,
+            flavor_name_folded_id: row.flavor_name_folded_id,
             
                 compat: row.compat,
             });
@@ -15210,10 +16108,22 @@ impl QueryEngine {
         assign_artist_ranks(&mut printings, &artist_vocab);
         let mana_vocab = mana.strings;
         drop(mana.map);
-        // String-sorted permutation of the vocab ids; VocabInterner caps the
-        // vocab at u16::MAX entries so the cast can't truncate.
-        let mut coll_vocab_sorted: Vec<u16> = (0..coll_vocab.len() as u16).collect();
-        coll_vocab_sorted.sort_unstable_by(|&a, &b| coll_vocab[a as usize].cmp(&coll_vocab[b as usize]));
+        // Renumber the collection vocab into lexicographic order, so a vocab id's numeric order IS
+        // its string's alphabetical order. `VocabInterner` hands out ids first-seen, which made two
+        // separate things necessary: a string-sorted permutation for `bind` to binary-search, and a
+        // lexicographic re-sort of every row's ids at emit. Renumbering here retires both.
+        //
+        // The three properties this establishes, all relied on downstream:
+        //  - `coll_vocab` is alphabetically sorted, so `bind` binary-searches it directly.
+        //  - every set-like row vector stays sorted BY ID (`jsonb_obj_to_ids` sorted+deduped it, and
+        //    a remap + re-sort preserves that), which is what `filter.rs`'s `binary_search`
+        //    containment test requires.
+        //  - because id order is now string order, that same vector is ALSO alphabetically sorted,
+        //    so emit hands back a list in a deterministic order without sorting anything.
+        //
+        // `card_subtypes` is remapped but NOT re-sorted: it carries the printed order deliberately,
+        // and `filter.rs` linear-scans it for exactly that reason.
+        let coll_vocab = renumber_coll_vocab(&mut cards, &mut printings, coll_vocab);
         // Assigns every printing's artwork_group_id in place; the returned counts
         // feed CardIndexes.artwork_groups below. Must run before printings is
         // borrowed by the builders in the CardIndexes literal.
@@ -15341,7 +16251,6 @@ impl QueryEngine {
             offsets,
             strings,
             coll_vocab,
-            coll_vocab_sorted,
             artist_vocab,
             mana_vocab,
             indexes,
@@ -15433,7 +16342,7 @@ impl QueryEngine {
         let resolved_fields = resolve_fields(fields)?;
         // get_mmap() remaps automatically if the on-disk inode has changed since
         // the last reload, keeping workers off stale (deleted) mappings.
-        let mmap = self.get_mmap()?;
+        let (mmap, str_cache) = self.get_mapping()?;
         // Safety: the archive is trusted by construction, so we skip validation.
         // This is the canonical justification for every access_unchecked in this
         // module (query_hashmap() and size() refer here):
@@ -15465,7 +16374,7 @@ impl QueryEngine {
         // run_query evaluates in a few hundred word ops instead of per-card
         // dispatch. Shared verbatim with explain()/explain_analyze() — see
         // bind_and_split_filter.
-        let params = QueryParams::from_strs(unique, prefer, orderby, direction, limit, offset);
+        let params = QueryParams::from_strs(unique, prefer, orderby, direction, limit, offset).bind_prefer(&data.coll_vocab);
         let (plane_expr, mut filter_expr, sort_bound, unsplit) = bind_and_split_filter(py, filters, unique, data, params.sort_col)?;
 
         let ctx = QueryCtx::from(data);
@@ -15477,7 +16386,7 @@ impl QueryEngine {
 
         let matches: Vec<Bound<PyDict>> = page
             .iter()
-            .map(|(c, p)| card_to_pydict(py, c, p, &data.strings, &data.coll_vocab, &resolved_fields))
+            .map(|(c, p)| card_to_pydict(py, c, p, &data.strings, &data.coll_vocab, &resolved_fields, &str_cache))
             .collect::<PyResult<Vec<_>>>()?;
         let matches_list = PyList::new(py, matches)?;
         PyTuple::new(py, [total.into_pyobject(py)?.into_any(), matches_list.into_any()])
@@ -15559,7 +16468,7 @@ impl QueryEngine {
         let mmap = self.get_mmap()?;
         // Safety: see query()'s access_unchecked justification.
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
-        let params = QueryParams::from_strs(unique, prefer, orderby, direction, limit, offset);
+        let params = QueryParams::from_strs(unique, prefer, orderby, direction, limit, offset).bind_prefer(&data.coll_vocab);
         let (plane_expr, mut filter_expr, sort_bound, unsplit) = bind_and_split_filter(py, filters, unique, data, params.sort_col)?;
 
         // `prefer` is accepted and passed through, but note what it does NOT yet change:
@@ -15608,7 +16517,7 @@ impl QueryEngine {
         let mmap = self.get_mmap()?;
         // Safety: see query()'s access_unchecked justification.
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
-        let params = QueryParams::from_strs(unique, prefer, orderby, direction, limit, offset);
+        let params = QueryParams::from_strs(unique, prefer, orderby, direction, limit, offset).bind_prefer(&data.coll_vocab);
         let (plane_expr, filter_expr, sort_bound, unsplit) = bind_and_split_filter(py, filters, unique, data, params.sort_col)?;
 
         // Release the GIL for the timing loop: it's pure Rust (no Python calls) and
@@ -15667,7 +16576,7 @@ impl QueryEngine {
     #[pyo3(signature = (n, fields=None))]
     fn sample_preferred<'py>(&self, py: Python<'py>, n: usize, fields: Option<Vec<String>>) -> PyResult<Bound<'py, PyList>> {
         let resolved_fields = resolve_fields(fields)?;
-        let mmap = self.get_mmap()?;
+        let (mmap, str_cache) = self.get_mapping()?;
         // Safety: see the access_unchecked justification in query().
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
 
@@ -15685,7 +16594,7 @@ impl QueryEngine {
             .map(|&cid| {
                 let card = &data.cards[cid];
                 let preferred = u32::from(data.offsets[cid]) as usize;
-                card_to_pydict(py, card, &data.printings[preferred], &data.strings, &data.coll_vocab, &resolved_fields)
+                card_to_pydict(py, card, &data.printings[preferred], &data.strings, &data.coll_vocab, &resolved_fields, &str_cache)
             })
             .collect::<PyResult<_>>()?;
         PyList::new(py, dicts)
@@ -15713,7 +16622,7 @@ impl QueryEngine {
         fields: Option<Vec<String>>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
         let resolved_fields = resolve_fields(fields)?;
-        let mmap = self.get_mmap()?;
+        let (mmap, str_cache) = self.get_mapping()?;
         // Safety: see the access_unchecked justification in query().
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
         let Some(pid) = find_printing_by_illustration_id(
@@ -15731,6 +16640,7 @@ impl QueryEngine {
             &data.strings,
             &data.coll_vocab,
             &resolved_fields,
+            &str_cache,
         )?;
         Ok(Some(dict))
     }
@@ -15743,7 +16653,7 @@ impl QueryEngine {
         fields: Option<Vec<String>>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
         let resolved_fields = resolve_fields(fields)?;
-        let mmap = self.get_mmap()?;
+        let (mmap, str_cache) = self.get_mapping()?;
         // Safety: see the access_unchecked justification in query().
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
         let Some(pid) = find_printing_by_scryfall_id(
@@ -15761,6 +16671,7 @@ impl QueryEngine {
             &data.strings,
             &data.coll_vocab,
             &resolved_fields,
+            &str_cache,
         )?;
         Ok(Some(dict))
     }
@@ -15780,7 +16691,7 @@ impl QueryEngine {
         fields: Option<Vec<String>>,
     ) -> PyResult<(String, Option<Bound<'py, PyDict>>)> {
         let resolved_fields = resolve_fields(fields)?;
-        let mmap = self.get_mmap()?;
+        let (mmap, str_cache) = self.get_mapping()?;
         // Safety: see the access_unchecked justification in query().
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
         match fuzzy_name_match(&data.cards, &data.strings, name, floor, lead) {
@@ -15797,6 +16708,7 @@ impl QueryEngine {
                     &data.strings,
                     &data.coll_vocab,
                     &resolved_fields,
+                    &str_cache,
                 )?;
                 Ok(("hit".to_string(), Some(dict)))
             }
@@ -15829,15 +16741,69 @@ impl QueryEngine {
     /// SAME: measured on api.scryfall.com, `{"name":"Delver of Secrets // Insectile Aberration"}`
     /// is not_found while `exact=` of that string is the card. `name_key_tier` carries the rest of
     /// the measurements.
-    #[pyo3(signature = (folded, set_code=None, fields=None))]
+    ///
+    /// `prefer` and `filters` are the batch's `?q=` -- see `CollectionScope`. One identifier is a
+    /// batch of one: this delegates to `collection_cards_by_names`, which is what the route calls.
+    #[pyo3(signature = (folded, set_code=None, fields=None, prefer="default", filters=None))]
     fn collection_card_by_name<'py>(
         &self,
         py: Python<'py>,
         folded: &str,
         set_code: Option<&str>,
         fields: Option<Vec<String>>,
+        prefer: &str,
+        filters: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        self.card_by_name(py, folded, set_code, fields, collection_name_match)
+        let identifiers = vec![(folded.to_owned(), set_code.map(str::to_owned))];
+        Ok(self.collection_cards_by_names(py, identifiers, fields, prefer, filters)?.pop().flatten())
+    }
+
+    /// `collection_card_by_name` over a whole batch: ONE ANSWER PER IDENTIFIER, in the order they
+    /// were sent, None for a name that resolves to nothing. The shape `POST /cards/collection`
+    /// calls, because the SCOPE IS BOUND ONCE HERE and reused for every identifier -- see
+    /// `CollectionScope` for what binding per identifier measured at.
+    ///
+    /// `prefer` is a `prefer=` value under this API's spellings ("default" is no preference) and
+    /// `filters` the parsed query whose terms every candidate printing must pass, exactly the
+    /// objects `query` takes. Neither given is the unscoped lookup, byte for byte.
+    #[pyo3(signature = (identifiers, fields=None, prefer="default", filters=None))]
+    fn collection_cards_by_names<'py>(
+        &self,
+        py: Python<'py>,
+        identifiers: Vec<(String, Option<String>)>,
+        fields: Option<Vec<String>>,
+        prefer: &str,
+        filters: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Vec<Option<Bound<'py, PyDict>>>> {
+        let resolved_fields = resolve_fields(fields)?;
+        let (mmap, str_cache) = self.get_mapping()?;
+        // Safety: see the access_unchecked justification in query().
+        let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
+        let scope = (prefer != "default" || filters.is_some())
+            .then(|| Self::bind_collection_scope(py, data, prefer, filters))
+            .transpose()?;
+        let mut out = Vec::with_capacity(identifiers.len());
+        for (folded, set_code) in &identifiers {
+            let Some((cid, pid)) = name_best(data, folded, set_code.as_deref(), NameScope::Collection, scope.as_ref()) else {
+                out.push(None);
+                continue;
+            };
+            out.push(Some(card_to_pydict(
+                py,
+                &data.cards[cid],
+                &data.printings[pid],
+                &data.strings,
+                &data.coll_vocab,
+                &resolved_fields,
+                &str_cache,
+            )?));
+        }
+        // A regex in the scope that failed to match is a query error, not a not_found -- the same
+        // rule `query` applies after its scan.
+        if scope.as_ref().is_some_and(|s| s.filter.is_some()) {
+            check_regex_match_failed()?;
+        }
+        Ok(out)
     }
 
     /// One printing per DISTINCT card name whose folded name contains every one of `words`.
@@ -15855,7 +16821,7 @@ impl QueryEngine {
         fields: Option<Vec<String>>,
     ) -> PyResult<Vec<Bound<'py, PyDict>>> {
         let resolved_fields = resolve_fields(fields)?;
-        let mmap = self.get_mmap()?;
+        let (mmap, str_cache) = self.get_mapping()?;
         // Safety: see the access_unchecked justification in query().
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
         names_containing_all_words(data, &words, set_code, limit)
@@ -15868,6 +16834,7 @@ impl QueryEngine {
                     &data.strings,
                     &data.coll_vocab,
                     &resolved_fields,
+                    &str_cache,
                 )
             })
             .collect()
@@ -15905,7 +16872,7 @@ impl QueryEngine {
             }
         };
         let resolved_fields = resolve_fields(fields)?;
-        let mmap = self.get_mmap()?;
+        let (mmap, str_cache) = self.get_mapping()?;
         // Safety: see the access_unchecked justification in query().
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
         let Some(pid) = find_printing_by_external_id(&data.indexes.external_id_index, ns, external_id) else {
@@ -15919,6 +16886,7 @@ impl QueryEngine {
             &data.strings,
             &data.coll_vocab,
             &resolved_fields,
+            &str_cache,
         )?;
         Ok(Some(dict))
     }
@@ -15935,7 +16903,7 @@ impl QueryEngine {
         fields: Option<Vec<String>>,
     ) -> PyResult<Bound<'py, PyList>> {
         let resolved_fields = resolve_fields(fields)?;
-        let mmap = self.get_mmap()?;
+        let (mmap, str_cache) = self.get_mapping()?;
         // Safety: see the access_unchecked justification in query().
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
         let Some(cid) =
@@ -15949,7 +16917,7 @@ impl QueryEngine {
         let card = &data.cards[cid];
         let dicts: Vec<Bound<PyDict>> = (start..end)
             .map(|pid| {
-                card_to_pydict(py, card, &data.printings[pid], &data.strings, &data.coll_vocab, &resolved_fields)
+                card_to_pydict(py, card, &data.printings[pid], &data.strings, &data.coll_vocab, &resolved_fields, &str_cache)
             })
             .collect::<PyResult<_>>()?;
         PyList::new(py, dicts)

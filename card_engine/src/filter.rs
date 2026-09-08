@@ -474,7 +474,10 @@ fn text_field_value<'a>(
     field: TextField,
 ) -> StrVal<'a> {
     match field {
-        TextField::NameLower       => StrVal::Known(card.card_name_lower.as_str()),
+        // `lower_name`, not the inline field: the inline is a CUT for the 36 names past its bound,
+        // and the surfaces reading this one -- `name:` as an exact text compare, and `name:/…/` --
+        // must see the whole string or they answer about a prefix no card is called.
+        TextField::NameLower       => StrVal::Known(crate::lower_name(card, strings)),
         TextField::OracleTextLower => opt_sv(str_at(strings, u32::from(card.oracle_text_lower_id))),
         TextField::Layout          => opt_sv(str_at(strings, u32::from(card.card_layout_id))),
         TextField::FlavorTextLower => printing.map_or(StrVal::PDep, |p| opt_sv(str_at(strings, u32::from(p.flavor_text_lower_id)))),
@@ -625,6 +628,33 @@ pub(crate) enum FilterExpr {
         op: CmpOp,
         year: i32,
     },
+
+    /// `is:atypical` — the printing is an ATYPICAL frame in Scryfall's sense; `is:default` is its
+    /// `Not`. The SAME predicate `prefer:atypical` ranks by (`printing_is_atypical`, lib.rs), over
+    /// the same class ids, so the two spellings can never disagree about which printings are the
+    /// class. Carries its ids UNBOUND from `build` and gets them in `bind()`, exactly as
+    /// `QueryParams::bind_prefer` does for the prefer — under UNBOUND every vocab test is false
+    /// and only full-art / textless / borderless would count, which is why bind is not optional.
+    ///
+    /// Measured against api.scryfall.com 2026-09-03: `is:default` 33,267 and `is:atypical`
+    /// 10,423 over the default corpus, `is:atypical is:default` 0 and `is:default -is:atypical`
+    /// 33,267 — exact complements per printing, which is what makes `default` a `Not` rather
+    /// than a second class table that could drift from this one.
+    ///
+    /// RESIDUAL, MEASURED AND NOT CLOSED. Against a store built the same day: `is:atypical`
+    /// 10,319 here (99.0%), `is:default` 33,284 (100.05%), and the two exact complements here
+    /// too; `is:default e:khm` 323 = 323, `is:atypical e:khm` 91 = 91, `is:default t:goblin`
+    /// 559 = 559, `is:atypical is:borderless` 3,612 against 3,611. The 1% is the CLASS, not the
+    /// plumbing: subtract every marker `PreferClassIds` knows from `is:atypical` and Scryfall
+    /// still answers 3,045 cards where this answers 933, and asking those 3,045 what they carry
+    /// says `is:reprint` 1,818, `is:foil` 1,258, `frame:1997` 549, `-lang:en` 452,
+    /// `-is:nonfoil` 421, `frame:2003` 420, `frame:legendary` 160, `frame:1993` 149 — the shape
+    /// of a rule that is partly RELATIVE to the card's own default printing (an old-frame,
+    /// foreign-only or foil-only row of a card whose default is none of those), which the class
+    /// as fitted on 450 cards for the prefer never had to model: a prefer only ever shows the
+    /// best member of the class, a filter shows every member. Closing it is a study with a
+    /// holdout, the same kind that produced the class, and it moves the prefer too.
+    Atypical(super::PreferClassIds),
 }
 
 /// Verifier per-candidate cost estimates, in hundredths of a nanosecond
@@ -702,6 +732,9 @@ pub(crate) fn verify_cost_tier(f: &FilterExpr) -> u32 {
     match f {
         FilterExpr::TextRegex { regex, .. } => regex_tier(regex.as_str()),
         FilterExpr::TextContains { .. } => TEXT_SCAN_NS100,
+        // Two flag bits, one interned-border read, then a handful of short `Vec<u16>` scans over
+        // the printing's frame effects and promo types — a few lookups, no text.
+        FilterExpr::Atypical(_) => SET_LOOKUP_NS100,
         FilterExpr::Devotion { .. } | FilterExpr::ManaCostCmp { .. } => SET_LOOKUP_NS100,
         FilterExpr::ArtistMatch { .. }
         | FilterExpr::FlavorMatch { .. }
@@ -891,6 +924,9 @@ fn leaf_compares_printing_field(f: &FilterExpr) -> bool {
         // Divergent-legality cards defer to the printing, but they are a rare
         // exception (non-tournament reprints); rank by the common card-level case.
         FilterExpr::Legality { .. } => false,
+        // The frame class is read entirely off the PRINTING (its compat flags, border, frame
+        // effects, promo types, finishes) — a card's plain printing and its borderless one differ.
+        FilterExpr::Atypical(_) => true,
         // Composites are composed by the two callers, which differ on `all` vs `any`; reaching here with
         // one is a bug in whichever caller forgot to handle it, not a case to answer silently.
         FilterExpr::And(_) | FilterExpr::Or(_) | FilterExpr::Not(_) => {
@@ -1031,7 +1067,6 @@ impl FilterExpr {
     pub(crate) fn bind(
         &mut self,
         vocab: &AStrings,
-        sorted_ids: &rkyv::Archived<Vec<u16>>,
         artist_vocab: &AStrings,
         mana_vocab: &AStrings,
         flavor: &rkyv::Archived<FlavorIndex>,
@@ -1040,19 +1075,20 @@ impl FilterExpr {
         match self {
             FilterExpr::And(children) | FilterExpr::Or(children) => {
                 for c in children {
-                    c.bind(vocab, sorted_ids, artist_vocab, mana_vocab, flavor, strings);
+                    c.bind(vocab, artist_vocab, mana_vocab, flavor, strings);
                 }
             }
-            FilterExpr::Not(inner) => inner.bind(vocab, sorted_ids, artist_vocab, mana_vocab, flavor, strings),
+            FilterExpr::Not(inner) => inner.bind(vocab, artist_vocab, mana_vocab, flavor, strings),
             FilterExpr::ManaCostCmp { hybrids, hybrid_ids, .. } if !hybrids.is_empty() => {
                 *hybrid_ids = bind_mana_hybrids(hybrids, mana_vocab);
             }
             FilterExpr::CollectionCmp { value, value_id, .. } => {
-                let i = sorted_ids.partition_point(|id| vocab[u16::from(*id) as usize].as_str() < value.as_str());
-                *value_id = sorted_ids
-                    .get(i)
-                    .map(|id| u16::from(*id))
-                    .filter(|&id| vocab[id as usize].as_str() == value.as_str());
+                // The vocab is renumbered into lexicographic order at load, so ids ARE the sorted
+                // order and the permutation this used to search through is gone.
+                let i = vocab.partition_point(|entry| entry.as_str() < value.as_str());
+                *value_id = u16::try_from(i)
+                    .ok()
+                    .filter(|&id| vocab.get(id as usize).is_some_and(|e| e.as_str() == value.as_str()));
             }
             FilterExpr::TextContains { field: TextSearchField::ArtistLower, word } => {
                 // memmem::Finder built once, reused across the vocab scan — its SIMD prefilter beats
@@ -1102,6 +1138,9 @@ impl FilterExpr {
                 let (gids, dense_ids) = flavor_match_sets(flavor, strings, 0, |s| regex_is_match(regex, s));
                 *self = FilterExpr::FlavorMatch { gids, dense_ids };
             }
+            // The class prefer binds the same ids the same way (`QueryParams::bind_prefer`); `vocab`
+            // here IS `coll_vocab`, which is where the frame-effect / promo-type words live.
+            FilterExpr::Atypical(ids) => *ids = super::PreferClassIds::bind(vocab),
             _ => {}
         }
     }
@@ -1457,7 +1496,10 @@ impl FilterExpr {
                 Tri::PrintingDep => Tri::PrintingDep,
             },
 
-            FilterExpr::ExactName(lower) => tri_bool(card.card_name_lower.as_str() == lower.as_str()),
+            // WHOLE name, not the inline: `!"curse of the fire penguin // curse of the fire penguin
+            // creature"` compares against a 63-byte string the inline field cannot hold, so
+            // reading the cut answered `false` for it -- and `true` for the cut spelling.
+            FilterExpr::ExactName(lower) => tri_bool(crate::lower_name(card, strings) == lower.as_str()),
 
             FilterExpr::NumericCmp { lhs, op, rhs } => {
                 numeric_cmp_tri(lhs, *op, rhs, &|f| field_num(card, printing, f))
@@ -1563,7 +1605,8 @@ impl FilterExpr {
                     (None, _) => false,
                     // card_subtypes keeps the printed order, so it is not id-sorted.
                     (Some(id), CollField::Subtypes) => coll.iter().any(|x| u16::from(*x) == id),
-                    // The set-like collections are sorted by id at load.
+                    // The set-like collections are sorted by id at load, and since the vocab is
+                    // renumbered lexicographically that is also alphabetical order.
                     (Some(id), _) => coll.binary_search(&id.into()).is_ok(),
                 };
                 let all_equal = || match *value_id {
@@ -1669,6 +1712,13 @@ impl FilterExpr {
                     CmpOp::Ge => card_year >= *year,
                     CmpOp::Le => card_year <= *year,
                 })
+            }
+
+            // Two-valued per printing: every input is a flag, a vocab-id list or an interned
+            // border, none of which is ever NULL.
+            FilterExpr::Atypical(ids) => {
+                let Some(p) = printing else { return Tri::PrintingDep };
+                tri_bool(super::printing_is_atypical(p, ids, strings))
             }
         }
     }
@@ -1931,6 +1981,16 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
             _                  => CollField::FrameData,
         };
         let value  = rhs.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()).unwrap_or("").to_string();
+        // The parser sends these two as ordinary `is:` tags; the engine claims them because the
+        // class lives here (`printing_is_atypical`), not in a stored tag — no row carries an
+        // `atypical` tag, so the collection lookup below answered zero for both.
+        if attr == "card_is_tags" {
+            match value.as_str() {
+                "atypical" => return Ok(FilterExpr::Atypical(super::PreferClassIds::UNBOUND)),
+                "default" => return Ok(FilterExpr::Not(Box::new(FilterExpr::Atypical(super::PreferClassIds::UNBOUND)))),
+                _ => {}
+            }
+        }
         let cmp_op = op_to_collection_cmp(op);
         return Ok(FilterExpr::CollectionCmp { field: coll_field, op: cmp_op, value, value_id: None });
     }
