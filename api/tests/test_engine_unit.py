@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from api.parsing import parse_scryfall_query
+from api.scryfall_compat.objects import CARD_OBJECT_FIELDS
 from card_engine import ENGINE_COLUMNS, QueryEngine, UnknownFieldError
 
 if TYPE_CHECKING:
@@ -1363,6 +1364,33 @@ class TestFieldSelection:
             "Jace, the Mind Sculptor": "3",
             "Nicol Bolas, Planeswalker": "5",
         }, "a field the SELECT list does not fetch is silently absent from every card object"
+
+    def test_every_card_object_field_resolves_and_flavor_name_is_the_printings(
+        self, fresh_engine: Callable[[], QueryEngine]
+    ) -> None:
+        """CARD_OBJECT_FIELDS is served in full, and `flavor_name` is the printing's own.
+
+        `resolve_fields` refuses the WHOLE list on one unknown name, and routes.py treats any
+        engine exception as "fall back to SQL" -- so a single field the table does not serve turns
+        every engine card-object lookup into a silent, permanent SQL fallback with nothing red
+        anywhere. That is what `flavor_name` did: the store carried Printing.flavor_name_id and the
+        list asked for the key, but no FIELD_TABLE row emitted it.
+        """
+        cards = json.loads(_FIXTURE.read_text())
+        godzilla = dict(cards[0], flavor_name="Godzilla, King of the Monsters")
+        e = fresh_engine()
+        e.reload([godzilla, *cards[1:]])
+
+        row = e.card_by_scryfall_id(godzilla["scryfall_id"], list(CARD_OBJECT_FIELDS))
+        assert row is not None
+        assert row.keys() == set(CARD_OBJECT_FIELDS), "every card-object field is served by the engine"
+        assert row["flavor_name"] == "Godzilla, King of the Monsters"
+
+        # Absent where Scryfall omits the key, not "" -- the object builder splats the key in only
+        # when the value is truthy, so None is what keeps it off the ~99.5% of printings without one.
+        plain = e.card_by_scryfall_id(cards[1]["scryfall_id"], list(CARD_OBJECT_FIELDS))
+        assert plain is not None
+        assert plain["flavor_name"] is None
 
     def test_requested_fields_returned_exactly(self, engine: QueryEngine) -> None:
         _, cards = _run(

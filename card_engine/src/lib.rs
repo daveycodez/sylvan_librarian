@@ -16125,6 +16125,13 @@ const FIELD_TABLE: &[(&str, FieldKey, FieldExtractor)] = &[
     ("printed_name", |py| intern!(py, "printed_name"), |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.printed_name_id)).into_pyobject(py)?.into_any())),
     ("printed_type_line", |py| intern!(py, "printed_type_line"), |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.printed_type_line_id)).into_pyobject(py)?.into_any())),
     ("printed_text", |py| intern!(py, "printed_text"), |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.printed_text_id)).into_pyobject(py)?.into_any())),
+    // Scryfall's top-level `flavor_name`, the alternate name a printing is SOLD under (the Godzilla
+    // series, the Secret Lair crossovers). The store has carried `Printing.flavor_name_id` since the
+    // by-name index learned to match it, and CARD_OBJECT_FIELDS has asked for the key since
+    // eb69a81b -- but no row served it, so `resolve_fields` refused the whole list and every
+    // engine card-object lookup raised UnknownFieldError into the SQL fallback. Same absence rule
+    // as printed_name: None where Scryfall omits the key. The FACE-level twin rides card_faces.
+    ("flavor_name", |py| intern!(py, "flavor_name"), |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.flavor_name_id)).into_pyobject(py)?.into_any())),
     ("image_status", |py| intern!(py, "image_status"), |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.image_status_id)).into_pyobject(py)?.into_any())),
     ("set_type", |py| intern!(py, "set_type"), |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.set_type_id)).into_pyobject(py)?.into_any())),
     ("security_stamp", |py| intern!(py, "security_stamp"), |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.security_stamp_id)).into_pyobject(py)?.into_any())),
