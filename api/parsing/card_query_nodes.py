@@ -1168,10 +1168,6 @@ def to_card_query_ast(node: QueryNode) -> QueryNode:
             node.operator,
             to_card_query_ast(node.rhs),
         )
-    if isinstance(node, AttributeNode):
-        return CardAttributeNode(
-            attribute_name=node.attribute_name,
-        )
     if isinstance(node, AndNode):
         return AndNode([to_card_query_ast(op) for op in node.operands])
     if isinstance(node, OrNode):
