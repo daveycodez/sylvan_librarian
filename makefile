@@ -24,6 +24,11 @@ GIT_SHA := $(shell git rev-parse HEAD 2>/dev/null || echo "unknown")
 GIT_BRANCH := $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
 MAYBENORUN := $(shell if echo | xargs --no-run-if-empty >/dev/null 2>/dev/null; then echo "--no-run-if-empty"; else echo ""; fi)
 BASE_COMPOSE := $(mkfile_dir)/docker-compose.yml
+DEV_COMPOSE := $(mkfile_dir)/docker-compose.dev.yml
+# The --file arguments for one stack. Only dev layers the override that bind-mounts the host
+# checkout's static files; blue and green serve the copy built into the image, otherwise a deploy
+# would have the old API serving the new JS (and both stacks always serving the same files).
+compose_files = --file $(BASE_COMPOSE)$(if $(filter dev,$(1)), --file $(DEV_COMPOSE))
 # The two per-host env files every compose invocation reads before the stack's own envs/<stack>.
 # They are separate files because they have separate writers: .env is rebuilt from env.json by a
 # truncating make rule, .env.generated is written by scripts/gen_postgres_conf.py. Later files
@@ -55,7 +60,7 @@ python_sources := $(shell find api client -type f -name "*.py")
 engine_sources := $(shell find card_engine/src -type f -name "*.rs") card_engine/Cargo.toml card_engine/Cargo.lock card_engine/pyproject.toml
 ENGINE_EXT_SUFFIX := $(shell $(PYTHON) -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
 ENGINE_SO := card_engine/card_engine/card_engine$(ENGINE_EXT_SUFFIX)
-image_sources := $(python_sources) api/Dockerfile client/Dockerfile $(requirements_sources) $(BASE_COMPOSE)
+image_sources := $(python_sources) api/Dockerfile client/Dockerfile $(requirements_sources) $(BASE_COMPOSE) $(DEV_COMPOSE)
 
 BUILD_STAMP_DIR := $(GIT_ROOT)/.tmp/build-stamps
 BUILD_HASH := $(shell { git rev-parse HEAD 2>/dev/null; git diff origin/main 2>/dev/null; } | md5sum | cut -d' ' -f1)
@@ -135,18 +140,18 @@ env.json: # @doc create env.json with generated local credentials if missing (ne
 	cat env.json | jq -r 'to_entries[] | "\(.key)=\(.value)"' | sort > $@
 
 %-up: deps-% # @doc start an environment in the foreground, e.g. make dev-up
-	cd $(GIT_ROOT) && docker compose --project-name sylvan_$* $(COMPOSE_ENV_FILES) --env-file envs/$* --file $(BASE_COMPOSE) up --remove-orphans --abort-on-container-exit
+	cd $(GIT_ROOT) && docker compose --project-name sylvan_$* $(COMPOSE_ENV_FILES) --env-file envs/$* $(call compose_files,$*) up --remove-orphans --abort-on-container-exit
 
 %-up-detach: deps-% # @doc start an environment in the background, e.g. make dev-up-detach
-	cd $(GIT_ROOT) && docker compose --project-name sylvan_$* $(COMPOSE_ENV_FILES) --env-file envs/$* --file $(BASE_COMPOSE) up --remove-orphans --detach
+	cd $(GIT_ROOT) && docker compose --project-name sylvan_$* $(COMPOSE_ENV_FILES) --env-file envs/$* $(call compose_files,$*) up --remove-orphans --detach
 
 %-down: | .env .env.generated # @doc stop an environment, e.g. make dev-down
-	cd $(GIT_ROOT) && docker compose --project-name sylvan_$* $(COMPOSE_ENV_FILES) --env-file envs/$* --file $(BASE_COMPOSE) down --remove-orphans
+	cd $(GIT_ROOT) && docker compose --project-name sylvan_$* $(COMPOSE_ENV_FILES) --env-file envs/$* $(call compose_files,$*) down --remove-orphans
 
 status: | .env .env.generated # @doc show container status for all environments
 	@$(foreach env,$(ENVS), \
 	  $(PYTHON) -c "import shutil; w=shutil.get_terminal_size().columns; print(' $(env) '.center(w, '='))" && \
-	  cd $(GIT_ROOT) && docker compose --project-name sylvan_$(env) $(COMPOSE_ENV_FILES) --env-file envs/$(env) --file $(BASE_COMPOSE) ps --all ; \
+	  cd $(GIT_ROOT) && docker compose --project-name sylvan_$(env) $(COMPOSE_ENV_FILES) --env-file envs/$(env) $(call compose_files,$(env)) ps --all ; \
 	)
 
 rolling-deploy: deps-blue deps-green # @doc rolling blue/green deploy — update blue (wait for healthy), then green
@@ -210,12 +215,12 @@ dockerclean:
 	docker images --format '{{.ID}}' | xargs $(MAYBENORUN) docker rmi --force
 
 dbconn-%: psql-dotfiles | .env .env.generated # @doc open psql against an environment, e.g. make dbconn-blue
-	cd $(GIT_ROOT) && docker compose --project-name sylvan_$* $(COMPOSE_ENV_FILES) --env-file envs/$* --file $(BASE_COMPOSE) \
+	cd $(GIT_ROOT) && docker compose --project-name sylvan_$* $(COMPOSE_ENV_FILES) --env-file envs/$* $(call compose_files,$*) \
 	  exec -e PSQLRC=/var/lib/postgresql/.psqlrc -e PSQL_HISTORY=/var/lib/postgresql/.psql_history \
 	  postgres psql -U $(XPGUSER) -d $(XPGDATABASE) --host=localhost
 
 reset-%: | .env .env.generated # @doc destroy an environment including its database volume
-	docker compose --project-name sylvan_$* $(COMPOSE_ENV_FILES) --env-file envs/$* --file $(BASE_COMPOSE) down --volumes --remove-orphans
+	docker compose --project-name sylvan_$* $(COMPOSE_ENV_FILES) --env-file envs/$* $(call compose_files,$*) down --volumes --remove-orphans
 	rm -rvf data/api/$* data/postgres/$*
 
 reset: $(addprefix reset-,$(ENVS)) # @doc destroy every environment including databases
