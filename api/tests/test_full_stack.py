@@ -17,6 +17,7 @@ import falcon.testing
 import pytest
 
 from api.api_worker import ApiWorker
+from api.settings import settings
 from api.tests.support import override_attr
 
 if TYPE_CHECKING:
@@ -87,3 +88,20 @@ class TestMissingUserAgent:
     def test_with_user_agent_is_still_200(self, client: falcon.testing.TestClient) -> None:
         result = client.simulate_get("/get_pid")
         assert result.status == falcon.HTTP_200
+
+
+class TestResponseCacheInvalidation:
+    """An import must not leave the cross-worker response cache serving the old corpus."""
+
+    def test_bumping_the_generation_misses_the_response_cache(self, app: falcon.App, client: falcon.testing.TestClient) -> None:
+        resource = _resource_of(app)
+        saved = settings.enable_cache
+        settings.enable_cache = True
+        try:
+            # robots.txt: cacheable (no no-store header) and independent of the database.
+            assert client.simulate_get("/robots.txt").headers.get("X-Cache") == "miss"
+            assert client.simulate_get("/robots.txt").headers.get("X-Cache") == "hit"
+            resource.app_context.bump_cache_generation()
+            assert client.simulate_get("/robots.txt").headers.get("X-Cache") == "miss"
+        finally:
+            settings.enable_cache = saved
