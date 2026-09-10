@@ -13883,153 +13883,19 @@ impl QueryEngine {
         *guard = Some(cached.clone());
         Ok(cached)
     }
-}
 
-#[pymethods]
-impl QueryEngine {
-    #[new]
-    #[pyo3(signature = (shm_path=None))]
-    fn new(shm_path: Option<&str>) -> Self {
-        // Use /dev/shm on Linux (shared memory), fall back to /tmp on macOS.
-        let default_path = if cfg!(target_os = "linux") {
-            "/dev/shm/sylvan_librarian_cards"
-        } else {
-            "/tmp/sylvan_librarian_cards"
-        };
-        QueryEngine {
-            shm_path: PathBuf::from(shm_path.unwrap_or(default_path)),
-            staging: Mutex::new(None),
-            cached_mmap: Mutex::new(None),  // populated by first reload()
-        }
-    }
-
-    fn remap(&self) -> PyResult<()> {
-        // Force a remap by clearing the cached inode so get_mmap() re-opens.
-        if let Some(ref mut c) = *self.cached_mmap.lock().unwrap() {
-            c.inode = 0;
-        }
-        self.get_mmap().map(|_| ())
-    }
-
-    /// Start a staged reload: acquire the cross-process write lock and reset
-    /// the staging buffer. Returns false (and refreshes the local mapping) if
-    /// another worker published a new archive while we waited for the lock —
-    /// the caller should skip fetching entirely. Any staging abandoned by a
-    /// previous failed cycle is discarded here.
-    fn reload_begin(&self) -> PyResult<bool> {
-        let mut staging = self.staging.lock().unwrap();
-        // Drop an abandoned cycle's buffer and its flock before re-acquiring.
-        *staging = None;
-
-        // Snapshot the archive's identity before contending for the cross-process
-        // lock, so we can detect whether another worker published a new archive
-        // while we were blocked. Publish is rename-only, so a publish always
-        // changes the inode — unlike mtime, which is subject to filesystem
-        // timestamp granularity and clock steps.
-        let inode_before = std::fs::metadata(&self.shm_path).ok().map(|m| m.ino());
-
-        // Cross-process exclusive lock: only one worker writes per reload cycle.
-        // The lock file is separate so it persists across archive replacements.
-        // Held until reload_commit()/reload_abort() drops the Staging.
-        let lock_path = self.shm_path.with_extension("lock");
-        // truncate(false) is explicit, not incidental: nothing is ever written to this file — it
-        // exists only as an flock target — so opening it must never disturb whatever is already
-        // there, including for a worker that already holds it open.
-        let lock_file = std::fs::OpenOptions::new()
-            .write(true).create(true).truncate(false).open(&lock_path)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("open lock: {e}")))?;
-        // LOCK_EX blocks until we hold the lock; released automatically on drop.
-        loop {
-            if unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                break;
-            }
-            let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::Interrupted {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("flock: {err}")));
-            }
-        }
-
-        // Under the flock no live writer can be mid-write, so any sibling `<archive>.<pid>.tmp`
-        // whose pid is dead is a crashed writer's leftover pinning RAM in /dev/shm. Swept here, once
-        // per cycle, rather than on a timer nothing owns.
-        sweep_stale_tmp_archives(&self.shm_path);
-
-        // If another worker published a new archive while we were waiting (the
-        // inode changed, or a file appeared), skip the rebuild and just remap
-        // our local handle.
-        let inode_after = std::fs::metadata(&self.shm_path).ok().map(|m| m.ino());
-        if inode_after.is_some() && inode_after != inode_before {
-            self.get_mmap().map(|_| ())?;
-            return Ok(false);
-        }
-
-        #[cfg(feature = "alloc-counter")]
-        alloc_stats::reset_peak();
-
-        *staging = Some(Staging {
-            rows: Vec::new(),
-            interner: Interner::new(),
-            vocab: VocabInterner::new(),
-            artists: VocabInterner::new(),
-            mana: ManaVocabInterner::new(),
-            stats: LoadStats::default(),
-            lock_file,
-        });
-        Ok(true)
-    }
-
-    /// Append one batch of card dicts to the staging buffer.
-    fn add_batch(&self, db_rows: &Bound<PyList>) -> PyResult<()> {
-        let mut guard = self.staging.lock().unwrap();
-        let staging = guard.as_mut().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("add_batch called without reload_begin")
-        })?;
-        for item in db_rows.iter() {
-            if let Ok(d) = item.cast::<PyDict>() {
-                staging.rows.push(card_from_pydict(
-                    d, &mut staging.interner, &mut staging.vocab, &mut staging.artists, &mut staging.mana, &mut staging.stats,
-                )?);
-            }
-        }
-        Ok(())
-    }
-
-    /// Discard an in-progress staged reload, releasing the cross-process lock.
-    fn reload_abort(&self) -> PyResult<()> {
-        self.staging.lock().unwrap().take();
-        Ok(())
-    }
-
-    /// Sort, index, serialize, and atomically publish the staged cards, then
-    /// release the cross-process lock. Queries keep serving the old archive
-    /// until the rename lands.
-    fn reload_commit(&self, py: Python<'_>) -> PyResult<()> {
-        let staging = self.staging.lock().unwrap().take().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("reload_commit called without reload_begin")
-        })?;
-        let Staging { mut rows, interner, vocab, artists, mana, stats, lock_file } = staging;
-
-        // A silent truncation is a wrong answer for exact-name and set-code queries on that row. The
-        // widths are documented as covering the whole dataset; the day one stops, this is how the
-        // operator hears about it (the API logs warnings) without the reload itself failing.
-        if stats.inline_truncations > 0 {
-            let msg = std::ffi::CString::new(format!(
-                "card_engine: {} inline string field(s) exceeded their width (card_name_lower/card_name_folded 61 bytes, card_set_code 8) and were truncated; widen InlineStr",
-                stats.inline_truncations,
-            ))
-            .expect("no NUL in message");
-            PyErr::warn(py, &py.get_type::<pyo3::exceptions::PyRuntimeWarning>(), &msg, 1)?;
-        }
-
-        // The store groups printings by oracle_id, so rows without one would all
-        // collapse into a single card. The DB enforces NOT NULL; fail loudly here
-        // for any other caller (e.g. hand-built test dicts).
-        if let Some((idx, row)) = rows.iter().enumerate().find(|(_, r)| r.oracle_id == 0) {
-            let name = interner.strings.get(row.card_name_id as usize).map_or("", |s| s.as_str());
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "card {idx} ({name:?}) is missing oracle_id (required for card grouping)"
-            )));
-        }
+    /// Sort, index and serialize the staged rows, then publish the archive with `rename(2)`.
+    ///
+    /// Plain Rust over plain data, split out of `reload_commit` so it can run under `py.detach`:
+    /// nothing here needs the GIL, and the build takes seconds on the full corpus.
+    fn build_and_publish(
+        &self,
+        mut rows: Vec<CardRow>,
+        interner: Interner,
+        vocab: VocabInterner,
+        artists: VocabInterner,
+        mana: ManaVocabInterner,
+    ) -> PyResult<()> {
         // Equal oracle ids end up adjacent (making each card's printings one
         // contiguous range), and within a card printings order by descending
         // default prefer_score so the default-prefer walk takes the first
@@ -14330,6 +14196,162 @@ impl QueryEngine {
 
         tmp.publish(&self.shm_path)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("rename shm: {e}")))?;
+        Ok(())
+    }
+}
+
+#[pymethods]
+impl QueryEngine {
+    #[new]
+    #[pyo3(signature = (shm_path=None))]
+    fn new(shm_path: Option<&str>) -> Self {
+        // Use /dev/shm on Linux (shared memory), fall back to /tmp on macOS.
+        let default_path = if cfg!(target_os = "linux") {
+            "/dev/shm/sylvan_librarian_cards"
+        } else {
+            "/tmp/sylvan_librarian_cards"
+        };
+        QueryEngine {
+            shm_path: PathBuf::from(shm_path.unwrap_or(default_path)),
+            staging: Mutex::new(None),
+            cached_mmap: Mutex::new(None),  // populated by first reload()
+        }
+    }
+
+    fn remap(&self) -> PyResult<()> {
+        // Force a remap by clearing the cached inode so get_mmap() re-opens.
+        if let Some(ref mut c) = *self.cached_mmap.lock().unwrap() {
+            c.inode = 0;
+        }
+        self.get_mmap().map(|_| ())
+    }
+
+    /// Start a staged reload: acquire the cross-process write lock and reset
+    /// the staging buffer. Returns false (and refreshes the local mapping) if
+    /// another worker published a new archive while we waited for the lock —
+    /// the caller should skip fetching entirely. Any staging abandoned by a
+    /// previous failed cycle is discarded here.
+    fn reload_begin(&self, py: Python<'_>) -> PyResult<bool> {
+        let mut staging = self.staging.lock().unwrap();
+        // Drop an abandoned cycle's buffer and its flock before re-acquiring.
+        *staging = None;
+
+        // Snapshot the archive's identity before contending for the cross-process
+        // lock, so we can detect whether another worker published a new archive
+        // while we were blocked. Publish is rename-only, so a publish always
+        // changes the inode — unlike mtime, which is subject to filesystem
+        // timestamp granularity and clock steps.
+        let inode_before = std::fs::metadata(&self.shm_path).ok().map(|m| m.ino());
+
+        // Cross-process exclusive lock: only one worker writes per reload cycle.
+        // The lock file is separate so it persists across archive replacements.
+        // Held until reload_commit()/reload_abort() drops the Staging.
+        let lock_path = self.shm_path.with_extension("lock");
+        // truncate(false) is explicit, not incidental: nothing is ever written to this file — it
+        // exists only as an flock target — so opening it must never disturb whatever is already
+        // there, including for a worker that already holds it open.
+        let lock_file = std::fs::OpenOptions::new()
+            .write(true).create(true).truncate(false).open(&lock_path)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("open lock: {e}")))?;
+        // LOCK_EX blocks until we hold the lock; released automatically on drop. Blocked with the
+        // GIL released: another worker may hold the lock for the length of a whole rebuild, and this
+        // worker's other threads should keep serving queries meanwhile.
+        py.detach(|| loop {
+            if unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(());
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        })
+        .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(format!("flock: {err}")))?;
+
+        // Under the flock no live writer can be mid-write, so any sibling `<archive>.<pid>.tmp`
+        // whose pid is dead is a crashed writer's leftover pinning RAM in /dev/shm. Swept here, once
+        // per cycle, rather than on a timer nothing owns.
+        sweep_stale_tmp_archives(&self.shm_path);
+
+        // If another worker published a new archive while we were waiting (the
+        // inode changed, or a file appeared), skip the rebuild and just remap
+        // our local handle.
+        let inode_after = std::fs::metadata(&self.shm_path).ok().map(|m| m.ino());
+        if inode_after.is_some() && inode_after != inode_before {
+            self.get_mmap().map(|_| ())?;
+            return Ok(false);
+        }
+
+        #[cfg(feature = "alloc-counter")]
+        alloc_stats::reset_peak();
+
+        *staging = Some(Staging {
+            rows: Vec::new(),
+            interner: Interner::new(),
+            vocab: VocabInterner::new(),
+            artists: VocabInterner::new(),
+            mana: ManaVocabInterner::new(),
+            stats: LoadStats::default(),
+            lock_file,
+        });
+        Ok(true)
+    }
+
+    /// Append one batch of card dicts to the staging buffer.
+    fn add_batch(&self, db_rows: &Bound<PyList>) -> PyResult<()> {
+        let mut guard = self.staging.lock().unwrap();
+        let staging = guard.as_mut().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("add_batch called without reload_begin")
+        })?;
+        for item in db_rows.iter() {
+            if let Ok(d) = item.cast::<PyDict>() {
+                staging.rows.push(card_from_pydict(
+                    d, &mut staging.interner, &mut staging.vocab, &mut staging.artists, &mut staging.mana, &mut staging.stats,
+                )?);
+            }
+        }
+        Ok(())
+    }
+
+    /// Discard an in-progress staged reload, releasing the cross-process lock.
+    fn reload_abort(&self) -> PyResult<()> {
+        self.staging.lock().unwrap().take();
+        Ok(())
+    }
+
+    /// Sort, index, serialize, and atomically publish the staged cards, then
+    /// release the cross-process lock. Queries keep serving the old archive
+    /// until the rename lands.
+    fn reload_commit(&self, py: Python<'_>) -> PyResult<()> {
+        let staging = self.staging.lock().unwrap().take().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("reload_commit called without reload_begin")
+        })?;
+        let Staging { rows, interner, vocab, artists, mana, stats, lock_file } = staging;
+
+        // A silent truncation is a wrong answer for exact-name and set-code queries on that row. The
+        // widths are documented as covering the whole dataset; the day one stops, this is how the
+        // operator hears about it (the API logs warnings) without the reload itself failing.
+        if stats.inline_truncations > 0 {
+            let msg = std::ffi::CString::new(format!(
+                "card_engine: {} inline string field(s) exceeded their width (card_name_lower/card_name_folded 61 bytes, card_set_code 8) and were truncated; widen InlineStr",
+                stats.inline_truncations,
+            ))
+            .expect("no NUL in message");
+            PyErr::warn(py, &py.get_type::<pyo3::exceptions::PyRuntimeWarning>(), &msg, 1)?;
+        }
+
+        // The store groups printings by oracle_id, so rows without one would all
+        // collapse into a single card. The DB enforces NOT NULL; fail loudly here
+        // for any other caller (e.g. hand-built test dicts).
+        if let Some((idx, row)) = rows.iter().enumerate().find(|(_, r)| r.oracle_id == 0) {
+            let name = interner.strings.get(row.card_name_id as usize).map_or("", |s| s.as_str());
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "card {idx} ({name:?}) is missing oracle_id (required for card grouping)"
+            )));
+        }
+        // Everything from the sort to the rename is CPU-bound Rust over plain data -- no Python object
+        // is touched -- so it runs with the GIL released and this worker's other threads keep serving
+        // queries for the duration of the build (seconds on the full corpus).
+        py.detach(|| self.build_and_publish(rows, interner, vocab, artists, mana))?;
 
         // The new archive is published; release the cross-process write lock.
         drop(lock_file);
@@ -14340,7 +14362,7 @@ impl QueryEngine {
     /// One-shot reload: the staged API as a single call. Kept for tests and
     /// for callers that already hold the full corpus in memory.
     fn reload(&self, py: Python<'_>, db_rows: &Bound<PyList>) -> PyResult<()> {
-        if !self.reload_begin()? {
+        if !self.reload_begin(py)? {
             return Ok(()); // another worker just published; we picked up theirs
         }
         if let Err(e) = self.add_batch(db_rows) {
