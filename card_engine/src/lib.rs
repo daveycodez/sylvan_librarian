@@ -13398,6 +13398,7 @@ fn archive_payload(mmap: &Mmap) -> &[u8] {
 
 // ─── PyO3 bindings ───────────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct CachedMmap {
     mmap: Arc<Mmap>,
     inode: u64,
@@ -13405,6 +13406,23 @@ struct CachedMmap {
     /// it safe: interned string ids are archive-relative, so a cache outliving its archive would
     /// hand out the wrong text.
     str_cache: Arc<EmitStrCache>,
+    /// `/get_catalog`'s count dicts for this mapping, same lifetime rule as `str_cache`.
+    catalog: Arc<CatalogCounts>,
+}
+
+/// The `common_card_types` / `common_card_keywords` answers, each a pure function of the mapping.
+/// Both used to be recomputed from scratch -- a full pass over every card -- on every
+/// `/get_catalog`. Built once per mapping in a `PyOnceLock` (Python allocation under the GIL) and
+/// handed out as a `.copy()`, so a caller mutating its dict cannot change the next caller's.
+struct CatalogCounts {
+    types: pyo3::sync::PyOnceLock<Py<PyDict>>,
+    keywords: pyo3::sync::PyOnceLock<Py<PyDict>>,
+}
+
+impl CatalogCounts {
+    const fn new() -> Self {
+        CatalogCounts { types: pyo3::sync::PyOnceLock::new(), keywords: pyo3::sync::PyOnceLock::new() }
+    }
 }
 
 /// One `PyString` per interned string id, for the result fields whose values repeat within a page.
@@ -13617,6 +13635,15 @@ pub(crate) fn count_common_types(data: &Archived<CardData>) -> HashMap<String, u
     result
 }
 
+/// A `{name: count}` dict, unbound, for `CatalogCounts` to hold.
+fn counts_dict(py: Python<'_>, counts: &HashMap<String, u32>) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new(py);
+    for (name, count) in counts {
+        d.set_item(name, count)?;
+    }
+    Ok(d.unbind())
+}
+
 /// Count keyword occurrences across oracle cards (one per oracle id).
 pub(crate) fn count_common_keywords(data: &Archived<CardData>) -> HashMap<String, u32> {
     let mut keyword_counts: HashMap<u16, u32> = HashMap::new();
@@ -13814,12 +13841,12 @@ impl QueryEngine {
     // the last remap (i.e. another worker wrote a new archive via rename).
     // One stat(2) per query; remap only when the inode actually changes.
     fn get_mmap(&self) -> PyResult<Arc<Mmap>> {
-        Ok(self.get_mapping()?.0)
+        Ok(self.get_mapping()?.mmap)
     }
 
-    /// The mapping plus its emit cache. Both come from the same `CachedMmap`, so a remap replaces
-    /// them together and a cache can never be read against an archive it was not built for.
-    fn get_mapping(&self) -> PyResult<(Arc<Mmap>, Arc<EmitStrCache>)> {
+    /// The mapping plus its per-mapping caches. All come from the same `CachedMmap`, so a remap
+    /// replaces them together and a cache can never be read against an archive it was not built for.
+    fn get_mapping(&self) -> PyResult<CachedMmap> {
         let path_inode = std::fs::metadata(&self.shm_path)
             .map(|m| m.ino())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("stat shm: {e}")))?;
@@ -13828,7 +13855,7 @@ impl QueryEngine {
         if let Some(ref c) = *guard
             && c.inode == path_inode
         {
-            return Ok((Arc::clone(&c.mmap), Arc::clone(&c.str_cache)));
+            return Ok(c.clone());
         }
         // Inode changed (new reload) or first call: open and map the current file.
         let file = std::fs::File::open(&self.shm_path)
@@ -13852,9 +13879,9 @@ impl QueryEngine {
                 self.shm_path.display(),
             )));
         }
-        let str_cache = Arc::new(EmitStrCache::default());
-        *guard = Some(CachedMmap { mmap: Arc::clone(&mmap), inode, str_cache: Arc::clone(&str_cache) });
-        Ok((mmap, str_cache))
+        let cached = CachedMmap { mmap, inode, str_cache: Arc::new(EmitStrCache::default()), catalog: Arc::new(CatalogCounts::new()) };
+        *guard = Some(cached.clone());
+        Ok(cached)
     }
 }
 
@@ -14340,7 +14367,7 @@ impl QueryEngine {
         let resolved_fields = resolve_fields(fields)?;
         // get_mmap() remaps automatically if the on-disk inode has changed since
         // the last reload, keeping workers off stale (deleted) mappings.
-        let (mmap, str_cache) = self.get_mapping()?;
+        let CachedMmap { mmap, str_cache, .. } = self.get_mapping()?;
         // Safety: the archive is trusted by construction, so we skip validation.
         // This is the canonical justification for every access_unchecked in this
         // module (query_hashmap() and size() refer here):
@@ -14574,7 +14601,7 @@ impl QueryEngine {
     #[pyo3(signature = (n, fields=None))]
     fn sample_preferred<'py>(&self, py: Python<'py>, n: usize, fields: Option<Vec<String>>) -> PyResult<Bound<'py, PyList>> {
         let resolved_fields = resolve_fields(fields)?;
-        let (mmap, str_cache) = self.get_mapping()?;
+        let CachedMmap { mmap, str_cache, .. } = self.get_mapping()?;
         // Safety: see the access_unchecked justification in query().
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
 
@@ -14603,29 +14630,25 @@ impl QueryEngine {
     /// Returns {type_name: count} covering both supertypes/types (decoded from
     /// the card_types bitmask) and subtypes (from card_subtypes strings).
     fn common_card_types<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let mmap = self.get_mmap()?;
-        // Safety: see the access_unchecked justification in query().
-        let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
-        let counts = count_common_types(data);
-        let d = PyDict::new(py);
-        for (name, count) in &counts {
-            d.set_item(name, count)?;
-        }
-        Ok(d)
+        let mapping = self.get_mapping()?;
+        let dict = mapping.catalog.types.get_or_try_init(py, || {
+            // Safety: see the access_unchecked justification in query().
+            let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mapping.mmap)) };
+            counts_dict(py, &count_common_types(data))
+        })?;
+        dict.bind(py).copy()
     }
 
     /// Count keyword occurrences across oracle cards.
     /// Returns {keyword_name: count} for all keywords present on preferred cards.
     fn common_card_keywords<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let mmap = self.get_mmap()?;
-        // Safety: see the access_unchecked justification in query().
-        let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
-        let counts = count_common_keywords(data);
-        let d = PyDict::new(py);
-        for (name, count) in &counts {
-            d.set_item(name, count)?;
-        }
-        Ok(d)
+        let mapping = self.get_mapping()?;
+        let dict = mapping.catalog.keywords.get_or_try_init(py, || {
+            // Safety: see the access_unchecked justification in query().
+            let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mapping.mmap)) };
+            counts_dict(py, &count_common_keywords(data))
+        })?;
+        dict.bind(py).copy()
     }
 
     /// Rust-heap allocator stats and reload() memory breakdown.
