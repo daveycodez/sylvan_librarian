@@ -99,7 +99,7 @@ class CardSearch {
     this.searchInput.setAttribute('autocomplete', 'off');
 
     this.debounceTimeout = null;
-    this.debounceDelay = 50; // milliseconds
+    this.debounceDelay = 120; // milliseconds
     this.resizeTimeout = null;
     this.currentController = null;
     this.currentRequestUrl = null; // URL of the in-flight request, if any
