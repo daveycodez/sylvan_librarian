@@ -22,6 +22,7 @@ from api.enums import ResponseShape
 from api.middlewares.caching_middleware import CachingMiddleware
 from api.settings import settings
 from api.tests.support import mock_app_context
+from api.utils.param_binding import ParamBindingError
 from api.utils.routing import BoundRoute, RouteSpec, route
 from api.utils.site_name import FALLBACK_SITE_NAME
 
@@ -446,26 +447,58 @@ class TestAPIResourceRequestHandling(unittest.TestCase):
 
         assert mock_resp.text is not None
 
-    def test_handle_handles_type_errors(self) -> None:
-        """Test _handle handles TypeError exceptions."""
+    def test_handle_turns_a_handler_type_error_into_a_500(self) -> None:
+        """A TypeError raised *inside* a handler is a server bug: 500, monitored, message not echoed.
+
+        This used to assert the opposite -- that any TypeError became a 400 -- which pinned the bug: the
+        dispatcher's `except TypeError` was meant for ParamBinder's positional-collision errors but
+        caught every TypeError below it, reflected the internal message to the client and skipped
+        error monitoring.
+        """
         mock_req = MagicMock()
         mock_req.method = "GET"
         mock_req.uri = mock_req.path = mock_req.relative_uri = "/search"
-        mock_req.params = {"invalid_param": "value"}
+        mock_req.params = {}
         mock_resp = MagicMock()
         mock_resp.complete = False
 
-        # Create a mock function that will raise TypeError when called with wrong args
-        def mock_action_that_raises_type_error(**kwargs: Any) -> Never:
-            # This simulates a function that expects specific argument types
-            # and fails even after our type conversion
-            msg = "Invalid parameter type after conversion"
+        def raise_type_error(**kwargs: Any) -> Never:
+            msg = "unsupported operand type(s): internal detail"
             raise TypeError(msg)
 
-        # Patch the action_map directly to include our mock
-        with patch.object(self.api_resource, "routes", {"search": make_bound_route(mock_action_that_raises_type_error)}):
-            with pytest.raises(falcon.HTTPBadRequest):
+        with (
+            patch.object(self.api_resource, "routes", {"search": make_bound_route(raise_type_error)}),
+            patch("api.api_resource.error_monitoring.error_handler") as mock_error_handler,
+        ):
+            with pytest.raises(falcon.HTTPInternalServerError) as excinfo:
                 self.api_resource._handle(mock_req, mock_resp)
+
+        mock_error_handler.assert_called_once()
+        assert excinfo.value.description == INTERNAL_ERROR_DESCRIPTION
+        assert "internal detail" not in repr(excinfo.value.to_dict())
+
+    def test_handle_turns_a_binding_error_into_a_400(self) -> None:
+        """ParamBinder's own TypeError subclass is the request's fault and stays a 400."""
+        mock_req = MagicMock()
+        mock_req.method = "GET"
+        mock_req.uri = mock_req.path = mock_req.relative_uri = "/search"
+        mock_req.params = {}
+        mock_resp = MagicMock()
+        mock_resp.complete = False
+
+        def raise_binding_error(**kwargs: Any) -> Never:
+            msg = "search() takes 0 positional arguments but 1 were given"
+            raise ParamBindingError(msg)
+
+        with (
+            patch.object(self.api_resource, "routes", {"search": make_bound_route(raise_binding_error)}),
+            patch("api.api_resource.error_monitoring.error_handler") as mock_error_handler,
+        ):
+            with pytest.raises(falcon.HTTPBadRequest) as excinfo:
+                self.api_resource._handle(mock_req, mock_resp)
+
+        mock_error_handler.assert_not_called()
+        assert "positional arguments" in str(excinfo.value.description)
 
     def test_handle_handles_general_exceptions(self) -> None:
         """Test _handle handles general exceptions."""

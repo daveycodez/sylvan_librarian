@@ -47,7 +47,7 @@ from api.utils.page_rendering import (
     serialize_embedded_json,
     serve_static_file,
 )
-from api.utils.param_binding import ParamCoercionError
+from api.utils.param_binding import ParamBindingError, ParamCoercionError
 from api.utils.routing import build_route_table, build_routes_listing, route
 from api.utils.site_name import hostname_to_site_name
 from api.utils.timer import Timer
@@ -417,8 +417,11 @@ class APIResource:
             # values, so it guides a fix without describing anything internal.
             logger.info("Rejected %s: %s", path, oops)
             raise falcon.HTTPBadRequest(title="Invalid Parameter", description=str(oops)) from oops
-        except TypeError as oops:
-            logger.error("Error handling request: %s", oops, exc_info=True)
+        except ParamBindingError as oops:
+            # The path's positional segments do not fit the handler (see ParamBinder.bind). Only this
+            # TypeError subclass: a bare `except TypeError` here also caught every TypeError a handler
+            # raised on its own, echoed its internal message as a 400, and bypassed error monitoring.
+            logger.info("Rejected %s: %s", path, oops)
             raise falcon.HTTPBadRequest(description=str(oops)) from oops
         except falcon.HTTPError as oops:
             logger.error("Error handling request for %s: %s", path, oops, exc_info=True)

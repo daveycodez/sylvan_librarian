@@ -18,6 +18,7 @@ from api.enums import CardOrdering, PreferOrder, SortDirection, UniqueOn
 from api.utils.param_binding import (
     MAX_ECHOED_VALUE_LEN,
     ParamBinder,
+    ParamBindingError,
     ParamCoercionError,
     RepeatedParamError,
     UnresolvableAnnotationError,
@@ -178,7 +179,7 @@ class TestRejection:
 
     def test_too_many_positional_arguments_raises(self) -> None:
         """Test extra path segments are refused rather than silently ignored."""
-        with pytest.raises(TypeError, match="positional arguments"):
+        with pytest.raises(ParamBindingError, match="positional arguments"):
             ParamBinder(handler).bind(("eoc", "104", "extra"), {})
 
     def test_positional_and_keyword_for_one_parameter_raises(self) -> None:
@@ -187,8 +188,13 @@ class TestRejection:
         The previous implementation let the keyword win silently, so a request to a path that identified
         nothing still returned 200.
         """
-        with pytest.raises(TypeError, match="multiple values"):
+        with pytest.raises(ParamBindingError, match="multiple values"):
             ParamBinder(handler).bind(("eoc",), {"set_code": "blb"})
+
+    def test_binding_errors_are_a_distinct_type_error(self) -> None:
+        """The dispatcher catches exactly this subclass, so a handler's own TypeError stays a 500."""
+        assert issubclass(ParamBindingError, TypeError)
+        assert not issubclass(TypeError, ParamBindingError)
 
 
 class TestRepeatedParameters:

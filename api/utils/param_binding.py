@@ -69,6 +69,16 @@ def _resolve_hints(func: Callable[..., Any]) -> dict[str, Any]:
         raise UnresolvableAnnotationError(msg) from oops
 
 
+class ParamBindingError(TypeError):
+    """The request's positional path segments do not fit the handler's signature.
+
+    Raised by `ParamBinder.bind` for too many positional values or a positional value colliding with a
+    keyword for the same parameter -- both properties of the request, so a 400. A distinct type so the
+    dispatcher can catch exactly these: catching bare TypeError there also swallowed every TypeError a
+    handler raised on its own, echoing the internal message as a 400 and bypassing error monitoring.
+    """
+
+
 # Scalars a query string can name directly. Enums are handled structurally rather than listed, so a new
 # enum needs no edit here — which the old converter table did require.
 _SCALAR_CONVERTERS: dict[Any, Callable[[str], Any]] = {
@@ -219,13 +229,13 @@ class ParamBinder:
             Keyword arguments ready to splat into the handler.
 
         Raises:
-            TypeError: More positional values than the handler has positional parameters, or a
-                positional value collides with a keyword for the same parameter.
+            ParamBindingError: More positional values than the handler has positional parameters, or
+                a positional value collides with a keyword for the same parameter.
             ParamCoercionError: A string value is not valid for its parameter's declared type.
         """
         if len(args) > len(self._positional_names):
             msg = f"{self._func_name}() takes {len(self._positional_names)} positional arguments but {len(args)} were given"
-            raise TypeError(msg)
+            raise ParamBindingError(msg)
         supplied: dict[str, Any] = dict(zip(self._positional_names, args, strict=False))
         # The previous implementation let a keyword silently overwrite a colliding positional, which
         # meant a stray path segment landing on an injected parameter was discarded and the request
@@ -233,7 +243,7 @@ class ParamBinder:
         collisions = supplied.keys() & kwargs.keys()
         if collisions:
             msg = f"{self._func_name}() got multiple values for {', '.join(sorted(collisions))}"
-            raise TypeError(msg)
+            raise ParamBindingError(msg)
         supplied.update(kwargs)
 
         bound: dict[str, Any] = {}
