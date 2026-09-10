@@ -757,7 +757,11 @@ class Parser:
     # ── implicit name (possibly hyphenated) ───────────────────────────────────
 
     def parse_hyphenated_name(self, first: str) -> CardBinaryOperatorNode:
-        """Build an implicit name node, greedily consuming no-space MINUS+WORD/NUMBER continuations."""
+        """Build an implicit name node, greedily consuming no-space MINUS+WORD/NUMBER continuations.
+
+        Continuations are read as source text (`raw`), so `x-007` stays `x-007`: a NUMBER's parsed
+        value would have made it `x-7`.
+        """
         parts = [first]
         while (
             self.peek().type == TT.MINUS
@@ -766,7 +770,7 @@ class Parser:
             and not self.peek(1).space_before
         ):
             self.consume()  # MINUS
-            parts.append(str(self.consume().value))
+            parts.append(self.consume().raw)
         return _name_node("-".join(parts))
 
     # ── value parsers ─────────────────────────────────────────────────────────
@@ -811,7 +815,9 @@ class Parser:
             return StringValueNode(literal)
         if tok.type in (TT.WORD, TT.NUMBER):
             self.consume()
-            word = str(tok.value)
+            # A number in text position is text: `set:001` means "001", `o:1.50` means "1.50". The
+            # token's parsed value would have made them "1" and "1.5".
+            word = tok.raw
             # Greedily consume hyphenated continuation (no space on either side)
             while (
                 self.peek().type == TT.MINUS
@@ -820,7 +826,7 @@ class Parser:
                 and not self.peek(1).space_before
             ):
                 self.consume()
-                word += "-" + str(self.consume().value)
+                word += "-" + self.consume().raw
             return StringValueNode(word)
         msg = f"Expected value for {attr!r}, got {tok.value!r} at position {tok.pos}"
         raise ParseError(msg)
@@ -839,7 +845,7 @@ class Parser:
                     if parts and t.space_before:
                         break
                     self.consume()
-                    parts.append(str(t.value))
+                    parts.append(t.raw)
                 else:
                     break
             if not parts:

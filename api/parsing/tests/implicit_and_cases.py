@@ -188,6 +188,11 @@ TESTCASES = [
     {"query": "name:test-word", "expected": "name:test-word", "id": "name_hyphenated_value"},
     {"query": "otag:dual-land", "expected": "otag:dual-land", "id": "otag_dual_land"},
     {"query": "otag:40k-model", "expected": "otag:40k-model", "id": "otag_40k_model"},
+    # A number in text position keeps its spelling: leading zeros and trailing decimals are text
+    {"query": "set:001", "expected": "set:001", "id": "text_value_leading_zeros"},
+    {"query": "x-007", "expected": "x-007", "id": "hyphenated_name_leading_zeros"},
+    {"query": "o:1.50", "expected": "o:1.50", "id": "text_value_trailing_decimal_zero"},
+    {"query": "name:007 t:elf", "expected": "name:007 AND t:elf", "id": "text_value_leading_zeros_then_attr"},
     {
         "query": "otag:cycle-shm-common-hybrid-1-drop",
         "expected": "otag:cycle-shm-common-hybrid-1-drop",
