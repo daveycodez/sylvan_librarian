@@ -287,5 +287,5 @@ compare-minification: # @doc compare file sizes: uncompressed, compressed, minif
 api/static/app.min.js: api/static/app.js # @doc minify app.js (used in both dev and prod)
 	@echo "Minifying $^..."
 	@npm install --no-save terser > /dev/null 2>&1 || true
-	@npx terser api/static/app.js --compress --mangle --output $@
+	@npx terser api/static/app.js --compress 'pure_funcs=["console.debug","console.log"]' --mangle --output $@
 	@echo "Created $@"
