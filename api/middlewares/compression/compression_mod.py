@@ -14,7 +14,30 @@ if TYPE_CHECKING:
 
 MIN_SIZE: int = 200
 
+# Raster image formats carry their own compression; running brotli over the 105 KB social-preview
+# WebP burned CPU on every uncached hit for a payload that came out no smaller. SVG is text and the
+# two favicon MIME types are uncompressed bitmaps -- both shrink well and stay compressible.
+_COMPRESSIBLE_IMAGE_TYPES: frozenset[str] = frozenset({"image/svg+xml", "image/x-icon", "image/vnd.microsoft.icon"})
+
 logger = logging.getLogger(__name__)
+
+
+def is_compressible_content_type(content_type: str | None) -> bool:
+    """Whether a response of this Content-Type is worth compressing.
+
+    Args:
+        content_type: The response's Content-Type header, parameters included, or None.
+
+    Returns:
+        False for `image/*` other than SVG and the favicon types; True for everything else,
+        including an unset Content-Type.
+    """
+    if not content_type:
+        return True
+    mime = content_type.partition(";")[0].strip().lower()
+    if mime.startswith("image/"):
+        return mime in _COMPRESSIBLE_IMAGE_TYPES
+    return True
 
 
 class CompressionMiddleware:
@@ -89,6 +112,9 @@ class CompressionMiddleware:
 
         # If content-encoding is already set don't compress.
         if resp.get_header("Content-Encoding"):
+            return
+
+        if not is_compressible_content_type(resp.content_type):
             return
 
         # my accept encoding is "gzip, deflate, br, zstd"

@@ -9,8 +9,6 @@ import pathlib
 import random
 import time
 
-import docker
-import docker.errors
 import orjson
 import psycopg
 import psycopg.conninfo
@@ -33,6 +31,11 @@ def get_pg_creds() -> dict[str, str]:
 def get_testcontainers_creds() -> dict[str, str]:
     """Get postgres credentials from the testcontainers environment."""
     logger.warning("Using an ephemeral postgres container...")
+    # Imported here, not at module level: this is the fallback for a process with no PG* variables,
+    # and every production worker was paying the docker SDK's import (and its transitive requests/
+    # urllib3 setup) at startup for a path it never takes.
+    import docker  # noqa: PLC0415
+    import docker.errors  # noqa: PLC0415
     from testcontainers.postgres import PostgresContainer  # noqa: PLC0415
 
     exposed_port = random.randint(1024, 49151)

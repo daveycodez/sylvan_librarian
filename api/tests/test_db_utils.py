@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+import pathlib
+import subprocess
+import sys
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
@@ -54,3 +57,19 @@ class TestCredentialRedaction:
         params = {"host": "localhost", "port": "5432", "password": SENTINEL_PASSWORD}
         assert db_utils.redact_credentials(params) == {"host": "localhost", "port": "5432", "password": db_utils.REDACTED}
         assert params["password"] == SENTINEL_PASSWORD, "the caller's dict is not mutated"
+
+
+def test_importing_db_utils_does_not_import_the_docker_sdk() -> None:
+    """The docker SDK is only for the testcontainers fallback; production workers must not pay for it.
+
+    Checked in a subprocess: this test process has already imported docker via testcontainers.
+    """
+    repo_root = pathlib.Path(__file__).resolve().parents[2]
+    completed = subprocess.run(
+        [sys.executable, "-c", "import sys, api.utils.db_utils; sys.exit(1 if 'docker' in sys.modules else 0)"],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
