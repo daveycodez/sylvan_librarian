@@ -12,7 +12,7 @@ import logging
 import multiprocessing
 import time
 from typing import TYPE_CHECKING
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import falcon
 import falcon.testing
@@ -198,3 +198,37 @@ class TestHotPathLogVolume:
         rejected = [record for record in caplog.records if record.getMessage().startswith("Rejected ")]
         assert rejected
         assert rejected[0].exc_info is None
+
+
+class TestReadyThroughTheStack:
+    """The readiness probe's 503 must survive the middleware stack -- and keep its no-store."""
+
+    def test_503_with_the_failed_check_named(self, app: falcon.App, client: falcon.testing.TestClient) -> None:
+        # The fixture stubs setup_complete to True. The engine store is mocked empty rather than
+        # assumed so: the engine's archive is shared by path across the whole test session, and
+        # another module may have loaded fixture cards into it.
+        empty_engine = MagicMock()
+        empty_engine.size.return_value = 0
+        saved = settings.enable_engine
+        settings.enable_engine = True
+        try:
+            with patch.object(_resource_of(app).app_context, "engine", empty_engine):
+                result = client.simulate_get("/ready")
+        finally:
+            settings.enable_engine = saved
+        assert result.status == falcon.HTTP_503
+        assert result.json["ready"] is False
+        assert result.json["failed"] == ["engine_loaded"]
+        assert result.headers.get("Cache-Control") == "no-store"
+        assert result.headers.get("X-Cache") != "hit"
+
+    def test_200_once_every_check_passes(self, client: falcon.testing.TestClient) -> None:
+        saved = settings.enable_engine
+        settings.enable_engine = False  # SQL serves everything; an empty store is not a failure
+        try:
+            result = client.simulate_get("/ready")
+        finally:
+            settings.enable_engine = saved
+        assert result.status == falcon.HTTP_200
+        assert result.json["ready"] is True
+        assert result.headers.get("Cache-Control") == "no-store"

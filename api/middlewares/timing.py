@@ -69,9 +69,10 @@ class TimingMiddleware:
         spans = req.context.get("_timing_spans", [])
         spans.append(("total", duration_ms))
         resp.set_header("Server-Timing", ", ".join(f"{name};dur={dur:.1f}" for name, dur in spans))
-        if is_server_error(resp.status):
+        if is_server_error(resp.status) and "no-store" not in (resp.get_header("Cache-Control") or ""):
             # Last line of defence, in the middleware whose process_response runs last: a handler
             # that set Cache-Control and then failed must not have that failure cached downstream.
+            # An explicit no-store (a readiness 503, say) already says so and is kept.
             resp.delete_header("Cache-Control")
 
 

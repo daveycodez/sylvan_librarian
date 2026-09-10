@@ -576,6 +576,28 @@ class APIResource:
         set_no_store_header(falcon_response)
         return os.getpid()
 
+    @route()
+    def ready(self, *, falcon_response: falcon.Response | None = None, **_: object) -> dict[str, Any]:
+        """Readiness probe: 200 only when this worker can actually answer a search.
+
+        /get_pid touches neither the database nor the engine, so a stack with zero cards imported
+        was "healthy" to anything polling it. This checks the two things a search needs -- the corpus
+        is imported (`setup_complete`) and the engine has a store loaded, or is disabled by settings
+        so SQL serves everything -- and answers 503 with the failed check(s) named otherwise.
+
+        Returns:
+            {"ready": bool, "checks": {name: bool}, "failed": [name, ...]}; status 503 when not ready.
+        """
+        set_no_store_header(falcon_response)
+        checks = {
+            "setup_complete": self.app_context.setup_complete(),
+            "engine_loaded": (not settings.enable_engine) or self.app_context.engine.size() > 0,
+        }
+        failed = [name for name, ok in checks.items() if not ok]
+        if failed and falcon_response is not None:
+            falcon_response.status = falcon.HTTP_503
+        return {"ready": not failed, "checks": checks, "failed": failed}
+
     def _require_setup_complete(self) -> None:
         """Require that setup is complete or raise a ServiceUnavailable error."""
         if not self.app_context.setup_complete():
