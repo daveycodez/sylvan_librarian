@@ -28,6 +28,7 @@ from api.parsing.nodes import (
     StringValueNode,
     TrueNode,
     flatten_nested_operations,
+    regex_plain_literal,
 )
 from api.parsing.query_budget import MAX_GROUP_DEPTH, QueryBudgetExceeded
 from api.parsing.spans import QUOTE_CHARS, brace_close_index, find_close_index, unescape
@@ -50,6 +51,12 @@ _DUAL_NUM_TEXT: frozenset[str] = frozenset(
 )
 
 _NUMERIC_ALIASES: frozenset[str] = frozenset(alias for alias, pc in _ALIAS_TO_PC.items() if pc == ParserClass.NUMERIC)
+
+# Aliases whose field runs a `/regex/` as a regex (the free-text columns, flagged in db_info).
+_REGEX_CAPABLE_ALIASES: frozenset[str] = frozenset(
+    alias.lower() for alias, fis in ALIAS_TO_FIELD_INFOS.items() if any(fi.regex_capable for fi in fis)
+)
+REGEX_UNSUPPORTED_FIELD_MESSAGE = "regular expressions are only supported on name, oracle text, flavor text and artist"
 
 # On Scryfall '!' is an alias for '=' on these classes only (verified live, #903 cause C) — on
 # TEXT/LEGALITY it isn't an operator at all, and a trailing bang there falls through to the
@@ -757,7 +764,17 @@ class Parser:
             return StringValueNode(str(tok.value))
         if tok.type == TT.REGEX:
             self.consume()
-            return RegexValueNode(str(tok.value))
+            pattern = str(tok.value)
+            if attr in _REGEX_CAPABLE_ALIASES:
+                return RegexValueNode(pattern)
+            # Only the free-text columns run a regex. Elsewhere a `/.../` used to be taken as the
+            # literal string it spelled, so `t:/elf|goblin/` matched nothing and said nothing. A
+            # pattern that IS a plain literal means the literal and works as one (`kw:/flying/`);
+            # anything with live metacharacters cannot be honoured and is an error worth reporting.
+            literal = regex_plain_literal(pattern)
+            if literal is None:
+                raise ParseError(REGEX_UNSUPPORTED_FIELD_MESSAGE)
+            return StringValueNode(literal)
         if tok.type in (TT.WORD, TT.NUMBER):
             self.consume()
             word = str(tok.value)

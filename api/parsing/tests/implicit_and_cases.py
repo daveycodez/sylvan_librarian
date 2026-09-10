@@ -50,6 +50,10 @@ TESTCASES = [
     # test_pyparsing_preprocess.py and test_regex_patterns.py.
     {"query": "name:/foo/ o:/bar/", "expected": "name:/foo/ AND o:/bar/", "id": "two_regex"},
     {"query": "name:/bolt/ type:instant", "expected": "name:/bolt/ AND type:instant", "id": "regex_and_attr"},
+    # A `/regex/` on a field that cannot run one: a plain literal is that literal, anything live is
+    # rejected by both parsers.
+    {"query": "t:/elf/ kw:/flying/", "expected": "t:/elf/ AND kw:/flying/", "id": "literal_regex_on_non_text_fields"},
+    {"query": "t:/elf|goblin/", "expected": "t:/elf|goblin/", "id": "live_regex_on_type_rejected"},
     # Regex with escaped slash (searching for "/" in pattern, e.g. "life/death")
     {"query": r"name:/life\/death/", "expected": r"name:/life\/death/", "id": "regex_escaped_slash"},
     {"query": r"name:/a\/b/ type:/c\/d/", "expected": r"name:/a\/b/ AND type:/c\/d/", "id": "two_regex_escaped_slash"},

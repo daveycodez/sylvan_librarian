@@ -29,6 +29,7 @@ from api.parsing.nodes import (
     RegexValueNode,
     StringValueNode,
     flatten_nested_operations,
+    regex_plain_literal,
 )
 
 if TYPE_CHECKING:
@@ -286,23 +287,14 @@ def _regex_plain_literal(pattern: str) -> str | None:
     renders a substring leaf as ``LIKE '%draw%a%card%'`` -- each word may match anywhere, in order,
     with anything between -- while the regex ``draw a card`` is contiguous. Lowering it would change
     what the query matches, so it stays a regex. Whether the quoted-phrase form should itself be
-    contiguous is a separate question, and not one this pass may answer.
+    contiguous is a separate question, and not one this pass may answer. (That rule is specific to
+    the substring lowering; the parsers' literal-on-a-non-regex-field acceptance uses the plain
+    ``nodes.regex_plain_literal``, since an exact-match field has no gap to worry about.)
     """
-    out: list[str] = []
-    it = iter(pattern)
-    for c in it:
-        if c == "\\":
-            nxt = next(it, None)
-            if nxt is None or (nxt.isascii() and nxt.isalnum()):
-                return None  # class escape (\d \w \b …) or a dangling backslash
-            out.append(nxt)
-        elif c in ".*+?()[]{}|^$":
-            return None
-        elif c.isspace():
-            return None  # contiguous in a regex, gapped in the substring form -- not the same query
-        else:
-            out.append(c)
-    return "".join(out) or None  # empty pattern matches everything -> leave it a regex
+    literal = regex_plain_literal(pattern)
+    if literal is None or any(c.isspace() for c in literal):
+        return None  # contiguous in a regex, gapped in the substring form -- not the same query
+    return literal
 
 
 def _lower_regex_leaves(node: QueryNode) -> None:

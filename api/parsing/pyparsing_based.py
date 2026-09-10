@@ -30,6 +30,7 @@ from api.parsing.db_info import (
     PARSER_CLASS_TO_FIELD_INFOS,
     ParserClass,
 )
+from api.parsing.hand_parser import REGEX_UNSUPPORTED_FIELD_MESSAGE
 from api.parsing.mana_symbols import first_invalid_mana_symbol
 from api.parsing.nodes import (
     AndNode,
@@ -44,6 +45,7 @@ from api.parsing.nodes import (
     StringValueNode,
     TrueNode,
     flatten_nested_operations,
+    regex_plain_literal,
 )
 
 if TYPE_CHECKING:
@@ -111,6 +113,21 @@ def make_binary_operator_node(tokens: list[object]) -> BinaryOperatorNode:
     """Create a BinaryOperatorNode, properly wrapping attributes and values."""
     left, operator, right = tokens
     return BinaryOperatorNode(create_value_node(left), operator, create_value_node(right))
+
+
+def make_text_condition_node(tokens: list[object]) -> BinaryOperatorNode:
+    """Build a text condition, honouring a `/regex/` only on a field that can run one.
+
+    Mirrors hand_parser.parse_text_value: on a non-regex field a pattern that is a plain literal
+    becomes that literal, anything else is rejected rather than silently matched as a string.
+    """
+    left, operator, right = tokens
+    if isinstance(right, tuple) and right[0] == "regex" and not left.field_infos[0].regex_capable:
+        literal = regex_plain_literal(right[1])
+        if literal is None:
+            raise ValueError(REGEX_UNSUPPORTED_FIELD_MESSAGE)
+        right = ("quoted", literal)
+    return make_binary_operator_node([left, operator, right])
 
 
 def create_attribute_parser(parser_class: ParserClass) -> ParserElement:
@@ -393,7 +410,8 @@ def create_all_condition_parsers(basic_parsers: dict, mana_parsers: dict, color_
     regex_pattern = basic_parsers["regex_pattern"]
     rarity_condition = create_condition_parser(rarity_attr_word, quoted_string | string_value_word, operators=EQ_ALIAS_OPERATORS)
     legality_condition = create_condition_parser(legality_attr_word, quoted_string | string_value_word)
-    text_condition = create_condition_parser(text_attr_word, regex_pattern | quoted_string | string_value_word)
+    text_condition = text_attr_word + DEFAULT_OPERATORS + (regex_pattern | quoted_string | string_value_word)
+    text_condition.set_parse_action(make_text_condition_node)
 
     date_value = Regex(r"\d{4}(?:-\d{2}-\d{2})?")
     date_condition = create_condition_parser(date_attr_word, date_value, operators=EQ_ALIAS_OPERATORS)
