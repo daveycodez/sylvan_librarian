@@ -42,8 +42,8 @@ Object.defineProperty(global, 'performance', {
 
 const appCode = fs.readFileSync(path.resolve(__dirname, 'app.js'), 'utf8');
 // eslint-disable-next-line no-new-func
-const { CardSearch, CatalogMap, columnsToRows } = Function(
-  appCode + '; return {CardSearch, CatalogMap, columnsToRows};'
+const { CardSearch, CatalogMap, columnsToRows, ThemeManager } = Function(
+  appCode + '; return {CardSearch, CatalogMap, columnsToRows, ThemeManager};'
 )();
 
 // ---------------------------------------------------------------------------
@@ -757,5 +757,81 @@ describe('CardSearch getColumnsFromViewportWidth', () => {
   ])('at width %p returns %p columns', (width, expectedColumns) => {
     window.innerWidth = width;
     expect(search.getColumnsFromViewportWidth()).toBe(expectedColumns);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// localStorage can throw on access (blocked third-party storage, some privacy modes). Both the
+// card page's initTheme and the search page's ThemeManager run before anything renders, so an
+// unguarded read used to strand the card page on "Loading..." and abort the search page's init.
+// ---------------------------------------------------------------------------
+
+async function withThrowingLocalStorage(fn) {
+  const descriptor = Object.getOwnPropertyDescriptor(window, 'localStorage');
+  Object.defineProperty(window, 'localStorage', {
+    configurable: true,
+    get() {
+      throw new Error('SecurityError: localStorage is not available');
+    },
+  });
+  try {
+    return await fn();
+  } finally {
+    if (descriptor) Object.defineProperty(window, 'localStorage', descriptor);
+    else delete window.localStorage;
+  }
+}
+
+describe('card.js with unavailable localStorage', () => {
+  function buildCardDOM() {
+    document.body.innerHTML = `
+      <button id="themeToggle"><span id="themeIcon">☀️</span></button>
+      <h1 id="site-title"><a href="/">Sylvan Librarian</a></h1>
+      <div id="card-loading">Loading...</div>
+      <div id="card-face" style="display: none"></div>
+      <div id="other-printings" style="display: none"><div id="printings-list"></div></div>
+    `;
+  }
+
+  afterEach(() => {
+    window.history.pushState({}, '', '/');
+    global.fetch.mockReset();
+  });
+
+  it('still renders the card when reading localStorage throws', async () => {
+    expect(() => window.localStorage).not.toThrow();
+    buildCardDOM();
+    window.history.pushState({}, '', '/card/m11/149');
+    const card = {
+      name: 'Lightning Bolt',
+      set_code: 'm11',
+      collector_number: '149',
+      mana_cost: '{R}',
+      type_line: 'Instant',
+      oracle_text: 'Lightning Bolt deals 3 damage to any target.',
+    };
+    global.fetch.mockResolvedValue({ json: async () => ({ cards: [card] }) });
+
+    await withThrowingLocalStorage(async () => {
+      expect(() => window.localStorage).toThrow();
+      Function(cardCode)(); // the full script, initTheme and main() included
+      for (let i = 0; i < 5; i++) await flushPromises();
+    });
+
+    expect(document.getElementById('card-face').innerHTML).toContain('Lightning Bolt');
+    expect(document.getElementById('card-loading').style.display).toBe('none');
+  });
+});
+
+describe('ThemeManager with unavailable localStorage', () => {
+  it('applies the default theme and toggles without throwing', async () => {
+    document.body.innerHTML += '<button id="themeToggle"><span id="themeIcon"></span></button>';
+    await withThrowingLocalStorage(() => {
+      const manager = new ThemeManager();
+      expect(document.documentElement.getAttribute('data-theme')).toBe('dark');
+      expect(() => manager.toggleTheme()).not.toThrow();
+      expect(document.documentElement.getAttribute('data-theme')).toBe('light');
+    });
+    document.documentElement.setAttribute('data-theme', 'dark');
   });
 });

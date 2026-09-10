@@ -1595,7 +1595,13 @@ class ThemeManager {
   constructor() {
     this.themeToggle = document.getElementById('themeToggle');
     this.themeIcon = document.getElementById('themeIcon');
-    this.currentTheme = localStorage.getItem('theme') || 'dark';
+    let savedTheme = null;
+    try {
+      savedTheme = localStorage.getItem('theme');
+    } catch (e) {
+      // localStorage may be unavailable (blocked storage, privacy mode); fall back to the default
+    }
+    this.currentTheme = savedTheme || 'dark';
 
     this.init();
   }
@@ -1632,7 +1638,11 @@ class ThemeManager {
   }
 
   saveTheme() {
-    localStorage.setItem('theme', this.currentTheme);
+    try {
+      localStorage.setItem('theme', this.currentTheme);
+    } catch (e) {
+      // localStorage may be unavailable; the theme still applies for this page view
+    }
   }
 }
 

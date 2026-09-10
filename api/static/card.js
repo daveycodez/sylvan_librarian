@@ -237,7 +237,12 @@ async function main() {
 }
 
 (function initTheme() {
-  const saved = localStorage.getItem('theme');
+  let saved = null;
+  try {
+    saved = localStorage.getItem('theme');
+  } catch (e) {
+    // localStorage may be unavailable (blocked storage, privacy mode); keep the default theme
+  }
   if (saved) document.documentElement.setAttribute('data-theme', saved);
   const toggle = document.getElementById('themeToggle');
   const icon = document.getElementById('themeIcon');
@@ -249,7 +254,11 @@ async function main() {
   toggle.addEventListener('click', () => {
     const next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
     document.documentElement.setAttribute('data-theme', next);
-    localStorage.setItem('theme', next);
+    try {
+      localStorage.setItem('theme', next);
+    } catch (e) {
+      // localStorage may be unavailable; the theme still applies for this page view
+    }
     updateIcon();
   });
 })();
