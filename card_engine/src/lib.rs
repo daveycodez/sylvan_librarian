@@ -13425,6 +13425,78 @@ impl EmitStrCache {
     }
 }
 
+/// A per-PID `.tmp` archive being written by `reload_commit`. Unlinked on drop unless `publish`
+/// renamed it into place, so no error path between `File::create` and the rename can leave the
+/// file behind. `publish` consumes the guard: after the rename there is nothing at `path` to unlink.
+struct TmpArchive {
+    path: PathBuf,
+    published: bool,
+}
+
+impl TmpArchive {
+    fn create(path: PathBuf) -> std::io::Result<(Self, std::fs::File)> {
+        let file = std::fs::File::create(&path)?;
+        Ok((TmpArchive { path, published: false }, file))
+    }
+
+    /// `rename(2)` the finished archive over `dest` -- atomic, and the only way out that keeps the file.
+    fn publish(mut self, dest: &std::path::Path) -> std::io::Result<()> {
+        std::fs::rename(&self.path, dest)?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for TmpArchive {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Whether `pid` names a live process: `kill(pid, 0)` succeeds, or fails with anything but ESRCH
+/// (EPERM means it exists and belongs to someone else). Unrepresentable pids count as alive -- the
+/// sweep must only ever remove what it can prove abandoned.
+fn pid_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else { return true };
+    // Safety: `kill` with signal 0 sends nothing; it only reports whether the pid is deliverable.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Remove `<archive>.<pid>.tmp` siblings of `shm_path` whose writer pid is no longer alive, and
+/// return how many went. The name shape is exactly what `reload_commit` writes; anything else in
+/// the directory, another archive's temp files included, is left alone, as is our own pid's.
+/// Meant to run under the reload flock, where no live writer can be between create and rename.
+fn sweep_stale_tmp_archives(shm_path: &std::path::Path) -> usize {
+    let (Some(dir), Some(base)) = (shm_path.parent(), shm_path.file_name().and_then(|n| n.to_str())) else { return 0 };
+    let prefix = format!("{base}.");
+    let me = std::process::id();
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(&prefix))
+            .and_then(|rest| rest.strip_suffix(".tmp"))
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == me || pid_alive(pid) {
+            continue;
+        }
+        if std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// In-progress staged reload: cards accumulated across add_batch() calls plus
 /// the cross-process flock, held from reload_begin() until reload_commit() /
 /// reload_abort() so no other process can interleave a write. Dropping the
@@ -13783,6 +13855,11 @@ impl QueryEngine {
             }
         }
 
+        // Under the flock no live writer can be mid-write, so any sibling `<archive>.<pid>.tmp`
+        // whose pid is dead is a crashed writer's leftover pinning RAM in /dev/shm. Swept here, once
+        // per cycle, rather than on a timer nothing owns.
+        sweep_stale_tmp_archives(&self.shm_path);
+
         // If another worker published a new archive while we were waiting (the
         // inode changed, or a file appeared), skip the rebuild and just remap
         // our local handle.
@@ -14099,10 +14176,12 @@ impl QueryEngine {
             self.shm_path.file_name().unwrap_or_default().to_string_lossy(),
             std::process::id(),
         );
-        let tmp_path = self.shm_path.with_file_name(tmp_name);
+        // The guard unlinks the .tmp on every exit below except a successful `publish`: an error
+        // after `File::create` (a full /dev/shm, a serialization failure) used to leave a
+        // multi-hundred-MB file behind, pinning RAM until something noticed.
+        let (tmp, f) = TmpArchive::create(self.shm_path.with_file_name(tmp_name))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("create tmp: {e}")))?;
         {
-            let f = std::fs::File::create(&tmp_path)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("create tmp: {e}")))?;
             let mut buf = std::io::BufWriter::with_capacity(1 << 20, f);
             buf.write_all(&archive_header())
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("write header: {e}")))?;
@@ -14120,7 +14199,7 @@ impl QueryEngine {
             // Snapshot the build peak before the component-size diagnostics
             // below re-serialize pieces into heap buffers and inflate it.
             let build_peak = alloc_stats::peak();
-            let archive_len = std::fs::metadata(&tmp_path)
+            let archive_len = std::fs::metadata(&tmp.path)
                 .map(|m| m.len() as usize)
                 .unwrap_or(0)
                 .saturating_sub(ARCHIVE_HEADER_LEN);
@@ -14133,7 +14212,7 @@ impl QueryEngine {
             alloc_stats::record_reload(stats_after_cards, stats_after_indexes, component_bytes, archive_len, build_peak);
         }
 
-        std::fs::rename(&tmp_path, &self.shm_path)
+        tmp.publish(&self.shm_path)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("rename shm: {e}")))?;
 
         // The new archive is published; release the cross-process write lock.

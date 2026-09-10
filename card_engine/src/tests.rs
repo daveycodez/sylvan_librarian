@@ -13634,3 +13634,84 @@ fn sync_format_shifts_adopts_an_equal_length_reassignment() {
         "appends move the generation too"
     );
 }
+
+/// A scratch directory under the system temp dir, unique per test and process, removed on drop.
+struct ScratchDir(std::path::PathBuf);
+
+impl ScratchDir {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("card_engine_{tag}_{}_{:?}", std::process::id(), std::thread::current().id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        ScratchDir(dir)
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `reload_commit` writes the archive into `<archive>.<pid>.tmp` and renames it into place. Any error
+/// between `File::create` and the rename used to leave that file behind -- in /dev/shm, pinning RAM.
+/// The guard unlinks it on every exit but a successful publish.
+#[test]
+fn tmp_archive_guard_unlinks_unless_published() {
+    let scratch = ScratchDir::new("tmp_archive");
+    let dest = scratch.0.join("store.bin");
+
+    // Dropped without publishing (the error path): gone.
+    let tmp_path = scratch.0.join("store.bin.1.tmp");
+    {
+        let (guard, mut file) = super::TmpArchive::create(tmp_path.clone()).expect("create");
+        std::io::Write::write_all(&mut file, b"partial").expect("write");
+        assert!(tmp_path.exists());
+        drop(file);
+        drop(guard);
+    }
+    assert!(!tmp_path.exists(), "an unpublished tmp archive must be unlinked on drop");
+    assert!(!dest.exists());
+
+    // Published: renamed into place, nothing left at the tmp path.
+    let tmp_path = scratch.0.join("store.bin.2.tmp");
+    let (guard, mut file) = super::TmpArchive::create(tmp_path.clone()).expect("create");
+    std::io::Write::write_all(&mut file, b"complete").expect("write");
+    drop(file);
+    guard.publish(&dest).expect("publish");
+    assert!(!tmp_path.exists());
+    assert_eq!(std::fs::read(&dest).expect("read dest"), b"complete");
+}
+
+/// `reload_begin` sweeps sibling `<archive>.<pid>.tmp` files whose pid is dead: a crashed writer's
+/// leftover. Live pids (ours included), other archives' temp files and non-matching names stay.
+#[test]
+fn stale_tmp_archive_sweep_removes_only_dead_writers_of_this_archive() {
+    let scratch = ScratchDir::new("tmp_sweep");
+    let shm_path = scratch.0.join("store.bin");
+    // Far above any pid_max in use (Linux caps at 2^22, macOS at 99,999), so `kill(pid, 0)` is ESRCH.
+    const DEAD_PID: u32 = 2_000_000_000;
+    assert!(!super::pid_alive(DEAD_PID));
+    assert!(super::pid_alive(std::process::id()));
+    assert!(super::pid_alive(u32::MAX), "an unrepresentable pid must count as alive: never remove what cannot be proven abandoned");
+
+    let touch = |name: &str| std::fs::write(scratch.0.join(name), b"x").expect("touch");
+    let dead = format!("store.bin.{DEAD_PID}.tmp");
+    let mine = format!("store.bin.{}.tmp", std::process::id());
+    let other_archive = format!("other.bin.{DEAD_PID}.tmp");
+    let not_a_pid = "store.bin.notapid.tmp";
+    let not_tmp = format!("store.bin.{DEAD_PID}.bak");
+    for name in [dead.as_str(), mine.as_str(), other_archive.as_str(), not_a_pid, not_tmp.as_str()] {
+        touch(name);
+    }
+    std::fs::write(&shm_path, b"archive").expect("archive");
+
+    assert_eq!(super::sweep_stale_tmp_archives(&shm_path), 1);
+    assert!(!scratch.0.join(&dead).exists(), "the dead writer's tmp is swept");
+    for kept in [mine.as_str(), other_archive.as_str(), not_a_pid, not_tmp.as_str(), "store.bin"] {
+        assert!(scratch.0.join(kept).exists(), "{kept} must be left alone");
+    }
+    // Idempotent, and harmless on a directory that does not exist.
+    assert_eq!(super::sweep_stale_tmp_archives(&shm_path), 0);
+    assert_eq!(super::sweep_stale_tmp_archives(&scratch.0.join("missing").join("store.bin")), 0);
+}
