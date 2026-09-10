@@ -13763,3 +13763,57 @@ fn numeric_loaders_reject_non_finite_and_out_of_range_values() {
     assert_eq!((int_of::<u16>(65_535.0), int_of::<u16>(65_536.0), int_of::<u16>(f32::NAN)), (Some(65_535), None, None));
     assert_eq!((int_of::<u32>(4_000_000_000.0), int_of::<u32>(1e12), int_of::<u32>(-1.0)), (Some(4_000_000_000), None, None));
 }
+
+/// `renumber_coll_vocab` iterated `(0..coll_vocab.len() as u16)`, which is the EMPTY range at exactly
+/// 65,536 entries -- the largest vocab `VocabInterner` allows -- so the sorted vocab came back empty
+/// and every row's ids pointed nowhere. The interner's own cap (ids up to `u16::MAX`) is exercised
+/// alongside: the 65,537th distinct value is refused rather than wrapped.
+#[test]
+fn coll_vocab_renumbers_at_exactly_u16_capacity_and_the_interner_refuses_past_it() {
+    let n = usize::from(u16::MAX) + 1;
+    let mut interner = VocabInterner::new();
+    // Descending insertion, so the lexicographic renumbering has real work to do.
+    for i in (0..n).rev() {
+        let id = interner.intern(format!("v{i:05}")).expect("65,536 distinct values fit u16 ids");
+        assert_eq!(usize::from(id), n - 1 - i);
+    }
+    assert!(interner.intern("one too many".to_string()).is_err(), "the 65,537th distinct value must be refused, not wrapped");
+    assert_eq!(interner.intern("v00007".to_string()).expect("existing"), (n - 1 - 7) as u16, "a repeat still resolves after the refusal");
+
+    let mut cards: Vec<OracleCard> = Vec::new();
+    let mut printings: Vec<Printing> = Vec::new();
+    let sorted = renumber_coll_vocab(&mut cards, &mut printings, interner.strings);
+    assert_eq!(sorted.len(), n, "the full vocab survives renumbering at capacity");
+    assert!(sorted.windows(2).all(|w| w[0] < w[1]), "renumbered vocab is strictly sorted");
+    assert_eq!((sorted[0].as_str(), sorted[n - 1].as_str()), ("v00000", "v65535"));
+}
+
+/// The per-symbol pip counter is a `u8`; a pathological cost text with more than 255 of one symbol
+/// used to wrap it to 0 (`{W}` x 256 = no white pips). It saturates now.
+#[test]
+fn mana_pip_counter_saturates_instead_of_wrapping() {
+    let pips = super::mana_pip_counts(&"{W}".repeat(300));
+    assert_eq!(pips.get("W"), Some(&u8::MAX));
+    let pips = super::mana_pip_counts(&"{W}".repeat(255));
+    assert_eq!(pips.get("W"), Some(&255));
+    let pips = super::mana_pip_counts(&format!("{}{{U}}", "{W}".repeat(256)));
+    assert_eq!((pips.get("W"), pips.get("U")), (Some(&255), Some(&1)));
+}
+
+/// `InlineStr::from_str` cuts silently at a char boundary; `truncates` is the loader's way of
+/// noticing that it did, so a name longer than the documented 61-byte width surfaces as a count.
+#[test]
+fn inline_str_reports_truncation_and_cuts_on_a_char_boundary() {
+    let fits = "a".repeat(61);
+    let long = "a".repeat(62);
+    assert!(!InlineStr::<61>::truncates(&fits));
+    assert!(InlineStr::<61>::truncates(&long));
+    assert_eq!(InlineStr::<61>::from_str(&fits).as_str(), fits);
+    assert_eq!(InlineStr::<61>::from_str(&long).as_str(), fits);
+    // 60 ASCII bytes + a 2-byte char: 62 bytes, cut before the char rather than through it.
+    let multibyte = format!("{}é", "a".repeat(60));
+    assert!(InlineStr::<61>::truncates(&multibyte));
+    assert_eq!(InlineStr::<61>::from_str(&multibyte).as_str(), "a".repeat(60));
+    assert!(!InlineStr::<8>::truncates("plst"));
+    assert!(InlineStr::<8>::truncates("nine-char"));
+}

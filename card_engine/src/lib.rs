@@ -167,7 +167,8 @@ pub(crate) fn mana_pip_counts(s: &str) -> HashMap<String, u8> {
                 // mana:{X} matches Fireball ({X}{R}) and excludes cards with
                 // no X pip, which this exclusion broke.
                 if in_brace && sym.parse::<u32>().is_err() {
-                    *pips.entry(sym.clone()).or_insert(0) += 1;
+                    let n = pips.entry(sym.clone()).or_insert(0);
+                    *n = n.saturating_add(1); // a u8 per symbol; a pathological cost must not wrap to 0
                 }
                 in_brace = false;
             }
@@ -716,9 +717,12 @@ fn str_list_to_ids(d: &Bound<PyDict>, key: &str, vocab: &mut VocabInterner) -> P
 /// `card_subtypes` is remapped but deliberately NOT re-sorted: it carries the printed order, which
 /// is why `filter.rs` linear-scans it instead of binary-searching.
 fn renumber_coll_vocab(cards: &mut [OracleCard], printings: &mut [Printing], coll_vocab: Vec<String>) -> Vec<String> {
-    let mut order: Vec<u16> = (0..coll_vocab.len() as u16).collect();
+    // `VocabInterner` caps ids at `u16::MAX`, so the vocab holds at most 65,536 entries and every
+    // INDEX fits a u16 -- but the LENGTH does not: `0..len as u16` is `0..0` at exactly 65,536.
+    debug_assert!(coll_vocab.len() <= usize::from(u16::MAX) + 1, "collection vocab ids are u16");
+    let mut order: Vec<u16> = (0..coll_vocab.len()).map(|i| i as u16).collect();
     order.sort_unstable_by(|&a, &b| coll_vocab[a as usize].cmp(&coll_vocab[b as usize]));
-    // remap[old] = new. VocabInterner caps the vocab at u16::MAX so the cast cannot truncate.
+    // remap[old] = new; both are indexes, so the casts cannot truncate.
     let mut remap: Vec<u16> = vec![0; coll_vocab.len()];
     for (new_id, &old_id) in order.iter().enumerate() {
         remap[old_id as usize] = new_id as u16;
@@ -807,14 +811,36 @@ fn mana_cost_from_pydict(d: &Bound<PyDict>, cmc_val: Option<f32>, mana_vocab: &m
     Ok(ManaCost { core, hybrids, devotion, cmc: cmc_val.unwrap_or(0.0) })
 }
 
-fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInterner, artists: &mut VocabInterner, mana: &mut ManaVocabInterner) -> PyResult<CardRow> {
+/// Load-time counters that are not part of any row. `inline_truncations` counts `InlineStr`
+/// fields whose source text was longer than the field: `from_str` cuts silently, and the 61-byte
+/// name width is documented as covering every name in the dataset, so a non-zero count is a
+/// future longer name that would otherwise go unnoticed. Surfaced by `reload_commit` as a warning.
+#[derive(Default)]
+struct LoadStats {
+    inline_truncations: usize,
+}
+
+fn card_from_pydict(
+    d: &Bound<PyDict>,
+    it: &mut Interner,
+    vocab: &mut VocabInterner,
+    artists: &mut VocabInterner,
+    mana: &mut ManaVocabInterner,
+    stats: &mut LoadStats,
+) -> PyResult<CardRow> {
     let released_at = opt_date_str(d, "released_at").unwrap_or_default();
     let released_at_int: Option<u32> = released_at.replace('-', "").parse().ok();
     // Raw strings from the dict; interned to ids as the struct is built below.
     let card_name = opt_str(d, "card_name").unwrap_or_default();
-    let card_name_lower = InlineStr::<61>::from_str(&card_name.to_lowercase());
+    let name_lower = card_name.to_lowercase();
     // Already lowercased + accent-folded in Python (fold_accents(), #649); read as-is.
-    let card_name_folded = InlineStr::<61>::from_str(&opt_str(d, "card_name_folded").unwrap_or_default());
+    let name_folded = opt_str(d, "card_name_folded").unwrap_or_default();
+    let set_code = opt_str(d, "card_set_code").unwrap_or_default();
+    stats.inline_truncations += usize::from(InlineStr::<61>::truncates(&name_lower))
+        + usize::from(InlineStr::<61>::truncates(&name_folded))
+        + usize::from(InlineStr::<8>::truncates(&set_code));
+    let card_name_lower = InlineStr::<61>::from_str(&name_lower);
+    let card_name_folded = InlineStr::<61>::from_str(&name_folded);
     let oracle_text = opt_str(d, "oracle_text").unwrap_or_default();
     let oracle_text_lower_id = it.intern(oracle_text.to_lowercase());
     let flavor_text = opt_str(d, "flavor_text").unwrap_or_default();
@@ -838,7 +864,7 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
         flavor_text_lower_id,
         flavor_text_id: it.intern(flavor_text),
         card_artist_vid,
-        card_set_code: InlineStr::<8>::from_str(&opt_str(d, "card_set_code").unwrap_or_default()),
+        card_set_code: InlineStr::<8>::from_str(&set_code),
         card_layout_id: it.intern(opt_str(d, "card_layout").unwrap_or_default()),
         card_border_id: it.intern(opt_str(d, "card_border").unwrap_or_default()),
         card_watermark_id: it.intern_opt(opt_str(d, "card_watermark")),
@@ -13541,6 +13567,7 @@ struct Staging {
     vocab: VocabInterner,
     artists: VocabInterner,
     mana: ManaVocabInterner,
+    stats: LoadStats,
     #[allow(dead_code)] // held for its flock; released on drop
     lock_file: std::fs::File,
 }
@@ -13905,7 +13932,15 @@ impl QueryEngine {
         #[cfg(feature = "alloc-counter")]
         alloc_stats::reset_peak();
 
-        *staging = Some(Staging { rows: Vec::new(), interner: Interner::new(), vocab: VocabInterner::new(), artists: VocabInterner::new(), mana: ManaVocabInterner::new(), lock_file });
+        *staging = Some(Staging {
+            rows: Vec::new(),
+            interner: Interner::new(),
+            vocab: VocabInterner::new(),
+            artists: VocabInterner::new(),
+            mana: ManaVocabInterner::new(),
+            stats: LoadStats::default(),
+            lock_file,
+        });
         Ok(true)
     }
 
@@ -13917,7 +13952,9 @@ impl QueryEngine {
         })?;
         for item in db_rows.iter() {
             if let Ok(d) = item.cast::<PyDict>() {
-                staging.rows.push(card_from_pydict(d, &mut staging.interner, &mut staging.vocab, &mut staging.artists, &mut staging.mana)?);
+                staging.rows.push(card_from_pydict(
+                    d, &mut staging.interner, &mut staging.vocab, &mut staging.artists, &mut staging.mana, &mut staging.stats,
+                )?);
             }
         }
         Ok(())
@@ -13932,11 +13969,23 @@ impl QueryEngine {
     /// Sort, index, serialize, and atomically publish the staged cards, then
     /// release the cross-process lock. Queries keep serving the old archive
     /// until the rename lands.
-    fn reload_commit(&self) -> PyResult<()> {
+    fn reload_commit(&self, py: Python<'_>) -> PyResult<()> {
         let staging = self.staging.lock().unwrap().take().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err("reload_commit called without reload_begin")
         })?;
-        let Staging { mut rows, interner, vocab, artists, mana, lock_file } = staging;
+        let Staging { mut rows, interner, vocab, artists, mana, stats, lock_file } = staging;
+
+        // A silent truncation is a wrong answer for exact-name and set-code queries on that row. The
+        // widths are documented as covering the whole dataset; the day one stops, this is how the
+        // operator hears about it (the API logs warnings) without the reload itself failing.
+        if stats.inline_truncations > 0 {
+            let msg = std::ffi::CString::new(format!(
+                "card_engine: {} inline string field(s) exceeded their width (card_name_lower/card_name_folded 61 bytes, card_set_code 8) and were truncated; widen InlineStr",
+                stats.inline_truncations,
+            ))
+            .expect("no NUL in message");
+            PyErr::warn(py, &py.get_type::<pyo3::exceptions::PyRuntimeWarning>(), &msg, 1)?;
+        }
 
         // The store groups printings by oracle_id, so rows without one would all
         // collapse into a single card. The DB enforces NOT NULL; fail loudly here
@@ -14256,7 +14305,7 @@ impl QueryEngine {
 
     /// One-shot reload: the staged API as a single call. Kept for tests and
     /// for callers that already hold the full corpus in memory.
-    fn reload(&self, db_rows: &Bound<PyList>) -> PyResult<()> {
+    fn reload(&self, py: Python<'_>, db_rows: &Bound<PyList>) -> PyResult<()> {
         if !self.reload_begin()? {
             return Ok(()); // another worker just published; we picked up theirs
         }
@@ -14264,7 +14313,7 @@ impl QueryEngine {
             self.reload_abort()?;
             return Err(e);
         }
-        self.reload_commit()
+        self.reload_commit(py)
     }
 
     #[allow(clippy::too_many_arguments)] // the PyO3 keyword surface; `run_query` behind it takes 9
