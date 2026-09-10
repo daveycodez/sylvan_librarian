@@ -1158,11 +1158,11 @@ class CardSearch {
     }
 
     modalContent.innerHTML = `
-      <button class="modal-close" onclick="cardSearch.closeModal()">&times;</button>
+      <button class="modal-close" onclick="cardSearch.closeModal()" aria-label="Close">&times;</button>
       ${imageHtml}
       <div class="modal-card-info">
         <div class="modal-card-name-mana-row">
-          <div class="modal-card-name">${this.escapeHtml(card.name || 'Unknown Card')}</div>
+          <div class="modal-card-name" id="modalCardName">${this.escapeHtml(card.name || 'Unknown Card')}</div>
           ${card.mana_cost ? `<div class="modal-card-mana">${this.formatCardText(card.mana_cost, true, false)}</div>` : ''}
         </div>
         ${card.type_line ? `<div class="modal-card-type">${this.escapeHtml(card.type_line)}</div>` : ''}
@@ -1184,6 +1184,10 @@ class CardSearch {
 
     // Show modal
     modalOverlay.style.display = 'flex';
+
+    // Move focus into the dialog, remembering where it came from so closeModal can put it back
+    this.previouslyFocusedElement = document.activeElement;
+    modalContent.querySelector('.modal-close')?.focus({ preventScroll: true });
 
     // Reset scroll position to top for both modal content and card info
     // (different elements scroll on different viewport sizes)
@@ -1213,6 +1217,13 @@ class CardSearch {
     this.restoreBackgroundScroll();
 
     document.removeEventListener('keydown', this.handleEscapeKey);
+
+    // Return focus to the element that had it before the dialog opened
+    const previouslyFocused = this.previouslyFocusedElement;
+    this.previouslyFocusedElement = null;
+    if (previouslyFocused?.isConnected && typeof previouslyFocused.focus === 'function') {
+      previouslyFocused.focus({ preventScroll: true });
+    }
   }
 
   handleEscapeKey = e => {

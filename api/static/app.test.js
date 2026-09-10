@@ -28,6 +28,9 @@ function buildDOM() {
     <input id="directionInput" value="asc" />
     <div id="results"></div>
     <div id="statusMessage"></div>
+    <div id="modalOverlay" class="modal-overlay">
+      <div id="modalContent" class="modal-content" role="dialog" aria-modal="true" aria-labelledby="modalCardName"></div>
+    </div>
   `;
 }
 
@@ -736,6 +739,53 @@ describe('CardSearch performSearch', () => {
 
     await search.performSearch('t:elf');
     expect(global.fetch).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('CardSearch card modal accessibility', () => {
+  const card = {
+    name: 'Lightning Bolt',
+    set_code: 'm11',
+    collector_number: '149',
+    mana_cost: '{R}',
+    type_line: 'Instant',
+    oracle_text: 'Lightning Bolt deals 3 damage to any target.',
+    set_name: 'Magic 2011',
+  };
+
+  beforeEach(() => {
+    window.scrollTo = jest.fn(); // restoreBackgroundScroll calls it; jsdom does not implement it
+  });
+
+  it('is a labelled dialog that takes focus on open and gives it back on close', () => {
+    const input = document.getElementById('searchInput');
+    input.focus();
+    expect(document.activeElement).toBe(input);
+
+    search.showCardModal(card);
+
+    const modalContent = document.getElementById('modalContent');
+    expect(modalContent.getAttribute('role')).toBe('dialog');
+    expect(modalContent.getAttribute('aria-modal')).toBe('true');
+    const label = document.getElementById(modalContent.getAttribute('aria-labelledby'));
+    expect(label.textContent).toBe('Lightning Bolt');
+    expect(document.activeElement).toBe(modalContent.querySelector('.modal-close'));
+
+    search.closeModal();
+
+    expect(document.getElementById('modalOverlay').style.display).toBe('none');
+    expect(document.activeElement).toBe(input);
+  });
+
+  it('closes on Escape and restores focus', () => {
+    const input = document.getElementById('searchInput');
+    input.focus();
+    search.showCardModal(card);
+
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+
+    expect(document.getElementById('modalOverlay').style.display).toBe('none');
+    expect(document.activeElement).toBe(input);
   });
 });
 
