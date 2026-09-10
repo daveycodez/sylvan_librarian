@@ -98,12 +98,24 @@ class TT(Enum):
 
 @dataclass
 class Token:
-    """A single lexed token with its type, value, source position, and whitespace flag."""
+    """A single lexed token with its type, value, source position, whitespace flag, and source text.
+
+    `raw` is the exact slice of the query the token came from. It differs from `value` where lexing
+    normalises: a NUMBER's value is the parsed int/float, a QUOTED's is the unescaped content, a
+    REGEX's is the pattern without its slashes. Anything that echoes a token back as *text* -- a bare
+    expression becoming a name search -- reads `raw`, so the user's spelling survives.
+    """
 
     type: TT
     value: str | int | float
     pos: int
     space_before: bool
+    raw: str | None = None
+
+    def __post_init__(self) -> None:
+        """Default `raw` to the value's own text, which is exact for every token type but the three above."""
+        if self.raw is None:
+            self.raw = str(self.value)
 
 
 _ARITH_OPS: frozenset[TT] = frozenset({TT.PLUS, TT.MINUS, TT.STAR, TT.SLASH})
@@ -206,8 +218,8 @@ def tokenize(src: str) -> list[Token]:  # noqa: C901, PLR0912, PLR0915
                 msg = f"Unclosed quote at position {start}"
                 raise LexError(msg)
             close_index, content = closed
-            tokens.append(Token(TT.QUOTED, content, start, sb))
             pos = close_index + 1
+            tokens.append(Token(TT.QUOTED, content, start, sb, raw=src[start:pos]))
             continue
 
         # Operators >= <= != : = > <  and  ! (bang)
@@ -264,8 +276,8 @@ def tokenize(src: str) -> list[Token]:  # noqa: C901, PLR0912, PLR0915
                 pos += 1
             else:
                 close_index, content = closed
-                tokens.append(Token(TT.REGEX, content, start, sb))
                 pos = close_index + 1
+                tokens.append(Token(TT.REGEX, content, start, sb, raw=src[start:pos]))
             continue
 
         # Single-char arithmetic / grouping
@@ -304,9 +316,9 @@ def tokenize(src: str) -> list[Token]:  # noqa: C901, PLR0912, PLR0915
                     j += 1
                 tokens.append(Token(TT.WORD, src[pos:j], start, sb))
             elif "." in src[pos:j]:
-                tokens.append(Token(TT.NUMBER, float(src[pos:j]), start, sb))
+                tokens.append(Token(TT.NUMBER, float(src[pos:j]), start, sb, raw=src[pos:j]))
             else:
-                tokens.append(Token(TT.NUMBER, int(src[pos:j]), start, sb))
+                tokens.append(Token(TT.NUMBER, int(src[pos:j]), start, sb, raw=src[pos:j]))
             pos = j
             continue
 
@@ -333,8 +345,18 @@ class ParseError(ValueError):
     """Raised when the parser encounters unexpected token structure."""
 
 
+_ARITH_OPERATORS = frozenset("+-*/")
+
+
 def _name_node(value: str) -> CardBinaryOperatorNode:
     return CardBinaryOperatorNode(CardAttributeNode("name", ParserClass.TEXT), ":", StringValueNode(value))
+
+
+def _is_filter(node: QueryNode) -> bool:
+    """False for a bare numeric expression: a literal, a numeric attribute, or arithmetic over them."""
+    if isinstance(node, NumericValueNode | CardAttributeNode):
+        return False
+    return not (isinstance(node, BinaryOperatorNode) and node.operator in _ARITH_OPERATORS)
 
 
 class Parser:
@@ -383,24 +405,73 @@ class Parser:
 
     # ── expr: OR-level ────────────────────────────────────────────────────────
 
-    def parse_expr(self) -> QueryNode:
-        """Parse an OR-level expression."""
-        operands = [self.parse_and_expr()]
+    def parse_expr(self, *, bare_ok: bool = False) -> QueryNode:
+        """Parse an OR-level expression.
+
+        A factor that comes back as a bare numeric expression -- a literal, a numeric attribute, or
+        arithmetic over them with no comparison (`1996`, `cmc+1`, `power - cmc`) -- is a name search
+        for its source text, which is what Scryfall does with a bare number. Left as it was, it
+        reached SQL as `WHERE %(p)s` and 400ed on a type error. The one exception is *bare_ok*: a
+        parenthesised group whose whole content is one bare expression hands it back undecided,
+        because the caller may still be using the group as an arithmetic operand (`(2*power)-1>3`).
+        """
+        disjuncts = [self._parse_conjuncts()]
         while self.peek().type == TT.WORD and self.peek().value.upper() == "OR":
             self.consume()
-            operands.append(self.parse_and_expr())
+            disjuncts.append(self._parse_conjuncts())
+        if bare_ok and len(disjuncts) == 1 and len(disjuncts[0]) == 1:
+            return disjuncts[0][0][0]
+        operands = [self._conjunction(conjuncts) for conjuncts in disjuncts]
         return operands[0] if len(operands) == 1 else OrNode(operands)
 
     # ── and_expr: AND-level with implicit AND ─────────────────────────────────
 
-    def parse_and_expr(self) -> QueryNode:
-        """Parse an AND-level expression, inserting implicit AND between adjacent factors."""
-        operands = [self.parse_factor()]
+    def _parse_conjuncts(self) -> list[tuple[QueryNode, int, int]]:
+        """Parse an AND-level run of factors (implicit AND between adjacent ones), each with its token span."""
+        factors = [self._parse_spanned_factor()]
         while self._can_start_factor():
             if self.peek().type == TT.WORD and self.peek().value.upper() == "AND":
                 self.consume()
-            operands.append(self.parse_factor())
+            factors.append(self._parse_spanned_factor())
+        return factors
+
+    def _conjunction(self, factors: list[tuple[QueryNode, int, int]]) -> QueryNode:
+        operands = [self._as_filter(node, start, end) for node, start, end in factors]
         return operands[0] if len(operands) == 1 else AndNode(operands)
+
+    def _parse_spanned_factor(self) -> tuple[QueryNode, int, int]:
+        start = self.pos
+        node = self.parse_factor()
+        return node, start, self.pos
+
+    def _as_filter(self, node: QueryNode, start: int, end: int) -> QueryNode:
+        """Return *node* unless it is a bare numeric expression, which becomes a name search for its text."""
+        return node if _is_filter(node) else _name_node(self._span_text(start, end))
+
+    def _span_text(self, start: int, end: int) -> str:
+        """Source text of tokens[start:end], less the whitespace between tokens and any parentheses around the whole span.
+
+        Dropping the whitespace makes `power - cmc` and `power-cmc` the same name search (the
+        pyparsing oracle's preprocess already normalises them that way). Dropping enclosing
+        parentheses makes `(2*power)` a search for `2*power`: the parentheses were grouping, not name.
+        """
+        while end - start >= 2 and self._parens_enclose(start, end):  # noqa: PLR2004
+            start, end = start + 1, end - 1
+        return "".join(tok.raw for tok in self.tokens[start:end])
+
+    def _parens_enclose(self, start: int, end: int) -> bool:
+        """True if tokens[start] is a '(' whose matching ')' is tokens[end - 1]."""
+        if self.tokens[start].type is not TT.LPAREN or self.tokens[end - 1].type is not TT.RPAREN:
+            return False
+        depth = 0
+        for tok in self.tokens[start : end - 1]:
+            if tok.type is TT.LPAREN:
+                depth += 1
+            elif tok.type is TT.RPAREN:
+                depth -= 1
+                if depth == 0:
+                    return False  # the opener closed early: `(2*power)-(1)`, two groups
+        return True
 
     def _can_start_factor(self) -> bool:
         tok = self.peek()
@@ -415,14 +486,25 @@ class Parser:
     # ── factor: optional negation ─────────────────────────────────────────────
 
     def parse_factor(self) -> QueryNode:
-        """Parse an optionally-negated primary expression."""
+        """Parse an optionally-negated primary expression.
+
+        Negation is always a filter position, so a negated bare literal is resolved here rather than
+        at the expr level: `cmc>2 -1` negates a name search for "1", not the integer 1. Unparenthesised
+        arithmetic stays an error (`-cmc+1` reads as "negative cmc, plus one"), while a parenthesised
+        group is a factor like any other and becomes a name search: `-(2*power)`.
+        """
         if self.peek().type == TT.MINUS:
             self.consume()
+            start = self.pos
             operand = self.parse_primary()
-            if isinstance(operand, BinaryOperatorNode) and operand.operator in ("+", "-", "*", "/"):
+            if (
+                isinstance(operand, BinaryOperatorNode)
+                and operand.operator in _ARITH_OPERATORS
+                and not self._parens_enclose(start, self.pos)
+            ):
                 msg = "Cannot negate an arithmetic expression"
                 raise ParseError(msg)
-            return NotNode(operand)
+            return NotNode(self._as_filter(operand, start, self.pos))
         return self.parse_primary()
 
     # ── primary ───────────────────────────────────────────────────────────────
@@ -466,7 +548,7 @@ class Parser:
             if self.peek().type == TT.RPAREN:
                 msg = "Empty parentheses are not allowed"
                 raise ParseError(msg)
-            inner = self.parse_expr()
+            inner = self.parse_expr(bare_ok=True)
             self.expect(TT.RPAREN)
             return inner
         finally:
@@ -510,20 +592,15 @@ class Parser:
                 op = "=" if next_tok.type == TT.BANG else next_tok.value
                 self.consume()
                 return CardBinaryOperatorNode(CardAttributeNode(wl, ParserClass.NUMERIC), op, self.parse_num_expr_value())
+            lhs: QueryNode = CardAttributeNode(wl, ParserClass.NUMERIC)
             if next_tok.type in _ARITH_OPS and not next_tok.space_before:
-                lhs = self._arith_tail(CardAttributeNode(wl, ParserClass.NUMERIC))
-                lhs = self._spaced_arith_tail(lhs)
-                if self.peek().type == TT.OP:
-                    op = self.consume().value
-                    return CardBinaryOperatorNode(lhs, op, self.parse_num_expr_value())
-                return lhs  # standalone arith expression (e.g. cmc-power)
-            lhs = self._spaced_arith_tail(CardAttributeNode(wl, ParserClass.NUMERIC))
-            if isinstance(lhs, CardAttributeNode):
-                # no arithmetic consumed → implicit name
-                return _name_node(word)
+                lhs = self._arith_tail(lhs)
+            lhs = self._spaced_arith_tail(lhs)
             if self.peek().type == TT.OP:
                 op = self.consume().value
                 return CardBinaryOperatorNode(lhs, op, self.parse_num_expr_value())
+            # A bare attribute (`power`) or arithmetic expression (`cmc-power`): parse_expr turns it
+            # into a name search unless a parenthesised group is using it as an arithmetic operand.
             return lhs
 
         # ── known non-NUMERIC attribute ──
@@ -540,7 +617,11 @@ class Parser:
         return self.parse_hyphenated_name(word)
 
     def parse_number_primary(self) -> QueryNode:
-        """Parse a bare numeric literal, optionally followed by an arithmetic tail and comparison."""
+        """Parse a bare numeric literal, optionally followed by an arithmetic tail and comparison.
+
+        With no comparison the result is a bare numeric expression; parse_expr turns it into a name
+        search for its source text (`1996`, `1+1`) unless a group is using it as an operand.
+        """
         tok = self.consume()  # NUMBER
         lhs: QueryNode = NumericValueNode(tok.value)
         if self.peek().type in _ARITH_OPS and not self.peek().space_before and self._num_term_start(self.peek(1)):
@@ -549,7 +630,7 @@ class Parser:
         if self.peek().type == TT.OP:
             op = self.consume().value
             return CardBinaryOperatorNode(lhs, op, self.parse_num_expr_value())
-        return lhs  # standalone numeric literal
+        return lhs
 
     # ── arithmetic helpers ────────────────────────────────────────────────────
 

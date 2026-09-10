@@ -186,6 +186,18 @@ TESTCASES = [
     # Numerics
     {"query": "cmc:3.5", "expected": "cmc:3.5", "id": "numeric_float"},
     {"query": "1 2 3", "expected": "1 AND 2 AND 3", "id": "numeric_sequence"},
+    # A bare numeric expression with no comparison is a name search for its text (as on Scryfall),
+    # never a non-boolean root; inside a comparison it stays arithmetic.
+    {"query": "1996", "expected": "1996", "id": "bare_number_is_name"},
+    {"query": "2.5 t:elf", "expected": "2.5 AND t:elf", "id": "bare_float_then_attr"},
+    {"query": "cmc+1", "expected": "cmc+1", "id": "bare_arith_is_name"},
+    {"query": "cmc+1<power", "expected": "cmc+1<power", "id": "arith_lhs_comparison"},
+    {"query": "(2*power)", "expected": "(2*power)", "id": "bare_group_arith_is_name"},
+    {"query": "(cmc+1)*2>3", "expected": "(cmc+1)*2>3", "id": "group_arith_operand"},
+    {"query": "-1", "expected": "-1", "id": "negated_bare_number"},
+    {"query": "t:elf -1", "expected": "t:elf AND -1", "id": "attr_then_negated_bare_number"},
+    {"query": "cmc>2 -1", "expected": "cmc>2 AND -1", "id": "cmp_then_negated_bare_number"},
+    {"query": "-(2*power)", "expected": "-(2*power)", "id": "negated_bare_group_arith"},
     # Mana symbols / curly (including complex symbols with slash)
     {"query": "c:{w}{u}", "expected": "c:{w}{u}", "id": "mana_curly"},
     {"query": "c:{W/U}", "expected": "c:{W/U}", "id": "mana_complex_slash"},

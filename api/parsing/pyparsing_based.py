@@ -20,6 +20,7 @@ from pyparsing import (
     Regex,
     ZeroOrMore,
     one_of,
+    original_text_for,
 )
 
 from api.parsing.card_query_nodes import CardAttributeNode, ExactNameNode, to_card_query_ast
@@ -359,19 +360,25 @@ def create_all_condition_parsers(basic_parsers: dict, mana_parsers: dict, color_
 
     expr = Forward()
 
-    paren_expr_term = lparen + expr + rparen
-    arithmetic_term = numeric_attr_word | literal_number | paren_expr_term
+    # A parenthesised arithmetic operand. Deliberately NOT `lparen + expr + rparen`: `expr` turns a
+    # bare arithmetic factor into a name search (see get_parse_expr), which is right for `(cmc+1)`
+    # on its own and wrong for the `(cmc+1)` in `(cmc+1)*2>3`. Restricting the group to arithmetic
+    # content is how this grammar tells the two apart; the hand parser does the same by handing a
+    # group's single bare expression back to the caller undecided (parse_expr's bare_ok).
+    arith_paren = Forward()
+    arithmetic_term = numeric_attr_word | literal_number | arith_paren
     arithmetic_expr = Forward()
     arithmetic_expr <<= arithmetic_term + arithmetic_op + arithmetic_term + ZeroOrMore(arithmetic_op + arithmetic_term)
     arithmetic_expr.set_parse_action(make_chained_arithmetic)
+    arith_paren <<= lparen + (arithmetic_expr | arithmetic_term) + rparen
 
     # Only the leading term of the RHS may be signed — 'power>-1+cmc' is (-1)+cmc, while
     # 'power>cmc+-1' stays a parse error, matching parse_signed_num_term in the hand parser.
     signed_arithmetic_expr = signed_literal_number + arithmetic_op + arithmetic_term + ZeroOrMore(arithmetic_op + arithmetic_term)
     signed_arithmetic_expr.set_parse_action(make_chained_arithmetic)
 
-    numeric_comparison_lhs = arithmetic_expr | paren_expr_term | numeric_attr_word | literal_number
-    numeric_comparison_rhs = arithmetic_expr | signed_arithmetic_expr | paren_expr_term | numeric_attr_word | signed_literal_number
+    numeric_comparison_lhs = arithmetic_expr | arith_paren | numeric_attr_word | literal_number
+    numeric_comparison_rhs = arithmetic_expr | signed_arithmetic_expr | arith_paren | numeric_attr_word | signed_literal_number
     unified_numeric_comparison = numeric_comparison_lhs + EQ_ALIAS_OPERATORS + numeric_comparison_rhs
     unified_numeric_comparison.set_parse_action(make_binary_operator_node)
 
@@ -523,11 +530,21 @@ def get_parse_expr() -> ParserElement:  # noqa: PLR0915
 
     implicit_name = _implicit_name_value.set_parse_action(make_implicit_name)
 
-    def make_numeric_literal(tokens: list[object]) -> NumericValueNode:
-        """Create a NumericValueNode for standalone numeric literals."""
-        return NumericValueNode(tokens[0])
+    def make_implicit_name_from_text(tokens: list[object]) -> BinaryOperatorNode:
+        """A bare numeric expression with no comparison is a name search for its text.
 
-    standalone_numeric = literal_number.set_parse_action(make_numeric_literal)
+        `1996` and `cmc+1` used to parse to a NumericValueNode / arithmetic node at the root, which
+        SQL renders as `WHERE %(p)s` and Postgres rejects with a type error. Scryfall treats a bare
+        number as a name search, and so does hand_parser (parse_expr), which reads the same source
+        text -- the preprocessed query has no whitespace inside an expression, so `power - cmc`
+        arrives here as `power-cmc`, the text the hand parser builds from its tokens.
+        """
+        return BinaryOperatorNode(CardAttributeNode("name", ParserClass.TEXT), ":", StringValueNode(str(tokens[0])))
+
+    # original_text_for wraps rather than mutates, so literal_number / arithmetic_expr keep producing
+    # numeric nodes everywhere they appear inside a comparison.
+    standalone_numeric = original_text_for(literal_number).add_parse_action(make_implicit_name_from_text)
+    bare_arithmetic = original_text_for(arithmetic_expr).add_parse_action(make_implicit_name_from_text)
 
     def make_group(tokens: list[object]) -> object:
         """Return the grouped expression inside parentheses."""
@@ -546,11 +563,11 @@ def get_parse_expr() -> ParserElement:  # noqa: PLR0915
             return NotNode(tokens[1])
         return tokens[0]
 
-    negatable_primary = attr_attr_condition | condition | group | exact_name | implicit_name
+    negatable_primary = attr_attr_condition | condition | group | exact_name | implicit_name | standalone_numeric
     negatable_factor = Optional(operator_not) + negatable_primary
     negatable_factor.set_parse_action(handle_negation)
 
-    factor = condition | hyphenated_condition | arithmetic_expr | negatable_factor | standalone_numeric
+    factor = condition | hyphenated_condition | bare_arithmetic | negatable_factor
 
     def handle_and(tokens: list[object]) -> object:
         """Group AND operands into an AndNode (AND binds tighter than OR)."""
