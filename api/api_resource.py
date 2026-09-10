@@ -633,7 +633,6 @@ class APIResource:
         Returns:
             Dict containing search results and metadata.
         """
-        set_cache_header(falcon_response, duration=timedelta(seconds=90))
         results = self._search(
             query=query or q,
             orderby=orderby,
@@ -644,6 +643,10 @@ class APIResource:
             unique=unique,
             prefer=prefer,
         )
+        # Only once there is a result to cache. Falcon keeps headers set before a handler raises, so
+        # setting this first stamped `public, max-age=90` on every cold-start 503 and every 500 from
+        # /search -- and a CDN in front would have served that failure for the next 90 seconds.
+        set_cache_header(falcon_response, duration=timedelta(seconds=90))
         if shape == ResponseShape.COLUMNAR:
             # Shallow copy: _search returns cached dicts, which must stay row-shaped.
             results = {**results, "cards": _columnarize_cards(results["cards"])}

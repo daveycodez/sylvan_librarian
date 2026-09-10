@@ -11,6 +11,7 @@ from __future__ import annotations
 import multiprocessing
 import time
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import falcon
 import falcon.testing
@@ -119,3 +120,36 @@ class TestRepeatedQueryParameters:
         result = client.simulate_get("/search", query_string=query_string)
         assert result.status == falcon.HTTP_400, result.text
         assert result.json["description"] == f"parameter '{param}' was given more than once"
+
+
+class TestSearchFailuresAreNotCacheable:
+    """A failed /search must not go out with a public Cache-Control.
+
+    /search set `Cache-Control: public, max-age=90` before running the search, and Falcon keeps a
+    header set before the handler raises -- so a cold-start 503 and an unhandled 500 both went out
+    cacheable, and a CDN in front served the failure for the next 90 seconds.
+    """
+
+    def test_503_carries_no_public_cache_control(self, app: falcon.App, client: falcon.testing.TestClient) -> None:
+        resource = _resource_of(app)
+        with patch.object(resource, "_search", side_effect=falcon.HTTPServiceUnavailable(title="Service Unavailable")):
+            result = client.simulate_get("/search", params={"q": "bolt"})
+        assert result.status == falcon.HTTP_503
+        assert "public" not in (result.headers.get("Cache-Control") or "")
+
+    def test_500_carries_no_public_cache_control(self, app: falcon.App, client: falcon.testing.TestClient) -> None:
+        resource = _resource_of(app)
+        with (
+            patch.object(resource, "_search", side_effect=RuntimeError("engine exploded")),
+            patch("api.api_resource.error_monitoring.error_handler"),
+        ):
+            result = client.simulate_get("/search", params={"q": "bolt"})
+        assert result.status == falcon.HTTP_500
+        assert "public" not in (result.headers.get("Cache-Control") or "")
+
+    def test_successful_search_is_still_cacheable(self, app: falcon.App, client: falcon.testing.TestClient) -> None:
+        resource = _resource_of(app)
+        with patch.object(resource, "_search", return_value={"cards": [], "total_cards": 0}):
+            result = client.simulate_get("/search", params={"q": "bolt"})
+        assert result.status == falcon.HTTP_200
+        assert result.headers.get("Cache-Control") == "public, max-age=90"

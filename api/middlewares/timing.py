@@ -69,6 +69,15 @@ class TimingMiddleware:
         spans = req.context.get("_timing_spans", [])
         spans.append(("total", duration_ms))
         resp.set_header("Server-Timing", ", ".join(f"{name};dur={dur:.1f}" for name, dur in spans))
+        if is_server_error(resp.status):
+            # Last line of defence, in the middleware whose process_response runs last: a handler
+            # that set Cache-Control and then failed must not have that failure cached downstream.
+            resp.delete_header("Cache-Control")
+
+
+def is_server_error(status: str | int | None) -> bool:
+    """Whether a response status line (or code) is a 5xx."""
+    return str(status or "").startswith("5")
 
 
 class ProfilingMiddleware:
