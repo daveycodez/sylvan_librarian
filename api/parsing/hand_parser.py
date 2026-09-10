@@ -69,16 +69,40 @@ _VALID_COLOR_NAMES: frozenset[str] = frozenset(COLOR_ALIAS_TO_CODES)
 _COLOR_LETTERS: frozenset[str] = frozenset("wubrgcWUBRGC")
 _MIN_MTG_YEAR: int = 1992
 _MAX_YEAR: int = 2040
+_MIN_FOUR_DIGIT_YEAR: int = 1000
+_MAX_FOUR_DIGIT_YEAR: int = 9999
+_EQUALITY_OPERATORS: frozenset[str] = frozenset({":", "="})
 
 
-def _validate_mtg_year(value: int | float, pos: int) -> int:
+def validate_year(value: int | float, pos: int, operator: str) -> int:
+    """Check a year value: four digits always, and for `=`/`:` one Magic could have a printing in.
+
+    `year:1500` and `date=2099` cannot match anything, so equality gets the sanity gate. A comparison
+    against any year is meaningful -- `year<1993` is "the first year", `date>=1990` is "everything",
+    `year!=1500` too -- so `<`, `<=`, `>`, `>=` and `!=` only require the value to be a year at all:
+    four digits, which is also the shape the SQL and engine date handling assume. Shared with the
+    pyparsing oracle so both parsers draw the same line.
+    """
     if isinstance(value, float):
         msg = f"Expected integer year, got {value!r} at position {pos}"
         raise ParseError(msg)
-    if not (_MIN_MTG_YEAR <= value <= _MAX_YEAR):
+    if not (_MIN_FOUR_DIGIT_YEAR <= value <= _MAX_FOUR_DIGIT_YEAR):
+        msg = f"Expected a four-digit year, got {value!r} at position {pos}"
+        raise ParseError(msg)
+    if operator in _EQUALITY_OPERATORS and not (_MIN_MTG_YEAR <= value <= _MAX_YEAR):
         msg = f"Year must be between {_MIN_MTG_YEAR} and {_MAX_YEAR}, got {value!r} at position {pos}"
         raise ParseError(msg)
     return value
+
+
+def validate_date(year: int, month: int, day: int, pos: int) -> str:
+    """Return the ISO form of a calendar date, or raise ParseError if it is not one (2020-02-30)."""
+    try:
+        datetime.date(year=year, month=month, day=day)
+    except ValueError as exc:
+        msg = f"Invalid date {year}-{month:02d}-{day:02d} at position {pos}: {exc}"
+        raise ParseError(msg) from exc
+    return f"{year}-{month:02d}-{day:02d}"
 
 
 # ── Token types ───────────────────────────────────────────────────────────────
@@ -615,7 +639,7 @@ class Parser:
         if pc is not None and (next_tok.type == TT.OP or bang_alias):
             op = "=" if bang_alias else next_tok.value
             self.consume()
-            return CardBinaryOperatorNode(CardAttributeNode(wl, pc), op, self.parse_value_for_class(pc, wl))
+            return CardBinaryOperatorNode(CardAttributeNode(wl, pc), op, self.parse_value_for_class(pc, wl, op))
         if pc is not None:
             # alias recognised but no operator → might still be a hyphenated bare word (e.g. "a-b-c")
             return self.parse_hyphenated_name(word)
@@ -737,7 +761,7 @@ class Parser:
 
     # ── value parsers ─────────────────────────────────────────────────────────
 
-    def parse_value_for_class(self, pc: ParserClass, attr: str) -> QueryNode:
+    def parse_value_for_class(self, pc: ParserClass, attr: str, operator: str) -> QueryNode:
         """Route to the correct value parser based on the attribute's parser class."""
         if pc == ParserClass.TEXT:
             return self.parse_text_value(attr)
@@ -750,9 +774,9 @@ class Parser:
         if pc in (ParserClass.RARITY, ParserClass.LEGALITY):
             return self.parse_string_value()
         if pc == ParserClass.DATE:
-            return self.parse_date_value()
+            return self.parse_date_value(operator)
         if pc == ParserClass.YEAR:
-            return self.parse_year_value()
+            return self.parse_year_value(operator)
         msg = f"Unknown parser class {pc!r}"
         raise ParseError(msg)
 
@@ -865,49 +889,51 @@ class Parser:
         msg = f"Expected color value, got {tok.value!r} at position {tok.pos}"
         raise ParseError(msg)
 
-    def parse_date_value(self) -> QueryNode:
-        """Parse a date value: YYYY or YYYY-MM-DD (hyphens must have no surrounding spaces)."""
+    def _hyphen_number_follows(self) -> bool:
+        """True if the next tokens are '-' NUMBER with no space on either side of the '-'."""
+        return (
+            self.peek().type == TT.MINUS
+            and not self.peek().space_before
+            and self.peek(1).type == TT.NUMBER
+            and not self.peek(1).space_before
+        )
+
+    def parse_date_value(self, operator: str) -> QueryNode:
+        """Parse a date value: YYYY or YYYY-MM-DD (hyphens must have no surrounding spaces).
+
+        Anything between the two -- `date:2020-01` -- is an error: it used to consume the month and
+        then fall through to the bare year, silently searching for something other than what was
+        typed. A float where a month or day should be (`2020-1.5-01`) is an error for the same reason;
+        `int()` would have truncated it.
+        """
         tok = self.peek()
         if tok.type != TT.NUMBER:
             msg = f"Expected date, got {tok.value!r} at position {tok.pos}"
             raise ParseError(msg)
         self.consume()
-        year = _validate_mtg_year(tok.value, tok.pos)
-        # Consume YYYY-MM-DD: two MINUS+NUMBER pairs without spaces
-        if (
-            self.peek().type == TT.MINUS
-            and not self.peek().space_before
-            and self.peek(1).type == TT.NUMBER
-            and not self.peek(1).space_before
-        ):
-            self.consume()
-            month_tok = self.consume()
-            if (
-                self.peek().type == TT.MINUS
-                and not self.peek().space_before
-                and self.peek(1).type == TT.NUMBER
-                and not self.peek(1).space_before
-            ):
-                self.consume()
-                day_tok = self.consume()
-                month = int(month_tok.value)
-                day = int(day_tok.value)
-                try:
-                    datetime.date(year=year, month=month, day=day)
-                except ValueError as exc:
-                    msg = f"Invalid date {year}-{month:02d}-{day:02d} at position {tok.pos}: {exc}"
-                    raise ParseError(msg) from exc
-                return StringValueNode(f"{year}-{month:02d}-{day:02d}")
-        return StringValueNode(str(year))
+        year = validate_year(tok.value, tok.pos, operator)
+        if not self._hyphen_number_follows():
+            return StringValueNode(str(year))
+        self.consume()  # MINUS
+        month_tok = self.consume()
+        if not self._hyphen_number_follows():
+            msg = f"Expected a full date YYYY-MM-DD, got {year}-{month_tok.raw} at position {tok.pos}"
+            raise ParseError(msg)
+        self.consume()  # MINUS
+        day_tok = self.consume()
+        if isinstance(month_tok.value, float) or isinstance(day_tok.value, float):
+            msg = f"Expected integer month and day, got {year}-{month_tok.raw}-{day_tok.raw} at position {tok.pos}"
+            raise ParseError(msg)
+        return StringValueNode(validate_date(year, month_tok.value, day_tok.value, tok.pos))
 
-    def parse_year_value(self) -> QueryNode:
-        """Parse a year value: 4-digit integer >= 1992."""
+    def parse_year_value(self, operator: str) -> QueryNode:
+        """Parse a year value: a four-digit integer (see validate_year for the per-operator gate)."""
         tok = self.peek()
         if tok.type != TT.NUMBER:
             msg = f"Expected year, got {tok.value!r} at position {tok.pos}"
             raise ParseError(msg)
         self.consume()
-        year = _validate_mtg_year(tok.value, tok.pos)
+        year = validate_year(tok.value, tok.pos, operator)
         return StringValueNode(str(year))
 
 

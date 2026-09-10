@@ -30,7 +30,7 @@ from api.parsing.db_info import (
     PARSER_CLASS_TO_FIELD_INFOS,
     ParserClass,
 )
-from api.parsing.hand_parser import REGEX_UNSUPPORTED_FIELD_MESSAGE
+from api.parsing.hand_parser import REGEX_UNSUPPORTED_FIELD_MESSAGE, validate_date, validate_year
 from api.parsing.mana_symbols import first_invalid_mana_symbol
 from api.parsing.nodes import (
     AndNode,
@@ -128,6 +128,24 @@ def make_text_condition_node(tokens: list[object]) -> BinaryOperatorNode:
             raise ValueError(REGEX_UNSUPPORTED_FIELD_MESSAGE)
         right = ("quoted", literal)
     return make_binary_operator_node([left, operator, right])
+
+
+def make_year_condition_node(_s: str, loc: int, tokens: list[object]) -> BinaryOperatorNode:
+    """Build a year condition, applying hand_parser.validate_year's per-operator gate."""
+    _left, operator, right = tokens
+    validate_year(int(right), loc, operator)
+    return make_binary_operator_node(tokens)
+
+
+def make_date_condition_node(_s: str, loc: int, tokens: list[object]) -> BinaryOperatorNode:
+    """Build a date condition: the year passes validate_year's gate, a full date must be a real date."""
+    _left, operator, right = tokens
+    year_str, _, month_day = right.partition("-")
+    validate_year(int(year_str), loc, operator)
+    if month_day:
+        month, day = (int(part) for part in month_day.split("-"))
+        validate_date(int(year_str), month, day, loc)
+    return make_binary_operator_node(tokens)
 
 
 def create_attribute_parser(parser_class: ParserClass) -> ParserElement:
@@ -414,10 +432,10 @@ def create_all_condition_parsers(basic_parsers: dict, mana_parsers: dict, color_
     text_condition.set_parse_action(make_text_condition_node)
 
     date_value = Regex(r"\d{4}(?:-\d{2}-\d{2})?")
-    date_condition = create_condition_parser(date_attr_word, date_value, operators=EQ_ALIAS_OPERATORS)
+    date_condition = (date_attr_word + EQ_ALIAS_OPERATORS + date_value).set_parse_action(make_date_condition_node)
 
     year_value = Regex(r"\d{4}")
-    year_condition = create_condition_parser(year_attr_word, year_value, operators=EQ_ALIAS_OPERATORS)
+    year_condition = (year_attr_word + EQ_ALIAS_OPERATORS + year_value).set_parse_action(make_year_condition_node)
 
     attr_attr_condition = (
         (numeric_attr_word + DEFAULT_OPERATORS + numeric_attr_word)

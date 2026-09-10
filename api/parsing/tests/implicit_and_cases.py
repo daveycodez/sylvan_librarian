@@ -213,6 +213,16 @@ TESTCASES = [
     # Date/year (numeric-looking values)
     {"query": "date:2025", "expected": "date:2025", "id": "date_value"},
     {"query": "year:2024", "expected": "year:2024", "id": "year_value"},
+    # A comparison against any four-digit year is meaningful; only `=`/`:` get the Magic-era gate.
+    {"query": "year<1991", "expected": "year<1991", "id": "year_before_magic_comparison"},
+    {"query": "date<1993", "expected": "date<1993", "id": "date_before_magic_comparison"},
+    {"query": "year>=2100", "expected": "year>=2100", "id": "year_far_future_comparison"},
+    {"query": "year:1500", "expected": "year:1500", "id": "year_before_magic_equality_rejected"},
+    {"query": "date=2099-01-01", "expected": "date=2099-01-01", "id": "date_far_future_equality_rejected"},
+    {"query": "year>99999", "expected": "year>99999", "id": "year_five_digits_rejected"},
+    # A partial or impossible date is an error, not a silent search for the year alone.
+    {"query": "date:2020-01", "expected": "date:2020-01", "id": "date_month_without_day_rejected"},
+    {"query": "date:2020-02-30", "expected": "date:2020-02-30", "id": "date_impossible_rejected"},
     # Dots in attribute values (e.g. sentence-ending period in oracle text search)
     {"query": "o:token.", "expected": "o:token.", "id": "oracle_value_trailing_dot"},
     {"query": "o:token. -o:counter", "expected": "o:token. AND -o:counter", "id": "oracle_value_trailing_dot_with_negation"},
