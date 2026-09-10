@@ -910,6 +910,45 @@ class TestAPIResourceStaticFileServing(unittest.TestCase):
         assert "<!-- SERVER_SIDE_RESULTS_COUNT -->" not in mock_response.text
         assert 'Found 1 card matching "elf"' in mock_response.text
 
+    def test_index_html_with_zero_results_says_so(self) -> None:
+        """A zero-hit query renders a `no-results` status, not a blank page, with the query escaped."""
+        mock_response = MagicMock()
+        hostile_query = "t:<script>alert(1)</script>"
+
+        with patch.object(self.api_resource, "_search", return_value={"cards": [], "total_cards": 0, "query": hostile_query}):
+            self.api_resource._root(falcon_response=mock_response, q=hostile_query)
+
+        text = mock_response.text
+        assert "no-results" in text
+        assert 'Found 0 cards matching "t:&lt;script&gt;alert(1)&lt;/script&gt;"' in text
+        assert "<script>alert(1)</script>" not in text
+        assert "<!-- SERVER_SIDE_RESULTS_COUNT -->" not in text
+
+    def test_index_html_with_rejected_query_shows_the_explanation(self) -> None:
+        """A rejected query renders an `error-message` status carrying the API's own explanation, escaped."""
+        mock_response = MagicMock()
+        hostile_query = "<script>alert(1)</script>"
+        rejection = falcon.HTTPBadRequest(title="Invalid Search Query", description=f'Failed to parse query: "{hostile_query}"')
+
+        with patch.object(self.api_resource, "_search", side_effect=rejection):
+            self.api_resource._root(falcon_response=mock_response, q=hostile_query)
+
+        text = mock_response.text
+        assert "error-message" in text
+        # escape_html also escapes the double quotes around the echoed query.
+        assert "Failed to parse query: &quot;&lt;script&gt;alert(1)&lt;/script&gt;&quot;" in text
+        assert "<script>alert(1)</script>" not in text
+        # No results were embedded, so the JS client still runs the search itself.
+        assert "window.EMBEDDED_SEARCH_RESULTS" not in text
+
+    def test_index_html_with_internal_failure_does_not_echo_the_error(self) -> None:
+        mock_response = MagicMock()
+        with patch.object(self.api_resource, "_search", side_effect=ValueError("internal detail about a column")):
+            self.api_resource._root(falcon_response=mock_response, q="elf")
+        assert "error-message" in mock_response.text
+        assert "internal detail" not in mock_response.text
+        assert "The search &quot;elf&quot; could not be run." in mock_response.text
+
     def test_favicon_ico_serves_binary_content(self) -> None:
         """Test favicon_ico serves binary content correctly."""
         mock_response = MagicMock()

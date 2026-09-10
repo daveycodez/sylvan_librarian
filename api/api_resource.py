@@ -26,7 +26,7 @@ from api.admin_resource import ADMIN_MOUNT_PREFIX, AdminContext, AdminResource
 from api.app_context import AppContext
 from api.enums import CardOrdering, PreferOrder, ResponseShape, SortDirection, UniqueOn
 from api.middlewares.timing import record_span
-from api.noscript_helpers import generate_results_count_html, generate_results_html
+from api.noscript_helpers import generate_error_html, generate_results_html, generate_status_html
 from api.parsing import generate_sql_query, parse_scryfall_query
 from api.parsing.query_budget import (
     QUERY_REGEX_REJECTED_MESSAGE,
@@ -267,6 +267,17 @@ def _copy_query_result(result: dict[str, Any]) -> dict[str, Any]:
     if "result" in copied:
         copied["result"] = [dict(row) for row in copied["result"]]
     return copied
+
+
+def _rejected_query_message(err: Exception, query: str) -> str:
+    """What to tell a no-JS reader whose embedded search was rejected.
+
+    An HTTPBadRequest's description is already the user-facing explanation the JSON API returns
+    for the same query. Anything else is an internal message and is not echoed.
+    """
+    if isinstance(err, falcon.HTTPBadRequest) and isinstance(err.description, str) and err.description:
+        return err.description
+    return f'The search "{query}" could not be run.'
 
 
 def _log_http_error(path: str, oops: falcon.HTTPError) -> None:
@@ -1183,22 +1194,16 @@ class APIResource:
                 cards = search_results.get("cards", [])
                 total_cards = search_results.get("total_cards", len(cards))
 
-                # Generate server-side HTML for cards (for no-JS support)
-                results_html = generate_results_html(cards) if cards else ""
-                results_count_html = generate_results_count_html(total_cards, search_query) if cards else ""
-
-                # Inject the server-side rendered HTML
+                # Server-side HTML for no-JS support: the cards, and a status line that says
+                # "found N" or "found none" -- a zero-hit search used to render a blank page.
                 html_content = html_content.replace(
                     "<!-- SERVER_SIDE_RESULTS -->",
-                    results_html,
+                    generate_results_html(cards),
                 )
-
-                # Inject the results count into the status message container
-                if results_count_html:
-                    html_content = html_content.replace(
-                        "<!-- SERVER_SIDE_RESULTS_COUNT -->",
-                        f'<div class="results-count">{results_count_html}</div>',
-                    )
+                html_content = html_content.replace(
+                    "<!-- SERVER_SIDE_RESULTS_COUNT -->",
+                    generate_status_html(total_cards, search_query),
+                )
 
                 # Convert search results to JSON and embed for JavaScript enhancement
                 search_results_json = serialize_embedded_json(search_results)
@@ -1213,8 +1218,13 @@ class APIResource:
                 # Disable caching for pages with search results
                 set_cache_header(falcon_response, duration=timedelta(seconds=90))
             except (ValueError, falcon.HTTPBadRequest, psycopg.errors.DatatypeMismatch) as err:
-                # If search fails, just serve the page without embedded results
+                # A rejected query. Serve the page without embedded results, but tell the no-JS
+                # reader why -- the JS client shows the same explanation; a blank page said nothing.
                 logger.warning("Failed to embed search results: %s", err)
+                html_content = html_content.replace(
+                    "<!-- SERVER_SIDE_RESULTS_COUNT -->",
+                    generate_error_html(_rejected_query_message(err, search_query)),
+                )
                 set_cache_header(falcon_response, duration=timedelta(hours=1))
         else:
             # Cache for 1 hour - improves repeat visit performance
