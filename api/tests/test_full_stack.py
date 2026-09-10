@@ -153,3 +153,19 @@ class TestSearchFailuresAreNotCacheable:
             result = client.simulate_get("/search", params={"q": "bolt"})
         assert result.status == falcon.HTTP_200
         assert result.headers.get("Cache-Control") == "public, max-age=90"
+
+
+class TestMalformedHostHeader:
+    """A Host header the client controls must never be a 500.
+
+    `req.host` raises ValueError for a non-numeric port, and the site-name lookup's urlparse raises
+    for an unbalanced IPv6 bracket; both surfaced as 500 + an error-monitor notice on every route
+    that derives a site name.
+    """
+
+    @pytest.mark.parametrize(argnames=["host"], argvalues=[("example.com:abc",), ("[abc",), ("a]b",), ("[::1",)])
+    @pytest.mark.parametrize(argnames=["path"], argvalues=[("/",), ("/card/tst/1",)])
+    def test_page_still_renders(self, client: falcon.testing.TestClient, host: str, path: str) -> None:
+        result = client.simulate_get(path, host=host)
+        assert result.status == falcon.HTTP_200, result.text
+        assert result.headers.get("content-type", "").startswith("text/html")

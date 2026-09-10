@@ -265,6 +265,19 @@ def _copy_query_result(result: dict[str, Any]) -> dict[str, Any]:
     return copied
 
 
+def _request_host(req: falcon.Request) -> str:
+    """The Host header's hostname, tolerating a malformed header.
+
+    `req.host` parses the port and raises ValueError for `Host: example.com:abc`, which made a
+    header any client can send a 500 (and an error-monitor notice) on every route. The raw header is
+    good enough for the one consumer, the site-name lookup, which validates it again itself.
+    """
+    try:
+        return req.host
+    except ValueError:
+        return req.env.get("HTTP_HOST", "")
+
+
 class APIResource:
     """Class implementing request handling for our simple API."""
 
@@ -359,7 +372,7 @@ class APIResource:
             # spoof it via ?admin_authenticated=1 on a path that doesn't resolve to anything.
             params["admin_authenticated"] = req.context.get("admin_authenticated", False)
         params["falcon_response"] = resp
-        params["request_host"] = req.get_header("X-Proxy-Host") or req.host
+        params["request_host"] = req.get_header("X-Proxy-Host") or _request_host(req)
         return params
 
     def _handle(self, req: falcon.Request, resp: falcon.Response) -> None:
