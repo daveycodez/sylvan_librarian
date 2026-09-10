@@ -13817,3 +13817,69 @@ fn inline_str_reports_truncation_and_cuts_on_a_char_boundary() {
     assert!(!InlineStr::<8>::truncates("plst"));
     assert!(InlineStr::<8>::truncates("nine-char"));
 }
+
+/// The emit caches (`EmitStrCache`, and the catalog counts beside it) belong to the MAPPING, not the
+/// engine: interned string ids are archive-relative, so after a reload the same id can name different
+/// text, and a cache that outlived its archive would hand out the old text under the new id. Archive
+/// A, then archive B published the way `reload_commit` publishes (`rename(2)`, a new inode) with the
+/// same string id and the same vocab id bound to different text: `get_mapping` must hand back a new
+/// mapping AND fresh caches, and the same archive asked for again must not.
+#[test]
+fn reload_replaces_the_emit_caches_with_the_mapping() {
+    let scratch = ScratchDir::new("emit_cache");
+    let shm_path = scratch.0.join("cards.bin");
+    let engine = super::QueryEngine {
+        shm_path: shm_path.clone(),
+        staging: std::sync::Mutex::new(None),
+        cached_mmap: std::sync::Mutex::new(None),
+    };
+
+    // One card whose `type_line` is string id 0 and whose one keyword is vocab id 0.
+    let store_with = |type_line: &str, keyword: &str| -> CardData {
+        let mut vocab = VocabInterner::new();
+        let kw = vocab.intern(keyword.to_string()).expect("intern");
+        let mut card = stub_card(1, TYPE_CREATURE, &[], &mut vocab);
+        card.card_keywords = vec![kw];
+        let mut data = store_of(vec![card], &[1], vocab);
+        data.strings = vec![type_line.to_string()];
+        data
+    };
+    let publish = |data: &CardData, tag: &str| {
+        let mut bytes = archive_header().to_vec();
+        bytes.extend_from_slice(&rkyv::to_bytes::<Error>(data).expect("serialize"));
+        let tmp = shm_path.with_extension(format!("{tag}.tmp"));
+        std::fs::write(&tmp, &bytes).expect("write tmp");
+        std::fs::rename(&tmp, &shm_path).expect("publish"); // rename(2), as reload_commit does: a new inode
+    };
+    let texts_of = |mmap: &Mmap| -> (String, String) {
+        // Safety: written by `rkyv::to_bytes` in this build, behind the header `get_mapping` checked.
+        let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(mmap)) };
+        (data.strings[0].as_str().to_string(), data.coll_vocab[0].as_str().to_string())
+    };
+
+    publish(&store_with("Creature — Elf", "flying"), "a");
+    let a = engine.get_mapping().expect("map A");
+    assert_eq!(texts_of(&a.mmap), ("Creature — Elf".to_string(), "flying".to_string()));
+    // Stand in for a served page: the cell arrays are sized on first use (the `PyString`s inside need a
+    // `py`, the sizing does not), which is enough to tell a reused cache from a fresh one.
+    a.str_cache.cells.get_or_init(|| (0..1).map(|_| OnceLock::new()).collect());
+    a.str_cache.coll_cells.get_or_init(|| (0..1).map(|_| OnceLock::new()).collect());
+
+    publish(&store_with("Creature — Goblin", "haste"), "b");
+    let b = engine.get_mapping().expect("map B");
+    assert_eq!(
+        texts_of(&b.mmap),
+        ("Creature — Goblin".to_string(), "haste".to_string()),
+        "string id 0 and vocab id 0 name different text in B"
+    );
+    assert!(!std::sync::Arc::ptr_eq(&a.mmap, &b.mmap), "a new inode is a new mapping");
+    assert!(!std::sync::Arc::ptr_eq(&a.str_cache, &b.str_cache), "a cache built over A must never serve B");
+    assert!(!std::sync::Arc::ptr_eq(&a.catalog, &b.catalog), "the catalog counts are per mapping too");
+    assert!(b.str_cache.cells.get().is_none() && b.str_cache.coll_cells.get().is_none(), "B's caches start empty");
+    // In-flight readers of A keep A: the old mapping is immutable and still theirs.
+    assert_eq!(texts_of(&a.mmap).0, "Creature — Elf");
+
+    // The same archive again: no remap, the same caches.
+    let b2 = engine.get_mapping().expect("map B again");
+    assert!(std::sync::Arc::ptr_eq(&b.mmap, &b2.mmap) && std::sync::Arc::ptr_eq(&b.str_cache, &b2.str_cache));
+}
