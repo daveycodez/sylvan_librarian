@@ -13676,10 +13676,11 @@ fn bind_and_split_filter(
     sort_col: SortCol,
 ) -> PyResult<(Option<PlaneExpr>, FilterExpr, SortBound, FilterExpr)> {
     let to_json = filters.call_method0("to_json")?;
-    let json_bytes: Vec<u8> = py
-        .import("orjson")?
-        .call_method1("dumps", (to_json,))?
-        .extract()?;
+    // `orjson.dumps` resolved once per process: `py.import` is a dict lookup plus an attribute walk
+    // on every query otherwise. A `PyOnceLock` because the initializer runs Python under the GIL.
+    static ORJSON_DUMPS: pyo3::sync::PyOnceLock<Py<PyAny>> = pyo3::sync::PyOnceLock::new();
+    let dumps = ORJSON_DUMPS.get_or_try_init(py, || py.import("orjson")?.getattr("dumps").map(Bound::unbind))?;
+    let json_bytes: Vec<u8> = dumps.bind(py).call1((to_json,))?.extract()?;
     let json_str = std::str::from_utf8(&json_bytes)
         .map_err(|e| RetryableQueryError::new_err(format!("bad UTF-8 from orjson: {e}")))?;
     let json_val: Value = serde_json::from_str(json_str)
