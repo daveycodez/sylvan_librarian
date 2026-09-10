@@ -277,10 +277,16 @@ def _regex_plain_literal(pattern: str) -> str | None:
     r"""The exact substring an unanchored, metacharacter-free regex matches, else None.
 
     A regex made only of literal characters (and escaped punctuation like ``\.``) is a plain
-    substring search, so ``o:/sacrifice a/`` == ``o:"sacrifice a"``. Escaped punctuation unescapes
-    to its literal; an alphanumeric escape (``\d`` / ``\w`` / ``\b``) is a character class -> None;
-    any anchor (``^`` / ``$``) or live metacharacter -> None. Mirrors the engine's ``regex_tier``
+    substring search, so ``o:/sacrifice/`` == ``o:sacrifice``. Escaped punctuation unescapes to its
+    literal; an alphanumeric escape (``\d`` / ``\w`` / ``\b``) is a character class -> None; any
+    anchor (``^`` / ``$``) or live metacharacter -> None. Mirrors the engine's ``regex_tier``
     classification (card_engine/src/filter.rs) so the two never disagree about "plain literal".
+
+    A literal containing whitespace is also None, even though it is a plain literal: the SQL path
+    renders a substring leaf as ``LIKE '%draw%a%card%'`` -- each word may match anywhere, in order,
+    with anything between -- while the regex ``draw a card`` is contiguous. Lowering it would change
+    what the query matches, so it stays a regex. Whether the quoted-phrase form should itself be
+    contiguous is a separate question, and not one this pass may answer.
     """
     out: list[str] = []
     it = iter(pattern)
@@ -292,6 +298,8 @@ def _regex_plain_literal(pattern: str) -> str | None:
             out.append(nxt)
         elif c in ".*+?()[]{}|^$":
             return None
+        elif c.isspace():
+            return None  # contiguous in a regex, gapped in the substring form -- not the same query
         else:
             out.append(c)
     return "".join(out) or None  # empty pattern matches everything -> leave it a regex

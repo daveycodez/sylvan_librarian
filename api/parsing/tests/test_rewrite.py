@@ -147,11 +147,12 @@ def test_not_generates_same_sql_as_negated_is(not_query: str, expansion: str) ->
 
 
 # ── #734: plain-literal regex -> substring lowering ──────────────────────────
-# A metacharacter-free, unanchored regex is a substring search, so it must parse to exactly the same
-# AST as its quoted-substring form (which is index-backed, where an arbitrary regex is a full scan).
+# A metacharacter-free, unanchored, whitespace-free regex is a substring search, so it must parse to
+# exactly the same AST as its substring form (which is index-backed, where an arbitrary regex is a
+# full scan).
 LOWERED_EQUIVALENCES = [
-    ("o:/sacrifice a/", 'o:"sacrifice a"'),
-    ("name:/lightning bolt/", 'name:"lightning bolt"'),
+    ("o:/sacrifice/", "o:sacrifice"),
+    ("name:/lightning/", "name:lightning"),
     (r"o:/foo\.bar/", 'o:"foo.bar"'),  # escaped punctuation unescapes to its literal
     (r"o:/\{t\}/", 'o:"{t}"'),  # escaped braces
     ("ft:/dragon/", "ft:dragon"),
@@ -189,18 +190,41 @@ def test_lowered_regex_generates_same_sql(regex_query: str, substring_query: str
         ("o:/[aeiou]/",),  # character class
         (r"o:/\d+/",),  # class escape
         ("o:/a|b/",),  # alternation
+        # A plain literal with whitespace is contiguous as a regex but the substring leaf renders as
+        # LIKE '%draw%a%card%' on the SQL path, so lowering it would widen the query.
+        ("o:/draw a card/",),
+        ("name:/lightning bolt/",),
     ],
-    ids=["anchored-both", "anchored-start", "anchored-end", "metachar", "char-class", "class-escape", "alternation"],
+    ids=[
+        "anchored-both",
+        "anchored-start",
+        "anchored-end",
+        "metachar",
+        "char-class",
+        "class-escape",
+        "alternation",
+        "whitespace",
+        "whitespace-name",
+    ],
 )
 def test_nonliteral_regex_stays_regex(parse_query, query: str) -> None:
-    """Anchors, metacharacters, and character classes are NOT substrings — keep them as a regex leaf."""
+    """Anchors, metacharacters, character classes, and whitespace are NOT substrings — keep the regex leaf."""
     assert isinstance(parse_query(query).root.rhs, RegexValueNode)
 
 
+def test_whitespace_literal_regex_keeps_contiguous_sql() -> None:
+    """The regex reaches the SQL as a contiguous `~*` match, not a gapped LIKE pattern."""
+    sql, params = generate_sql_query(parse_scryfall_query("o:/draw a card/"))
+    assert "~*" in sql
+    assert "draw a card" in params.values()
+
+
 _PLAIN_LITERAL_CASES = {
-    "bare_literal": {"pattern": "sacrifice a", "expected": "sacrifice a"},
+    "bare_literal": {"pattern": "sacrifice", "expected": "sacrifice"},
     "escaped_dot": {"pattern": r"foo\.bar", "expected": "foo.bar"},
-    "escaped_braces": {"pattern": r"\{t\}: add", "expected": "{t}: add"},
+    "escaped_braces": {"pattern": r"\{t\}:", "expected": "{t}:"},
+    "whitespace": {"pattern": "sacrifice a", "expected": None},
+    "tab": {"pattern": "sacrifice\ta", "expected": None},
     "start_anchor": {"pattern": "^flying", "expected": None},
     "end_anchor": {"pattern": "flying$", "expected": None},
     "star": {"pattern": "a*b", "expected": None},
