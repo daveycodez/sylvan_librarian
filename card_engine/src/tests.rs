@@ -12841,7 +12841,7 @@ fn printing_range_walk_matches_naive_page() {
                 let perm = archived.indexes.sort_perms.get(sc, desc).expect("perm exists");
                 for &(off, lim) in &[(0usize, 10usize), (0, 100), (5, 20), (50, 50), (300, 25)] {
                     let got = walk_printing_page(
-                        &QueryCtx::from(archived), &kernel_params(Mode::Printing, sc, desc, lim, off), &leaf, perm,
+                        &QueryCtx::from(archived), &kernel_params(Mode::Printing, sc, desc, lim, off), &leaf, perm, archived.printings.len(),
                     );
                     let want = naive_printing_page(archived, &leaf, sc, desc, off, lim);
                     assert_eq!(page_scryfall_ids(&got), want, "walk seed {seed} desc {desc} off {off} lim {lim}");
@@ -12876,7 +12876,7 @@ fn printing_range_aligned_page_matches_naive_incl_tie_buckets() {
                     if off >= k {
                         continue;
                     }
-                    let got = aligned_page(idx, 0, 5000, &archived.cards, &archived.printings, &archived.indexes.printing_to_card, desc, off, lim);
+                    let got = aligned_page(idx, 0, 5000, &archived.cards, &archived.printings, &archived.indexes.printing_to_card, desc, off, lim, k);
                     let want = naive_printing_page(archived, &leaf, SortCol::PriceUsd, desc, off, lim);
                     assert_eq!(page_scryfall_ids(&got), want, "aligned seed {seed} desc {desc} off {off} lim {lim} k {k}");
                 }

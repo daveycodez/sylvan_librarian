@@ -6641,11 +6641,14 @@ fn walk_printing_page<'a>(
     params: &QueryParams,
     leaf: &FilterExpr,
     perm: &Archived<Vec<u32>>,
+    total: usize,
 ) -> Vec<(&'a AOracleCard, &'a APrinting)> {
     let QueryCtx { cards, printings, offsets, strings, .. } = *ctx;
     let QueryParams { sort_col, descending, limit, page_offset, .. } = *params;
     let residual: [&FilterExpr; 1] = [leaf];
-    let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit);
+    // Sized to the rows this page can actually hold, not the caller's `limit`: an internal caller
+    // passes 1,000,000 for "everything", which is 16 MB of buffer for a page of a few thousand.
+    let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit.min(total.saturating_sub(page_offset)));
     if limit == 0 {
         return page;
     }
@@ -6712,10 +6715,11 @@ fn aligned_page<'a>(
     descending: bool,
     page_offset: usize,
     limit: usize,
+    total: usize,
 ) -> Vec<(&'a AOracleCard, &'a APrinting)> {
     let ks = idx.keys.partition_point(|k| u32::from(*k) < lo);
     let ke = idx.keys.partition_point(|k| u32::from(*k) < hi);
-    let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit);
+    let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit.min(total.saturating_sub(page_offset)));
     if limit == 0 {
         return page;
     }
@@ -6806,7 +6810,7 @@ fn printing_range_fastpath_inner<'a>(
             return None;
         }
         note_paging_taken(PagingTaken::RangeAligned);
-        let page = aligned_page(idx, lo, hi, cards, printings, &indexes.printing_to_card, descending, page_offset, limit);
+        let page = aligned_page(idx, lo, hi, cards, printings, &indexes.printing_to_card, descending, page_offset, limit, k);
         return Some((k, page));
     }
     // The walk reproduces run_query_streamed's *stream* emission (per-card-contiguous), which the
@@ -6829,7 +6833,7 @@ fn printing_range_fastpath_inner<'a>(
         return None;
     }
     note_paging_taken(PagingTaken::RangeWalk);
-    Some((k, walk_printing_page(ctx, params, filter, perm)))
+    Some((k, walk_printing_page(ctx, params, filter, perm, k)))
 }
 
 /// The exact `unique=printing` total for a bare `border:VALUE` leaf, from the #724 printing planes:
@@ -8334,8 +8338,8 @@ fn walk_value_orderby_page<'a>(
     let QueryCtx { cards, printings, offsets, indexes, .. } = *ctx;
     let QueryParams { mode, prefer, descending, limit, page_offset, .. } = *params;
     let printing_to_card = &indexes.printing_to_card;
-    let want = page_offset + limit;
-    let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit);
+    let want = page_offset.saturating_add(limit);
+    let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit.min(total.saturating_sub(page_offset)));
     if limit == 0 {
         return Some((page, ComposePageWork::default()));
     }
@@ -9738,7 +9742,11 @@ fn walk_grouped_page<'a>(
     let QueryParams { mode, prefer, sort_col, descending, limit, page_offset, .. } = *params;
     let max_artwork_groups = u16::from(indexes.max_artwork_groups);
     let is_set = |pid: usize| pbits[pid >> 6] & (1u64 << (pid & 63)) != 0;
-    let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit);
+    // Sized to the rows this page can hold rather than the caller's `limit` (1,000,000 from an
+    // internal "everything" caller is 16 MB of buffer). The set-printing count is the exact total in
+    // printing mode and an upper bound in the grouped modes; ~1.5k word popcounts against a walk.
+    let set_printings: usize = pbits.iter().map(|w| w.count_ones() as usize).sum();
+    let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit.min(set_printings.saturating_sub(page_offset)));
     // per group key: (best matching pid, its prefer score). Pre-sized so the grouping loop needs no
     // per-printing resize check: Artwork needs one slot per group, Card collapses to a single group
     // (gid 0), Printing does no grouping. Card's fixed len 1 also keeps the loop safe if a
@@ -9910,7 +9918,7 @@ fn walk_card_page_via_popcount_skip<'a>(
     // emitted card's span here, not during the scatter, is what keeps this bounded by `limit` rather
     // than by total matches -- the same reason `run_query_streamed_popcount`'s own emit phase does it.
     let is_set = |pid: usize| pbits[pid >> 6] & (1u64 << (pid & 63)) != 0;
-    let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit);
+    let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit.min(total.saturating_sub(page_offset)));
     if limit == 0 {
         return (page, work);
     }
@@ -10025,7 +10033,7 @@ fn walk_printing_page_via_popcount_skip<'a>(
     // printings before pushing rows -- bounded by one block's worth of cards plus however many more
     // it takes to fill `limit`, not by how deep the walk would otherwise need to go.
     let is_set = |pid: usize| pbits[pid >> 6] & (1u64 << (pid & 63)) != 0;
-    let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit);
+    let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit.min((total as usize).saturating_sub(page_offset)));
     if limit == 0 {
         return (page, work);
     }
@@ -10151,7 +10159,7 @@ fn walk_artwork_page_via_popcount_skip<'a>(
     let mut touched: Vec<u16> = Vec::new();
     let mut scratch: Vec<Match> = Vec::new();
     let mut skip = skip as usize;
-    let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit);
+    let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit.min((total as usize).saturating_sub(page_offset)));
     if limit == 0 {
         return (page, work);
     }
@@ -12701,7 +12709,7 @@ fn run_query_streamed_popcount<'a>(
         let existential = plane.is_some_and(|e| plane_expr_is_existential(e, u64::from(planes.divergent_formats)));
         // Ends `ns_loop` (the skip scan) and starts `ns_finish` (the emit walk).
         let t_finish = std::time::Instant::now();
-        let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit);
+        let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit.min(total.saturating_sub(page_offset)));
         'walk: while limit > 0 && word_idx < permuted.len() {
             let mut w = permuted[word_idx];
             while w != 0 {
@@ -12975,7 +12983,7 @@ fn run_query_streamed<'a>(
     // narrowing the segment cannot change which rows come back — only how many entries are stepped to
     // find them.
     let mut skip = page_offset;
-    let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit);
+    let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit.min(total.saturating_sub(page_offset)));
     let mut scratch: Vec<Match> = Vec::new();
     // Counted for every entry the walk touches, including the ones skipped on a zero count -- that
     // skip IS the walk's cost, and it is what grows as matches thin out in a larger corpus. Entries
