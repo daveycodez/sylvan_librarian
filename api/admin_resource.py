@@ -90,6 +90,10 @@ IMPORT_LOCK_TIMEOUT = 2
 # total, and it halves the logged parameter too (see log_parameter_max_length in the pg config).
 _UPSERT_PAGE_SIZE = 3_000
 
+# Per-statement timeout for the import's upsert batches and the is: tag sync. Set LOCAL, inside the
+# transaction of each batch, so it never outlives the batch on the pooled connection.
+_IMPORT_STATEMENT_TIMEOUT_MS = 30_000
+
 # BOOLEAN_IS_TAGS sync runs once per import over the whole corpus, evaluating every
 # managed expression per row. Chunk by scryfall_id hash so each statement stays within
 # the import's statement_timeout as the tag list grows.
@@ -843,6 +847,8 @@ class AdminResource:
         sync_sql = _build_boolean_is_tags_sql(BOOLEAN_IS_TAGS)
         with conn.cursor() as cursor:
             for chunk_index in range(_BOOLEAN_IS_TAGS_SYNC_CHUNK_COUNT):
+                # Each chunk commits, so each chunk is its own transaction and sets its own timeout.
+                db_utils.set_statement_timeout(cursor, _IMPORT_STATEMENT_TIMEOUT_MS)
                 cursor.execute(
                     sync_sql,
                     {
@@ -1236,8 +1242,6 @@ class AdminResource:
 
         try:
             with self.app_context.writer_pool.connection() as conn:
-                with conn.cursor() as cursor:
-                    db_utils.set_statement_timeout(cursor, 30_000)
 
                 class _CardStream:
                     """Preprocesses raw cards lazily, tracking stage counts."""
@@ -1257,6 +1261,9 @@ class AdminResource:
                 cards_inserted = cards_updated = cards_sent = 0
 
                 for page in itertools.batched(stream, page_size):
+                    with conn.cursor() as cursor:
+                        # LOCAL to this batch's transaction; nothing persists on the pooled connection.
+                        db_utils.set_statement_timeout(cursor, _IMPORT_STATEMENT_TIMEOUT_MS)
                     batch = _bulk_upsert(
                         conn,
                         "cards",

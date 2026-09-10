@@ -10,10 +10,13 @@ import sys
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
+import psycopg
+import pytest
+
 from api.utils import db_utils
 
 if TYPE_CHECKING:
-    import pytest
+    from api.api_resource import APIResource
 
 SENTINEL_PASSWORD = "hunter2-do-not-log-me"
 
@@ -73,3 +76,40 @@ def test_importing_db_utils_does_not_import_the_docker_sdk() -> None:
         text=True,
     )
     assert completed.returncode == 0, completed.stderr
+
+
+class TestStatementTimeoutIsTransactionLocal:
+    """set_statement_timeout guards the statement that follows it, and only that transaction.
+
+    Against the real container: a session-level SET on a pooled connection persisted past commit,
+    so a writer connection kept a backfill's 600 s timeout for every later statement, and the reader
+    pool re-asserted its 10 s on every SQL search.
+    """
+
+    def test_timeout_applies_to_the_following_statement(self, api_resource: APIResource) -> None:
+        with api_resource.app_context.writer_pool.connection() as conn, conn.cursor() as cursor:
+            db_utils.set_statement_timeout(cursor, 50)
+            with pytest.raises(psycopg.errors.QueryCanceled):
+                cursor.execute("SELECT pg_sleep(1)")
+            conn.rollback()
+
+    def test_timeout_does_not_survive_a_commit_on_the_same_connection(self, api_resource: APIResource) -> None:
+        with api_resource.app_context.writer_pool.connection() as conn, conn.cursor() as cursor:
+            db_utils.set_statement_timeout(cursor, 12_345)
+            cursor.execute("SHOW statement_timeout")
+            assert cursor.fetchone()["statement_timeout"] == "12345ms", "in effect inside the transaction"
+            conn.commit()
+            cursor.execute("SHOW statement_timeout")
+            assert cursor.fetchone()["statement_timeout"] == "0", "gone once the transaction ended"
+
+    def test_next_borrower_of_the_pool_starts_clean(self, api_resource: APIResource) -> None:
+        pool = api_resource.app_context.writer_pool
+        with pool.connection() as conn, conn.cursor() as cursor:
+            db_utils.set_statement_timeout(cursor, 12_345)
+        with pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("SHOW statement_timeout")
+            assert cursor.fetchone()["statement_timeout"] == "0"
+
+    def test_rejects_a_non_integer(self) -> None:
+        with pytest.raises(ValueError, match="non-negative integer"):
+            db_utils.set_statement_timeout(MagicMock(), "10; DROP TABLE x")  # type: ignore[arg-type]

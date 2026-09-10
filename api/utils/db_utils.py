@@ -113,10 +113,18 @@ def configure_connection(conn: psycopg.Connection) -> None:
 
 
 def set_statement_timeout(cursor: psycopg.Cursor, statement_timeout: int) -> None:
-    """Validate and set the statement timeout for a database cursor.
+    """Set the statement timeout for the rest of the cursor's current transaction.
 
-    PostgreSQL SET commands don't support parameterized values, so we must
-    validate the value before using it in string interpolation.
+    `SET LOCAL`, not `SET`: pooled connections outlive the request that borrowed them, and a
+    session-level SET persisted past commit -- a writer connection kept a backfill's 600 s timeout for
+    every later statement, and the reader pool paid a round trip per SQL search to re-assert 10 s on
+    a connection that already had it. A LOCAL setting reverts at commit or rollback, so each borrower
+    starts clean. Pool connections are not autocommit, so the first statement opens the transaction
+    and this call, issued before the statement it guards, lands inside it. Re-issue it after every
+    commit in a loop that commits per batch.
+
+    PostgreSQL SET commands don't support parameterized values, so the value is validated before it
+    is interpolated.
 
     Args:
         cursor: Database cursor to execute the SET command on
@@ -128,7 +136,7 @@ def set_statement_timeout(cursor: psycopg.Cursor, statement_timeout: int) -> Non
     if not isinstance(statement_timeout, int) or statement_timeout < 0:
         msg = f"statement_timeout must be a non-negative integer, got: {statement_timeout}"
         raise ValueError(msg)
-    cursor.execute(f"set statement_timeout = {statement_timeout}")
+    cursor.execute(f"SET LOCAL statement_timeout = {statement_timeout}")
 
 
 def make_pool() -> psycopg_pool.ConnectionPool:
