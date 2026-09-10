@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::atomic::fence;
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -393,6 +394,14 @@ impl GenerationalSharedCache {
 
     // ── Rotation ──────────────────────────────────────────────────────────
 
+    /// Is `key` (with this hash) present and unexpired in any page other than `except`?
+    /// Must be called under the spinlock: it reads the other pages' slot tables directly.
+    fn live_in_other_pages(&self, except: usize, hash: u64, key: &[u8]) -> bool {
+        (0..self.n_pages)
+            .filter(|&p| p != except)
+            .any(|p| self.do_probe(p, hash, key).is_some())
+    }
+
     fn scan_survivors(&self, page_idx: usize) -> Vec<SurvivorEntry> {
         // Abort immediately if another worker is mid-rotation on this page (odd generation).
         if self.page_generation(page_idx) & 1 != 0 { return Vec::new(); }
@@ -486,7 +495,29 @@ impl GenerationalSharedCache {
             }
         }
 
-        // 3. Zero retiring page data (slot table + arena only; preserve header ptr).
+        // 3a. Drop the fingerprints of the entries that die with the retiring page. The filter is
+        //     shared by every page, so a fingerprint goes only if the key is neither a survivor nor
+        //     live in another page (a key re-set after this page was sealed has a newer copy there,
+        //     and its fingerprint must stay). Without this each rotation left gen_maxsize dead
+        //     fingerprints behind, the filter saturated, and every subsequent insert's failed
+        //     kick sequence evicted a random *live* fingerprint — false misses on cached keys.
+        let survivor_hashes: HashSet<u64> = survivors.iter().map(|s| s.hash).collect();
+        let arena = self.arena_base(retiring_idx);
+        for i in 0..self.slot_count_per_page {
+            let slot = unsafe { &*self.slot_ptr(retiring_idx, i as u32) };
+            let hash = slot.key_hash;
+            if hash == EMPTY || hash == TOMBSTONE || survivor_hashes.contains(&hash) {
+                continue;
+            }
+            let key = unsafe {
+                std::slice::from_raw_parts(arena.add(slot.key_offset as usize), slot.key_len as usize)
+            };
+            if !self.live_in_other_pages(retiring_idx, hash, key) {
+                self.filter().delete(hash);
+            }
+        }
+
+        // 3b. Zero retiring page data (slot table + arena only; preserve header ptr).
         let data_start = self.page_offset(retiring_idx) + PAGE_HEADER_SIZE;
         let data_len = self.slot_count_per_page * SLOT_SIZE
             + (self.page_size - self.arena_start_in_page);
@@ -501,9 +532,11 @@ impl GenerationalSharedCache {
 
         // 4. Re-insert survivors into the (now-blank) retiring page. If a survivor doesn't
         //    fit (arena full), remove it from the filter so it doesn't become a permanent
-        //    false positive.
+        //    false positive — unless a newer copy lives in another page.
         for s in survivors {
-            if !self.do_insert(retiring_idx, s.hash, &s.key_bytes, &s.value_bytes, s.expiry_ns, s.value_hash, s.body_len) {
+            if !self.do_insert(retiring_idx, s.hash, &s.key_bytes, &s.value_bytes, s.expiry_ns, s.value_hash, s.body_len)
+                && !self.live_in_other_pages(retiring_idx, s.hash, &s.key_bytes)
+            {
                 self.filter().delete(s.hash);
             }
         }
@@ -796,9 +829,8 @@ impl GenerationalSharedCache {
     /// Remove all copies of `key` from every page and the shared filter.
     /// Returns true if at least one copy was found and tombstoned.
     ///
-    /// Filter delete only happens if the key is found in the active page. If the key lives only
-    /// in a sealed page the filter fingerprint is left in place — future gets probe and
-    /// return None correctly; the fingerprint is cleared on the next rotation.
+    /// Every copy is tombstoned, so the fingerprint is deleted whichever page the key was found
+    /// in; a tombstone keeps no hash, so a fingerprint left behind here would never be reclaimed.
     pub fn pop(&mut self, key: &[u8]) -> bool {
         let hash = normalize_hash(xxh3_64(key));
         fence(Ordering::Acquire);
@@ -820,7 +852,6 @@ impl GenerationalSharedCache {
                     inc_value_seq(slot);
                     self.page_header_mut(active_idx).entry_count =
                         self.page_header(active_idx).entry_count.saturating_sub(1);
-                    self.filter().delete(hash);
                     write_key_hash(slot, TOMBSTONE);
                 } else {
                     // Sealed page: bracket the TOMBSTONE write with generation bumps so
@@ -833,6 +864,9 @@ impl GenerationalSharedCache {
                 }
                 found = true;
             }
+        }
+        if found {
+            self.filter().delete(hash);
         }
 
         unlock(&self.mmap);
@@ -988,6 +1022,58 @@ mod tests {
         let stats = cache.page_stats();
         assert_eq!(stats.len(), 2);
         assert!(stats.iter().all(|p| p.arena_used <= p.arena_capacity));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rotations_do_not_saturate_the_filter() {
+        // maxsize 64 gives a 64-bucket filter: 256 fingerprint slots for at most 64 live entries.
+        // Each rotation used to leave its page's dead fingerprints behind, so after a few hundred
+        // sets the filter was full and every insert's failed kick evicted a live fingerprint:
+        // keys that were cached went missing.
+        let path = temp_path("filter");
+        let mut cache = GenerationalSharedCache::open(&path, 64, 2, None, None).unwrap();
+        let recent = 8usize; // well inside two rotations (gen_maxsize 32), so all still cached
+        let keys: Vec<String> = (0..20_000u32).map(|i| format!("k{i}")).collect();
+        for i in 0..keys.len() {
+            put(&mut cache, keys[i].as_bytes(), b"v");
+            for k in &keys[i.saturating_sub(recent)..=i] {
+                assert!(cache.contains(k.as_bytes()), "{k} lost after set {i}: filter dropped a live fingerprint");
+            }
+        }
+        assert!(cache.rotation_count() > 500);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_key_re_set_after_rotation_keeps_its_fingerprint_when_the_old_copy_dies() {
+        let path = temp_path("reset");
+        let mut cache = GenerationalSharedCache::open(&path, 64, 2, None, None).unwrap();
+        put(&mut cache, b"hot", b"v1");
+        // gen_maxsize is 32. 40 sets: one rotation, "hot" v1 now sits in the sealed page and the
+        // active page holds a32..a39. Re-set "hot" (v2 lands in the active page), then 30 more
+        // sets: exactly one further rotation, which zeroes the page holding v1 — a dead copy of a
+        // key that is live in the other page. Its fingerprint must not be deleted with v1.
+        for i in 0..40u32 { put(&mut cache, format!("a{i}").as_bytes(), b"x"); }
+        assert_eq!(cache.rotation_count(), 1);
+        put(&mut cache, b"hot", b"v2");
+        for i in 0..30u32 { put(&mut cache, format!("b{i}").as_bytes(), b"x"); }
+        assert_eq!(cache.rotation_count(), 2);
+        assert!(cache.contains(b"hot"));
+        assert_eq!(get_body(&mut cache, b"hot").as_deref(), Some(&b"v2"[..]));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pop_of_a_sealed_page_key_clears_it_everywhere() {
+        let path = temp_path("pop");
+        let mut cache = GenerationalSharedCache::open(&path, 64, 2, None, None).unwrap();
+        put(&mut cache, b"gone", b"v");
+        for i in 0..40u32 { put(&mut cache, format!("a{i}").as_bytes(), b"x"); }
+        assert!(cache.rotation_count() >= 1);
+        assert!(cache.pop(b"gone"));
+        assert!(!cache.contains(b"gone"));
+        assert!(get_body(&mut cache, b"gone").is_none());
         let _ = std::fs::remove_file(path);
     }
 
