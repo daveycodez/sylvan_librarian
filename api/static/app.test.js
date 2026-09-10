@@ -852,17 +852,24 @@ describe('CardSearch getColumnsFromViewportWidth', () => {
 // unguarded read used to strand the card page on "Loading..." and abort the search page's init.
 // ---------------------------------------------------------------------------
 
+// Blocked storage throws either at the property (`localStorage` itself) or at the call
+// (`getItem`/`setItem`), depending on the browser. Break both: the property override covers the
+// bare `localStorage` identifier the scripts use, and the prototype spies cover any path that
+// still reaches a Storage instance -- on Node 26's jsdom, `window.localStorage` resolves through
+// a different accessor than the bare global and does not see the override.
 async function withThrowingLocalStorage(fn) {
+  const boom = () => {
+    throw new Error('SecurityError: localStorage is not available');
+  };
   const descriptor = Object.getOwnPropertyDescriptor(window, 'localStorage');
-  Object.defineProperty(window, 'localStorage', {
-    configurable: true,
-    get() {
-      throw new Error('SecurityError: localStorage is not available');
-    },
-  });
+  Object.defineProperty(window, 'localStorage', { configurable: true, get: boom });
+  const spies = ['getItem', 'setItem', 'removeItem'].map(m =>
+    jest.spyOn(Storage.prototype, m).mockImplementation(boom)
+  );
   try {
     return await fn();
   } finally {
+    spies.forEach(s => s.mockRestore());
     if (descriptor) Object.defineProperty(window, 'localStorage', descriptor);
     else delete window.localStorage;
   }
@@ -885,7 +892,7 @@ describe('card.js with unavailable localStorage', () => {
   });
 
   it('still renders the card when reading localStorage throws', async () => {
-    expect(() => window.localStorage).not.toThrow();
+    expect(() => localStorage.getItem('theme')).not.toThrow();
     buildCardDOM();
     window.history.pushState({}, '', '/card/m11/149');
     const card = {
@@ -899,7 +906,7 @@ describe('card.js with unavailable localStorage', () => {
     global.fetch.mockResolvedValue({ json: async () => ({ cards: [card] }) });
 
     await withThrowingLocalStorage(async () => {
-      expect(() => window.localStorage).toThrow();
+      expect(() => localStorage.getItem('theme')).toThrow();
       Function(cardCode)(); // the full script, initTheme and main() included
       for (let i = 0; i < 5; i++) await flushPromises();
     });
