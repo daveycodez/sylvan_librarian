@@ -13465,22 +13465,25 @@ impl EmitStrCache {
     /// the row dict to be tracked with it, the empty tuple is not.
     fn coll_list<'py>(&self, py: Python<'py>, vocab: &AStrings, ids: &Archived<Vec<u16>>) -> PyResult<Bound<'py, PyTuple>> {
         let cells = self.coll_cells.get_or_init(|| (0..vocab.len()).map(|_| OnceLock::new()).collect());
-        let mut items: Vec<Bound<'py, PyString>> = Vec::with_capacity(ids.len());
-        for id in ids.iter() {
-            let idx = u16::from(*id) as usize;
-            let Some(text) = vocab.get(idx) else { continue };
-            match cells.get(idx).and_then(|cell| cell.get()) {
-                Some(hit) => items.push(hit.bind(py).clone()),
-                None => {
-                    let built = PyString::new(py, text.as_str());
-                    if let Some(cell) = cells.get(idx) {
+        // Straight into the tuple: `PyTuple::new` takes an exact-size iterator, so the intermediate
+        // `Vec<Bound<PyString>>` per row is gone. Ids are in-vocab by construction (the same
+        // assumption `coll_str` indexes on), so there is no skip path to break the exact size.
+        debug_assert_eq!(cells.len(), vocab.len(), "coll_cells is sized to this archive's vocab");
+        PyTuple::new(
+            py,
+            ids.iter().map(|id| {
+                let idx = u16::from(*id) as usize;
+                let cell = &cells[idx];
+                match cell.get() {
+                    Some(hit) => hit.bind(py).clone(),
+                    None => {
+                        let built = PyString::new(py, coll_str(vocab, idx as u16));
                         let _ = cell.set(built.clone().unbind());
+                        built
                     }
-                    items.push(built);
                 }
-            }
-        }
-        PyTuple::new(py, items)
+            }),
+        )
     }
 }
 
