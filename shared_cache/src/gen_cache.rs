@@ -40,6 +40,15 @@ fn sampled_body_hash(body: Option<&[u8]>) -> u64 {
     xxh3_64(&b[..N]) ^ xxh3_64(&b[b.len() - N..]).rotate_left(32)
 }
 
+/// Occupancy of one page, for `SharedCache.stats()`: a page whose arena is full well below
+/// `gen_maxsize` entries is the arena-bound case that used to leave the cache write-dead.
+pub struct PageStats {
+    pub entry_count: u32,
+    pub arena_used: u32,
+    pub arena_capacity: u32,
+    pub sealed: bool,
+}
+
 pub struct GenerationalSharedCache {
     mmap: MmapMut,
     n_pages: usize,
@@ -700,36 +709,79 @@ impl GenerationalSharedCache {
         let Ok(value_bytes) = rkyv::to_bytes::<rkyv::rancor::Error>(&cr) else { return; };
         let expiry = expiry_ns_for(ttl_secs, self.default_ttl_ns);
 
-        // Step 1: check if rotation needed; snapshot retiring page ref.
+        // Step 1: rotate first if the active page has reached its entry budget.
         if !try_lock(&self.mmap) { return; }
         let active_idx = self.active_idx();
         let needs_rotation = self.page_header(active_idx).entry_count >= self.gen_maxsize as u32;
-        let (retiring_idx, gen_snapshot) = if needs_rotation {
-            let g = self.coord().counter;
-            let ri = (active_idx + 1) % self.n_pages;
-            (ri, g)
-        } else {
-            (0, 0)
+        unlock(&self.mmap);
+        if needs_rotation && !self.rotate() { return; }
+
+        // Step 2: insert into the active page.
+        let Some(inserted) = self.insert_active(hash, key, &value_bytes, expiry, content_vh, new_body_len) else {
+            return;
         };
+        if inserted || needs_rotation {
+            return;
+        }
+
+        // Step 3: the page is full below its entry budget — its arena (maxsize x 8 KB by default) ran
+        // out first, which happens as soon as bodies average more than the per-entry share. Nothing
+        // else would ever rotate it (entry_count cannot grow), so every later set would be dropped
+        // and the cache would be write-dead. Treat arena exhaustion as the rotation trigger and retry
+        // once; a second failure means the survivors filled the fresh page, and that is left alone.
+        // No rotation for a value that could not fit even an empty page: it would only evict.
+        if !self.fits_empty_page(key.len(), value_bytes.len()) || !self.rotate() {
+            return;
+        }
+        self.insert_active(hash, key, &value_bytes, expiry, content_vh, new_body_len);
+    }
+
+    /// One rotation: snapshot the counter under the lock, scan the retiring page's survivors
+    /// lock-free, then commit under the lock unless another worker rotated in between (in which
+    /// case its rotation serves). False only when the lock could not be taken.
+    fn rotate(&mut self) -> bool {
+        if !try_lock(&self.mmap) { return false; }
+        let active_idx = self.active_idx();
+        let gen_snapshot = self.coord().counter;
+        let retiring_idx = (active_idx + 1) % self.n_pages;
         unlock(&self.mmap);
 
-        // Step 2: lock-free survivor scan (if needed).
-        let survivors = if needs_rotation {
-            self.scan_survivors(retiring_idx)
-        } else {
-            Vec::new()
-        };
+        let survivors = self.scan_survivors(retiring_idx);
 
-        // Step 3: commit rotation (if still valid) + insert.
-        if !try_lock(&self.mmap) { return; }
-        if needs_rotation && self.coord().counter == gen_snapshot {
+        if !try_lock(&self.mmap) { return false; }
+        if self.coord().counter == gen_snapshot {
             self.commit_rotation(survivors);
         }
+        unlock(&self.mmap);
+        true
+    }
+
+    /// Insert into whichever page is active, registering the key in the filter on success.
+    /// `None` when the lock could not be taken; `Some(false)` when the page had no room.
+    fn insert_active(
+        &mut self,
+        hash: u64,
+        key: &[u8],
+        value_bytes: &[u8],
+        expiry_ns: u64,
+        value_hash: u64,
+        body_len: u32,
+    ) -> Option<bool> {
+        if !try_lock(&self.mmap) { return None; }
         let active_idx = self.active_idx();
-        if self.do_insert(active_idx, hash, key, &value_bytes, expiry, content_vh, new_body_len) {
+        let inserted = self.do_insert(active_idx, hash, key, value_bytes, expiry_ns, value_hash, body_len);
+        if inserted {
             self.filter().insert(hash);
         }
         unlock(&self.mmap);
+        Some(inserted)
+    }
+
+    /// Would a fresh (empty) page's arena hold this key + value?
+    fn fits_empty_page(&self, key_len: usize, value_len: usize) -> bool {
+        let value_padded = (value_len + ARENA_ALIGN - 1) & !(ARENA_ALIGN - 1);
+        let key_padded = (key_len + ARENA_ALIGN - 1) & !(ARENA_ALIGN - 1);
+        value_padded + key_padded <= self.page_size - self.arena_start_in_page
     }
 
     /// Remove all copies of `key` from every page and the shared filter.
@@ -810,6 +862,31 @@ impl GenerationalSharedCache {
         (0..self.n_pages).map(|i| self.page_header(i).entry_count).sum()
     }
 
+    /// Number of rotations since the file was (re)initialised.
+    pub fn rotation_count(&self) -> u32 {
+        self.coord().counter
+    }
+
+    pub fn gen_maxsize(&self) -> usize {
+        self.gen_maxsize
+    }
+
+    /// Per-page occupancy, unlocked: a snapshot for diagnostics, not a consistent view.
+    pub fn page_stats(&self) -> Vec<PageStats> {
+        let arena_capacity = (self.page_size - self.arena_start_in_page) as u32;
+        (0..self.n_pages)
+            .map(|i| {
+                let ph = self.page_header(i);
+                PageStats {
+                    entry_count: ph.entry_count,
+                    arena_used: ph.arena_head,
+                    arena_capacity,
+                    sealed: ph.is_sealed != 0,
+                }
+            })
+            .collect()
+    }
+
     pub fn contains(&self, key: &[u8]) -> bool {
         let hash = normalize_hash(xxh3_64(key));
         fence(Ordering::Acquire);
@@ -849,6 +926,76 @@ impl GenerationalSharedCache {
         let found = self.do_probe(active_idx, hash, key).is_some();
         unlock(&self.mmap);
         found
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    pub(super) fn temp_path(name: &str) -> String {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let mut p = std::env::temp_dir();
+        p.push(format!("shared_cache_{name}_{}_{nanos}.cache", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p.to_string_lossy().into_owned()
+    }
+
+    pub(super) fn put(cache: &mut GenerationalSharedCache, key: &[u8], body: &[u8]) {
+        let pending = cache.fast_check(key, Some(body)).expect("content differs from what is cached");
+        cache.set(key, pending, "200 OK", Vec::new(), Some(body), Some(1), Some(2), None);
+    }
+
+    pub(super) fn get_body(cache: &mut GenerationalSharedCache, key: &[u8]) -> Option<Vec<u8>> {
+        cache
+            .get_with(key, |b| access_response(b).body.as_ref().map(|v| v.as_slice().to_vec()))
+            .flatten()
+    }
+
+    #[test]
+    fn arena_exhaustion_rotates_instead_of_leaving_the_page_write_dead() {
+        // maxsize 64 over 2 pages: gen_maxsize 32 and a 32 x 8 KB = 256 KB arena per page. Bodies of
+        // three times the per-entry share fill the arena after ~10 entries, long before the page
+        // reaches its 32-entry budget — the only rotation trigger before this fix.
+        let path = temp_path("arena");
+        let mut cache = GenerationalSharedCache::open(&path, 64, 2, None, None).unwrap();
+        let body = vec![0xABu8; 3 * 8192];
+
+        for i in 0..200u32 {
+            let key = format!("key-{i}");
+            put(&mut cache, key.as_bytes(), &body);
+            assert_eq!(
+                get_body(&mut cache, key.as_bytes()).as_deref(),
+                Some(body.as_slice()),
+                "key {i} was dropped: the cache stopped admitting writes"
+            );
+        }
+
+        let live = cache.entry_count();
+        assert!(live > 0 && live <= 64, "live entries {live} outside (0, maxsize]");
+        assert!(cache.rotation_count() >= 10, "only {} rotations", cache.rotation_count());
+        let stats = cache.page_stats();
+        assert_eq!(stats.len(), 2);
+        assert!(stats.iter().all(|p| p.arena_used <= p.arena_capacity));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_value_larger_than_the_arena_does_not_trigger_a_rotation() {
+        let path = temp_path("oversize");
+        let mut cache = GenerationalSharedCache::open(&path, 64, 2, None, None).unwrap();
+        put(&mut cache, b"small", b"x");
+        let before = cache.rotation_count();
+
+        let huge = vec![0u8; 512 * 1024];
+        put(&mut cache, b"huge", &huge);
+
+        assert_eq!(cache.rotation_count(), before, "an unfittable value evicted a page for nothing");
+        assert_eq!(get_body(&mut cache, b"small").as_deref(), Some(&b"x"[..]));
+        assert!(get_body(&mut cache, b"huge").is_none());
+        let _ = std::fs::remove_file(path);
     }
 }
 
