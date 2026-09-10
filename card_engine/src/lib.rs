@@ -13162,9 +13162,14 @@ const RARITY_NAMES: [&str; 6] = ["common", "uncommon", "rare", "mythic", "specia
 /// the legality status words, and cheaper still because there is nothing to invalidate. Built FROM
 /// `RARITY_NAMES` so the spellings exist in exactly one place; an `intern!` arm per word would be a
 /// second copy of the table with nothing checking the two agree.
+///
+/// A `PyOnceLock`, not a std `OnceLock`: the initializer allocates Python objects while holding the
+/// GIL, and a std cell blocks every other initializer for the duration -- the deadlock pyo3
+/// documents its cell for (a second thread holding the GIL and waiting on the cell while the first
+/// waits for the GIL). Same type the `intern!` keys already use.
 fn rarity_pystring(py: Python<'_>, value: u8) -> Option<&'static Py<PyString>> {
-    static WORDS: OnceLock<Vec<Py<PyString>>> = OnceLock::new();
-    WORDS.get_or_init(|| RARITY_NAMES.iter().map(|name| PyString::intern(py, name).unbind()).collect())
+    static WORDS: pyo3::sync::PyOnceLock<Vec<Py<PyString>>> = pyo3::sync::PyOnceLock::new();
+    WORDS.get_or_init(py, || RARITY_NAMES.iter().map(|name| PyString::intern(py, name).unbind()).collect())
         .get(value as usize)
 }
 
@@ -13186,16 +13191,16 @@ fn rarity_pystring(py: Python<'_>, value: u8) -> Option<&'static Py<PyString>> {
 fn color_identity_tuple<'py>(py: Python<'py>, mask: u8) -> PyResult<Bound<'py, PyAny>> {
     /// Six colour bits, so every mask this field can hold indexes into the table.
     const N_MASKS: u8 = 64;
-    static TUPLES: OnceLock<Vec<Py<PyTuple>>> = OnceLock::new();
+    // A `PyOnceLock` (see `rarity_pystring`): the initializer allocates Python objects under the GIL.
+    static TUPLES: pyo3::sync::PyOnceLock<Vec<Py<PyTuple>>> = pyo3::sync::PyOnceLock::new();
     // All 64 or nothing. A `filter_map(.ok())` build used to drop a failed mask and shift every
     // later tuple one slot down, so `mask` indexed the wrong identity for the rest of the process.
-    // A failed build is not cached; the field is then built per call, correct and merely slower.
-    if TUPLES.get().is_none()
-        && let Ok(all) = (0..N_MASKS).map(|m| PyTuple::new(py, identity_letters(m)).map(|t| t.unbind())).collect::<PyResult<Vec<_>>>()
-    {
-        let _ = TUPLES.set(all); // a concurrent builder may have won; the contents are identical
-    }
-    match TUPLES.get().and_then(|tuples| tuples.get(mask as usize)) {
+    // A failed build is not cached (`get_or_try_init` leaves the cell empty); the field is then
+    // built per call, correct and merely slower.
+    let tuples = TUPLES.get_or_try_init(py, || {
+        (0..N_MASKS).map(|m| PyTuple::new(py, identity_letters(m)).map(|t| t.unbind())).collect::<PyResult<Vec<_>>>()
+    });
+    match tuples.ok().and_then(|tuples| tuples.get(mask as usize)) {
         Some(cached) => Ok(cached.bind(py).clone().into_any()),
         None => Ok(PyTuple::new(py, identity_letters(mask))?.into_any()),
     }

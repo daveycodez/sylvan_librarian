@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use pyo3::intern;
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyDict, PyString};
 use rkyv::Archived;
 
@@ -140,9 +141,12 @@ type FormatKeys = Arc<[Py<PyString>]>;
 /// without changing the length. Neither a count nor a length can tell those apart; the `Arc` the
 /// snapshot cache hands out can, because it only ever allocates a new one when the registry moved.
 /// The cached clone keeps the old snapshot alive, so a pointer can never be reused for a new one.
+///
+/// A `PyOnceLock`, as the `intern!` keys use: Python objects are built while holding the GIL, and
+/// a std cell would block every other initializer for the duration -- pyo3's documented deadlock.
 fn format_keys(py: Python<'_>, entries: &SortedFormats) -> FormatKeys {
-    static KEYS: OnceLock<RwLock<Option<(SortedFormats, FormatKeys)>>> = OnceLock::new();
-    let cache = KEYS.get_or_init(|| RwLock::new(None));
+    static KEYS: PyOnceLock<RwLock<Option<(SortedFormats, FormatKeys)>>> = PyOnceLock::new();
+    let cache = KEYS.get_or_init(py, || RwLock::new(None));
 
     if let Ok(guard) = cache.read()
         && let Some((built_for, keys)) = &*guard
