@@ -105,3 +105,17 @@ class TestResponseCacheInvalidation:
             assert client.simulate_get("/robots.txt").headers.get("X-Cache") == "miss"
         finally:
             settings.enable_cache = saved
+
+
+class TestRepeatedQueryParameters:
+    """`?q=a&q=b` is a 400 that names the parameter, not a 500 from inside the parser."""
+
+    @pytest.mark.parametrize(
+        argnames=["query_string", "param"],
+        argvalues=[("q=a&q=b", "q"), ("unique=cards&unique=art", "unique")],
+        ids=["str", "enum"],
+    )
+    def test_repeated_scalar_is_400(self, client: falcon.testing.TestClient, query_string: str, param: str) -> None:
+        result = client.simulate_get("/search", query_string=query_string)
+        assert result.status == falcon.HTTP_400, result.text
+        assert result.json["description"] == f"parameter '{param}' was given more than once"

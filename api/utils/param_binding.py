@@ -124,6 +124,28 @@ class ParamCoercionError(ValueError):
         super().__init__(f"Invalid value for {param!r}: {shown!r}{detail}")
 
 
+class RepeatedParamError(ParamCoercionError):
+    """A scalar parameter arrived more than once in the query string.
+
+    Falcon hands `?q=a&q=b` to the handler as `["a", "b"]`. A parameter declared `str`, `int`, an enum
+    or `bool` has no meaning for that, and letting the list through produced a 500 from deep inside the
+    handler (`list.encode`, `unhashable type: 'list'`) for what is a malformed request. Only a parameter
+    declared `Sequence[str]` accepts repetition.
+    """
+
+    def __init__(self, param: str) -> None:
+        """Record which parameter was repeated.
+
+        Args:
+            param: Parameter name as the handler declares it.
+        """
+        self.param = param
+        self.value = ""
+        self.expected = "a single value"
+        self.allowed = ()
+        ValueError.__init__(self, f"parameter {param!r} was given more than once")
+
+
 def _unwrap_optional(hint: Any) -> Any:  # noqa: ANN401
     """Return the single non-None member of an Optional hint, else the hint unchanged.
 
@@ -217,27 +239,45 @@ class ParamBinder:
         bound: dict[str, Any] = {}
         for name, converter, expected, has_default, default in self._plan:
             if name in supplied:
-                value = supplied[name]
-                if type(value) is str:
-                    if converter is None:
-                        raise ParamCoercionError(name, value, expected)
-                    try:
-                        bound[name] = converter(value)
-                    except (ValueError, TypeError) as oops:
-                        raise ParamCoercionError(name, value, expected, _allowed_values(converter)) from oops
-                else:
-                    bound[name] = value
+                bound[name] = _convert_value(name, supplied[name], converter, expected)
             elif has_default:
                 bound[name] = default
 
         # Names the handler does not declare. Non-strings pass through so injected keywords still reach
         # handlers that accept them via **kwargs — and still raise TypeError for handlers that do not,
-        # which is the existing behavior. Unknown *strings* are query noise and are dropped; per-route
-        # strictness needs a route decorator to declare it and is not available yet.
+        # which is the existing behavior. Unknown *strings* -- and repeated unknown strings, which Falcon
+        # delivers as a list -- are query noise and are dropped; per-route strictness needs a route
+        # decorator to declare it and is not available yet.
         for name, value in supplied.items():
-            if name not in self._known and type(value) is not str:
+            if name not in self._known and type(value) is not str and not _is_repeated_query_value(value):
                 bound[name] = value
         return bound
+
+
+def _convert_value(name: str, value: Any, converter: Callable[[str], Any] | None, expected: str) -> Any:  # noqa: ANN401
+    """Convert one supplied value per its parameter's plan entry.
+
+    Strings are converted; Falcon's list-of-str shape for a repeated query parameter is accepted only
+    by a Sequence[str] parameter and rejected for every scalar, here rather than inside the handler;
+    anything else (an injected object) passes through untouched.
+    """
+    if type(value) is str:
+        if converter is None:
+            raise ParamCoercionError(name, value, expected)
+        try:
+            return converter(value)
+        except (ValueError, TypeError) as oops:
+            raise ParamCoercionError(name, value, expected, _allowed_values(converter)) from oops
+    if _is_repeated_query_value(value):
+        if converter is not _convert_to_str_list:
+            raise RepeatedParamError(name)
+        return [part for raw in value for part in _convert_to_str_list(raw)]
+    return value
+
+
+def _is_repeated_query_value(value: object) -> bool:
+    """Whether value is what Falcon produces for a query parameter given more than once: a list of str."""
+    return type(value) is list and all(type(item) is str for item in value)
 
 
 def _describe(hint: Any) -> str:  # noqa: ANN401

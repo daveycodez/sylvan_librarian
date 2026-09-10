@@ -19,6 +19,7 @@ from api.utils.param_binding import (
     MAX_ECHOED_VALUE_LEN,
     ParamBinder,
     ParamCoercionError,
+    RepeatedParamError,
     UnresolvableAnnotationError,
     bind_params,
 )
@@ -188,6 +189,42 @@ class TestRejection:
         """
         with pytest.raises(TypeError, match="multiple values"):
             ParamBinder(handler).bind(("eoc",), {"set_code": "blb"})
+
+
+class TestRepeatedParameters:
+    """Falcon delivers `?q=a&q=b` as a list; only a Sequence[str] parameter has a meaning for that.
+
+    Before this the list passed through the binder untouched (it is not a str), so `/search?q=a&q=b`
+    500ed on `list.encode` inside the parser and `?unique=cards&unique=art` 400ed with the internal
+    "unhashable type: 'list'" -- both for a malformed request the binder should have named.
+    """
+
+    @pytest.mark.parametrize(
+        argnames=["param", "raw"],
+        argvalues=[
+            ("q", ["a", "b"]),
+            ("unique", ["cards", "art"]),
+            ("limit", ["1", "2"]),
+            ("verbose", ["true", "false"]),
+        ],
+        ids=["str", "enum", "int", "bool"],
+    )
+    def test_scalar_given_twice_is_a_structured_400(self, param: str, raw: list[str]) -> None:
+        with pytest.raises(RepeatedParamError, match=f"parameter {param!r} was given more than once") as excinfo:
+            ParamBinder(handler).bind((), {param: raw})
+        # The same family _handle already turns into a 400, so no new except clause is needed there.
+        assert isinstance(excinfo.value, ParamCoercionError)
+        assert excinfo.value.param == param
+
+    def test_sequence_parameter_accepts_repetition(self) -> None:
+        """`?fields=name&fields=cmc,power` means the same as `?fields=name,cmc,power`."""
+        bound = ParamBinder(handler).bind((), {"fields": ["name", "cmc,power"]})
+        assert bound["fields"] == ["name", "cmc", "power"]
+
+    def test_repeated_unknown_parameter_is_query_noise(self) -> None:
+        """`?utm_source=a&utm_source=b` is dropped like the single-valued form, not passed to the handler."""
+        bound = ParamBinder(handler).bind((), {"utm_source": ["a", "b"]})
+        assert "utm_source" not in bound
 
 
 class TestAnnotationResolution:
