@@ -619,7 +619,30 @@ fn opt_date_str(d: &Bound<PyDict>, key: &str) -> Option<String> {
 fn opt_price_cents(d: &Bound<PyDict>, key: &str) -> Option<u32> {
     d.get_item(key).ok().flatten().and_then(|v| {
         v.extract::<f64>().ok().or_else(|| v.extract::<i64>().ok().map(|n| n as f64))
-    }).map(|dollars| (dollars * 100.0).round() as u32)
+    }).and_then(price_cents_of)
+}
+
+/// Dollars to integer cents, or `None` when the value is not a finite number inside the u32 cents
+/// domain. `(dollars * 100.0).round() as u32` saturates: NaN loaded as `Some(0)` (a free card) and
+/// 1e12 as `Some(u32::MAX)` (the most expensive card in the store) rather than as no price at all.
+fn price_cents_of(dollars: f64) -> Option<u32> {
+    let cents = (dollars * 100.0).round();
+    (cents.is_finite() && (0.0..=f64::from(u32::MAX)).contains(&cents)).then_some(cents as u32)
+}
+
+/// A numeric field truncated toward zero to an integer type, or `None` when it is not finite or
+/// does not fit. `v as u8` and friends saturate silently, so an out-of-range or NaN value loaded as
+/// the type's edge (NaN as 0) instead of as absent.
+fn int_of<T: TryFrom<i64>>(v: f32) -> Option<T> {
+    if !v.is_finite() {
+        return None;
+    }
+    let t = v.trunc();
+    // `f32 as i64` saturates at the edges, and every T here is narrower than i64 anyway.
+    if t <= i64::MIN as f32 || t >= i64::MAX as f32 {
+        return None;
+    }
+    T::try_from(t as i64).ok()
 }
 
 fn opt_f32(d: &Bound<PyDict>, key: &str) -> Option<f32> {
@@ -630,19 +653,19 @@ fn opt_f32(d: &Bound<PyDict>, key: &str) -> Option<f32> {
 }
 
 fn opt_i8(d: &Bound<PyDict>, key: &str) -> Option<i8> {
-    opt_f32(d, key).map(|v| v as i8)
+    opt_f32(d, key).and_then(int_of)
 }
 
 fn opt_u8(d: &Bound<PyDict>, key: &str) -> Option<u8> {
-    opt_f32(d, key).map(|v| v as u8)
+    opt_f32(d, key).and_then(int_of)
 }
 
 fn opt_u16(d: &Bound<PyDict>, key: &str) -> Option<u16> {
-    opt_f32(d, key).map(|v| v as u16)
+    opt_f32(d, key).and_then(int_of)
 }
 
 fn opt_u32(d: &Bound<PyDict>, key: &str) -> Option<u32> {
-    opt_f32(d, key).map(|v| v as u32)
+    opt_f32(d, key).and_then(int_of)
 }
 
 fn str_list(d: &Bound<PyDict>, key: &str) -> Vec<String> {

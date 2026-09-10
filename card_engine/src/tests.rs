@@ -13738,3 +13738,28 @@ fn text_contains_narrowing_requires_a_built_trigram_index() {
         }
     }
 }
+
+/// The numeric loaders saturated: `(dollars * 100.0).round() as u32` turned NaN into `Some(0)` and
+/// 1e12 into `Some(u32::MAX)`, and `v as i8`/`u8`/`u16`/`u32` clamped silently. A value that is not
+/// finite or does not fit is absent now, not the type's edge.
+#[test]
+fn numeric_loaders_reject_non_finite_and_out_of_range_values() {
+    use super::{int_of, price_cents_of};
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e12, -1.0, 42_949_672.96] {
+        assert_eq!(price_cents_of(bad), None, "price {bad}");
+    }
+    assert_eq!(price_cents_of(0.28), Some(28));
+    assert_eq!(price_cents_of(5142.02), Some(514_202));
+    assert_eq!(price_cents_of(0.0), Some(0));
+    assert_eq!(price_cents_of(42_949_672.95), Some(u32::MAX), "the top of the cents domain still loads");
+
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1e12, -1.0, 256.0] {
+        assert_eq!(int_of::<u8>(bad), None, "u8 {bad}");
+    }
+    assert_eq!(int_of::<u8>(255.0), Some(255));
+    assert_eq!(int_of::<u8>(2.7), Some(2), "truncation toward zero is unchanged for in-range values");
+    assert_eq!((int_of::<i8>(-128.0), int_of::<i8>(-129.0), int_of::<i8>(127.0), int_of::<i8>(128.0)), (Some(-128), None, Some(127), None));
+    assert_eq!(int_of::<i8>(-2.7), Some(-2));
+    assert_eq!((int_of::<u16>(65_535.0), int_of::<u16>(65_536.0), int_of::<u16>(f32::NAN)), (Some(65_535), None, None));
+    assert_eq!((int_of::<u32>(4_000_000_000.0), int_of::<u32>(1e12), int_of::<u32>(-1.0)), (Some(4_000_000_000), None, None));
+}
