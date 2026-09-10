@@ -69,6 +69,11 @@ TESTCASES = [
     {"query": "cmc>2 power<5", "expected": "cmc>2 AND power<5", "id": "cmp_gt_lt"},
     {"query": "cmc>=3 cmc<=5", "expected": "cmc>=3 AND cmc<=5", "id": "cmp_gte_lte"},
     {"query": "color!=W", "expected": "color!=W", "id": "cmp_neq"},
+    # Colour and rarity values are validated by the parser, quoted or bare
+    {"query": 'c:"azorius" r:"rare"', "expected": 'c:"azorius" AND r:"rare"', "id": "quoted_color_and_rarity"},
+    {"query": 'c:"xyz"', "expected": 'c:"xyz"', "id": "quoted_invalid_color_rejected"},
+    {"query": "r:foo", "expected": "r:foo", "id": "invalid_rarity_rejected"},
+    {"query": 'r:"foo"', "expected": 'r:"foo"', "id": "quoted_invalid_rarity_rejected"},
     # Arithmetic in comparison — no AND inside expression
     {"query": "power+toughness>cmc+cmc", "expected": "power+toughness>cmc+cmc", "id": "arithmetic_comparison"},
     {

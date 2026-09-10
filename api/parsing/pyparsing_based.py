@@ -23,8 +23,8 @@ from pyparsing import (
     original_text_for,
 )
 
-from api.parsing.card_query_nodes import CardAttributeNode, ExactNameNode, to_card_query_ast
-from api.parsing.colors import COLOR_ALIAS_TO_CODES
+from api.parsing.card_query_nodes import CardAttributeNode, ExactNameNode, is_valid_rarity, to_card_query_ast
+from api.parsing.colors import COLOR_ALIAS_TO_CODES, is_valid_color_value
 from api.parsing.db_info import (
     NUMERIC_CARD_ATTRIBUTES,
     PARSER_CLASS_TO_FIELD_INFOS,
@@ -128,6 +128,31 @@ def make_text_condition_node(tokens: list[object]) -> BinaryOperatorNode:
             raise ValueError(REGEX_UNSUPPORTED_FIELD_MESSAGE)
         right = ("quoted", literal)
     return make_binary_operator_node([left, operator, right])
+
+
+def _value_text(value: object) -> str:
+    """The text of a condition's rhs token, whether it arrived bare or as a ("quoted", text) marker."""
+    return value[1] if isinstance(value, tuple) else str(value)
+
+
+def make_color_condition_node(tokens: list[object]) -> BinaryOperatorNode:
+    """Build a colour condition, rejecting a value outside the colour vocabulary (quoted values included).
+
+    Mirrors hand_parser.parse_color_value: the bare alternative is already vocabulary-shaped by its
+    grammar, but a quoted value used to pass straight through and fail inside the query engine.
+    """
+    if not is_valid_color_value(_value_text(tokens[2])):
+        msg = f"Invalid color value {_value_text(tokens[2])!r}"
+        raise ValueError(msg)
+    return make_binary_operator_node(tokens)
+
+
+def make_rarity_condition_node(tokens: list[object]) -> BinaryOperatorNode:
+    """Build a rarity condition, rejecting anything that does not name a rarity (hand_parser.parse_rarity_value)."""
+    if not is_valid_rarity(_value_text(tokens[2])):
+        msg = f"Invalid rarity {_value_text(tokens[2])!r}"
+        raise ValueError(msg)
+    return make_binary_operator_node(tokens)
 
 
 def make_year_condition_node(_s: str, loc: int, tokens: list[object]) -> BinaryOperatorNode:
@@ -424,10 +449,14 @@ def create_all_condition_parsers(basic_parsers: dict, mana_parsers: dict, color_
     mana_value_or_string = mana_value | mana_quoted_value
     mana_condition = create_condition_parser(mana_attr_word, mana_value_or_string, operators=EQ_ALIAS_OPERATORS)
 
-    color_condition = create_condition_parser(color_attr_word, color_value | quoted_string, operators=EQ_ALIAS_OPERATORS)
+    color_condition = (color_attr_word + EQ_ALIAS_OPERATORS + (color_value | quoted_string)).set_parse_action(
+        make_color_condition_node
+    )
 
     regex_pattern = basic_parsers["regex_pattern"]
-    rarity_condition = create_condition_parser(rarity_attr_word, quoted_string | string_value_word, operators=EQ_ALIAS_OPERATORS)
+    rarity_condition = (rarity_attr_word + EQ_ALIAS_OPERATORS + (quoted_string | string_value_word)).set_parse_action(
+        make_rarity_condition_node
+    )
     legality_condition = create_condition_parser(legality_attr_word, quoted_string | string_value_word)
     text_condition = text_attr_word + DEFAULT_OPERATORS + (regex_pattern | quoted_string | string_value_word)
     text_condition.set_parse_action(make_text_condition_node)

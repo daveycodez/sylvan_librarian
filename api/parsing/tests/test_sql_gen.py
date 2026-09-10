@@ -978,21 +978,15 @@ def test_rarity_search_sql_translation(parse_query, input_query: str, expected_s
     assert context == expected_parameters, f"\nExpected params: {expected_parameters}\nObserved params: {context}"
 
 
-def test_rarity_invalid_values(parse_query) -> None:
-    """Test that invalid rarity values raise appropriate errors."""
-    # This should parse successfully but fail during SQL generation
+@pytest.mark.parametrize(argnames="query", argvalues=["rarity>invalid", "r<unknown"])
+def test_rarity_invalid_values(parse_query, query: str) -> None:
+    """An unknown rarity is rejected by the parser, before any SQL is generated.
 
-    parsed = parse_query("rarity>invalid")
-
-    # Should raise ValueError when generating SQL due to invalid rarity
-    with pytest.raises(ValueError, match="Invalid rarity in comparison"):
-        generate_sql_query(parsed)
-
-    # Test with another invalid rarity
-    parsed2 = parse_query("r<unknown")
-
-    with pytest.raises(ValueError, match="Invalid rarity in comparison"):
-        generate_sql_query(parsed2)
+    It used to parse and fail during SQL generation instead ("Invalid rarity in comparison"), which
+    on the engine path meant a logged engine-failure traceback for a typo.
+    """
+    with pytest.raises(ValueError, match=r"Failed to parse query|Invalid rarity"):
+        parse_query(query)
 
 
 def test_rarity_case_insensitive(parse_query) -> None:

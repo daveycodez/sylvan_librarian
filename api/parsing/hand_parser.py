@@ -11,8 +11,8 @@ import datetime
 from dataclasses import dataclass
 from enum import Enum, auto
 
-from api.parsing.card_query_nodes import CardAttributeNode, CardBinaryOperatorNode, ExactNameNode
-from api.parsing.colors import COLOR_ALIAS_TO_CODES
+from api.parsing.card_query_nodes import CardAttributeNode, CardBinaryOperatorNode, ExactNameNode, is_valid_rarity
+from api.parsing.colors import is_valid_color_value
 from api.parsing.db_info import ALIAS_TO_FIELD_INFOS, ParserClass
 from api.parsing.mana_symbols import first_invalid_mana_symbol
 from api.parsing.nodes import (
@@ -65,8 +65,6 @@ _BANG_ALIAS_CLASSES: frozenset[ParserClass] = frozenset(
     {ParserClass.COLOR, ParserClass.MANA, ParserClass.RARITY, ParserClass.YEAR, ParserClass.DATE}
 )
 
-_VALID_COLOR_NAMES: frozenset[str] = frozenset(COLOR_ALIAS_TO_CODES)
-_COLOR_LETTERS: frozenset[str] = frozenset("wubrgcWUBRGC")
 _MIN_MTG_YEAR: int = 1992
 _MAX_YEAR: int = 2040
 _MIN_FOUR_DIGIT_YEAR: int = 1000
@@ -785,7 +783,9 @@ class Parser:
             return self.parse_color_value()
         if pc == ParserClass.MANA:
             return self.parse_mana_value()
-        if pc in (ParserClass.RARITY, ParserClass.LEGALITY):
+        if pc == ParserClass.RARITY:
+            return self.parse_rarity_value()
+        if pc == ParserClass.LEGALITY:
             return self.parse_string_value()
         if pc == ParserClass.DATE:
             return self.parse_date_value(operator)
@@ -875,11 +875,31 @@ class Parser:
         msg = f"Expected string value, got {tok.value!r} at position {tok.pos}"
         raise ParseError(msg)
 
+    def parse_rarity_value(self) -> QueryNode:
+        """Parse a rarity value and check it names a rarity.
+
+        Validated here, like mana and colour, rather than at SQL generation: an unknown rarity used to
+        parse and then fail inside the query engine, logging an engine-failure traceback for a typo.
+        """
+        tok = self.peek()
+        node = self.parse_string_value()
+        if not is_valid_rarity(node.value):
+            msg = f"Invalid rarity {node.value!r} at position {tok.pos}"
+            raise ParseError(msg)
+        return node
+
     def parse_color_value(self) -> QueryNode:
-        """Parse a color value: a recognized color name or a combination of color letters."""
+        """Parse a color value: a recognized color name or a combination of color letters.
+
+        Quoted values get the same vocabulary check as bare ones -- quoting is another way to type
+        the value, not an opt-out, and `c:"xyz"` used to reach the query engine before failing.
+        """
         tok = self.peek()
         if tok.type == TT.QUOTED:
             self.consume()
+            if not is_valid_color_value(str(tok.value)):
+                msg = f"Invalid color value {tok.value!r} at position {tok.pos}"
+                raise ParseError(msg)
             return StringValueNode(str(tok.value))
         if tok.type == TT.WORD:
             self.consume()
@@ -898,7 +918,7 @@ class Parser:
             ):
                 self.consume()
                 val += "-" + str(self.consume().value)
-            if val.lower() not in _VALID_COLOR_NAMES and not all(c in _COLOR_LETTERS for c in val):
+            if not is_valid_color_value(val):
                 msg = f"Invalid color value {val!r} at position {tok.pos}"
                 raise ParseError(msg)
             return StringValueNode(val)

@@ -78,6 +78,11 @@ RARITY_TO_NUMBER = {
 }
 
 
+def is_valid_rarity(rarity: str) -> bool:
+    """True if *rarity* names a rarity (full name or letter); the parsers reject anything else up front."""
+    return rarity.lower().strip() in RARITY_TO_NUMBER
+
+
 def get_rarity_number(rarity: str) -> int:
     """Convert rarity string to numeric value for comparison.
 
