@@ -116,6 +116,48 @@ pub(crate) fn compile_search_regex_for_test(pattern: &str) -> Regex {
     compile_search_regex(pattern).expect("test regex should compile")
 }
 
+/// A lowercase substring needle with its `memmem::Finder` built once at construction.
+///
+/// `str::contains` builds a Two-Way searcher on every call, and the `TextContains` verify runs
+/// once per candidate; the bind-time scans already reused one `Finder` across a whole vocab
+/// (~1.3x, bench_substring_finders). The `String` stays alongside for everything that reads the
+/// needle as text -- length gates, trigram lookups, fingerprints -- via `Deref<Target = str>`.
+#[derive(Clone)]
+pub(crate) struct Needle {
+    word: String,
+    finder: memmem::Finder<'static>,
+}
+
+impl Needle {
+    pub(crate) fn new(word: impl Into<String>) -> Self {
+        let word = word.into();
+        let finder = memmem::Finder::new(word.as_bytes()).into_owned();
+        Needle { word, finder }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.word
+    }
+
+    /// The prebuilt searcher, for scans that test many haystacks against this needle.
+    pub(crate) fn finder(&self) -> &memmem::Finder<'static> {
+        &self.finder
+    }
+
+    /// Whether `hay` contains the needle -- the per-candidate test.
+    #[inline]
+    pub(crate) fn is_in(&self, hay: &str) -> bool {
+        self.finder.find(hay.as_bytes()).is_some()
+    }
+}
+
+impl std::ops::Deref for Needle {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.word
+    }
+}
+
 // ─── Comparison / arithmetic operators ───────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -565,7 +607,7 @@ pub(crate) enum FilterExpr {
 
     TextContains {
         field: TextSearchField,
-        word: String,
+        word: Needle,
     },
     /// An artist predicate (contains/exact/regex) after bind() resolved it
     /// against the ~2.2k-entry artist vocab: sorted vocab ids whose artist
@@ -1108,9 +1150,9 @@ impl FilterExpr {
                     .filter(|&id| vocab.get(id as usize).is_some_and(|e| e.as_str() == value.as_str()));
             }
             FilterExpr::TextContains { field: TextSearchField::ArtistLower, word } => {
-                // memmem::Finder built once, reused across the vocab scan — its SIMD prefilter beats
-                // rebuilding str::contains's searcher per entry (~1.3x, bench_substring_finders). #734.
-                let finder = memmem::Finder::new(word.as_bytes());
+                // The needle's prebuilt memmem::Finder, reused across the vocab scan — its SIMD prefilter
+                // beats rebuilding str::contains's searcher per entry (~1.3x, bench_substring_finders). #734.
+                let finder = word.finder();
                 let ids = artist_match_ids(artist_vocab, |s| finder.find(s.as_bytes()).is_some());
                 *self = FilterExpr::ArtistMatch { ids };
             }
@@ -1132,7 +1174,7 @@ impl FilterExpr {
             }
             FilterExpr::TextContains { field: TextSearchField::FlavorTextLower, word } => {
                 let mask = flavor_fingerprint(word.as_str());
-                let finder = memmem::Finder::new(word.as_bytes()); // built once, reused (see ArtistLower)
+                let finder = word.finder(); // built once at construction, reused (see ArtistLower)
                 let (gids, dense_ids) = flavor_match_sets(flavor, strings, mask, |s| finder.find(s.as_bytes()).is_some());
                 *self = FilterExpr::FlavorMatch { gids, dense_ids };
             }
@@ -1255,7 +1297,7 @@ impl FilterExpr {
                     _ => return,
                 }
                 let Some(cand) = trigram_candidates(name_trigram, word) else { return };
-                let finder = memmem::Finder::new(word.as_bytes()); // built once, reused across the verify scan
+                let finder = word.finder(); // built once at construction, reused across the verify scan
                 let mut ids: Vec<u32> = cand
                     .into_iter()
                     .filter(|&cid| finder.find(cards[cid as usize].card_name_folded.as_str().as_bytes()).is_some())
@@ -1271,7 +1313,7 @@ impl FilterExpr {
                     _ => return,
                 }
                 let Some(dense) = trigram_candidates(&oracle.trigrams, word) else { return };
-                let finder = memmem::Finder::new(word.as_bytes()); // built once, reused across the verify scan
+                let finder = word.finder(); // built once at construction, reused across the verify scan
                 let mut gids: Vec<u32> = Vec::with_capacity(dense.len());
                 for d in dense {
                     let gid = u32::from(oracle.gids[d as usize]);
@@ -1518,7 +1560,7 @@ impl FilterExpr {
 
             FilterExpr::TextContains { field, word } => {
                 match text_search_field_value(card, printing, strings, *field) {
-                    StrVal::Known(s) => tri_bool(s.contains(word.as_str())),
+                    StrVal::Known(s) => tri_bool(word.is_in(s)),
                     StrVal::Null => Tri::Null,
                     StrVal::PDep => Tri::PrintingDep,
                 }
@@ -2040,7 +2082,7 @@ fn build_text_filter(attr: &str, op: &str, rhs: &Value) -> Result<FilterExpr, St
             "card_artist" => TextSearchField::ArtistLower,
             _ => return Err(format!("text substring not supported on {attr}")),
         };
-        return Ok(FilterExpr::TextContains { field: tsf, word: lower_word });
+        return Ok(FilterExpr::TextContains { field: tsf, word: Needle::new(lower_word) });
     }
 
     let field = match attr {

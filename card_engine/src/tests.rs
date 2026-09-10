@@ -1,5 +1,5 @@
 use super::{
-    renumber_coll_vocab,
+    Needle, renumber_coll_vocab,
     and_child_rank, assign_name_ranks,
     build_numeric_index, build_oracle_text_index, build_trigram_index,
     build_rarity_index, build_flavor_index, build_hybrid_tag_index, build_layout_hybrid_index, bitmap_beats_postings, HybridTagIndex, build_sort_permutations,
@@ -2095,10 +2095,10 @@ fn fuzz_build_filter(spec: &FuzzSpec) -> FilterExpr {
             FilterExpr::CollectionCmp { field: *field, op: *op, value: value.clone(), value_id: None }
         }
         FuzzSpec::Leaf(FuzzLeaf::Artist { word }) => {
-            FilterExpr::TextContains { field: TextSearchField::ArtistLower, word: word.clone() }
+            FilterExpr::TextContains { field: TextSearchField::ArtistLower, word: Needle::new(word.clone()) }
         }
         FuzzSpec::Leaf(FuzzLeaf::TextContains { field, needle }) => {
-            FilterExpr::TextContains { field: *field, word: needle.clone() }
+            FilterExpr::TextContains { field: *field, word: Needle::new(needle.clone()) }
         }
         FuzzSpec::Leaf(FuzzLeaf::NameExact { op, value }) => {
             FilterExpr::TextExact { field: TextField::NameLower, op: *op, value: value.clone() }
@@ -6797,7 +6797,7 @@ fn artist_predicates_bind_to_vocab_ids_and_narrow() {
 
     let mut f = FilterExpr::TextContains {
         field: super::TextSearchField::ArtistLower,
-        word: "rebecca".to_string(),
+        word: Needle::new("rebecca".to_string()),
     };
     f.bind(&archived.coll_vocab, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     // bind rewrites the contains into an id-set match
@@ -6820,7 +6820,7 @@ fn artist_predicates_bind_to_vocab_ids_and_narrow() {
     // an artist matching nothing narrows to the exact empty set
     let mut g = FilterExpr::TextContains {
         field: super::TextSearchField::ArtistLower,
-        word: "zzz".to_string(),
+        word: Needle::new("zzz".to_string()),
     };
     g.bind(&archived.coll_vocab, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     match narrow_candidates(&g, &archived.indexes, &archived.offsets, &archived.cards) {
@@ -6871,7 +6871,7 @@ fn flavor_match_bind_eval_and_narrow() {
 
     let mut f = FilterExpr::TextContains {
         field: super::TextSearchField::FlavorTextLower,
-        word: "dream".to_string(),
+        word: Needle::new("dream".to_string()),
     };
     bound(&mut f);
     let FilterExpr::FlavorMatch { ref gids, ref dense_ids } = f else { panic!("expected FlavorMatch after bind") };
@@ -6892,7 +6892,7 @@ fn flavor_match_bind_eval_and_narrow() {
     // nor its negation.
     let mut inner = FilterExpr::TextContains {
         field: super::TextSearchField::FlavorTextLower,
-        word: "dream".to_string(),
+        word: Needle::new("dream".to_string()),
     };
     bound(&mut inner);
     let neg = FilterExpr::Not(Box::new(inner));
@@ -6931,7 +6931,7 @@ fn flavor_match_bind_eval_and_narrow() {
     // A needle matching nothing proves the empty candidate set.
     let mut none = FilterExpr::TextContains {
         field: super::TextSearchField::FlavorTextLower,
-        word: "zzzqqq".to_string(),
+        word: Needle::new("zzzqqq".to_string()),
     };
     bound(&mut none);
     match narrow_candidates(&none, &archived.indexes, &archived.offsets, &archived.cards) {
@@ -8777,7 +8777,7 @@ fn split_planes_composition_rules() {
 
     let green = || FilterExpr::ColorCmp { field: ColorField::Colors, op: CmpOp::Ge, mask: 16 };
     let creature = || FilterExpr::TypeCmp { mask: TYPE_CREATURE, op: CmpOp::Ge };
-    let text = || FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: "draw".to_string() };
+    let text = || FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: Needle::new("draw".to_string()) };
 
     // And(plane, plane, text): planes consumed, the lone leftover unwraps.
     let (pe, residual) = split_planes(FilterExpr::And(vec![green(), creature(), text()]), bounds, words, true);
@@ -9193,8 +9193,8 @@ fn memoize_text_predicates_parity() {
         f.memoize_text_predicates(&archived.cards, &archived.strings, &archived.indexes.name_trigram, &archived.indexes.name_bigrams, &archived.indexes.oracle_trigram, archived.cards.len());
         f
     };
-    let oracle = |w: &str| FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: w.to_string() };
-    let name = |w: &str| FilterExpr::TextContains { field: TextSearchField::NameLower, word: w.to_string() };
+    let oracle = |w: &str| FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: Needle::new(w.to_string()) };
+    let name = |w: &str| FilterExpr::TextContains { field: TextSearchField::NameLower, word: Needle::new(w.to_string()) };
 
     for needle in ["damage", "draw", "goblin", "abcde", "card.", "zzz"] {
         let rewritten = memo(oracle(needle));
@@ -9232,12 +9232,12 @@ fn memoize_text_predicates_guards() {
         f.memoize_text_predicates(&archived.cards, &archived.strings, &archived.indexes.name_trigram, &archived.indexes.name_bigrams, &archived.indexes.oracle_trigram, archived.cards.len());
         f
     };
-    let short = memo(FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: "dr".to_string() });
+    let short = memo(FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: Needle::new("dr".to_string()) });
     assert!(matches!(short, FilterExpr::TextContains { .. }), "2-char needle has no trigrams");
-    let flavor = memo(FilterExpr::TextContains { field: TextSearchField::FlavorTextLower, word: "damage".to_string() });
+    let flavor = memo(FilterExpr::TextContains { field: TextSearchField::FlavorTextLower, word: Needle::new("damage".to_string()) });
     assert!(matches!(flavor, FilterExpr::TextContains { .. }), "flavor is printing-level, not ours");
     // "xyz" appears in 4 of the 6 distinct texts (> half): guard keeps the scan.
-    let broad = memo(FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: "xyz".to_string() });
+    let broad = memo(FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: Needle::new("xyz".to_string()) });
     assert!(matches!(broad, FilterExpr::TextContains { .. }), "broad needle stays unrewritten");
 }
 
@@ -9249,7 +9249,7 @@ fn run_query_memoizes_only_full_scans() {
     let data = text_fixture_store();
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
-    let oracle = |w: &str| FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: w.to_string() };
+    let oracle = |w: &str| FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: Needle::new(w.to_string()) };
     // Keywords <= "flying": no narrowing arm for Le, true for keyword-less cards.
     let broad_sibling = || FilterExpr::CollectionCmp {
         field: CollField::Keywords,
@@ -9288,7 +9288,7 @@ fn oracle_match_none_str_mirrors_text_contains() {
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
     let memoized = FilterExpr::OracleMatch { gids: Vec::new() };
-    let plain = FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: "draw".to_string() };
+    let plain = FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: Needle::new("draw".to_string()) };
     assert!(memoized.eval_card(&archived.cards[0], &archived.strings) == Tri::Null);
     assert!(plain.eval_card(&archived.cards[0], &archived.strings) == Tri::Null);
 }
@@ -9393,7 +9393,7 @@ fn oracle_word_index_exact_union_parity() {
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
     let rec = |f: &FilterExpr| super::narrow_rec(f, &archived.indexes, &archived.offsets, &archived.cards, true);
-    let oracle = |w: &str| FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: w.to_string() };
+    let oracle = |w: &str| FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: Needle::new(w.to_string()) };
 
     for needle in ["target", "creature", "cast", "zzzzz"] {
         let expected = brute_force_oracle_contains(archived, needle);
@@ -9412,7 +9412,7 @@ fn oracle_word_index_dispatch_shapes() {
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
     let rec = |f: &FilterExpr| super::narrow_rec(f, &archived.indexes, &archived.offsets, &archived.cards, true);
-    let oracle = |w: &str| FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: w.to_string() };
+    let oracle = |w: &str| FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: Needle::new(w.to_string()) };
 
     // Single dense hit, no sparse hit: the dense word's bitmap comes back
     // directly, no allocation-and-scatter round trip.
@@ -9451,7 +9451,7 @@ fn oracle_word_index_multi_dense_no_sparse() {
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
     let rec = |f: &FilterExpr| super::narrow_rec(f, &archived.indexes, &archived.offsets, &archived.cards, true);
-    let oracle = |w: &str| FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: w.to_string() };
+    let oracle = |w: &str| FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: Needle::new(w.to_string()) };
 
     let expected = brute_force_oracle_contains(archived, "word");
     let n = rec(&oracle("word")).expect("oracle:word must narrow");
@@ -9475,7 +9475,7 @@ fn compile_plane_word_bonus_composes_with_other_planes() {
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
     let bounds = &archived.indexes.planes;
     let words = &archived.indexes.oracle_trigram.words;
-    let oracle = |w: &str| FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: w.to_string() };
+    let oracle = |w: &str| FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: Needle::new(w.to_string()) };
 
     // Single-dense-hit needle: compile_plane must consume it directly.
     assert!(compile_plane(&oracle("target"), bounds, words).is_some(), "single dense hit must compile to a plane");
@@ -9880,7 +9880,7 @@ fn not_narrows_only_tight_children() {
     // 1-char: below even the bigram floor, so genuinely unindexable.
     // A sub-trigram ORACLE needle: names have unigram/bigram indexes (#858, #639) so they narrow
     // tightly, but oracle text has neither and still cannot narrow at all.
-    let name1 = || FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: "q".into() };
+    let name1 = || FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: Needle::new("q") };
 
     // Tight leaf → complement narrows, loose, and covers every ¬-match.
     let n = rec(&FilterExpr::Not(Box::new(goblin()))).expect("Not(subtype) must narrow");
@@ -9942,7 +9942,7 @@ fn or_composes_plane_and_complement_children() {
 
     // An unindexable child still vetoes: nothing can represent it. Oracle rather than name, since a
     // 1-byte name needle now resolves exactly through the unigram index (#858).
-    let or = FilterExpr::Or(vec![goblin(), FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: "q".into() }]);
+    let or = FilterExpr::Or(vec![goblin(), FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: Needle::new("q") }]);
     assert!(rec(&or).is_none());
 }
 
@@ -10004,7 +10004,7 @@ fn not_over_partial_and_is_blocked() {
     // the total below pins. Not a 1-byte needle any more -- those resolve exactly through the unigram
     // index now (#858) -- and not an oracle needle either, since this fixture leaves oracle text unset,
     // making it Null rather than False and changing what the negation matches.
-    let unindexable = || FilterExpr::TextContains { field: TextSearchField::NameLower, word: "qqqq".into() };
+    let unindexable = || FilterExpr::TextContains { field: TextSearchField::NameLower, word: Needle::new("qqqq") };
 
     // Static check: And with an unrepresentable child can't be tight → Not
     // must refuse to narrow at all.
@@ -10078,7 +10078,7 @@ fn name_bigrams_tiers_and_exactness() {
     assert!(idx.postings.get(b"qx").is_some(), "64-name bigram stays a posting list");
 
     let rec = |w: &str| {
-        let f = FilterExpr::TextContains { field: TextSearchField::NameLower, word: w.to_string() };
+        let f = FilterExpr::TextContains { field: TextSearchField::NameLower, word: Needle::new(w.to_string()) };
         super::narrow_rec(&f, &archived.indexes, &archived.offsets, &archived.cards, false)
     };
     // Dense tier: exact bitmap, tight.
@@ -10100,7 +10100,7 @@ fn name_bigrams_tiers_and_exactness() {
     assert_eq!(n.set.len(), 0);
     // 1-char is indexed too now (#858) -- see name_unigrams_tiers_and_exactness for its tiers. What
     // stays unindexable is a sub-trigram ORACLE needle, which has no unigram/bigram index.
-    let f = FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: "z".to_string() };
+    let f = FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: Needle::new("z".to_string()) };
     assert!(super::narrow_rec(&f, &archived.indexes, &archived.offsets, &archived.cards, false).is_none());
 }
 
@@ -10126,7 +10126,7 @@ fn not_over_unigram_is_tight_but_oracle_stays_loose() {
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
     let rec = |f: &FilterExpr| super::narrow_rec(f, &archived.indexes, &archived.offsets, &archived.cards, true);
 
-    let name_q = || FilterExpr::TextContains { field: TextSearchField::NameLower, word: "q".into() };
+    let name_q = || FilterExpr::TextContains { field: TextSearchField::NameLower, word: Needle::new("q") };
     let n = rec(&FilterExpr::Not(Box::new(name_q()))).expect("-name:q must narrow");
     assert!(n.tight, "name is never Null, so the complement of a tight 1-byte set is exact");
     let cand = n.set.into_cards(&archived.offsets, &archived.indexes.printing_to_card);
@@ -10140,14 +10140,14 @@ fn not_over_unigram_is_tight_but_oracle_stays_loose() {
     assert_eq!(cand, brute, "-name:q must be exactly the cards whose name lacks 'q'");
 
     // An absent byte complements to every card, and that must stay exact rather than trip a breadth guard.
-    let name_v = FilterExpr::TextContains { field: TextSearchField::NameLower, word: "v".into() };
+    let name_v = FilterExpr::TextContains { field: TextSearchField::NameLower, word: Needle::new("v") };
     let n = rec(&FilterExpr::Not(Box::new(name_v))).expect("-name:v must narrow");
     assert!(n.tight);
     assert_eq!(n.set.len(), archived.cards.len(), "no name contains 'v', so its negation is every card");
 
     // The other side of the gate: oracle text can be absent, so its complement is NOT exact. It cannot
     // narrow at all here (no sub-trigram oracle index), which is the conservative outcome either way.
-    let oracle_q = FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: "q".into() };
+    let oracle_q = FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: Needle::new("q") };
     assert!(!super::never_null(&oracle_q), "oracle text is nullable, so its negation must not be tight");
     assert!(rec(&FilterExpr::Not(Box::new(oracle_q))).is_none());
 }
@@ -10176,7 +10176,7 @@ fn name_unigrams_tiers_and_exactness() {
     assert!(idx.postings.get(&b'q').is_some(), "a byte in 64 names stays a posting list");
 
     let rec = |w: &str| {
-        let f = FilterExpr::TextContains { field: TextSearchField::NameLower, word: w.to_string() };
+        let f = FilterExpr::TextContains { field: TextSearchField::NameLower, word: Needle::new(w.to_string()) };
         super::narrow_rec(&f, &archived.indexes, &archived.offsets, &archived.cards, false)
     };
     // Dense tier: exact bitmap, tight.
@@ -10219,7 +10219,7 @@ fn name_bigrams_compose_and_memoize() {
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
-    let name2 = |w: &str| FilterExpr::TextContains { field: TextSearchField::NameLower, word: w.to_string() };
+    let name2 = |w: &str| FilterExpr::TextContains { field: TextSearchField::NameLower, word: Needle::new(w.to_string()) };
 
     // Or of two bigram children composes: "fi" → {0,1,4}, "dr" → {0,2}.
     let or = FilterExpr::Or(vec![name2("fi"), name2("dr")]);
@@ -10575,7 +10575,7 @@ fn accent_folded_name_search_matches_unaccented_query() {
 
     // A query word already folded by Python (whether the user typed "eowyn" or
     // "Éowyn") must find the accented card and only it.
-    let contains_eowyn = FilterExpr::TextContains { field: TextSearchField::NameLower, word: "eowyn".to_string() };
+    let contains_eowyn = FilterExpr::TextContains { field: TextSearchField::NameLower, word: Needle::new("eowyn".to_string()) };
     let matches: Vec<u32> = archived.cards.iter().enumerate()
         .filter(|(_, c)| contains_eowyn.eval_card(c, &archived.strings) == Tri::True)
         .map(|(i, _)| i as u32)
@@ -10632,7 +10632,7 @@ fn type_mask() -> FilterExpr {
 }
 
 fn contains_scan() -> FilterExpr {
-    FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: "draw".to_string() }
+    FilterExpr::TextContains { field: TextSearchField::OracleTextLower, word: Needle::new("draw".to_string()) }
 }
 
 fn machinery_regex() -> FilterExpr {
@@ -13730,7 +13730,7 @@ fn text_contains_narrowing_requires_a_built_trigram_index() {
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
     for (label, field) in [("name", TextSearchField::NameLower), ("oracle", TextSearchField::OracleTextLower)] {
         for word in ["abc", "abcd"] {
-            let f = FilterExpr::TextContains { field, word: word.to_string() };
+            let f = FilterExpr::TextContains { field, word: Needle::new(word) };
             assert!(
                 narrow_candidates(&f, &archived.indexes, &archived.offsets, &archived.cards).is_none(),
                 "{label} contains {word:?}: an unbuilt trigram index must decline to narrow, not prove an empty set"
