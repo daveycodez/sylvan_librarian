@@ -174,9 +174,7 @@ def _build_boolean_is_tags_sql(tags: dict[str, str]) -> str:
     ``hashtext(scryfall_id)`` falls in that slice are touched.
     """
     managed = ", ".join(f"'{tag}'" for tag in tags)
-    object_entries = ",\n            ".join(
-        f"'{tag}', CASE WHEN ({expr}) THEN true END" for tag, expr in tags.items()
-    )
+    object_entries = ",\n            ".join(f"'{tag}', CASE WHEN ({expr}) THEN true END" for tag, expr in tags.items())
     return f"""
 WITH proposed AS (
     SELECT
@@ -197,6 +195,7 @@ WHERE
     cards.scryfall_id = proposed.scryfall_id AND
     cards.card_is_tags IS DISTINCT FROM proposed.proposed_is_tags
 """
+
 
 CUSTOM_IS_TAGS = [
     "historic",  # artifact, legendary, saga
@@ -240,6 +239,33 @@ CARD_IS_TAGS = LAND_IS_TAGS + [  # noqa: RUF005
     "reserved",
     "vanilla",
 ]
+
+
+def plan_migrations(applied: list[dict[str, str]], on_disk: list[dict[str, str]]) -> tuple[set[str], bool]:
+    """Decide which migrations can be skipped, and whether the schema has to be rebuilt first.
+
+    Walks the applied rows and the on-disk files together, in order. While each applied row matches
+    its file (same name, same hash), the file is already applied and is skipped. At the first row
+    that does not match, the history has diverged: the whole `magic` schema is dropped and rebuilt,
+    so *nothing* counts as applied any more -- including the rows that matched before the
+    divergence, whose objects go with the schema. Rows after the divergence are not looked at, since
+    they cannot rescue anything: the old loop kept walking, re-added later matching rows to the
+    skip set, and then skipped their files even though their DDL had just been dropped.
+
+    Args:
+        applied: `file_name`/`file_sha256` rows from the migrations table, in application order.
+        on_disk: `db_utils.get_migrations()` output, in filename order.
+
+    Returns:
+        The hashes to skip, and whether to drop the schema and its migration rows before applying.
+    """
+    already_applied: set[str] = set()
+    for applied_row, fs_migration in zip(applied, on_disk, strict=False):
+        if applied_row.items() <= fs_migration.items():
+            already_applied.add(applied_row["file_sha256"])
+        else:
+            return set(), True
+    return already_applied, False
 
 
 class AdminContext:
@@ -324,15 +350,12 @@ class AdminResource:
                 cursor.execute("SELECT file_name, file_sha256 FROM migrations ORDER BY date_applied")
                 applied_migrations = [dict(r) for r in cursor]
 
-                already_applied = set()
-                for applied_migration, fs_migration in zip(applied_migrations, filesystem_migrations, strict=False):
-                    if applied_migration.items() <= fs_migration.items():
-                        already_applied.add(applied_migration["file_sha256"])
-                    else:
-                        already_applied.clear()
-                        cursor.execute("DELETE FROM migrations")
-                        cursor.execute("DROP SCHEMA IF EXISTS magic CASCADE")
-                        conn.commit()
+                already_applied, needs_reset = plan_migrations(applied_migrations, filesystem_migrations)
+                if needs_reset:
+                    logger.warning("Applied migrations diverge from the files on disk; rebuilding the magic schema")
+                    cursor.execute("DELETE FROM migrations")
+                    cursor.execute("DROP SCHEMA IF EXISTS magic CASCADE")
+                    conn.commit()
 
                 for imigration in filesystem_migrations:
                     file_sha256 = imigration["file_sha256"]
