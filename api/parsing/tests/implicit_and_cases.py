@@ -171,6 +171,11 @@ TESTCASES = [
     {"query": "flying -cmc+5>1", "expected": "flying AND -cmc+5>1", "id": "word_then_arith_leading_minus_flying"},
     # Leading negation and multiple negations
     {"query": "-t:creature", "expected": "-t:creature", "id": "leading_negation"},
+    # A negated condition whose value spells an alias of the same class is still attr:value
+    {"query": "-c:c", "expected": "-c:c", "id": "negated_color_value_is_alias"},
+    {"query": "-id:c", "expected": "-id:c", "id": "negated_identity_value_is_alias"},
+    {"query": "t:elf -c:c", "expected": "t:elf AND -c:c", "id": "attr_then_negated_color_alias_value"},
+    {"query": "-r:r", "expected": "-r:r", "id": "negated_rarity_value_is_alias"},
     {"query": "a -b -c", "expected": "a AND -b AND -c", "id": "multiple_negations"},
     # Single item in parens then word
     {"query": "(a) b", "expected": "(a) AND b", "id": "single_in_parens_then_word"},

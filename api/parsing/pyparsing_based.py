@@ -572,7 +572,6 @@ def get_parse_expr() -> ParserElement:  # noqa: PLR0915
     arithmetic_expr = condition_parsers["arithmetic_expr"]
     condition = condition_parsers["condition"]
     hyphenated_condition = condition_parsers["hyphenated_condition"]
-    attr_attr_condition = condition_parsers["attr_attr_condition"]
 
     _word_for_exact = word.copy()
     _quoted_string_for_exact = basic_parsers["quoted_string"]
@@ -629,7 +628,10 @@ def get_parse_expr() -> ParserElement:  # noqa: PLR0915
             return NotNode(tokens[1])
         return tokens[0]
 
-    negatable_primary = attr_attr_condition | condition | group | exact_name | implicit_name | standalone_numeric
+    # `condition` first, as in `factor`: it already ends in attr_attr_condition, and trying that one
+    # ahead of it read `-c:c` as colour-attribute-vs-colour-attribute (the value `c` is also an
+    # alias), a node with no rhs value that crashed SQL generation instead of negating a colour filter.
+    negatable_primary = condition | group | exact_name | implicit_name | standalone_numeric
     negatable_factor = Optional(operator_not) + negatable_primary
     negatable_factor.set_parse_action(handle_negation)
 
