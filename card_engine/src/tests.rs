@@ -13715,3 +13715,26 @@ fn stale_tmp_archive_sweep_removes_only_dead_writers_of_this_archive() {
     assert_eq!(super::sweep_stale_tmp_archives(&shm_path), 0);
     assert_eq!(super::sweep_stale_tmp_archives(&scratch.0.join("missing").join("store.bin")), 0);
 }
+
+/// The 3+-byte `TextContains` narrowing arm called `trigram_candidates` without the "index built"
+/// guard the `TextRegex` arm has. On an archive whose trigram indexes are `Default` (a fixture, or
+/// any store built without them) `trigram_candidates` returns EMPTY rather than `None`, so the
+/// narrowing proved an empty result for every card. Unbuilt now means "no narrowing", as for regex.
+#[test]
+fn text_contains_narrowing_requires_a_built_trigram_index() {
+    let mut vocab = VocabInterner::new();
+    let cards = vec![stub_card(1, TYPE_CREATURE, &[], &mut vocab), stub_card(2, TYPE_CREATURE, &[], &mut vocab)];
+    let data = store_of(cards, &[1, 1], vocab);
+    assert_eq!(data.indexes.name_trigram.domain, 0, "the fixture leaves the trigram indexes unbuilt");
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    for (label, field) in [("name", TextSearchField::NameLower), ("oracle", TextSearchField::OracleTextLower)] {
+        for word in ["abc", "abcd"] {
+            let f = FilterExpr::TextContains { field, word: word.to_string() };
+            assert!(
+                narrow_candidates(&f, &archived.indexes, &archived.offsets, &archived.cards).is_none(),
+                "{label} contains {word:?}: an unbuilt trigram index must decline to narrow, not prove an empty set"
+            );
+        }
+    }
+}

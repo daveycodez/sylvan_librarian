@@ -4902,6 +4902,16 @@ fn narrow_rec(
             if word.len() >= 3
                 && matches!(field, TextSearchField::NameLower | TextSearchField::OracleTextLower) =>
         {
+            // Only narrow when the trigram index is actually built for this store -- fixtures (and any
+            // store without it) leave it `Default`, where `trigram_candidates` returns empty rather
+            // than None and would wrongly narrow to zero. Same guard as the `TextRegex` arm below.
+            let built = match field {
+                TextSearchField::NameLower => u32::from(indexes.name_trigram.domain) as usize == n_cards,
+                _ => u32::from(indexes.oracle_trigram.words.n_cards) as usize == n_cards,
+            };
+            if !built {
+                return None;
+            }
             // A needle of exactly 3 bytes is exactly ONE trigram, so the posting list IS the containment
             // set — no false positives to verify away. At 4+ bytes the intersection of several trigrams
             // really is a superset ("the" AND "her" without "ther"), so those stay loose. (#859)
