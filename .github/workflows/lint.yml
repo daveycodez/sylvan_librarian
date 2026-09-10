@@ -7,8 +7,13 @@ on:
   pull_request:
     paths:
       - '**/*.py'
+      - '**/*.js'
+      - '**/*.html'
       - 'requirements/**'
       - 'pyproject.toml'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.prettierrc'
       - '.github/workflows/lint.yml'
 
 permissions:
@@ -41,3 +46,17 @@ jobs:
       - name: Run ruff linting
         run: |
           python -m ruff check
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+          cache: 'npm'
+
+      - name: Install npm dependencies (prettier)
+        run: npm ci
+
+      # --check, not --write: `make prettier_lint` rewrites files locally, which in CI would
+      # silently pass on a tree that is not formatted. Same file set as the makefile's.
+      - name: Check prettier formatting
+        run: git ls-files -z '*.html' '*.js' | xargs -0 npx prettier --check

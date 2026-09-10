@@ -84,6 +84,7 @@ IMAGE_TAG := $(BUILD_HASH)
 	lint \
 	mplantin_font \
 	postgres-config \
+	prettier_check \
 	psql-dotfiles \
 	pull_images \
 	reset \
@@ -154,16 +155,34 @@ status: | .env .env.generated # @doc show container status for all environments
 	  cd $(GIT_ROOT) && docker compose --project-name sylvan_$(env) $(COMPOSE_ENV_FILES) --env-file envs/$(env) $(call compose_files,$(env)) ps --all ; \
 	)
 
-rolling-deploy: deps-blue deps-green # @doc rolling blue/green deploy — update blue (wait for healthy), then green
+# Hit the freshly started stack from the host, the way the reverse proxy will. `up --wait` only
+# proves the container's own healthcheck passed; a bad published port, a proxy-facing bind address,
+# or an engine that loads but cannot search would all still take green down with it. The port comes
+# from the stack's env file and the host side of the published port defaults as docker-compose.yml
+# does. `set -e` so a failing curl aborts the recipe (and, for blue, the whole deploy).
+define smoke_check
+set -e; port=$$(grep -E '^API_PORT=' envs/$(1) | cut -d= -f2); host=$${BIND_ADDR:-127.0.0.1}; \
+for path in ready 'search?q=t:elf'; do \
+  curl --fail --silent --show-error --max-time 30 --user-agent deploy-smoke --output /dev/null "http://$$host:$${port:-28080}/$$path" \
+    || { echo "=== $(1): smoke check on /$$path failed, aborting deploy"; exit 1; }; \
+done; echo "=== $(1): /ready and /search answered"
+endef
+
+rolling-deploy: pull_images deps-blue deps-green # @doc rolling blue/green deploy — update blue (wait for healthy + smoke check), then green
 	@echo "=== Deploying blue ==="
-	cd $(GIT_ROOT) && docker compose --project-name sylvan_blue $(COMPOSE_ENV_FILES) --env-file envs/blue --file $(BASE_COMPOSE) up --remove-orphans --detach --wait
+	cd $(GIT_ROOT) && docker compose --project-name sylvan_blue $(COMPOSE_ENV_FILES) --env-file envs/blue $(call compose_files,blue) up --remove-orphans --detach --wait
+	cd $(GIT_ROOT) && $(call smoke_check,blue)
 	@echo "=== Blue healthy. Deploying green ==="
-	cd $(GIT_ROOT) && docker compose --project-name sylvan_green $(COMPOSE_ENV_FILES) --env-file envs/green --file $(BASE_COMPOSE) up --remove-orphans --detach --wait
+	cd $(GIT_ROOT) && docker compose --project-name sylvan_green $(COMPOSE_ENV_FILES) --env-file envs/green $(call compose_files,green) up --remove-orphans --detach --wait
+	cd $(GIT_ROOT) && $(call smoke_check,green)
 	@echo "=== Rolling deploy complete ==="
 
 down: $(addsuffix -down,$(ENVS)) # @doc stop every environment
 
-images: build_images pull_images # @doc refresh images
+# Pulling is deliberately not part of `images` (and so not of every `make *-up`): the postgres:18
+# tag only moves on a point release, and a registry round-trip on each start is not worth it. The
+# deploy targets pull, so a deploy is what picks up a new point release.
+images: build_images # @doc refresh locally built images
 
 build_images: $(BUILD_STAMP) # @doc refresh locally built images
 
@@ -173,8 +192,10 @@ $(BUILD_STAMP): $(image_sources) | .env .env.generated
 	cd $(GIT_ROOT) && docker compose --progress=plain $(COMPOSE_ENV_FILES) --env-file envs/dev --file $(BASE_COMPOSE) build
 	touch $@
 
-pull_images: $(BASE_COMPOSE) | .env .env.generated # @doc pull images from remote repos
-	true || docker compose $(COMPOSE_ENV_FILES) --env-file envs/dev --file $(BASE_COMPOSE) pull
+# Only the services that come from a registry: apiservice and client are built here and marked
+# pull_policy: never, so a bare `pull` would try (and fail) to fetch them.
+pull_images: | .env .env.generated # @doc pull the postgres image (a moving major-version tag)
+	cd $(GIT_ROOT) && docker compose $(COMPOSE_ENV_FILES) --env-file envs/dev --file $(BASE_COMPOSE) pull postgres
 
 ensure_pydocker: ensure_uv
 	@$(PYTHON) -c "import docker" 2>/dev/null || \
@@ -189,8 +210,11 @@ ensure_uv:
 	$(PYTHON) -m pip install uv || \
 	uv pip install --python "$(PYTHON)" uv
 
-lint: ruff_lint prettier_lint # @doc lint all python files
-	true
+lint: ruff_lint prettier_lint # @doc lint (and auto-format) python, html and js
+
+# prettier_lint rewrites files; prettier_check is the read-only variant CI runs (lint.yml).
+prettier_check: # @doc fail if any html/js file is not prettier-formatted
+	npx prettier --check $(html_files) $(js_files)
 
 prettier_lint: /tmp/prettier.stamp
 	true
