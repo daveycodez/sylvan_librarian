@@ -103,6 +103,9 @@ DISALLOWED_QUERY_ARGS: frozenset[str] = frozenset(["falcon_response", "request_h
 # more. Callers must not append exception detail to it.
 INTERNAL_ERROR_DESCRIPTION = "An internal error occurred."
 
+# Status codes from here up are the server's fault and keep their traceback in the log.
+HTTP_SERVER_ERROR_FLOOR = 500
+
 # Public field name -> magic.cards column. The `fields=` vocabulary for /search. This is
 # deliberately a subset of FIELD_TABLE in card_engine/src/lib.rs, not a mirror of it — not
 # everything the engine can extract needs to be a public API field. Every key here must still
@@ -265,6 +268,19 @@ def _copy_query_result(result: dict[str, Any]) -> dict[str, Any]:
     return copied
 
 
+def _log_http_error(path: str, oops: falcon.HTTPError) -> None:
+    """Log a handler's HTTPError at a level that matches whose fault it is.
+
+    A 4xx is the client's problem (a 404 from a scanner, a 400 from a typo) and logs as one line at
+    INFO; a traceback at ERROR for each made the log unreadable and paged on noise. A 5xx HTTPError --
+    the cold-start 503, mainly -- keeps the traceback.
+    """
+    if oops.status_code >= HTTP_SERVER_ERROR_FLOOR:
+        logger.error("Error handling request for %s: %s", path, oops, exc_info=True)
+    else:
+        logger.info("Rejected %s: %s %s", path, oops.status, oops.title)
+
+
 def _request_host(req: falcon.Request) -> str:
     """The Host header's hostname, tolerating a malformed header.
 
@@ -390,7 +406,7 @@ class APIResource:
 
         path = req.path.strip("/") or "_root"
 
-        logger.info(
+        logger.debug(
             "Handling request for %s / |%s| / response id: %d",
             req.relative_uri,
             path,
@@ -424,7 +440,7 @@ class APIResource:
             logger.info("Rejected %s: %s", path, oops)
             raise falcon.HTTPBadRequest(description=str(oops)) from oops
         except falcon.HTTPError as oops:
-            logger.error("Error handling request for %s: %s", path, oops, exc_info=True)
+            _log_http_error(path, oops)
             raise
         except falcon.HTTPStatus:
             # Not an error, so deliberately not folded into the HTTPError branch above and its
@@ -455,7 +471,7 @@ class APIResource:
             raise falcon.HTTPInternalServerError(title="Server Error", description=INTERNAL_ERROR_DESCRIPTION) from oops
         finally:
             duration = (time.monotonic() - before) * 1000
-            logger.info("Request duration: %.1f ms / %s", duration, resp.status)
+            logger.debug("Request duration: %.1f ms / %s", duration, resp.status)
             record_span(req, "handler", duration)
             if isinstance(res, dict):
                 for span_name, span_data in res.get("outer_timings", {}).items():
@@ -852,7 +868,7 @@ class APIResource:
         offset: int = DEFAULT_OFFSET,
         fields: Sequence[str] | None = None,
     ) -> dict[str, Any]:
-        logger.info("Searching engine for %r", query)
+        logger.debug("Searching engine for %r", query)
         query_explanation = parsed_query.to_human_explanation() if query else ""
         try:
             with timer("engine_query"):
@@ -899,7 +915,7 @@ class APIResource:
         offset: int = DEFAULT_OFFSET,
         fields: Sequence[str] | None = None,
     ) -> dict[str, Any]:
-        logger.info("Searching SQL for %r", query)
+        logger.debug("Searching SQL for %r", query)
         resolved_fields = self._resolve_result_fields(fields)
         query_explanation = parsed_query.to_human_explanation() if query else ""
         try:
@@ -1029,8 +1045,8 @@ class APIResource:
         params["limit"] = limit
         params["offset"] = offset
         query_sql = rewrap(query_sql)
-        logger.info("Full query: %s", query_sql)
-        logger.info("Params: %s", params)
+        logger.debug("Full query: %s", query_sql)
+        logger.debug("Params: %s", params)
         try:
             with timer("run_query"):
                 result_bag = self._run_query(query=query_sql, params=params, explain=False)
@@ -1196,7 +1212,7 @@ class APIResource:
         falcon_response.data = contents
         falcon_response.content_type = "image/vnd.microsoft.icon"
         content_length = len(contents)
-        logger.info("Favicon content length: %d", content_length)
+        logger.debug("Favicon content length: %d", content_length)
         falcon_response.headers["content-length"] = content_length
         # Cache favicon for 7 days - it rarely changes
         set_cache_header(falcon_response, duration=timedelta(days=7))

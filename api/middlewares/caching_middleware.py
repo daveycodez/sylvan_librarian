@@ -181,10 +181,11 @@ class CachingMiddleware:
             req.context["cache_hit"] = True
             req.context["cached_result_count"] = cached.result_count
             req.context["cached_total_cards"] = cached.total_cards
-            logger.info("Cache hit pid=%d: %s / %s", os.getpid(), req.relative_uri, resp.status)
+            logger.debug("Cache hit pid=%d: %s / %s", os.getpid(), req.relative_uri, resp.status)
             return
         resp.set_header("X-Cache", "miss")
-        logger.info("Cache miss pid=%d: %s", os.getpid(), req.relative_uri)
+        # The X-Cache header is the machine-readable hit/miss signal; nothing consumes these lines.
+        logger.debug("Cache miss pid=%d: %s", os.getpid(), req.relative_uri)
 
     def process_response(
         self: CachingMiddleware,
@@ -230,4 +231,4 @@ class CachingMiddleware:
             result_count=len(media.get("cards") or []) if is_dict_media else None,
             total_cards=media.get("total_cards") if is_dict_media else None,
         )
-        logger.info("Cache updated pid=%d: %s", os.getpid(), req.relative_uri)
+        logger.debug("Cache updated pid=%d: %s", os.getpid(), req.relative_uri)

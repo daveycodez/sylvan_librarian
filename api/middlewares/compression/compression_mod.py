@@ -56,7 +56,7 @@ class CompressionMiddleware:
                 continue
             compressor_candidates.append(compressor)
         compressor = min(compressor_candidates, key=lambda v: v.priority) if compressor_candidates else None
-        logger.info(
+        logger.debug(
             "Server priorities: %s / Accept encoding: %s / Selected compressor: %s",
             {k: v.priority for k, v in self._compressors.items()},
             accept_encoding_header,
@@ -97,14 +97,14 @@ class CompressionMiddleware:
             return
 
         if resp.stream:
-            logger.info("Compressing stream")
+            logger.debug("Compressing stream")
             resp.stream = compressor.compress_stream(resp.stream)
             resp.content_length = None
         else:
             data = resp.render_body()
             # If there is no content or it is very short then don't compress.
             if data is None or len(data) < MIN_SIZE:
-                logger.info("Skipping compression for short response")
+                logger.debug("Skipping compression for short response")
                 return
             size_before_compression = len(data)
             before_compression = time.monotonic()
@@ -113,7 +113,9 @@ class CompressionMiddleware:
             resp.text = None
             size_after_compression = len(compressed)
             compress_ms = 1000 * (after_compression - before_compression)
-            logger.info(
+            # Per-request detail; the Server-Timing header carries the compress span for anyone who
+            # wants it per response, and TimingMiddleware's line is the one INFO record per request.
+            logger.debug(
                 "%s: Compressed %s bytes to %s bytes using %s (%.2f x compression) in %.2f ms - %s",
                 req.url,
                 f"{size_before_compression:,}",

@@ -8,6 +8,7 @@ early one has already transformed the body, say -- passes every one of them. The
 
 from __future__ import annotations
 
+import logging
 import multiprocessing
 import time
 from typing import TYPE_CHECKING
@@ -169,3 +170,31 @@ class TestMalformedHostHeader:
         result = client.simulate_get(path, host=host)
         assert result.status == falcon.HTTP_200, result.text
         assert result.headers.get("content-type", "").startswith("text/html")
+
+
+class TestHotPathLogVolume:
+    """One INFO record per ordinary request: TimingMiddleware's timing line.
+
+    The hot path wrote seven to nine INFO lines per request (dispatch, handler duration, cache
+    hit/miss/update, compressor selection, compression summary, engine/SQL dispatch), which is a
+    measurable cost at the request rates the API serves and drowned the one line that matters.
+    """
+
+    def test_static_request_logs_one_info_line(self, client: falcon.testing.TestClient, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.INFO, logger="api"):
+            client.simulate_get("/robots.txt", headers={"Accept-Encoding": "gzip"})
+        info_lines = [record.getMessage() for record in caplog.records if record.levelno == logging.INFO]
+        assert len(info_lines) == 1, info_lines
+        assert info_lines[0].startswith("[timing]")
+
+    def test_not_found_logs_at_info_without_a_traceback(
+        self, client: falcon.testing.TestClient, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.INFO, logger="api"):
+            result = client.simulate_get("/no-such-route")
+        assert result.status == falcon.HTTP_404
+        errors = [record for record in caplog.records if record.levelno >= logging.ERROR]
+        assert errors == [], [record.getMessage() for record in errors]
+        rejected = [record for record in caplog.records if record.getMessage().startswith("Rejected ")]
+        assert rejected
+        assert rejected[0].exc_info is None
