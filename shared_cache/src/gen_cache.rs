@@ -3,6 +3,7 @@ use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use memmap2::MmapMut;
+use rkyv::util::AlignedVec;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::cuckoo::CuckooFilter;
@@ -51,6 +52,9 @@ pub struct PageStats {
 
 pub struct GenerationalSharedCache {
     mmap: MmapMut,
+    /// Reused per-hit copy buffer for `get_with`, so the copy-before-decode costs a memcpy but
+    /// not an allocation. 16-byte aligned because rkyv's archived types are read in place.
+    scratch: AlignedVec,
     n_pages: usize,
     gen_maxsize: usize,
     slot_count_per_page: usize,
@@ -559,6 +563,7 @@ impl GenerationalSharedCache {
 
         Ok(GenerationalSharedCache {
             mmap,
+            scratch: AlignedVec::new(),
             n_pages,
             gen_maxsize,
             slot_count_per_page,
@@ -570,22 +575,17 @@ impl GenerationalSharedCache {
         })
     }
 
-    /// Call `f` with a direct slice into the mmap arena — zero extra allocation.
+    /// Call `f` with a private copy of the entry's bytes.
     ///
-    /// The lock is released before `f` runs. Another process can modify the underlying
-    /// bytes concurrently (active page: in-place update bracketed by value_seq increments;
-    /// sealed page: rotation zeroing bracketed by odd generation bumps). This is a
-    /// deliberate trade-off: copying bytes under the lock eliminates the zero-copy benefit.
-    ///
-    /// This means `f` observes a data race in Rust's memory model — technically UB.
-    /// The practical safety argument:
-    ///   - The race window is extremely narrow.
-    ///   - rkyv stores relative pointers (offset from the pointer's own address). A torn
-    ///     read of an offset resolves somewhere within the mmap region, not arbitrary memory.
-    ///   - The generation/value_seq checks after `f` returns detect any concurrent write
-    ///     and discard the result. Worst case: one extra database query.
-    ///
-    /// Callers that cannot tolerate this trade-off should copy the bytes inside `f` (e.g. `bytes.to_vec()`) before decoding.
+    /// The lock is released before the bytes are read, so another process can be writing them
+    /// (active page: an in-place update bracketed by value_seq increments; sealed page: rotation
+    /// zeroing bracketed by odd generation bumps). The seqlock protocol is therefore: snapshot
+    /// seq/generation, copy the bytes out, re-check, and only then decode the copy. A torn copy is
+    /// detected by the re-check and discarded before `f` ever sees it — the decoder
+    /// (`rkyv::access_unchecked`, which trusts every relative pointer it reads) never runs over a
+    /// buffer that can change underneath it. The copy goes into a reused aligned scratch buffer,
+    /// so it costs a memcpy but no allocation: measured at +~70 ns on a 5 KB body (517 -> 585 ns
+    /// per hit) and +~320 ns on a 24 KB body (851 -> 1175 ns), against a miss of ~57 ns.
     pub fn get_with<F, T>(&mut self, key: &[u8], f: F) -> Option<T>
     where
         F: FnOnce(&[u8]) -> T,
@@ -612,14 +612,14 @@ impl GenerationalSharedCache {
         unlock(&self.mmap);
 
         if let Some((abs, len, gen_before, slot_idx, seq_before)) = active_snap {
-            let result = f(&self.mmap[abs..abs + len]);
-            if self.page_generation(active_idx) != gen_before {
-                return None;
-            }
-            if read_value_seq(self.slot_ptr(active_idx, slot_idx) as *const u8) != seq_before {
-                return None;
-            }
-            return Some(result);
+            let buf = self.copy_out(abs, len);
+            // Seqlock read side: the data reads above must complete before the re-checks below.
+            fence(Ordering::Acquire);
+            let stable = self.page_generation(active_idx) == gen_before
+                && read_value_seq(self.slot_ptr(active_idx, slot_idx) as *const u8) == seq_before;
+            let result = if stable { Some(f(buf.as_slice())) } else { None };
+            self.scratch = buf;
+            return result;
         }
 
         // Probe sealed pages lock-free, newest first.
@@ -632,17 +632,26 @@ impl GenerationalSharedCache {
             if let Some((off, len, slot_idx)) = self.do_probe(page_idx, hash, key) {
                 set_visited(self.slot_ptr(page_idx, slot_idx) as *const u8);
                 let abs = self.page_offset(page_idx) + self.arena_start_in_page + off as usize;
-                let result = f(&self.mmap[abs..abs + len as usize]);
-                // Discard if generation changed while f ran (rotation started or completed).
-                let gen_after = self.page_generation(page_idx);
-                if gen_after != gen_before {
-                    return None;
-                }
-                return Some(result);
+                let buf = self.copy_out(abs, len as usize);
+                fence(Ordering::Acquire);
+                // Discard if a rotation started or completed while the bytes were being copied.
+                let stable = self.page_generation(page_idx) == gen_before;
+                let result = if stable { Some(f(buf.as_slice())) } else { None };
+                self.scratch = buf;
+                return result;
             }
         }
 
         None // filter false positive
+    }
+
+    /// Copy `len` bytes at `abs` into the reusable scratch buffer and hand it out; the caller puts
+    /// it back in `self.scratch` when done so the allocation is kept for the next hit.
+    fn copy_out(&mut self, abs: usize, len: usize) -> AlignedVec {
+        let mut buf = std::mem::replace(&mut self.scratch, AlignedVec::new());
+        buf.clear();
+        buf.extend_from_slice(&self.mmap[abs..abs + len]);
+        buf
     }
 
     /// Returns `None` if `key` is already cached with identical content — caller can skip `set()`.
