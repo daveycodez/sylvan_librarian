@@ -13129,10 +13129,11 @@ type CollIds = for<'a> fn(&'a AOracleCard, &'a APrinting) -> &'a Archived<Vec<u1
 #[derive(Clone, Copy)]
 enum CachedSource {
     /// Not cacheable; the table's own extractor runs.
-    Extractor,
+    Extractor(FieldExtractor),
     /// A `CardData.strings` id, served as one cached `PyString`.
     Str(CachedStrId),
-    /// A `coll_vocab` id vector, served as a list of cached `PyString`s.
+    /// A `coll_vocab` id vector, served as a tuple of cached `PyString`s (`EmitStrCache::coll_list`).
+    /// These fields have no `FIELD_TABLE` row: the cache is their only path.
     Coll(CollIds),
 }
 
@@ -13141,13 +13142,13 @@ enum CachedSource {
 /// All six are cached: their elements come from `coll_vocab` (~16k entries), a bounded vocabulary
 /// that repeats heavily across rows -- 11,278 elements over 1,946 distinct values in one 500-row
 /// sample, with no sharing at all before this. None of them needs a sort any more; see `coll_list`.
-const CACHED_COLL_FIELDS: &[(&str, CollIds)] = &[
-    ("card_subtypes", |c, _p| &c.card_subtypes),
-    ("card_keywords", |c, _p| &c.card_keywords),
-    ("card_oracle_tags", |c, _p| &c.card_oracle_tags),
-    ("card_art_tags", |_c, p| &p.card_art_tags),
-    ("card_is_tags", |_c, p| &p.card_is_tags),
-    ("card_frame_data", |_c, p| &p.card_frame_data),
+const CACHED_COLL_FIELDS: &[(&str, FieldKey, CollIds)] = &[
+    ("card_subtypes", |py| intern!(py, "card_subtypes"), |c, _p| &c.card_subtypes),
+    ("card_keywords", |py| intern!(py, "card_keywords"), |c, _p| &c.card_keywords),
+    ("card_oracle_tags", |py| intern!(py, "card_oracle_tags"), |c, _p| &c.card_oracle_tags),
+    ("card_art_tags", |py| intern!(py, "card_art_tags"), |_c, p| &p.card_art_tags),
+    ("card_is_tags", |py| intern!(py, "card_is_tags"), |_c, p| &p.card_is_tags),
+    ("card_frame_data", |py| intern!(py, "card_frame_data"), |_c, p| &p.card_frame_data),
 ];
 
 /// The result fields served from `EmitStrCache`, and the id each one caches on.
@@ -13162,7 +13163,7 @@ const CACHED_COLL_FIELDS: &[(&str, CollIds)] = &[
 /// any other table would cache the wrong text.
 /// One resolved result field: its name, its interned dict key, its extractor, and — for a field
 /// served from `EmitStrCache` — the id to cache on.
-type ResolvedField = (&'static str, FieldKey, FieldExtractor, CachedSource);
+type ResolvedField = (&'static str, FieldKey, CachedSource);
 
 const CACHED_STR_FIELDS: &[(&str, CachedStrId)] = &[
     ("type_line", |c, _p| u32::from(c.type_line_id)),
@@ -13191,18 +13192,6 @@ const FIELD_TABLE: &[(&str, FieldKey, FieldExtractor)] = &[
     // approximation.
     ("price_usd", |py| intern!(py, "price_usd"), |py, _c, p, _s, _v| Ok(p.price_usd.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).into_pyobject(py)?.into_any())),
     ("prefer_score", |py| intern!(py, "prefer_score"), |py, _c, p, _s, _v| Ok(p.prefer_score.as_ref().map(|v| f32::from(*v)).into_pyobject(py)?.into_any())),
-    // card_subtypes preserves the printed order; the set-like collections are stored
-    // sorted by vocab id (first-seen order), so they get re-sorted lexicographically
-    // for deterministic output.
-    ("card_subtypes", |py| intern!(py, "card_subtypes"), |py, c, _p, _s, v| {
-        let items: Vec<&str> = c.card_subtypes.iter().map(|id| coll_str(v, u16::from(*id))).collect();
-        Ok(items.into_pyobject(py)?.into_any())
-    }),
-    ("card_keywords", |py| intern!(py, "card_keywords"), |py, c, _p, _s, v| Ok(sorted_strs(v, &c.card_keywords).into_pyobject(py)?.into_any())),
-    ("card_oracle_tags", |py| intern!(py, "card_oracle_tags"), |py, c, _p, _s, v| Ok(sorted_strs(v, &c.card_oracle_tags).into_pyobject(py)?.into_any())),
-    ("card_art_tags", |py| intern!(py, "card_art_tags"), |py, _c, p, _s, v| Ok(sorted_strs(v, &p.card_art_tags).into_pyobject(py)?.into_any())),
-    ("card_is_tags", |py| intern!(py, "card_is_tags"), |py, _c, p, _s, v| Ok(sorted_strs(v, &p.card_is_tags).into_pyobject(py)?.into_any())),
-    ("card_frame_data", |py| intern!(py, "card_frame_data"), |py, _c, p, _s, v| Ok(sorted_strs(v, &p.card_frame_data).into_pyobject(py)?.into_any())),
     // Card-data fields for downstream filtering, in Scryfall JSON shapes (names and value
     // shapes match RESULT_FIELD_COLUMNS in api/api_resource.py, which reshapes the SQL
     // path's raw columns to agree with these).
@@ -13286,14 +13275,6 @@ pub(crate) fn coll_str(vocab: &AStrings, id: u16) -> &str {
     vocab[id as usize].as_str()
 }
 
-/// Resolves interned collection ids to a lexicographically sorted `Vec<&str>` for
-/// deterministic field output.
-fn sorted_strs<'a>(vocab: &'a AStrings, ids: &Archived<Vec<u16>>) -> Vec<&'a str> {
-    let mut v: Vec<&str> = ids.iter().map(|id| coll_str(vocab, u16::from(*id))).collect();
-    v.sort_unstable();
-    v
-}
-
 const DEFAULT_FIELDS: &[&str] =
     &["name", "set_code", "collector_number", "power", "toughness", "mana_cost", "oracle_text", "set_name", "type_line"];
 
@@ -13312,19 +13293,18 @@ fn resolve_fields(fields: Option<Vec<String>>) -> PyResult<Vec<ResolvedField>> {
         if !seen.insert(name) {
             continue;
         }
-        match FIELD_TABLE.iter().find(|(n, _, _)| *n == name) {
-            Some((n, key, extractor)) => {
-                let cached = CACHED_STR_FIELDS
-                    .iter()
-                    .find(|(cn, _)| cn == n)
-                    .map(|(_, id_of)| CachedSource::Str(*id_of))
-                    .or_else(|| {
-                        CACHED_COLL_FIELDS.iter().find(|(cn, _)| cn == n).map(|(_, ids_of)| CachedSource::Coll(*ids_of))
-                    })
-                    .unwrap_or(CachedSource::Extractor);
-                resolved.push((*n, *key, *extractor, cached));
-            }
-            None => return Err(UnknownFieldError::new_err(format!("unknown field: {name:?}"))),
+        // The collection fields live only in `CACHED_COLL_FIELDS`: they had `FIELD_TABLE` rows too,
+        // whose extractors were unreachable once resolution routed them to the cache.
+        if let Some((n, key, extractor)) = FIELD_TABLE.iter().find(|(n, _, _)| *n == name) {
+            let cached = CACHED_STR_FIELDS
+                .iter()
+                .find(|(cn, _)| cn == n)
+                .map_or(CachedSource::Extractor(*extractor), |(_, id_of)| CachedSource::Str(*id_of));
+            resolved.push((*n, *key, cached));
+        } else if let Some((n, key, ids_of)) = CACHED_COLL_FIELDS.iter().find(|(n, _, _)| *n == name) {
+            resolved.push((*n, *key, CachedSource::Coll(*ids_of)));
+        } else {
+            return Err(UnknownFieldError::new_err(format!("unknown field: {name:?}")));
         }
     }
     Ok(resolved)
@@ -13340,11 +13320,11 @@ fn card_to_pydict<'py>(
     str_cache: &EmitStrCache,
 ) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
-    for (_, key, extractor, cached) in fields {
+    for (_, key, cached) in fields {
         let value = match cached {
             CachedSource::Str(id_of) => str_cache.get(py, strings, id_of(card, printing))?,
             CachedSource::Coll(ids_of) => str_cache.coll_list(py, vocab, ids_of(card, printing))?.into_any(),
-            CachedSource::Extractor => extractor(py, card, printing, strings, vocab)?,
+            CachedSource::Extractor(extractor) => extractor(py, card, printing, strings, vocab)?,
         };
         d.set_item(key(py), value)?;
     }
