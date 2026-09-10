@@ -5332,7 +5332,10 @@ fn narrow_rec(
                 .iter()
                 .map(|&d| (u32::from(flavor.offsets[d as usize + 1]) - u32::from(flavor.offsets[d as usize])) as usize)
                 .sum();
-            if range_too_broad_to_narrow(total, flavor.printings.len()) {
+            // `n_printings`, as the range arms pass: the breadth question is "what fraction of the
+            // store", and `flavor.printings.len()` (printings WITH flavor text) is a smaller
+            // denominator that made a broad flavor match look narrower than it is.
+            if range_too_broad_to_narrow(total, n_printings) {
                 return None;
             }
             Narrowed::tight(Candidates::Printings(expand_flavor_ids(flavor, dense_ids, n_printings)))
