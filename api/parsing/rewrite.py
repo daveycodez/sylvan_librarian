@@ -190,8 +190,10 @@ def _clone_expansion(node: QueryNode) -> QueryNode:
     ``card_query_nodes.to_sql``, e.g. ``self.rhs.value = ...``, ``self.operator = ...``), which
     would otherwise corrupt ``_expanded_template``'s cached result for every future query that
     reuses the same synonym -- so each leaf needs its own node and its own ``rhs`` object.
-    ``lhs`` and each value node's own ``.value`` are never reassigned in place downstream, so
-    those are shared, not copied.
+    ``lhs`` is shared, not copied, which makes it a contract that nothing downstream writes to it:
+    ``_handle_jsonb_array`` resolves type-vs-subtype into a local for exactly this reason (it used
+    to assign ``lhs.attribute_name``, and through this sharing that was a write to the cached
+    template). ``test_rewrite`` pins the template's lhs across repeated SQL generation.
 
     Deliberately not ``copy.deepcopy``: measured ~20x slower than this on these subtrees (a
     6-leaf expansion: 32us vs 1.5us) because deepcopy's generic per-object reduce/memo machinery

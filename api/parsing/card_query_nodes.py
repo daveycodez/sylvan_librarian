@@ -1118,12 +1118,14 @@ class CardBinaryOperatorNode(BinaryOperatorNode):
     def _handle_jsonb_array(self, context: QueryContext) -> str:
         # TODO: this should produce the query as an array, not jsonb
         rhs_val = self.rhs.value.strip().title()
-        if self.lhs.attribute_name.lower() in ("card_types", "card_subtypes", "type"):
-            if rhs_val in CARD_SUPERTYPES | CARD_TYPES:
-                self.lhs.attribute_name = "card_types"
-            else:
-                self.lhs.attribute_name = "card_subtypes"
-        col = self.lhs.to_sql(context)
+        # Resolve type-vs-subtype into a local, never back onto lhs: rewrite.py's expansion clones
+        # share one lhs across every copy of a cached template, so writing it here rewrote the
+        # template for every later query (idempotently, by luck of the same value resolving the
+        # same way). kwargs() above resolves the same question the same way for the engine.
+        column = self.lhs.attribute_name.lower()
+        if column in ("card_types", "card_subtypes", "type"):
+            column = "card_types" if rhs_val in CARD_SUPERTYPES | CARD_TYPES else "card_subtypes"
+        col = f"card.{column}"
 
         query = context.add([rhs_val])
         if self.operator == "=":

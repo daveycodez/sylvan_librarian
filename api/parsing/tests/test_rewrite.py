@@ -6,11 +6,13 @@ post-parse seam. Mappings are validated against Scryfall's live API in
 docs/issues/00713-is-tag-recovery.md.
 """
 
+from collections.abc import Iterator
+
 import pytest
 
 from api.parsing import generate_sql_query, parse_scryfall_query
-from api.parsing.nodes import RegexValueNode
-from api.parsing.rewrite import _regex_plain_literal
+from api.parsing.nodes import QueryNode, RegexValueNode
+from api.parsing.rewrite import _expanded_template, _regex_plain_literal
 
 # (synonym query, canonical expansion) — the two must produce identical ASTs.
 EQUIVALENCES = [
@@ -245,3 +247,40 @@ _PLAIN_LITERAL_CASES = {
 def test_regex_plain_literal(expected: str | None, pattern: str) -> None:
     """`_regex_plain_literal` extracts the literal for metachar-free patterns, else None."""
     assert _regex_plain_literal(pattern) == expected
+
+
+# ── cached templates are shared, so SQL generation must not write to lhs ─────
+
+
+def _leaves(node: QueryNode) -> Iterator[QueryNode]:
+    if hasattr(node, "operands"):
+        for operand in node.operands:
+            yield from _leaves(operand)
+    elif hasattr(node, "operand"):
+        yield from _leaves(node.operand)
+    else:
+        yield node
+
+
+def test_sql_generation_leaves_the_cached_expansion_template_alone() -> None:
+    """Rendering `is:party` three times gives identical SQL and never touches the template's lhs.
+
+    `_clone_expansion` shares lhs across every clone of a cached template; `_handle_jsonb_array`
+    used to assign `lhs.attribute_name` while resolving type vs subtype, which rewrote the cached
+    template (idempotently, as it happened -- but a write into a cache all the same).
+    """
+    outputs = [generate_sql_query(parse_scryfall_query("is:party")) for _ in range(3)]
+    assert outputs[0] == outputs[1] == outputs[2]
+    template = _expanded_template(("is", "party"))
+    type_leaves = [leaf for leaf in _leaves(template) if leaf.lhs.original_attribute == "t"]
+    assert len(type_leaves) == 5  # creature, cleric, rogue, warrior, wizard
+    assert {leaf.lhs.attribute_name for leaf in type_leaves} == {"card_types"}
+
+
+def test_type_leaf_lhs_is_not_rewritten_by_sql_generation(parse_query) -> None:
+    """A subtype value routes the SQL to card_subtypes without renaming the node's column."""
+    parsed = parse_query("t:cleric")
+    sql, _params = generate_sql_query(parsed)
+    assert "card.card_subtypes" in sql
+    assert parsed.root.lhs.attribute_name == "card_types"
+    assert generate_sql_query(parsed) == (sql, _params)
