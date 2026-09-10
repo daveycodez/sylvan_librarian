@@ -106,7 +106,7 @@ fn legality_code(status: &str) -> u64 {
     }
 }
 
-pub(crate) fn jsonb_obj_to_legality_bits(d: &Bound<PyDict>, key: &str) -> u64 {
+pub(crate) fn jsonb_obj_to_legality_bits(d: &Bound<PyDict>, key: &Bound<'_, PyString>) -> u64 {
     d.get_item(key)
         .ok()
         .flatten()

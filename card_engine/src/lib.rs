@@ -511,7 +511,7 @@ impl ManaVocabInterner {
 
 // ─── Loading helpers ─────────────────────────────────────────────────────────
 
-fn opt_str(d: &Bound<PyDict>, key: &str) -> Option<String> {
+fn opt_str(d: &Bound<PyDict>, key: &Bound<'_, PyString>) -> Option<String> {
     d.get_item(key).ok().flatten().and_then(|v| v.extract::<String>().ok())
 }
 
@@ -555,7 +555,7 @@ fn parse_uuid_or_hash(s: &str) -> u128 {
     if h == 0 { 1 } else { h }
 }
 
-fn opt_uuid(d: &Bound<PyDict>, key: &str) -> u128 {
+fn opt_uuid(d: &Bound<PyDict>, key: &Bound<'_, PyString>) -> u128 {
     let Some(v) = d.get_item(key).ok().flatten() else { return 0 };
     // psycopg returns uuid.UUID objects natively; try that first.
     if let Ok(u) = v.extract::<uuid::Uuid>() {
@@ -604,7 +604,7 @@ fn uuid_from_u128(v: u128) -> Option<uuid::Uuid> {
 }
 
 // Accepts ISO strings or datetime.date (psycopg returns date columns as datetime.date).
-fn opt_date_str(d: &Bound<PyDict>, key: &str) -> Option<String> {
+fn opt_date_str(d: &Bound<PyDict>, key: &Bound<'_, PyString>) -> Option<String> {
     let v = d.get_item(key).ok().flatten()?;
     if let Ok(s) = v.extract::<String>() {
         return Some(s);
@@ -617,7 +617,7 @@ fn opt_date_str(d: &Bound<PyDict>, key: &str) -> Option<String> {
 /// the source value is a decimal price (from Scryfall's JSON via Python's json/psycopg, both
 /// already correctly-rounded f64), so rounding to the nearest cent recovers the exact intended
 /// value even if the f64 isn't bit-exact for the decimal (see Printing's price_usd doc comment).
-fn opt_price_cents(d: &Bound<PyDict>, key: &str) -> Option<u32> {
+fn opt_price_cents(d: &Bound<PyDict>, key: &Bound<'_, PyString>) -> Option<u32> {
     d.get_item(key).ok().flatten().and_then(|v| {
         v.extract::<f64>().ok().or_else(|| v.extract::<i64>().ok().map(|n| n as f64))
     }).and_then(price_cents_of)
@@ -646,30 +646,30 @@ fn int_of<T: TryFrom<i64>>(v: f32) -> Option<T> {
     T::try_from(t as i64).ok()
 }
 
-fn opt_f32(d: &Bound<PyDict>, key: &str) -> Option<f32> {
+fn opt_f32(d: &Bound<PyDict>, key: &Bound<'_, PyString>) -> Option<f32> {
     d.get_item(key).ok().flatten().and_then(|v| {
         v.extract::<f64>().ok().map(|n| n as f32)
             .or_else(|| v.extract::<i64>().ok().map(|n| n as f32))
     })
 }
 
-fn opt_i8(d: &Bound<PyDict>, key: &str) -> Option<i8> {
+fn opt_i8(d: &Bound<PyDict>, key: &Bound<'_, PyString>) -> Option<i8> {
     opt_f32(d, key).and_then(int_of)
 }
 
-fn opt_u8(d: &Bound<PyDict>, key: &str) -> Option<u8> {
+fn opt_u8(d: &Bound<PyDict>, key: &Bound<'_, PyString>) -> Option<u8> {
     opt_f32(d, key).and_then(int_of)
 }
 
-fn opt_u16(d: &Bound<PyDict>, key: &str) -> Option<u16> {
+fn opt_u16(d: &Bound<PyDict>, key: &Bound<'_, PyString>) -> Option<u16> {
     opt_f32(d, key).and_then(int_of)
 }
 
-fn opt_u32(d: &Bound<PyDict>, key: &str) -> Option<u32> {
+fn opt_u32(d: &Bound<PyDict>, key: &Bound<'_, PyString>) -> Option<u32> {
     opt_f32(d, key).and_then(int_of)
 }
 
-fn str_list(d: &Bound<PyDict>, key: &str) -> Vec<String> {
+fn str_list(d: &Bound<PyDict>, key: &Bound<'_, PyString>) -> Vec<String> {
     d.get_item(key)
         .ok()
         .flatten()
@@ -677,7 +677,7 @@ fn str_list(d: &Bound<PyDict>, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn jsonb_color_to_bits(d: &Bound<PyDict>, key: &str) -> u8 {
+fn jsonb_color_to_bits(d: &Bound<PyDict>, key: &Bound<'_, PyString>) -> u8 {
     let colors: Vec<String> = d
         .get_item(key)
         .ok()
@@ -693,7 +693,7 @@ fn jsonb_color_to_bits(d: &Bound<PyDict>, key: &str) -> u8 {
 
 /// Interned vocab ids of a JSON list of strings, preserving element order
 /// (card_subtypes keeps the printed subtype order).
-fn str_list_to_ids(d: &Bound<PyDict>, key: &str, vocab: &mut VocabInterner) -> PyResult<Vec<u16>> {
+fn str_list_to_ids(d: &Bound<PyDict>, key: &Bound<'_, PyString>, vocab: &mut VocabInterner) -> PyResult<Vec<u16>> {
     str_list(d, key).into_iter().map(|s| vocab.intern(s)).collect()
 }
 
@@ -749,7 +749,7 @@ fn renumber_coll_vocab(cards: &mut [OracleCard], printings: &mut [Printing], col
     sorted_vocab
 }
 
-fn jsonb_obj_to_ids(d: &Bound<PyDict>, key: &str, vocab: &mut VocabInterner) -> PyResult<Vec<u16>> {
+fn jsonb_obj_to_ids(d: &Bound<PyDict>, key: &Bound<'_, PyString>, vocab: &mut VocabInterner) -> PyResult<Vec<u16>> {
     let mut ids: Vec<u16> = d
         .get_item(key)
         .ok()
@@ -779,7 +779,7 @@ fn mana_cost_from_pydict(d: &Bound<PyDict>, cmc_val: Option<f32>, mana_vocab: &m
     let mut core = 0u64;
     let mut devotion = 0u64;
     let mut hybrids: Vec<(u8, u8)> = Vec::new();
-    if let Some(m) = d.get_item("mana_cost_jsonb").ok().flatten().and_then(|v| v.cast_into::<PyDict>().ok()) {
+    if let Some(m) = d.get_item(intern!(d.py(), "mana_cost_jsonb")).ok().flatten().and_then(|v| v.cast_into::<PyDict>().ok()) {
         for (k, v) in m.iter() {
             let Ok(sym) = k.extract::<String>() else { continue };
             let count = v.cast::<PyList>().ok().map(|l| l.len().min(127) as u8).unwrap_or(0);
@@ -828,33 +828,40 @@ fn card_from_pydict(
     mana: &mut ManaVocabInterner,
     stats: &mut LoadStats,
 ) -> PyResult<CardRow> {
-    let released_at = opt_date_str(d, "released_at").unwrap_or_default();
+    // Interned dict keys: ~45 `get_item`s per row, and a `&str` key builds and hashes a fresh
+    // `PyString` on every one of them; `intern!` resolves each name once per process.
+    macro_rules! k {
+        ($name:literal) => {
+            intern!(d.py(), $name)
+        };
+    }
+    let released_at = opt_date_str(d, k!("released_at")).unwrap_or_default();
     let released_at_int: Option<u32> = released_at.replace('-', "").parse().ok();
     // Raw strings from the dict; interned to ids as the struct is built below.
-    let card_name = opt_str(d, "card_name").unwrap_or_default();
+    let card_name = opt_str(d, k!("card_name")).unwrap_or_default();
     let name_lower = card_name.to_lowercase();
     // Already lowercased + accent-folded in Python (fold_accents(), #649); read as-is.
-    let name_folded = opt_str(d, "card_name_folded").unwrap_or_default();
-    let set_code = opt_str(d, "card_set_code").unwrap_or_default();
+    let name_folded = opt_str(d, k!("card_name_folded")).unwrap_or_default();
+    let set_code = opt_str(d, k!("card_set_code")).unwrap_or_default();
     stats.inline_truncations += usize::from(InlineStr::<61>::truncates(&name_lower))
         + usize::from(InlineStr::<61>::truncates(&name_folded))
         + usize::from(InlineStr::<8>::truncates(&set_code));
     let card_name_lower = InlineStr::<61>::from_str(&name_lower);
     let card_name_folded = InlineStr::<61>::from_str(&name_folded);
-    let oracle_text = opt_str(d, "oracle_text").unwrap_or_default();
+    let oracle_text = opt_str(d, k!("oracle_text")).unwrap_or_default();
     let oracle_text_lower_id = it.intern(oracle_text.to_lowercase());
-    let flavor_text = opt_str(d, "flavor_text").unwrap_or_default();
+    let flavor_text = opt_str(d, k!("flavor_text")).unwrap_or_default();
     let flavor_text_lower_id = it.intern(flavor_text.to_lowercase());
-    let card_artist_vid = match opt_str(d, "card_artist") {
+    let card_artist_vid = match opt_str(d, k!("card_artist")) {
         Some(a) => artists.intern(a.to_lowercase())?,
         None => ARTIST_NONE,
     };
-    let card_types = card_types_list_to_bits(&str_list(d, "card_types"));
+    let card_types = card_types_list_to_bits(&str_list(d, k!("card_types")));
 
     Ok(CardRow {
-        scryfall_id: opt_uuid(d, "scryfall_id"),
-        oracle_id: opt_uuid(d, "oracle_id"),
-        illustration_id: opt_uuid(d, "illustration_id"),
+        scryfall_id: opt_uuid(d, k!("scryfall_id")),
+        oracle_id: opt_uuid(d, k!("oracle_id")),
+        illustration_id: opt_uuid(d, k!("illustration_id")),
 
         card_name_lower,
         card_name_folded,
@@ -865,45 +872,45 @@ fn card_from_pydict(
         flavor_text_id: it.intern(flavor_text),
         card_artist_vid,
         card_set_code: InlineStr::<8>::from_str(&set_code),
-        card_layout_id: it.intern(opt_str(d, "card_layout").unwrap_or_default()),
-        card_border_id: it.intern(opt_str(d, "card_border").unwrap_or_default()),
-        card_watermark_id: it.intern_opt(opt_str(d, "card_watermark")),
-        collector_number_id: it.intern(opt_str(d, "collector_number").unwrap_or_default()),
-        mana_cost_text_id: it.intern_opt(opt_str(d, "mana_cost_text")),
-        type_line_id: it.intern(opt_str(d, "type_line").unwrap_or_default()),
-        set_name_id: it.intern(opt_str(d, "set_name").unwrap_or_default()),
+        card_layout_id: it.intern(opt_str(d, k!("card_layout")).unwrap_or_default()),
+        card_border_id: it.intern(opt_str(d, k!("card_border")).unwrap_or_default()),
+        card_watermark_id: it.intern_opt(opt_str(d, k!("card_watermark"))),
+        collector_number_id: it.intern(opt_str(d, k!("collector_number")).unwrap_or_default()),
+        mana_cost_text_id: it.intern_opt(opt_str(d, k!("mana_cost_text"))),
+        type_line_id: it.intern(opt_str(d, k!("type_line")).unwrap_or_default()),
+        set_name_id: it.intern(opt_str(d, k!("set_name")).unwrap_or_default()),
         released_at_int,
 
-        card_colors: jsonb_color_to_bits(d, "card_colors"),
-        card_color_identity: jsonb_color_to_bits(d, "card_color_identity"),
-        produced_mana: jsonb_color_to_bits(d, "produced_mana"),
+        card_colors: jsonb_color_to_bits(d, k!("card_colors")),
+        card_color_identity: jsonb_color_to_bits(d, k!("card_color_identity")),
+        produced_mana: jsonb_color_to_bits(d, k!("produced_mana")),
 
-        cmc: opt_u8(d, "cmc"), // Un-set cards have fractional cmc, but we don't load those into the dataset
-        creature_power: opt_i8(d, "creature_power"),
-        creature_toughness: opt_i8(d, "creature_toughness"),
-        planeswalker_loyalty: opt_u8(d, "planeswalker_loyalty"),
-        card_rarity_int: opt_u8(d, "card_rarity_int"),
-        collector_number_int: opt_u16(d, "collector_number_int"),
-        edhrec_rank: opt_u32(d, "edhrec_rank"),
-        price_usd: opt_price_cents(d, "price_usd"),
-        price_eur: opt_price_cents(d, "price_eur"),
-        price_tix: opt_price_cents(d, "price_tix"),
-        prefer_score: opt_f32(d, "prefer_score"),
-        cubecobra_score: opt_f32(d, "cubecobra_score"),
+        cmc: opt_u8(d, k!("cmc")), // Un-set cards have fractional cmc, but we don't load those into the dataset
+        creature_power: opt_i8(d, k!("creature_power")),
+        creature_toughness: opt_i8(d, k!("creature_toughness")),
+        planeswalker_loyalty: opt_u8(d, k!("planeswalker_loyalty")),
+        card_rarity_int: opt_u8(d, k!("card_rarity_int")),
+        collector_number_int: opt_u16(d, k!("collector_number_int")),
+        edhrec_rank: opt_u32(d, k!("edhrec_rank")),
+        price_usd: opt_price_cents(d, k!("price_usd")),
+        price_eur: opt_price_cents(d, k!("price_eur")),
+        price_tix: opt_price_cents(d, k!("price_tix")),
+        prefer_score: opt_f32(d, k!("prefer_score")),
+        cubecobra_score: opt_f32(d, k!("cubecobra_score")),
 
         card_types,
-        card_subtypes: str_list_to_ids(d, "card_subtypes", vocab)?,
-        card_keywords: jsonb_obj_to_ids(d, "card_keywords", vocab)?,
-        card_legalities: jsonb_obj_to_legality_bits(d, "card_legalities"),
-        card_oracle_tags: jsonb_obj_to_ids(d, "card_oracle_tags", vocab)?,
-        card_art_tags: jsonb_obj_to_ids(d, "card_art_tags", vocab)?,
-        card_is_tags: jsonb_obj_to_ids(d, "card_is_tags", vocab)?,
-        card_frame_data: jsonb_obj_to_ids(d, "card_frame_data", vocab)?,
+        card_subtypes: str_list_to_ids(d, k!("card_subtypes"), vocab)?,
+        card_keywords: jsonb_obj_to_ids(d, k!("card_keywords"), vocab)?,
+        card_legalities: jsonb_obj_to_legality_bits(d, k!("card_legalities")),
+        card_oracle_tags: jsonb_obj_to_ids(d, k!("card_oracle_tags"), vocab)?,
+        card_art_tags: jsonb_obj_to_ids(d, k!("card_art_tags"), vocab)?,
+        card_is_tags: jsonb_obj_to_ids(d, k!("card_is_tags"), vocab)?,
+        card_frame_data: jsonb_obj_to_ids(d, k!("card_frame_data"), vocab)?,
 
-        mana_cost: mana_cost_from_pydict(d, opt_f32(d, "cmc"), mana, card_types)?,
+        mana_cost: mana_cost_from_pydict(d, opt_f32(d, k!("cmc")), mana, card_types)?,
 
-        creature_power_text_id: it.intern_opt(opt_str(d, "creature_power_text")),
-        creature_toughness_text_id: it.intern_opt(opt_str(d, "creature_toughness_text")),
+        creature_power_text_id: it.intern_opt(opt_str(d, k!("creature_power_text"))),
+        creature_toughness_text_id: it.intern_opt(opt_str(d, k!("creature_toughness_text"))),
     })
 }
 
