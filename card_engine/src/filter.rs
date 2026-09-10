@@ -125,13 +125,15 @@ pub(crate) fn compile_search_regex_for_test(pattern: &str) -> Regex {
 #[derive(Clone)]
 pub(crate) struct Needle {
     word: String,
-    finder: memmem::Finder<'static>,
+    // Boxed so `FilterExpr` stays small: an owned `Finder` is ~300 bytes on x86_64 (its SIMD
+    // prefilters live inline), which would triple the enum for the sake of one variant.
+    finder: Box<memmem::Finder<'static>>,
 }
 
 impl Needle {
     pub(crate) fn new(word: impl Into<String>) -> Self {
         let word = word.into();
-        let finder = memmem::Finder::new(word.as_bytes()).into_owned();
+        let finder = Box::new(memmem::Finder::new(word.as_bytes()).into_owned());
         Needle { word, finder }
     }
 
