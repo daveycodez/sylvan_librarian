@@ -272,6 +272,55 @@ def plan_migrations(applied: list[dict[str, str]], on_disk: list[dict[str, str]]
     return already_applied, False
 
 
+# How many skipped-card ids the import's one WARNING quotes.
+_SKIPPED_IDS_TO_LOG = 5
+
+# What preprocess_card raises on a malformed upstream row: a missing key, a wrong-typed value, a
+# string where a list was expected. Anything else is a bug in preprocessing and still propagates.
+_PREPROCESS_ERRORS = (KeyError, TypeError, AttributeError, ValueError)
+
+
+class _CardStream:
+    """Preprocesses raw cards lazily, tracking stage counts and skipping rows preprocess_card rejects."""
+
+    def __init__(self, cards: Iterable[dict[str, Any]]) -> None:
+        self._cards = cards
+        self.raw = 0
+        self.preprocessed = 0
+        self.skipped = 0
+        self.skipped_ids: list[str] = []
+        self.first_error: str | None = None
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        for card in self._cards:
+            self.raw += 1
+            try:
+                processed = preprocess_card(card)
+            except _PREPROCESS_ERRORS as oops:
+                self.skipped += 1
+                if len(self.skipped_ids) < _SKIPPED_IDS_TO_LOG:
+                    card_id = card.get("id") if isinstance(card, dict) else None
+                    self.skipped_ids.append(str(card_id) if card_id is not None else "<no id>")
+                if self.first_error is None:
+                    self.first_error = f"{type(oops).__name__}: {oops}"
+                continue
+            for item in processed:
+                self.preprocessed += 1
+                yield item
+
+    def log_skips(self) -> None:
+        """One WARNING for every card preprocess_card rejected, so a bad upstream row is visible but not fatal."""
+        if not self.skipped:
+            return
+        logger.warning(
+            "Skipped %d of %d raw cards that failed preprocessing; first ids: %s; first error: %s",
+            self.skipped,
+            self.raw,
+            ", ".join(self.skipped_ids),
+            self.first_error,
+        )
+
+
 class AdminContext:
     """Cross-worker primitives private to AdminResource's own use.
 
@@ -1230,36 +1279,31 @@ class AdminResource:
         is never held in memory. Each batch is upserted via bulk_upsert: new rows
         are inserted, changed rows are updated, and unchanged rows are skipped.
 
+        Each batch is committed on its own. One transaction across the whole import meant a lost
+        backend or a single bad row rolled back ~90k rows and held autovacuum off the table for the
+        duration; now a failure loses at most the batch in flight, and what was committed stays.
+
+        A raw card that preprocess_card cannot handle (a missing `type_line`, `legalities`, `colors`
+        or `id`, mostly) is skipped and counted rather than aborting the import: one malformed
+        upstream row should cost one row, not the whole load. Skips are summarised in one WARNING
+        with the first few ids.
+
         Returns a dict with:
             - cards_inserted: new cards added
             - cards_updated: existing cards with changed data
             - cards_loaded: cards_inserted + cards_updated
             - cards_sent: rows attempted (after preprocessing)
+            - cards_skipped: raw cards preprocess_card rejected with an exception
             - status: "success", "no_cards_before_preprocessing", "no_cards_after_preprocessing", "database_error"
             - message: descriptive message
         """
         self.setup_schema()
 
+        stream = _CardStream(cards)
+        cards_inserted = cards_updated = cards_sent = 0
+        committed_batches = 0
         try:
             with self.app_context.writer_pool.connection() as conn:
-
-                class _CardStream:
-                    """Preprocesses raw cards lazily, tracking stage counts."""
-
-                    def __init__(self) -> None:
-                        self.raw = 0
-                        self.preprocessed = 0
-
-                    def __iter__(self) -> Iterator[dict[str, Any]]:
-                        for card in cards:
-                            self.raw += 1
-                            for processed in preprocess_card(card):
-                                self.preprocessed += 1
-                                yield processed
-
-                stream = _CardStream()
-                cards_inserted = cards_updated = cards_sent = 0
-
                 for page in itertools.batched(stream, page_size):
                     with conn.cursor() as cursor:
                         # LOCAL to this batch's transaction; nothing persists on the pooled connection.
@@ -1272,6 +1316,8 @@ class AdminResource:
                         conflict_target=["scryfall_id"],
                         skip_columns=["card_oracle_tags", "card_art_tags", "card_is_tags"],
                     )
+                    conn.commit()
+                    committed_batches += 1
                     cards_sent += len(page)
                     cards_inserted += batch["inserted"]
                     cards_updated += batch["updated"]
@@ -1282,7 +1328,7 @@ class AdminResource:
                         cards_sent,
                     )
 
-                conn.commit()
+                stream.log_skips()
 
                 if cards_sent:
                     self._sync_boolean_is_tags(conn)
@@ -1303,15 +1349,22 @@ class AdminResource:
                     "cards_updated": cards_updated,
                     "cards_loaded": cards_loaded,
                     "cards_sent": cards_sent,
+                    "cards_skipped": stream.skipped,
                     "message": f"Successfully loaded {cards_loaded} cards ({cards_inserted} new, {cards_updated} updated)",
                 }
 
         except (psycopg.Error, ValueError, KeyError) as e:
             logger.exception("Error loading cards")
+            stream.log_skips()
+            if committed_batches:
+                # Rows from the batches before the failure are in the table; readers must not keep
+                # serving cached answers computed without them.
+                self._clear_caches()
             return {
                 "status": "database_error",
                 "cards_loaded": 0,
                 "cards_sent": 0,
+                "cards_skipped": stream.skipped,
                 "message": f"Error loading cards: {type(e).__name__}: {e}",
             }
 
