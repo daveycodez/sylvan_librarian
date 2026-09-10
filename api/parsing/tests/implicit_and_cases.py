@@ -172,6 +172,12 @@ TESTCASES = [
     {"query": "old-growth-troll", "expected": "old-growth-troll", "id": "multi_hyphen_word"},
     {"query": "dual-land", "expected": "dual-land", "id": "dual_land_word"},
     {"query": "a-b-c", "expected": "a-b-c", "id": "multi_hyphen_a_b_c"},
+    # A hyphenated word whose first half is a numeric alias is still a word, not half an arithmetic
+    # expression; with a numeric term after the '-' it is arithmetic as before.
+    {"query": "pow-wow", "expected": "pow-wow", "id": "hyphenated_numeric_alias_prefix"},
+    {"query": "power-plant t:land", "expected": "power-plant AND t:land", "id": "hyphenated_numeric_alias_then_attr"},
+    {"query": "mv-x", "expected": "mv-x", "id": "hyphenated_numeric_alias_single_letter"},
+    {"query": "pow-tou>0", "expected": "pow-tou>0", "id": "numeric_alias_subtraction_comparison"},
     # Attribute value with hyphen (otag, is, oracle_tags, name)
     {"query": "name:Jace-the-mind", "expected": "name:Jace-the-mind", "id": "attr_value_hyphenated"},
     {"query": "name:test-word", "expected": "name:test-word", "id": "name_hyphenated_value"},

@@ -626,6 +626,12 @@ class Parser:
             lhs: QueryNode = CardAttributeNode(wl, ParserClass.NUMERIC)
             if next_tok.type in _ARITH_OPS and not next_tok.space_before:
                 lhs = self._arith_tail(lhs)
+                if isinstance(lhs, CardAttributeNode):
+                    # The operator had no numeric term after it, so this is not arithmetic at all:
+                    # `pow-wow`, `power-plant`, `mv-x` are hyphenated bare words, read exactly as they
+                    # would be if their first half were not an alias. Returning the bare attribute
+                    # here used to leave the '-' unconsumed and fail the whole query.
+                    return self.parse_hyphenated_name(word)
             lhs = self._spaced_arith_tail(lhs)
             if self.peek().type == TT.OP:
                 op = self.consume().value
