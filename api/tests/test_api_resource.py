@@ -591,6 +591,14 @@ class TestSearchResponseShape(TestBaseAPIResourceTest):
         assert result["total_cards"] == 2
         assert result["query"] == "test"
 
+    @pytest.mark.parametrize(argnames=["shape"], argvalues=[(ResponseShape.ROWS,), (ResponseShape.COLUMNAR,)])
+    def test_search_stashes_the_row_count_for_telemetry(self, shape: ResponseShape) -> None:
+        """The middlewares read the row count off resp.context; for columnar, len(cards) would be 3 fields."""
+        resp = falcon.Response()
+        with patch.object(self.api_resource, "_search", return_value=self.search_results):
+            self.api_resource.search(falcon_response=resp, q="test", shape=shape)
+        assert resp.context.result_count == 2
+
     def test_search_columnar_does_not_mutate_cached_results(self) -> None:
         """_search returns cached dicts, so columnarizing must not modify them in place."""
         with patch.object(self.api_resource, "_search", return_value=self.search_results):

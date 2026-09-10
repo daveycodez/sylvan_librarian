@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import types
 from unittest.mock import MagicMock, patch
 
 import orjson
@@ -323,3 +324,18 @@ class TestCachingMiddleware:
         """A middleware built without the shared counter still produces a stable key."""
         middleware = CachingMiddleware(cache={})
         assert middleware._cache_key(self._make_req()) == self._cache_key(generation=0)
+
+    def test_columnar_result_count_comes_from_the_handler(self) -> None:
+        """For shape=columnar, len(media["cards"]) is the field count; the stashed row count is stored."""
+        cache = {}
+        middleware = CachingMiddleware(cache=cache)
+        req = self._make_req()
+        resp = self._make_resp()
+        resp.media = {"cards": {"name": ["a", "b", "c"], "cmc": [1, 2, 3]}, "total_cards": 3}
+        resp.context = types.SimpleNamespace(result_count=3)
+
+        with patch("api.middlewares.caching_middleware.settings") as mock_settings:
+            mock_settings.enable_cache = True
+            middleware.process_response(req, resp, None, True)
+
+        assert cache[self._cache_key()].result_count == 3

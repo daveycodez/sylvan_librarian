@@ -11,6 +11,7 @@ import orjson
 from cachebox import LRUCache
 
 from api.settings import settings
+from api.utils.response_telemetry import result_count_of
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -228,7 +229,7 @@ class CachingMiddleware:
             status=resp.status,
             headers=cacheable_headers(resp._headers),
             body=resp.render_body(),
-            result_count=len(media.get("cards") or []) if is_dict_media else None,
+            result_count=result_count_of(resp, media) if is_dict_media else None,
             total_cards=media.get("total_cards") if is_dict_media else None,
         )
         logger.debug("Cache updated pid=%d: %s", os.getpid(), req.relative_uri)

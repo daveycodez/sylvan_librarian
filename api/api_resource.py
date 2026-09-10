@@ -48,6 +48,7 @@ from api.utils.page_rendering import (
     serve_static_file,
 )
 from api.utils.param_binding import ParamBindingError, ParamCoercionError
+from api.utils.response_telemetry import note_result_count
 from api.utils.routing import build_route_table, build_routes_listing, route
 from api.utils.site_name import hostname_to_site_name
 from api.utils.timer import Timer
@@ -679,6 +680,8 @@ class APIResource:
         # setting this first stamped `public, max-age=90` on every cold-start 503 and every 500 from
         # /search -- and a CDN in front would have served that failure for the next 90 seconds.
         set_cache_header(falcon_response, duration=timedelta(seconds=90))
+        # Counted before the reshape: columnar `cards` is a dict of fields, whose len is not a row count.
+        note_result_count(falcon_response, len(results["cards"]))
         if shape == ResponseShape.COLUMNAR:
             # Shallow copy: _search returns cached dicts, which must stay row-shaped.
             results = {**results, "cards": _columnarize_cards(results["cards"])}
@@ -1392,6 +1395,7 @@ class APIResource:
         else:
             cards = list(self.app_context.engine.sample_preferred(num_cards))
         total_cards = len(cards)
+        note_result_count(falcon_response, total_cards)
         if shape == ResponseShape.COLUMNAR:
             cards = _columnarize_cards(cards)
         return {"cards": cards, "total_cards": total_cards}
