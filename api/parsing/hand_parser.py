@@ -31,7 +31,7 @@ from api.parsing.nodes import (
     regex_plain_literal,
 )
 from api.parsing.query_budget import MAX_GROUP_DEPTH, QueryBudgetExceeded
-from api.parsing.spans import QUOTE_CHARS, brace_close_index, find_close_index, unescape
+from api.parsing.spans import QUOTE_CHARS, brace_close_index, find_close_index, opens_quote, unescape
 
 # ── Alias → parser-class lookup ──────────────────────────────────────────────
 
@@ -151,7 +151,9 @@ class Token:
 
 _ARITH_OPS: frozenset[TT] = frozenset({TT.PLUS, TT.MINUS, TT.STAR, TT.SLASH})
 _WORD_START = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_")
-_WORD_CONT = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789.")
+# An apostrophe continues a word (`can't`, `Urza's`); it opens a string only at token start, where
+# spans.opens_quote says so -- the lexer never reaches this set for one of those.
+_WORD_CONT = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789.'")
 _DIGIT = frozenset("0123456789")
 _SPACE = frozenset(" \t\r\n")
 
@@ -240,10 +242,12 @@ def tokenize(src: str) -> list[Token]:  # noqa: C901, PLR0912, PLR0915
             tokens.append(Token(TT.MANA, src[start:pos], start, sb))
             continue
 
-        # Quoted string. The escape-skipping walk here has to agree with the balancer's
-        # `spans.find_close_index` that a backslash escapes the next character, or the balancer
-        # reads the ' in 'don\'t' as the close and appends a quote the lexer never wanted (#905).
-        if c in QUOTE_CHARS:
+        # Quoted string. Whether a quote opens one at all is `spans.opens_quote` -- a "'" mid-word is
+        # an apostrophe, so `o:can't` is a word, not an unterminated string -- and the escape-skipping
+        # walk is `spans.find_close_index`; the balancer reads both. Where the two disagree, the
+        # balancer closes a quote the lexer never opened, or reads the ' in 'don\'t' as the close and
+        # appends one the lexer never wanted (#905).
+        if c in QUOTE_CHARS and opens_quote(src, pos):
             closed = _closed_quote(src, pos + 1, c)
             if closed is None:
                 msg = f"Unclosed quote at position {start}"

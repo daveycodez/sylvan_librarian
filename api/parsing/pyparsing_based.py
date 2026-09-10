@@ -265,8 +265,9 @@ def create_basic_parsers() -> dict[str, ParserElement]:
     # [^\W\d] is "word char that's not a digit" — i.e. any Unicode letter or underscore
     # (Python 3 `re` treats `\w`/`\W` as Unicode-aware by default for str patterns), so
     # bare words can start with accented letters like "Éowyn" (#649) without also
-    # allowing a leading digit.
-    word = Regex(r"[^\W\d][\w-]*\w|[^\W\d]").set_parse_action(make_word)
+    # allowing a leading digit. An apostrophe continues a word (`can't`), mirroring the hand
+    # lexer, where a "'" opens a string only at token start (spans.opens_quote).
+    word = Regex(r"[^\W\d][\w'-]*[\w']|[^\W\d]").set_parse_action(make_word)
 
     literal_number = float_number | integer
     # Signed literals are wired into the right-hand side of a numeric comparison only (see
@@ -274,7 +275,7 @@ def create_basic_parsers() -> dict[str, ParserElement]:
     negative_float = Regex(r"-\d+\.\d*").set_parse_action(lambda t: float(t[0]))
     negative_integer = Regex(r"-\d+\b").set_parse_action(lambda t: int(t[0]))
     signed_literal_number = negative_float | negative_integer | literal_number
-    string_value_word = Regex(r"\w[\w.-]*")
+    string_value_word = Regex(r"\w[\w.'-]*")
 
     return {
         "attrop": attrop,
@@ -673,7 +674,7 @@ def _get_implicit_and_tokenizer() -> ParserElement:
 
     float_tok = Regex(r"\b\d+\.\d*\b").set_parse_action(lambda t: t[0])
 
-    string_value_tok = Regex(r"\w([\w.-]*[\w.])?").set_parse_action(lambda t: t[0])
+    string_value_tok = Regex(r"\w([\w.'-]*[\w.'])?").set_parse_action(lambda t: t[0])
 
     curly_mana_symbol = Regex(r"\{[^}]+\}")
     # Mirrors create_mana_parsers' simple_mana_symbol (#954): any letter or digit, so a bare run

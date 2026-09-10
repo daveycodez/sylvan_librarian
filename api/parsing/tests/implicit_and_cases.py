@@ -43,6 +43,11 @@ TESTCASES = [
     # Single-quoted strings
     {"query": "'full art'", "expected": "'full art'", "id": "single_quoted"},
     {"query": "a 'b c' d", "expected": "a AND 'b c' AND d", "id": "single_quoted_between"},
+    # A mid-word apostrophe is part of the word, not an unterminated string
+    {"query": "o:can't", "expected": "o:can't", "id": "apostrophe_in_value"},
+    {"query": "can't stop", "expected": "can't AND stop", "id": "apostrophe_in_bare_word"},
+    {"query": "o:can't t:elf", "expected": "o:can't AND t:elf", "id": "apostrophe_value_then_attr"},
+    {"query": "name:Urza's -o:can't", "expected": "name:Urza's AND -o:can't", "id": "apostrophe_with_negation"},
     # Regex patterns (slash-delimited, single token)
     {"query": "name:/bolt/", "expected": "name:/bolt/", "id": "regex_single"},
     # A regex only opens in value position, so two of them means two conditions. The bare form
