@@ -212,6 +212,52 @@ impl GenerationalSharedCache {
         })
     }
 
+    // ── Locking ───────────────────────────────────────────────────────────
+
+    /// Take the spinlock. If it had to be stolen from a process that died holding it, the shared
+    /// state is re-initialised first: the dead holder may have left a page half-zeroed, a
+    /// generation odd (lock-free readers would skip that page forever) or the ring counter
+    /// un-advanced, and none of that can be told apart from a healthy cache afterwards. Losing
+    /// the cache's contents once after a worker crash is the safe outcome; serving from a torn
+    /// page is not.
+    fn lock(&mut self) -> bool {
+        match try_lock_outcome(&self.mmap) {
+            LockOutcome::Acquired => true,
+            LockOutcome::Stolen => {
+                self.reinit_locked();
+                true
+            }
+            LockOutcome::Busy => false,
+        }
+    }
+
+    /// Zero the filter and every page and reset the headers. The caller holds the spinlock.
+    fn reinit_locked(&mut self) {
+        let fb = filter_bytes(self.filter_bucket_count);
+        unsafe {
+            std::ptr::write_bytes(self.mmap.as_mut_ptr().add(filter_offset()), 0, fb);
+        }
+        for i in 0..self.n_pages {
+            let base = unsafe { self.mmap.as_mut_ptr().add(self.page_offset(i)) };
+            // Odd while the page is zeroed (seqlock protocol), then the next even value. Set, not
+            // bumped: after a steal the parity is whatever the dead writer left, and two bumps
+            // from odd would leave the page permanently "mid-rotation".
+            let odd = read_page_generation(base) | 1;
+            set_page_generation(base, odd);
+            let data_start = self.page_offset(i) + PAGE_HEADER_SIZE;
+            let data_len = self.slot_count_per_page * SLOT_SIZE + (self.page_size - self.arena_start_in_page);
+            unsafe {
+                std::ptr::write_bytes(self.mmap.as_mut_ptr().add(data_start), 0, data_len);
+            }
+            let ph = self.page_header_mut(i);
+            ph.arena_head = 0;
+            ph.entry_count = 0;
+            ph.is_sealed = if i == 0 { 0 } else { 1 };
+            set_page_generation(base, odd.wrapping_add(1));
+        }
+        self.coord_mut().counter = 0;
+    }
+
     // ── Arena allocation ──────────────────────────────────────────────────
 
     fn alloc_arena(
@@ -632,7 +678,7 @@ impl GenerationalSharedCache {
         }
 
         // Probe active page under lock; snapshot (abs, len, gen) then release before calling f.
-        if !try_lock(&self.mmap) {
+        if !self.lock() {
             return None;
         }
         let active_idx = self.active_idx();
@@ -702,7 +748,7 @@ impl GenerationalSharedCache {
         fence(Ordering::Acquire);
         if !self.filter().lookup(hash) { return Some(pending); }
 
-        if !try_lock(&self.mmap) { return Some(pending); }
+        if !self.lock() { return Some(pending); }
         let active_idx = self.active_idx();
         let active_snap = self.do_probe(active_idx, hash, key).map(|(_, _, si)| {
             let s = unsafe { &*self.slot_ptr(active_idx, si) };
@@ -752,7 +798,7 @@ impl GenerationalSharedCache {
         let expiry = expiry_ns_for(ttl_secs, self.default_ttl_ns);
 
         // Step 1: rotate first if the active page has reached its entry budget.
-        if !try_lock(&self.mmap) { return; }
+        if !self.lock() { return; }
         let active_idx = self.active_idx();
         let needs_rotation = self.page_header(active_idx).entry_count >= self.gen_maxsize as u32;
         unlock(&self.mmap);
@@ -782,7 +828,7 @@ impl GenerationalSharedCache {
     /// lock-free, then commit under the lock unless another worker rotated in between (in which
     /// case its rotation serves). False only when the lock could not be taken.
     fn rotate(&mut self) -> bool {
-        if !try_lock(&self.mmap) { return false; }
+        if !self.lock() { return false; }
         let active_idx = self.active_idx();
         let gen_snapshot = self.coord().counter;
         let retiring_idx = (active_idx + 1) % self.n_pages;
@@ -790,7 +836,7 @@ impl GenerationalSharedCache {
 
         let survivors = self.scan_survivors(retiring_idx);
 
-        if !try_lock(&self.mmap) { return false; }
+        if !self.lock() { return false; }
         if self.coord().counter == gen_snapshot {
             self.commit_rotation(survivors);
         }
@@ -809,7 +855,7 @@ impl GenerationalSharedCache {
         value_hash: u64,
         body_len: u32,
     ) -> Option<bool> {
-        if !try_lock(&self.mmap) { return None; }
+        if !self.lock() { return None; }
         let active_idx = self.active_idx();
         let inserted = self.do_insert(active_idx, hash, key, value_bytes, expiry_ns, value_hash, body_len);
         if inserted {
@@ -838,7 +884,7 @@ impl GenerationalSharedCache {
             return false;
         }
 
-        if !try_lock(&self.mmap) { return false; }
+        if !self.lock() { return false; }
         let active_idx = self.active_idx();
         let mut found = false;
 
@@ -874,30 +920,8 @@ impl GenerationalSharedCache {
     }
 
     pub fn invalidate(&mut self) {
-        if !try_lock(&self.mmap) { return; }
-        // Zero filter.
-        let fb = filter_bytes(self.filter_bucket_count);
-        unsafe {
-            std::ptr::write_bytes(self.mmap.as_mut_ptr().add(filter_offset()), 0, fb);
-        }
-        // Zero each page's data and reset headers.
-        for i in 0..self.n_pages {
-            // Odd bump: signals write-in-progress (seqlock protocol).
-            bump_page_generation(unsafe { self.mmap.as_mut_ptr().add(self.page_offset(i)) });
-            let data_start = self.page_offset(i) + PAGE_HEADER_SIZE;
-            let data_len = self.slot_count_per_page * SLOT_SIZE
-                + (self.page_size - self.arena_start_in_page);
-            unsafe {
-                std::ptr::write_bytes(self.mmap.as_mut_ptr().add(data_start), 0, data_len);
-            }
-            let ph = self.page_header_mut(i);
-            ph.arena_head = 0;
-            ph.entry_count = 0;
-            ph.is_sealed = if i == 0 { 0 } else { 1 };
-            // Even bump: page is stable (zeroed and reset); generation always lands on even.
-            bump_page_generation(unsafe { self.mmap.as_mut_ptr().add(self.page_offset(i)) });
-        }
-        self.coord_mut().counter = 0;
+        if !self.lock() { return; }
+        self.reinit_locked();
         unlock(&self.mmap);
     }
 
@@ -930,7 +954,7 @@ impl GenerationalSharedCache {
             .collect()
     }
 
-    pub fn contains(&self, key: &[u8]) -> bool {
+    pub fn contains(&mut self, key: &[u8]) -> bool {
         let hash = normalize_hash(xxh3_64(key));
         fence(Ordering::Acquire);
         if !self.filter().lookup(hash) {
@@ -938,7 +962,7 @@ impl GenerationalSharedCache {
         }
         // Full slot probe — no arena copy, no deserialization. Correctly returns false
         // for filter false positives and tombstoned entries (e.g. after pop()).
-        if !try_lock(&self.mmap) { return false; }
+        if !self.lock() { return false; }
         let active_idx = self.active_idx();
         let in_active = self.do_probe(active_idx, hash, key).is_some();
         unlock(&self.mmap);
@@ -962,7 +986,7 @@ impl GenerationalSharedCache {
         if !self.filter().lookup(hash) {
             return false;
         }
-        if !try_lock(&self.mmap) {
+        if !self.lock() {
             return false;
         }
         let active_idx = self.active_idx();
@@ -1074,6 +1098,32 @@ mod tests {
         assert!(cache.pop(b"gone"));
         assert!(!cache.contains(b"gone"));
         assert!(get_body(&mut cache, b"gone").is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_lock_stolen_from_a_dead_writer_reinitialises_the_cache() {
+        use std::sync::atomic::AtomicU32;
+        let path = temp_path("steal");
+        let mut cache = GenerationalSharedCache::open(&path, 64, 2, None, None).unwrap();
+        put(&mut cache, b"k1", b"v1");
+        assert!(cache.contains(b"k1"));
+
+        // A writer that died mid-rotation: the lock word names a pid that no longer exists, and
+        // the page it was zeroing was left at an odd generation with the ring counter un-advanced.
+        let word = unsafe { &*(cache.mmap.as_ptr() as *const AtomicU32) };
+        word.store(i32::MAX as u32, Ordering::Relaxed);
+        bump_page_generation(unsafe { cache.mmap.as_mut_ptr().add(cache.page_offset(1)) });
+        assert_eq!(cache.page_generation(1) & 1, 1);
+
+        assert!(!cache.contains(b"k1"), "a torn cache was served as if intact");
+        assert_eq!(word.load(Ordering::Relaxed), 0, "lock not released after the steal");
+        assert_eq!(cache.entry_count(), 0);
+        assert!((0..2).all(|p| cache.page_generation(p) & 1 == 0), "a generation was left odd");
+        assert_eq!(cache.rotation_count(), 0);
+
+        put(&mut cache, b"k2", b"v2");
+        assert_eq!(get_body(&mut cache, b"k2").as_deref(), Some(&b"v2"[..]));
         let _ = std::fs::remove_file(path);
     }
 

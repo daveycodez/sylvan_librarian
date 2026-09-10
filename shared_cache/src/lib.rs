@@ -120,7 +120,7 @@ impl SharedCache {
         Ok(stats)
     }
 
-    fn __contains__(&self, key: &[u8]) -> bool {
+    fn __contains__(&mut self, key: &[u8]) -> bool {
         self.inner.contains(key)
     }
 
