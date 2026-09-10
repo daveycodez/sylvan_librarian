@@ -13187,12 +13187,16 @@ fn color_identity_tuple<'py>(py: Python<'py>, mask: u8) -> PyResult<Bound<'py, P
     /// Six colour bits, so every mask this field can hold indexes into the table.
     const N_MASKS: u8 = 64;
     static TUPLES: OnceLock<Vec<Py<PyTuple>>> = OnceLock::new();
-    let tuples = TUPLES.get_or_init(|| {
-        (0..N_MASKS).filter_map(|m| PyTuple::new(py, identity_letters(m)).ok().map(|t| t.unbind())).collect()
-    });
-    match tuples.get(mask as usize) {
+    // All 64 or nothing. A `filter_map(.ok())` build used to drop a failed mask and shift every
+    // later tuple one slot down, so `mask` indexed the wrong identity for the rest of the process.
+    // A failed build is not cached; the field is then built per call, correct and merely slower.
+    if TUPLES.get().is_none()
+        && let Ok(all) = (0..N_MASKS).map(|m| PyTuple::new(py, identity_letters(m)).map(|t| t.unbind())).collect::<PyResult<Vec<_>>>()
+    {
+        let _ = TUPLES.set(all); // a concurrent builder may have won; the contents are identical
+    }
+    match TUPLES.get().and_then(|tuples| tuples.get(mask as usize)) {
         Some(cached) => Ok(cached.bind(py).clone().into_any()),
-        // Only reachable if the one-time build above failed partway; correct, just uncached.
         None => Ok(PyTuple::new(py, identity_letters(mask))?.into_any()),
     }
 }
