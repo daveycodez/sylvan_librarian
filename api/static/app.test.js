@@ -63,7 +63,8 @@ const ACCEPTED_QUERIES = require('./fixtures/accepted_queries.json');
 const cardCode = fs.readFileSync(path.resolve(__dirname, 'card.js'), 'utf8');
 const cardModuleCode = cardCode.replace(/\(function initTheme[\s\S]*?\}\)\(\);/, '').replace(/\bmain\(\);/, '');
 const cardModule = Function(
-  cardModuleCode + '; return { formatCardText, convertManaSymbols, formatOracleText, renderCardFace, escapeHtml };'
+  cardModuleCode +
+    '; return { formatCardText, convertManaSymbols, formatOracleText, renderCardFace, renderPrintingsStrip, escapeHtml };'
 )();
 
 // Derived fixture: new catalog format expected by the /get_catalog endpoint
@@ -473,6 +474,41 @@ describe('card.js formatting and rendering', () => {
     expect(rendered).toContain(
       `Deal 3 damage to &lt;script&gt;alert(&quot;oracle&quot;)&lt;/script&gt;.<br>Pay ${modalManaSpan('ms ms-r ms-cost')} &amp; &quot;draw&quot;.`
     );
+  });
+});
+
+// Collector numbers are not URL-safe by construction: Scryfall uses ★ for promo variants, and the
+// value is user-visible data that reaches an href. Path segments are percent-encoded and the
+// finished URL HTML-escaped, so neither a ★ nor a hostile quote can leave the attribute.
+describe('card page URLs encode their path segments', () => {
+  const starCard = { name: 'Promo', set_code: 'PLST', collector_number: 'MH1-27★', set_name: 'The List' };
+  const hostileCard = { name: 'Hostile', set_code: 'tst', collector_number: '1" onmouseover="alert(1)' };
+
+  it('renderCardFace encodes and escapes the manapool href', () => {
+    expect(cardModule.renderCardFace(starCard)).toContain(
+      'href="https://manapool.com/card/plst/MH1-27%E2%98%85?ref=sylvan-librarian"'
+    );
+    const hostile = cardModule.renderCardFace(hostileCard);
+    expect(hostile).not.toContain('onmouseover="alert(1)"');
+    expect(hostile).toContain(
+      'href="https://manapool.com/card/tst/1%22%20onmouseover%3D%22alert(1)?ref=sylvan-librarian"'
+    );
+  });
+
+  it('renderPrintingsStrip encodes the /card/ href', () => {
+    const strip = cardModule.renderPrintingsStrip([{ representative: starCard, count: 1 }]);
+    expect(strip).toContain('href="/card/PLST/MH1-27%E2%98%85"');
+    expect(cardModule.renderPrintingsStrip([{ representative: hostileCard, count: 1 }])).not.toContain(
+      'onmouseover="alert(1)"'
+    );
+  });
+
+  it('showCardModal encodes and escapes the manapool href', () => {
+    window.scrollTo = jest.fn();
+    search.showCardModal(starCard);
+    const link = document.getElementById('modalContent').querySelector('.modal-image-link');
+    expect(link.getAttribute('href')).toBe('https://manapool.com/card/plst/MH1-27%E2%98%85?ref=sylvan-librarian');
+    search.closeModal();
   });
 });
 

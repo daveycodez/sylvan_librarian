@@ -1148,10 +1148,10 @@ class CardSearch {
     if (imageLarge) {
       const imgTag = `<img class="modal-image" src="${this.escapeHtml(imageLarge)}" width="745" height="1040" alt="${this.escapeHtml(card.name || 'Card Image')}" />`;
       if (card.set_code && card.collector_number) {
-        // Build manapool.com referral URL
-        // Set codes and collector numbers from our database are safe for URLs
-        const manapoolUrl = `https://manapool.com/card/${card.set_code.toLowerCase()}/${card.collector_number}?ref=sylvan-librarian`;
-        imageHtml = `<div class="modal-image-wrapper"><a href="${manapoolUrl}" target="_blank" rel="noopener" class="modal-image-link">${imgTag}</a></div>`;
+        // Build manapool.com referral URL; collector numbers can carry ★ and other non-URL characters,
+        // so the path segments are encoded and the href escaped like every other attribute
+        const manapoolUrl = `https://manapool.com/card/${encodeURIComponent(card.set_code.toLowerCase())}/${encodeURIComponent(card.collector_number)}?ref=sylvan-librarian`;
+        imageHtml = `<div class="modal-image-wrapper"><a href="${this.escapeHtml(manapoolUrl)}" target="_blank" rel="noopener" class="modal-image-link">${imgTag}</a></div>`;
       } else {
         imageHtml = `<div class="modal-image-wrapper">${imgTag}</div>`;
       }
