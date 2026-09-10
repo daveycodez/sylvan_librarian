@@ -6,6 +6,7 @@ import json
 import logging
 import multiprocessing
 import os
+import signal
 from typing import TYPE_CHECKING
 
 import falcon
@@ -44,6 +45,19 @@ def json_error_serializer(request: falcon.Request, response: falcon.Response, ex
     exception_dict = json.loads(json.dumps(exception_dict, default=str))  # Ensure all values are JSON serializable
     response.media = exception_dict  # Set the response body
     response.content_type = "application/json"  # Set the content type
+
+
+def forward_sigterm_to_sigint(signum: int, frame: object) -> None:
+    """Turn the SIGTERM the master sends on shutdown into the SIGINT bjoern shuts down gracefully on.
+
+    bjoern (3.2.2) installs a libev handler for SIGINT only: it stops accepting, lets the requests in
+    flight finish, and returns from bjoern.run. SIGTERM has no handler there, so its default
+    disposition killed the worker mid-request -- no better than the SIGKILL it replaces. bjoern also
+    calls PyErr_CheckSignals every 0.1 s from its loop, which is what lets this Python-level handler
+    run in an idle worker rather than waiting for the next request.
+    """
+    del signum, frame
+    os.kill(os.getpid(), signal.SIGINT)
 
 
 class ApiWorker(multiprocessing.Process):
@@ -196,13 +210,18 @@ class ApiWorker(multiprocessing.Process):
                 last_import_time=self.last_import_time,
                 schema_setup_event=self.schema_setup_event,
             )  # Get the Falcon app
-            bjoern.run(
-                wsgi_app=app,
-                host=self.host,
-                port=self.port,
-                reuse_port=True,
-                listen_backlog=1024 * 4,
-            )  # Start the Bjoern server
+            signal.signal(signal.SIGTERM, forward_sigterm_to_sigint)
+            try:
+                bjoern.run(
+                    wsgi_app=app,
+                    host=self.host,
+                    port=self.port,
+                    reuse_port=True,
+                    listen_backlog=1024 * 4,
+                )  # Start the Bjoern server
+            except KeyboardInterrupt:
+                # bjoern raises this once its loop has drained after a SIGINT: a clean shutdown.
+                logger.info("Worker %d stopped after draining in-flight requests", os.getpid())
         except Exception as oops:
             logger.error("Error running server: %s", oops, exc_info=True)
             if self.exit_flag:
