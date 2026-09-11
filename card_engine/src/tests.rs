@@ -13410,7 +13410,7 @@ fn limit_zero_yields_no_rows_and_the_full_total() {
             let (ref_total, _) = run_query_with_plan(PhysicalPlan::GatheredScan, &ctx, &params_of(full_limit, 0), &mut res, None, pe.as_ref())
                 .expect("GatheredScan is always applicable");
 
-            for offset in [0usize, 3] {
+            for offset in [0usize, 1, 2, 3, 7, 50, 999] {
                 let (pe, mut res) = split();
                 let (total, page) = run_query_routed(&ctx, &params_of(0, offset), &mut res, None, pe.as_ref());
                 assert_eq!(total, ref_total, "routed total: {}", what("router", offset));

@@ -6609,6 +6609,28 @@ fn build_card_range_bits(
     (card_bits, range_pbits)
 }
 
+/// Push a row onto a bounded page and report whether the page is complete.
+///
+/// Complete means no room left, asked twice because there are two ways to have none: a zero-limit
+/// page has none before any row is offered, and an N-page has none once its Nth row lands. Neither
+/// test is redundant. Drop the first and a zero limit never completes, so the walk runs to
+/// exhaustion. Hoist the second above the push and a filled page scans on to the next qualifying
+/// candidate, inflating `printings_examined`.
+#[inline]
+fn push_bounded<'a>(
+    page: &mut Vec<(&'a AOracleCard, &'a APrinting)>,
+    limit: usize,
+    row: Option<(&'a AOracleCard, &'a APrinting)>,
+) -> bool {
+    let len = page.len();
+    if len >= limit {
+        return true;
+    }
+    let Some(row) = row else { return false };
+    page.push(row);
+    len + 1 >= limit
+}
+
 /// Page for a `unique=printing` bare-range query ordered by a *card-level* key: walk that key's
 /// precomputed card permutation, emit each card's matching printings, stop once the page is full.
 /// A card-level sort key is shared by all of a card's printings, so card order is printing order;
@@ -6627,9 +6649,6 @@ fn walk_printing_page<'a>(
     let QueryParams { sort_col, descending, limit, page_offset, .. } = *params;
     let residual: [&FilterExpr; 1] = [leaf];
     let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit);
-    if limit == 0 {
-        return page;
-    }
     let mut scratch: Vec<Match> = Vec::new();
     let mut skip = page_offset;
     for cid in perm.iter().map(|x| u32::from(*x)) {
@@ -6652,8 +6671,7 @@ fn walk_printing_page<'a>(
         }
         scratch.sort_unstable_by(page_cmp);
         for m in scratch.iter().skip(skip) {
-            page.push((&cards[m.1 as usize], &printings[m.2 as usize]));
-            if page.len() >= limit {
+            if push_bounded(&mut page, limit, Some((&cards[m.1 as usize], &printings[m.2 as usize]))) {
                 return page;
             }
         }
@@ -6697,9 +6715,6 @@ fn aligned_page<'a>(
     let ks = idx.keys.partition_point(|k| u32::from(*k) < lo);
     let ke = idx.keys.partition_point(|k| u32::from(*k) < hi);
     let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit);
-    if limit == 0 {
-        return page;
-    }
     let mut skip = page_offset;
     for step in 0..ke.saturating_sub(ks) {
         let run = idx.run(if descending { ke - 1 - step } else { ks + step });
@@ -6710,8 +6725,7 @@ fn aligned_page<'a>(
         for t in run.start + skip..run.end {
             let pid = idx.pid_at(t);
             let cid = u32::from(printing_to_card[pid]) as usize;
-            page.push((&cards[cid], &printings[pid]));
-            if page.len() >= limit {
+            if push_bounded(&mut page, limit, Some((&cards[cid], &printings[pid]))) {
                 return page;
             }
         }
@@ -8315,12 +8329,9 @@ fn walk_value_orderby_page<'a>(
     let QueryCtx { cards, printings, offsets, indexes, .. } = *ctx;
     let QueryParams { mode, prefer, descending, limit, page_offset, .. } = *params;
     let printing_to_card = &indexes.printing_to_card;
-    let want = page_offset + limit;
     let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit);
-    if limit == 0 {
-        return Some((page, ComposePageWork::default()));
-    }
     let mut seen = 0usize; // group rows passed: skipped for the offset, then emitted
+    let mut complete = false;
     // The walk's real work: one `pbits` test per printing considered -- index entries and
     // representative-resolution probes alike. Not `seen`: the entries that miss are the cost
     // `printings_walked` has to predict, and on a clumped filter almost every entry misses.
@@ -8342,16 +8353,15 @@ fn walk_value_orderby_page<'a>(
                     continue;
                 }
             }
-            if seen >= page_offset {
-                page.push((&cards[cid], &printings[pid]));
-            }
+            complete = push_bounded(&mut page, limit, (seen >= page_offset).then(|| (&cards[cid], &printings[pid])));
             seen += 1;
-            if seen >= want {
+            if complete {
                 break 'walk;
             }
         }
     }
-    if seen < want && seen < total {
+    // Declining = this index could not finish the page, so the caller must fall back and materialize.
+    if !complete && seen < total {
         return None;
     }
     let pushed = page.len() as u64;
@@ -9737,9 +9747,6 @@ fn walk_grouped_page<'a>(
     // each one's whole printing span, stopping only when the page fills. `cost::printings_walked`
     // models that as `page_span / match_rate`, which nothing checked before these counters.
     let mut work = ComposePageWork::default();
-    if limit == 0 {
-        return (page, work);
-    }
     for cid in perm.iter().map(|x| u32::from(*x)) {
         let card = &cards[cid as usize];
         let start = u32::from(offsets[cid as usize]) as usize;
@@ -9795,8 +9802,7 @@ fn walk_grouped_page<'a>(
         }
         scratch.sort_unstable_by(page_cmp);
         for m in scratch.iter().skip(skip) {
-            page.push((&cards[m.1 as usize], &printings[m.2 as usize]));
-            if page.len() >= limit {
+            if push_bounded(&mut page, limit, Some((&cards[m.1 as usize], &printings[m.2 as usize]))) {
                 return (page, work);
             }
         }
@@ -9892,9 +9898,6 @@ fn walk_card_page_via_popcount_skip<'a>(
     // than by total matches -- the same reason `run_query_streamed_popcount`'s own emit phase does it.
     let is_set = |pid: usize| pbits[pid >> 6] & (1u64 << (pid & 63)) != 0;
     let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit);
-    if limit == 0 {
-        return (page, work);
-    }
     'walk: while word_idx < permuted.len() {
         let mut w = permuted[word_idx];
         while w != 0 {
@@ -9923,8 +9926,7 @@ fn walk_card_page_via_popcount_skip<'a>(
                 }
             }
             let (bp, _) = best.expect("card_bits set this card because some printing of it matched");
-            page.push((card, &printings[bp as usize]));
-            if page.len() >= limit {
+            if push_bounded(&mut page, limit, Some((card, &printings[bp as usize]))) {
                 break 'walk;
             }
         }
@@ -10007,9 +10009,6 @@ fn walk_printing_page_via_popcount_skip<'a>(
     // it takes to fill `limit`, not by how deep the walk would otherwise need to go.
     let is_set = |pid: usize| pbits[pid >> 6] & (1u64 << (pid & 63)) != 0;
     let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit);
-    if limit == 0 {
-        return (page, work);
-    }
     let start_rank = block_idx * 64;
     'walk: for rank in start_rank..n_cards {
         let cid = u32::from(order.perm[rank]) as usize;
@@ -10027,8 +10026,7 @@ fn walk_printing_page_via_popcount_skip<'a>(
                 skip -= 1;
                 continue;
             }
-            page.push((card, &printings[pid]));
-            if page.len() >= limit {
+            if push_bounded(&mut page, limit, Some((card, &printings[pid]))) {
                 break 'walk;
             }
         }
@@ -10133,9 +10131,6 @@ fn walk_artwork_page_via_popcount_skip<'a>(
     let mut scratch: Vec<Match> = Vec::new();
     let mut skip = skip as usize;
     let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit);
-    if limit == 0 {
-        return (page, work);
-    }
     let start_rank = block_idx * 64;
     for rank in start_rank..n_cards {
         let cid = u32::from(order.perm[rank]);
@@ -10176,8 +10171,7 @@ fn walk_artwork_page_via_popcount_skip<'a>(
         }
         scratch.sort_unstable_by(page_cmp);
         for m in scratch.iter().skip(skip) {
-            page.push((&cards[m.1 as usize], &printings[m.2 as usize]));
-            if page.len() >= limit {
+            if push_bounded(&mut page, limit, Some((&cards[m.1 as usize], &printings[m.2 as usize]))) {
                 return (page, work);
             }
         }
@@ -12037,7 +12031,7 @@ fn run_query_routed<'a>(
         }
     };
     phases.finish();
-    count_only_if_zero_limit(params, out)
+    out
 }
 
 /// In-process force/dispatch entry point (#702 step 2): run `plan` for this
@@ -12107,18 +12101,6 @@ fn run_query_with_plan<'a>(
             Some(exec_gathered_scan(ctx, params, filter, &prep, plane))
         }
     }
-    .map(|out| count_only_if_zero_limit(params, out))
-}
-
-/// `limit == 0` is the count-only page: the exact total, no rows. Every walk-style executor
-/// terminates on `page.len() >= limit` AFTER a push (and guards a zero limit before its walk), so
-/// the executors are individually safe; this is the one point every plan passes through, so no
-/// plan can drift on the contract and a zero limit can never run a walk to exhaustion again.
-fn count_only_if_zero_limit<'a>(
-    params: &QueryParams,
-    (total, page): (usize, Vec<(&'a AOracleCard, &'a APrinting)>),
-) -> (usize, Vec<(&'a AOracleCard, &'a APrinting)>) {
-    if params.limit == 0 { (total, Vec::new()) } else { (total, page) }
 }
 
 /// One applicable plan's predicted cost, as `explain` (#745) reports it — exposing
@@ -12683,7 +12665,7 @@ fn run_query_streamed_popcount<'a>(
         // Ends `ns_loop` (the skip scan) and starts `ns_finish` (the emit walk).
         let t_finish = std::time::Instant::now();
         let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit);
-        'walk: while limit > 0 && word_idx < permuted.len() {
+        'walk: while word_idx < permuted.len() {
             let mut w = permuted[word_idx];
             while w != 0 {
                 let bit = w.trailing_zeros();
@@ -12724,10 +12706,7 @@ fn run_query_streamed_popcount<'a>(
                     }
                     best.map(|(pid, _)| pid)
                 };
-                if let Some(pid) = chosen {
-                    page.push((card, &printings[pid as usize]));
-                }
-                if page.len() >= limit {
+                if push_bounded(&mut page, limit, chosen.map(|pid| (card, &printings[pid as usize]))) {
                     break 'walk;
                 }
             }
@@ -12905,7 +12884,7 @@ fn run_query_streamed<'a>(
             });
         });
     };
-    if limit == 0 || total == 0 || page_offset >= total {
+    if total == 0 || page_offset >= total {
         publish(std::time::Instant::now(), 0);
         return (total, Vec::new());
     }
@@ -12989,8 +12968,7 @@ fn run_query_streamed<'a>(
         );
         scratch.sort_unstable_by(page_cmp);
         for m in scratch.iter().skip(skip) {
-            page.push((&cards[m.1 as usize], &printings[m.2 as usize]));
-            if page.len() >= limit {
+            if push_bounded(&mut page, limit, Some((&cards[m.1 as usize], &printings[m.2 as usize]))) {
                 break 'walk;
             }
         }
