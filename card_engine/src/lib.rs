@@ -8353,7 +8353,10 @@ fn walk_value_orderby_page<'a>(
                     continue;
                 }
             }
-            complete = push_bounded(&mut page, limit, (seen >= page_offset).then(|| (&cards[cid], &printings[pid])));
+            // Offered on every pass, with no row while the offset is still being skipped, so a
+            // zero limit completes here rather than after walking `page_offset` rows to reach it.
+            let row = if seen >= page_offset { Some((&cards[cid], &printings[pid])) } else { None };
+            complete = push_bounded(&mut page, limit, row);
             seen += 1;
             if complete {
                 break 'walk;
