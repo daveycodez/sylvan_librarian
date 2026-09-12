@@ -64,6 +64,16 @@ SCOPE_B_ID = "88888888-8888-4888-8888-888888888888"
 SCOPE_SET_X = "asfa"
 SCOPE_X_ID = "99999999-9999-4999-8999-999999999999"
 
+# The language rule wants an address NO English printing carries and an address TWO languages
+# share, in a set of their own so nothing else here counts them. Modelled on The Hobbit Eternal,
+# which prints five of its 158 cards only in Dwarvish: on api.scryfall.com `/cards/hoc/95` is the
+# `lang: dw` Arcane Signet, because there is no English hoc/95 (measured 2026-09-11).
+LANG_SET_CODE = "sfl"
+SIGNET_ID = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+AMBER_ORACLE_ID = "cccccccc-3333-4333-8333-cccccccccccc"
+AMBER_EN_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+AMBER_JA_ID = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+
 
 def _bolt() -> dict:
     card = make_raw_card(card_id=BOLT_ID, name="Compat Bolt")
@@ -235,6 +245,44 @@ def _scoped(card_id: str, set_code: str, number: str, *, extra: bool = False) ->
     return card
 
 
+def _signet() -> dict:
+    """A printing that exists in ONE language, and that language is not English -- hoc/95's shape."""
+    card = make_raw_card(card_id=SIGNET_ID, name="Compat Dwarvish Signet")
+    card |= {
+        "object": "card",
+        "set": LANG_SET_CODE,
+        "set_name": "Scryfall Compat Languages",
+        "collector_number": "1",
+        "type_line": "Artifact",
+        "oracle_text": "",
+        "lang": "dw",
+    }
+    return card
+
+
+def _amber(card_id: str, lang: str, released_at: str) -> dict:
+    """One of two printings sharing an address.
+
+    The address lookup breaks ties on prefer_score and then on released_at DESC. The corpus puts
+    the Japanese row FIRST on both -- the fixture pins its prefer_score above the English row's, and
+    it released later -- on purpose: the English-first rule is only proven by an address where
+    English would otherwise lose.
+    """
+    card = make_raw_card(card_id=card_id, name="Compat Shared Amber")
+    card |= {
+        "object": "card",
+        "oracle_id": AMBER_ORACLE_ID,
+        "set": LANG_SET_CODE,
+        "set_name": "Scryfall Compat Languages",
+        "collector_number": "2",
+        "type_line": "Artifact",
+        "oracle_text": "",
+        "lang": lang,
+        "released_at": released_at,
+    }
+    return card
+
+
 @pytest.fixture(name="compat_corpus", scope="module")
 def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
     """Load this module's cards and their rulings once, then hand back the resource."""
@@ -247,9 +295,25 @@ def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
         _scoped(SCOPE_A_ID, SCOPE_SET_A, "1"),
         _scoped(SCOPE_B_ID, SCOPE_SET_B, "1"),
         _scoped(SCOPE_X_ID, SCOPE_SET_X, "31", extra=True),
+        _signet(),
+        _amber(AMBER_JA_ID, "ja", "2021-06-01"),
+        _amber(AMBER_EN_ID, "en", "2020-01-01"),
     )
     api_resource.admin._upsert_cards([copy.deepcopy(card) for card in cards])
     with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
+        # The ORDER of the pair sharing sfl/2 is the premise of the language tests, and prefer_score
+        # is session state: a backfill run by any module before this one scores an English row about
+        # forty higher than its foreign twin, which would put the English row first and make
+        # "English is not displaced" true for the wrong reason. Pinned so the Japanese row leads
+        # whatever ran before.
+        cursor.execute(
+            "UPDATE magic.cards SET prefer_score = %(score)s WHERE scryfall_id = %(id)s",
+            {"score": 200, "id": AMBER_JA_ID},
+        )
+        cursor.execute(
+            "UPDATE magic.cards SET prefer_score = %(score)s WHERE scryfall_id = %(id)s",
+            {"score": 100, "id": AMBER_EN_ID},
+        )
         cursor.execute("DELETE FROM magic.rulings WHERE oracle_id = %(oracle_id)s", {"oracle_id": BOLT_ORACLE_ID})
         # Three rulings across two dates, two of them same-day: a single ruling cannot tell one
         # ordering from another, which is how the ascending sort went unnoticed. Inserted oldest
@@ -722,6 +786,41 @@ class TestByIdentifier:
     def test_a_language_the_printing_lacks_is_a_404(self, compat_corpus: APIResource):
         assert dispatch(compat_corpus, f"/cards/{SET_CODE}/1/ja").status == falcon.HTTP_404
 
+    def test_an_address_no_english_printing_carries_falls_through_to_the_printing_that_does(self, compat_corpus: APIResource):
+        """`/cards/hoc/95` is the Dwarvish Arcane Signet on api.scryfall.com, measured 2026-09-11.
+
+        There is no English hoc/95. The segment-less form answers the printing that exists; the
+        hardcoded `en` it replaced answered a 404 that `/cards/hoc/95/dw` contradicted.
+        """
+        card = payload(dispatch(compat_corpus, f"/cards/{LANG_SET_CODE}/1"))
+        assert (card["id"], card["lang"]) == (SIGNET_ID, "dw")
+
+    def test_english_answers_the_segment_less_form_even_when_a_foreign_row_outranks_it(self, compat_corpus: APIResource):
+        """The fall-through is for an address with NO English row; it never displaces one that has.
+
+        The premise comes first: under the lookup's own ordering the Japanese row is FIRST at this
+        address, so a plain address lookup answers it and the assertion after cannot pass by an
+        accident of ordering.
+        """
+        plain = compat_corpus._fetch_one_card(
+            "lower(card_set_code) = %(set_code)s AND collector_number = %(number)s",
+            {"set_code": LANG_SET_CODE, "number": "2"},
+        )
+        assert plain["id"] == AMBER_JA_ID
+        assert payload(dispatch(compat_corpus, f"/cards/{LANG_SET_CODE}/2"))["id"] == AMBER_EN_ID
+
+    def test_a_named_language_selects_that_row_where_two_share_the_address(self, compat_corpus: APIResource):
+        assert payload(dispatch(compat_corpus, f"/cards/{LANG_SET_CODE}/2/ja"))["id"] == AMBER_JA_ID
+
+    @pytest.mark.parametrize(
+        ("number", "lang"),
+        [("1", "en"), ("2", "de")],
+        ids=["english-of-a-foreign-only-address", "a-language-nobody-printed"],
+    )
+    def test_a_named_language_no_printing_carries_is_still_a_404(self, compat_corpus: APIResource, number, lang):
+        """`/cards/m15/18/de` is a 404 on api.scryfall.com: only the ABSENT segment falls through."""
+        assert dispatch(compat_corpus, f"/cards/{LANG_SET_CODE}/{number}/{lang}").status == falcon.HTTP_404
+
     def test_text_format_on_a_path_lookup(self, compat_corpus: APIResource):
         resp = dispatch(compat_corpus, f"/cards/{BOLT_ID}", "format=text")
         assert resp.text.splitlines()[0] == "Compat Bolt {R}"
@@ -775,6 +874,28 @@ class TestCollection:
             dispatch(compat_corpus, "/cards/collection", method="POST", body={"identifiers": [{"oracle_id": BOLT_ORACLE_ID}]}),
         )
         assert body["data"][0]["id"] == BOLT_ID
+
+    def test_set_and_number_falls_through_to_a_foreign_only_row_beside_an_english_answer(self, compat_corpus: APIResource):
+        """`{"set":"hoc","collector_number":"95"}` finds the Dwarvish row with an empty not_found.
+
+        Measured on api.scryfall.com 2026-09-11. In the same batch, an address that has an English
+        printing answers the English one, whatever a foreign row sharing the number would score.
+        """
+        body = payload(
+            dispatch(
+                compat_corpus,
+                "/cards/collection",
+                method="POST",
+                body={
+                    "identifiers": [
+                        {"set": LANG_SET_CODE, "collector_number": "1"},
+                        {"set": LANG_SET_CODE, "collector_number": "2"},
+                    ],
+                },
+            ),
+        )
+        assert {card["id"] for card in body["data"]} == {SIGNET_ID, AMBER_EN_ID}
+        assert body["not_found"] == []
 
     def test_over_the_limit_is_a_422(self, compat_corpus: APIResource):
         resp = dispatch(

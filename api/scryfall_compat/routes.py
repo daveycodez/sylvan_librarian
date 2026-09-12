@@ -175,6 +175,10 @@ _EXACT_NAME_MATCH = f"({_WHOLE_NAME_MATCH} OR ({_NAME_SPLITS_IN_TWO} AND {_FACE_
 # One expression for both scopes -- a two-faced card matched by a face cannot also carry the needle
 # as its whole collated name.
 _WHOLE_NAME_FIRST = f"{_WHOLE_NAME_MATCH} DESC, "
+# ORDER BY term that puts an address's English printing ahead of every other language. `false`
+# sorts before `true`, so a row whose lang IS 'en' comes first; a row with no lang at all sorts
+# last. `_card_at_address` carries the measurements this encodes.
+_ENGLISH_FIRST = "raw_card_blob ->> 'lang' <> 'en', "
 
 # Path segments that name an external id namespace rather than a set code.
 _EXTERNAL_ID_NAMESPACES = ("multiverse", "mtgo", "arena", "tcgplayer", "cardmarket")
@@ -1745,10 +1749,10 @@ class ScryfallCardsRoutes:
         if "multiverse_id" in identifier:
             return self._card_by_multiverse_id(_as_int(str(identifier["multiverse_id"])))
         if "set" in identifier and "collector_number" in identifier:
-            return self._fetch_one_card(
-                "lower(card_set_code) = lower(%(set_code)s) AND collector_number = %(number)s",
-                {"set_code": str(identifier["set"]), "number": str(identifier["collector_number"])},
-            )
+            # The identifier has no language key, so it is the segment-less `/cards/:code/:number`
+            # rule: the English printing where one exists, else the printing that carries the
+            # address. `_card_at_address` carries the measurements.
+            return self._card_at_address(str(identifier["set"]), str(identifier["collector_number"]), None)
         if "name" in identifier:
             set_code = identifier.get("set")
             named = _NameIdentifier(str(identifier["name"]), str(set_code) if set_code else None)
@@ -1950,11 +1954,48 @@ class ScryfallCardsRoutes:
                 return None
             return self._card_by_scryfall_id(identifier)
 
+        return self._card_at_address(identifier, number, suffix or None)
+
+    def _card_at_address(self, set_code: str, number: str, lang: str | None) -> dict[str, Any] | None:
+        """Resolve a set code and collector number, with or without a language, as Scryfall does.
+
+        A NAMED language is exact: `/cards/m15/18/de` is a 404 on api.scryfall.com because no German
+        printing carries that address, and a miss stays a miss here. An ABSENT language is NOT
+        "English" and NOT "any language" -- it is English where an English printing exists, else the
+        printing that does carry the address. Measured 2026-09-11: The Hobbit Eternal prints five of
+        its 158 cards only in Dwarvish, and `/cards/hoc/95` answers the `lang: dw` Arcane Signet,
+        `/cards/hoc/96` the Dwarvish Mox Amber, `/cards/pmei/2010-1` the Japanese-only Darksteel
+        Juggernaut; `POST /cards/collection` finds `{"set":"hoc","collector_number":"95"}` with an
+        empty not_found. Wherever an English row exists it is the English row that answers the
+        segment-less form, whatever a foreign row sharing the number would score.
+
+        The miss was live on this store too. It imports default_cards, which carries a printing in
+        its printed language whenever no English printing of it exists -- that is how hoc/95 gets in
+        -- and this hardcoded `en` for the absent segment, so `/cards/hoc/95` was a 404 that
+        `/cards/hoc/95/dw` contradicted. The collection identifier never had a language clause, and
+        keeps answering what it answered: with one printing per address here the English-first term
+        changes nothing, and it states the same rule as the path route so the two cannot drift.
+
+        ONE query either way. With no language the lang clause drops out and `_ENGLISH_FIRST` goes
+        ahead of the prefer ordering, so an English row wins whenever one exists and a foreign row
+        answers only when none does. Which printing answers when SEVERAL non-English rows share an
+        address and no English one does is not measured; the existing prefer_score / released_at
+        order picks among them.
+
+        Args:
+            set_code: The set code, in any case.
+            number: The collector number, as printed.
+            lang: The language named by the request, or None when it named none.
+
+        Returns:
+            The card, or None when the address resolves to nothing.
+        """
         clauses = ["lower(card_set_code) = lower(%(set_code)s)", "collector_number = %(number)s"]
-        params: dict[str, Any] = {"set_code": identifier, "number": number}
-        # Scryfall defaults the language segment to English rather than to "any language".
+        params: dict[str, Any] = {"set_code": set_code, "number": number}
+        if lang is None:
+            return self._fetch_one_card(" AND ".join(clauses), params, rank_first=_ENGLISH_FIRST)
         clauses.append("raw_card_blob ->> 'lang' = %(lang)s")
-        params["lang"] = suffix or "en"
+        params["lang"] = lang
         return self._fetch_one_card(" AND ".join(clauses), params)
 
     def _card_by_multiverse_id(self, multiverse_id: int | None) -> dict[str, Any] | None:
