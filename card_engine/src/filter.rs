@@ -775,11 +775,13 @@ pub(crate) fn regex_tier(pattern: &str) -> u32 {
 
 /// True when *pattern* needs fancy-regex's backtracking VM (lookarounds, etc.).
 ///
-/// `i` walks BYTES, so `pattern` may only be sliced at `i` where `bytes[i]` is ASCII (an ASCII byte
-/// is always a char boundary). The one slice here sits inside the `b'('` arm for that reason; a
-/// catch-all arm used to slice at every byte and panicked on the first multibyte char (`dûl`).
+/// `i` walks BYTES, and slicing `pattern` at an `i` that is not a char boundary panics. The one
+/// slice below is inside the `b'('` arm for that reason: `bytes[i]` is ASCII there, and an ASCII
+/// byte is always a boundary. Any new slice keyed off `i` needs the same guarantee.
 pub(crate) fn pattern_requires_backtrack(pattern: &str) -> bool {
-    const LOOKAROUNDS: &[&str] = &["(?=", "(?!", "(?<=", "(?<!"];
+    // Group openers fancy-regex can only run on its own backtracking VM: the four lookarounds,
+    // atomic group, conditional, named backreference.
+    const BACKTRACK_GROUPS: &[&str] = &["(?=", "(?!", "(?<=", "(?<!", "(?>", "(?(", "(?P="];
     let bytes = pattern.as_bytes();
     let mut in_class = false;
     let mut i = 0;
@@ -789,11 +791,7 @@ pub(crate) fn pattern_requires_backtrack(pattern: &str) -> bool {
             b']' if in_class => in_class = false,
             b'(' if !in_class && i + 1 < bytes.len() && bytes[i + 1] == b'?' => {
                 let rest = &pattern[i..];
-                if LOOKAROUNDS.iter().any(|tok| rest.starts_with(tok)) {
-                    return true;
-                }
-                // Atomic group, conditional, named backreference.
-                if rest.starts_with("(?>") || rest.starts_with("(?(") || rest.starts_with("(?P=") {
+                if BACKTRACK_GROUPS.iter().any(|tok| rest.starts_with(tok)) {
                     return true;
                 }
             }
