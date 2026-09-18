@@ -148,6 +148,19 @@ RESULT_FIELD_COLUMNS: dict[str, str] = {
     "legalities": "card_legalities",
 }
 
+# Result fields whose SQL column needs a cast to match the engine path's Python type.
+#
+# `scryfall_id`/`illustration_id` are `uuid` columns, so psycopg would decode them to `uuid.UUID`
+# while the engine emits the canonical lowercase-hyphenated text. Postgres renders `uuid::text` in
+# that same form, so the two paths agree and the JSON is identical either way.
+#
+# Applied to the OUTPUT projection only, never to the CTE: `illustration_id` is the `DISTINCT ON`
+# key for `unique=artwork`, and that dedup should keep comparing native uuids rather than their text.
+RESULT_FIELD_OUTPUT_CAST: dict[str, str] = {
+    "illustration_id": "::text",
+    "scryfall_id": "::text",
+}
+
 # Scryfall's canonical color order, used to reshape identity objects into lists.
 _COLOR_ORDER: tuple[str, ...] = ("W", "U", "B", "R", "G", "C")
 
@@ -916,7 +929,9 @@ class APIResource:
             dict.fromkeys([RESULT_FIELD_COLUMNS[name] for name in resolved_fields] + ["edhrec_rank", "prefer_score"]),
         )
         _select_cols = "".join(f"\n                    {col}," for col in _cte_columns)
-        _result_cols = ",\n                    ".join(f"{RESULT_FIELD_COLUMNS[name]} AS {name}" for name in resolved_fields)
+        _result_cols = ",\n                    ".join(
+            f"{RESULT_FIELD_COLUMNS[name]}{RESULT_FIELD_OUTPUT_CAST.get(name, '')} AS {name}" for name in resolved_fields
+        )
         # WHICH SIDE A MISSING SORT VALUE GOES depends on the COLUMN, and the two families
         # disagree. Measured against api.scryfall.com, one page-1 request per (column, direction)
         # over `e:khm unique=prints` on 2026-08-17, re-confirming the 2026-08-11 rows:
