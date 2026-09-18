@@ -61,9 +61,6 @@ class TimingMiddleware:
             os.getpid(),
             resp.status,
             req.relative_uri,
-            # `req.user_agent`, not `req.get_header("User-Agent", "-")`: get_header's second positional
-            # parameter is `required`, so that spelling made a missing User-Agent a 400 from the last
-            # middleware to run -- after the body had already been compressed and Content-Encoding set.
             req.user_agent or "-",
         )
         spans = req.context.get("_timing_spans", [])
