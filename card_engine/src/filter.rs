@@ -2679,6 +2679,41 @@ fn build_text_filter(attr: &str, op: &str, rhs: &Value, orig: &str) -> Result<Fi
             "card_artist" => TextSearchField::ArtistLower,
             _ => return Err(format!("text substring not supported on {attr}")),
         };
+        // `~` EXPANDS IN A QUOTED PHRASE EXACTLY AS IT DOES IN A REGEX, and only this entry point
+        // was missing it: `fo:"~ dies"` answers 0 without this against 822 on api.scryfall.com,
+        // while `fo:/~ dies/` answers 822 on both. A quoted value reaches this branch as a plain
+        // substring and never meets `translate_self_reference`, so the alias was matched as the
+        // literal tilde — and no oracle text contains one.
+        //
+        // The two forms are the SAME SEARCH there, measured 2026-09-18 in a single pass so corpus
+        // growth cannot explain the pair: `o:"~"` and `o:/~/` are both 19,407 with an EMPTY
+        // difference set in BOTH directions (`o:"~" -o:/~/` and `o:/~/ -o:"~"` are each 404), and
+        // `fo:"~"`/`fo:/~/` are both 22,222. That equality is why the substring is lowered onto
+        // the regex machinery instead of growing a second implementation of the name
+        // substitution, the "this <noun>" family and the word-boundary rule — three things
+        // `with_self_reference` already measures card for card.
+        //
+        // THE TWO ORACLE COLUMNS ONLY, the same line the regex entry point draws above. `ft:"~"`
+        // is 2 on api.scryfall.com — the literal tildes in Blighted Agent's and Urabrask the
+        // Hidden's Phyrexian-script flavor text — so flavor keeps `TextContains` and its literal
+        // tilde, and `name:"~"` likewise.
+        //
+        // `regex::escape` writes `\~`, which `translate_self_reference` expands (an escaped tilde
+        // is still the alias — Scryfall's `o:/\~/` answers `o:/~/`'s count). It neutralises every
+        // other metacharacter the phrase carries, so `o:"draw a card."` stays an exact phrase
+        // rather than letting its `.` become a wildcard, and no bracket expression can form for
+        // the class-tracking in `translate_self_reference` to skip over.
+        if lower_word.contains('~')
+            && matches!(tsf, TextSearchField::OracleTextLower | TextSearchField::FullOracleTextLower)
+        {
+            let field = if matches!(tsf, TextSearchField::FullOracleTextLower) {
+                TextField::FullOracleTextLower
+            } else {
+                TextField::OracleTextLower
+            };
+            let re = compile_search_regex_self_referential(&::regex::escape(&lower_word), SelfRefScope::Oracle)?;
+            return Ok(FilterExpr::TextRegex { field, regex: re });
+        }
         return Ok(FilterExpr::TextContains { field: tsf, word: lower_word });
     }
 
