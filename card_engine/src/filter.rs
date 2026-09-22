@@ -774,8 +774,14 @@ pub(crate) fn regex_tier(pattern: &str) -> u32 {
 }
 
 /// True when *pattern* needs fancy-regex's backtracking VM (lookarounds, etc.).
+///
+/// `i` walks BYTES, and slicing `pattern` at an `i` that is not a char boundary panics. The one
+/// slice below is inside the `b'('` arm for that reason: `bytes[i]` is ASCII there, and an ASCII
+/// byte is always a boundary. Any new slice keyed off `i` needs the same guarantee.
 pub(crate) fn pattern_requires_backtrack(pattern: &str) -> bool {
-    const LOOKAROUNDS: &[&str] = &["(?=", "(?!", "(?<=", "(?<!"];
+    // Group openers fancy-regex can only run on its own backtracking VM: the four lookarounds,
+    // atomic group, conditional, named backreference.
+    const BACKTRACK_GROUPS: &[&str] = &["(?=", "(?!", "(?<=", "(?<!", "(?>", "(?(", "(?P="];
     let bytes = pattern.as_bytes();
     let mut in_class = false;
     let mut i = 0;
@@ -785,10 +791,7 @@ pub(crate) fn pattern_requires_backtrack(pattern: &str) -> bool {
             b']' if in_class => in_class = false,
             b'(' if !in_class && i + 1 < bytes.len() && bytes[i + 1] == b'?' => {
                 let rest = &pattern[i..];
-                if LOOKAROUNDS.iter().any(|tok| rest.starts_with(tok)) {
-                    return true;
-                }
-                if rest.starts_with("(?>") || rest.starts_with("(?(") {
+                if BACKTRACK_GROUPS.iter().any(|tok| rest.starts_with(tok)) {
                     return true;
                 }
             }
@@ -799,7 +802,6 @@ pub(crate) fn pattern_requires_backtrack(pattern: &str) -> bool {
                 }
                 i += 1;
             }
-            _ if !in_class && pattern[i..].starts_with("(?P=") => return true,
             _ => {}
         }
         i += 1;
@@ -1031,7 +1033,6 @@ impl FilterExpr {
     pub(crate) fn bind(
         &mut self,
         vocab: &AStrings,
-        sorted_ids: &rkyv::Archived<Vec<u16>>,
         artist_vocab: &AStrings,
         mana_vocab: &AStrings,
         flavor: &rkyv::Archived<FlavorIndex>,
@@ -1040,19 +1041,20 @@ impl FilterExpr {
         match self {
             FilterExpr::And(children) | FilterExpr::Or(children) => {
                 for c in children {
-                    c.bind(vocab, sorted_ids, artist_vocab, mana_vocab, flavor, strings);
+                    c.bind(vocab, artist_vocab, mana_vocab, flavor, strings);
                 }
             }
-            FilterExpr::Not(inner) => inner.bind(vocab, sorted_ids, artist_vocab, mana_vocab, flavor, strings),
+            FilterExpr::Not(inner) => inner.bind(vocab, artist_vocab, mana_vocab, flavor, strings),
             FilterExpr::ManaCostCmp { hybrids, hybrid_ids, .. } if !hybrids.is_empty() => {
                 *hybrid_ids = bind_mana_hybrids(hybrids, mana_vocab);
             }
             FilterExpr::CollectionCmp { value, value_id, .. } => {
-                let i = sorted_ids.partition_point(|id| vocab[u16::from(*id) as usize].as_str() < value.as_str());
-                *value_id = sorted_ids
-                    .get(i)
-                    .map(|id| u16::from(*id))
-                    .filter(|&id| vocab[id as usize].as_str() == value.as_str());
+                // The vocab is renumbered into lexicographic order at load, so ids ARE the sorted
+                // order and the permutation this used to search through is gone.
+                let i = vocab.partition_point(|entry| entry.as_str() < value.as_str());
+                *value_id = u16::try_from(i)
+                    .ok()
+                    .filter(|&id| vocab.get(id as usize).is_some_and(|e| e.as_str() == value.as_str()));
             }
             FilterExpr::TextContains { field: TextSearchField::ArtistLower, word } => {
                 // memmem::Finder built once, reused across the vocab scan — its SIMD prefilter beats
@@ -1563,7 +1565,8 @@ impl FilterExpr {
                     (None, _) => false,
                     // card_subtypes keeps the printed order, so it is not id-sorted.
                     (Some(id), CollField::Subtypes) => coll.iter().any(|x| u16::from(*x) == id),
-                    // The set-like collections are sorted by id at load.
+                    // The set-like collections are sorted by id at load, and since the vocab is
+                    // renumbered lexicographically that is also alphabetical order.
                     (Some(id), _) => coll.binary_search(&id.into()).is_ok(),
                 };
                 let all_equal = || match *value_id {

@@ -1,4 +1,5 @@
 use super::{
+    renumber_coll_vocab,
     and_child_rank, assign_name_ranks,
     build_numeric_index, build_oracle_text_index, build_trigram_index,
     build_rarity_index, build_flavor_index, build_hybrid_tag_index, build_layout_hybrid_index, bitmap_beats_postings, HybridTagIndex, build_sort_permutations,
@@ -61,9 +62,19 @@ fn mode_only_params(mode: Mode) -> QueryParams {
 }
 
 /// String-sorted permutation of the vocab ids, as reload_commit builds it.
-fn sorted_vocab_ids(vocab: &[String]) -> Vec<u16> {
-    let mut ids: Vec<u16> = (0..vocab.len() as u16).collect();
-    ids.sort_unstable_by(|&a, &b| vocab[a as usize].cmp(&vocab[b as usize]));
+/// Resolve collection element strings against an already-renumbered (lexicographic) vocab, in the
+/// load-time shape: sorted, deduped ids.
+///
+/// Fixtures that assign collections AFTER `store_of` must resolve here rather than carrying ids
+/// across it: `renumber_coll_vocab` invalidates every id taken before it ran.
+fn coll_ids_in(vocab: &[String], items: &[&str]) -> Vec<u16> {
+    let mut ids: Vec<u16> = items
+        .iter()
+        .filter_map(|s| vocab.binary_search_by(|e| e.as_str().cmp(s)).ok())
+        .map(|i| i as u16)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
     ids
 }
 
@@ -261,7 +272,7 @@ fn usd_cmp(op: CmpOp, dollars: f64) -> FilterExpr {
 /// first printing of each range is the default-preferred one). Printings get
 /// sequential scryfall/illustration ids starting at 1, and released_at values
 /// that make the LAST printing of each range the oldest.
-fn store_of(cards: Vec<OracleCard>, printing_counts: &[usize], vocab: VocabInterner) -> CardData {
+fn store_of(mut cards: Vec<OracleCard>, printing_counts: &[usize], vocab: VocabInterner) -> CardData {
     assert_eq!(cards.len(), printing_counts.len());
     let mut printings = Vec::new();
     let mut offsets = vec![0u32];
@@ -284,6 +295,10 @@ fn store_of(cards: Vec<OracleCard>, printing_counts: &[usize], vocab: VocabInter
     // Same derivation reload_commit does, so a fixture store has the artwork-space offsets the
     // compose fastpath reads rather than an empty vec.
     let artwork_base = build_artwork_base_from(&artwork_groups);
+    // Establish the load path's invariant BEFORE any index is built from these ids: the vocab is
+    // renumbered lexicographically and every row's ids remapped (see `renumber_coll_vocab`). Index
+    // builders below read the ids, so renumbering after them would leave the indexes on old ids.
+    let coll_vocab = renumber_coll_vocab(&mut cards, &mut printings, vocab.strings);
     // Real planes and bigrams so narrowing tests see the same store shape
     // reload_commit builds (type narrowing goes through the planes since #637).
     let indexes = CardIndexes {
@@ -308,8 +323,7 @@ fn store_of(cards: Vec<OracleCard>, printing_counts: &[usize], vocab: VocabInter
         printings,
         offsets,
         strings: vec![],
-        coll_vocab_sorted: sorted_vocab_ids(&vocab.strings),
-        coll_vocab: vocab.strings,
+        coll_vocab,
         artist_vocab: vec![],
         mana_vocab: vec![],
         indexes,
@@ -965,7 +979,7 @@ fn collection_cmp_binds_vocab_ids_and_matches() {
             value: value.to_string(),
             value_id: None,
         };
-        f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+        f.bind(&archived.coll_vocab, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
         archived.cards.iter().map(|c| f.eval_card(c, &archived.strings) == Tri::True).collect()
     };
 
@@ -995,7 +1009,7 @@ fn printing_level_predicates_are_printing_dep_in_card_pass() {
         value: "wolf".to_string(),
         value_id: None,
     };
-    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    f.bind(&archived.coll_vocab, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
 
     let card = &archived.cards[0];
     // Card pass can't decide an art-tag predicate...
@@ -2113,7 +2127,7 @@ fn fuzz_build_filter(spec: &FuzzSpec) -> FilterExpr {
 fn fuzz_bound_filter(spec: &FuzzSpec, archived: &Archived<CardData>) -> FilterExpr {
     let mut f = fuzz_build_filter(spec);
     f.bind(
-        &archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab,
+        &archived.coll_vocab, &archived.artist_vocab,
         &archived.mana_vocab, &archived.indexes.flavor, &archived.strings,
     );
     f
@@ -2248,9 +2262,12 @@ fn fuzz_store_n(rng: &mut rand::rngs::SmallRng, ncards: usize) -> CardData {
     // Printing-space collections + artist vid + flavor text id, same flat card/printing order as
     // pmeta. Interned here (while the vocabs/interner are in scope) but only applied to the printings
     // after store_of returns.
-    let mut art_meta: Vec<Vec<u16>> = Vec::new();
-    let mut is_meta: Vec<Vec<u16>> = Vec::new();
-    let mut frame_meta: Vec<Vec<u16>> = Vec::new();
+    // Element STRINGS, not ids. `store_of` renumbers the vocab lexicographically, which invalidates
+    // any vocab id taken before it ran -- and these are assigned to printings afterwards. They are
+    // still interned below so the vocab contains them; only the resolution is deferred.
+    let mut art_meta: Vec<Vec<&str>> = Vec::new();
+    let mut is_meta: Vec<Vec<&str>> = Vec::new();
+    let mut frame_meta: Vec<Vec<&str>> = Vec::new();
     let mut artist_meta: Vec<u16> = Vec::new();
     let mut flavor_meta: Vec<u32> = Vec::new();
 
@@ -2422,9 +2439,14 @@ fn fuzz_store_n(rng: &mut rand::rngs::SmallRng, ncards: usize) -> CardData {
             // (real data has no NULL artists). frame_data keeps "2015" dominant so the corpus-scale
             // store exercises the thresholded-index drop.
             let (na, ni, nf) = (rng.random_range(0..=4), rng.random_range(0..=2), rng.random_range(0..=2));
-            art_meta.push(vocab_ids(&mut vocab, &fuzz_collection_picks(rng, &FUZZ_ART_TAGS, na)));
-            is_meta.push(vocab_ids(&mut vocab, &fuzz_collection_picks(rng, &FUZZ_IS_TAGS, ni)));
-            frame_meta.push(vocab_ids(&mut vocab, &fuzz_collection_picks(rng, &FUZZ_FRAME_DATA, nf)));
+            for (meta, picks) in [
+                (&mut art_meta, fuzz_collection_picks(rng, &FUZZ_ART_TAGS, na)),
+                (&mut is_meta, fuzz_collection_picks(rng, &FUZZ_IS_TAGS, ni)),
+                (&mut frame_meta, fuzz_collection_picks(rng, &FUZZ_FRAME_DATA, nf)),
+            ] {
+                vocab_ids(&mut vocab, &picks); // intern now, resolve after the renumber
+                meta.push(picks);
+            }
             artist_meta.push(artist_vocab.intern(fuzz_weighted(rng, &FUZZ_ARTISTS).to_string()).unwrap());
             // Flavor is printing-varying (a fresh corpus draw per printing, ~half empty like the
             // corpus) so the printing-space FlavorMatch path selects among differing printings.
@@ -2445,9 +2467,9 @@ fn fuzz_store_n(rng: &mut rand::rngs::SmallRng, ncards: usize) -> CardData {
         data.printings[idx].price_eur = m.price_eur;
         data.printings[idx].price_tix = m.price_tix;
         data.printings[idx].released_at_int = Some(m.released_at);
-        data.printings[idx].card_art_tags = std::mem::take(&mut art_meta[idx]);
-        data.printings[idx].card_is_tags = std::mem::take(&mut is_meta[idx]);
-        data.printings[idx].card_frame_data = std::mem::take(&mut frame_meta[idx]);
+        data.printings[idx].card_art_tags = coll_ids_in(&data.coll_vocab, &art_meta[idx]);
+        data.printings[idx].card_is_tags = coll_ids_in(&data.coll_vocab, &is_meta[idx]);
+        data.printings[idx].card_frame_data = coll_ids_in(&data.coll_vocab, &frame_meta[idx]);
         data.printings[idx].card_artist_vid = artist_meta[idx];
         data.printings[idx].flavor_text_lower_id = flavor_meta[idx];
     }
@@ -3413,7 +3435,7 @@ fn a_dense_but_not_broad_frame_value_narrows_without_broad_ok() {
             value_id: None,
         };
         f.bind(
-            &archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab,
+            &archived.coll_vocab, &archived.artist_vocab,
             &archived.mana_vocab, &archived.indexes.flavor, &archived.strings,
         );
         let got = narrow_rec(&f, &archived.indexes, offsets, cards, false);
@@ -3513,7 +3535,7 @@ fn value_totals_are_exact_in_all_three_spaces() {
     for (label, leaf) in &leaves {
         let mut f = leaf.clone();
         f.bind(
-            &archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab,
+            &archived.coll_vocab, &archived.artist_vocab,
             &archived.mana_vocab, &archived.indexes.flavor, &archived.strings,
         );
         for (mode_label, mode) in [("printing", Mode::Printing), ("card", Mode::Card), ("artwork", Mode::Artwork)] {
@@ -6670,7 +6692,6 @@ fn bench_checked_vs_unchecked_access() {
         printings,
         offsets,
         strings,
-        coll_vocab_sorted: sorted_vocab_ids(&vocab.strings),
         coll_vocab: vocab.strings,
         artist_vocab: vec![],
         mana_vocab: vec![],
@@ -6719,7 +6740,7 @@ fn card_pass_extracts_residual_and_matches() {
         value: "wolf".to_string(),
         value_id: None,
     };
-    wolf.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    wolf.bind(&archived.coll_vocab, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     let creature = || FilterExpr::TypeCmp { mask: TYPE_CREATURE, op: CmpOp::Ge };
 
     // And[t:creature, art:wolf]: the type check is proven at card level and
@@ -6747,7 +6768,7 @@ fn card_pass_extracts_residual_and_matches() {
         value: "wolf".to_string(),
         value_id: None,
     };
-    wolf2.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    wolf2.bind(&archived.coll_vocab, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     let or = FilterExpr::Or(vec![creature(), wolf2]);
     let t = or.card_pass(&archived.cards[0], &archived.strings, &mut residual, &mut is_or, 0);
     assert!(t == Tri::True && residual.is_empty());
@@ -6778,7 +6799,7 @@ fn artist_predicates_bind_to_vocab_ids_and_narrow() {
         field: super::TextSearchField::ArtistLower,
         word: "rebecca".to_string(),
     };
-    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    f.bind(&archived.coll_vocab, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     // bind rewrites the contains into an id-set match
     let FilterExpr::ArtistMatch { ref ids } = f else { panic!("expected ArtistMatch after bind") };
     assert_eq!(ids, &vec![rebecca]);
@@ -6801,7 +6822,7 @@ fn artist_predicates_bind_to_vocab_ids_and_narrow() {
         field: super::TextSearchField::ArtistLower,
         word: "zzz".to_string(),
     };
-    g.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    g.bind(&archived.coll_vocab, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     match narrow_candidates(&g, &archived.indexes, &archived.offsets, &archived.cards) {
         Some(Candidates::Printings(v)) => assert!(v.is_empty()),
         _ => panic!("empty artist match must narrow to the empty set"),
@@ -6845,7 +6866,7 @@ fn flavor_match_bind_eval_and_narrow() {
     let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
     let bound = |f: &mut FilterExpr| {
-        f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+        f.bind(&archived.coll_vocab, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     };
 
     let mut f = FilterExpr::TextContains {
@@ -7959,9 +7980,9 @@ fn collection_compose_leaves() {
     // compares the bound vocab *id* — so resolve `value_id` (the same partition_point `bind` runs), or
     // the reference would treat every value as unknown and match nothing.
     let coll = |field, op, value: &str| -> FilterExpr {
-        let (vocab, sorted) = (&archived.coll_vocab, &archived.coll_vocab_sorted);
-        let i = sorted.partition_point(|id| vocab[u16::from(*id) as usize].as_str() < value);
-        let value_id = sorted.get(i).map(|id| u16::from(*id)).filter(|&id| vocab[id as usize].as_str() == value);
+        let vocab = &archived.coll_vocab;
+        let i = vocab.partition_point(|entry| entry.as_str() < value);
+        let value_id = u16::try_from(i).ok().filter(|&id| vocab.get(id as usize).is_some_and(|e| e.as_str() == value));
         FilterExpr::CollectionCmp { field, op, value: value.to_string(), value_id }
     };
     let ge = |field, v: &str| coll(field, CmpOp::Ge, v);
@@ -8864,7 +8885,7 @@ fn usd_inside_arithmetic_evaluates_in_dollars_not_cents() {
         op: CmpOp::Lt,
         rhs: NumExpr::Field(NumField::Power),
     };
-    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    f.bind(&archived.coll_vocab, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     assert!(f.matches(card, printing, &archived.strings), "usd+1<power must evaluate in dollars: 50+1=51 < 52");
 }
 
@@ -8887,7 +8908,7 @@ fn usd_compared_directly_against_another_field_evaluates_in_dollars() {
 
     // usd<cmc: $2.00 < cmc(3) -- must match.
     let mut f = FilterExpr::NumericCmp { lhs: NumExpr::Field(NumField::PriceUsd), op: CmpOp::Lt, rhs: NumExpr::Field(NumField::Cmc) };
-    f.bind(&archived.coll_vocab, &archived.coll_vocab_sorted, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
+    f.bind(&archived.coll_vocab, &archived.artist_vocab, &archived.mana_vocab, &archived.indexes.flavor, &archived.strings);
     assert!(f.matches(card, printing, &archived.strings), "usd<cmc must evaluate in dollars: 2.00 < 3");
 }
 
@@ -10233,15 +10254,21 @@ fn name_bigrams_compose_and_memoize() {
 #[test]
 fn broad_tag_postings_scatter_or_decline() {
     let mut vocab = VocabInterner::new();
-    let spell = vocab.intern("spell".to_string()).unwrap();
-    let rare_tag = vocab.intern("etched".to_string()).unwrap();
+    vocab.intern("spell".to_string()).unwrap();
+    vocab.intern("etched".to_string()).unwrap();
     let cards: Vec<OracleCard> = (0..1200u32).map(|i| stub_card(u128::from(i) + 1, TYPE_CREATURE, &[], &mut vocab)).collect();
     let mut data = store_of(cards, &vec![4usize; 1200], vocab); // 4,800 printings
+    // Resolved AFTER store_of: it renumbers the vocab lexicographically, so ids taken before it are
+    // stale. That also reorders these two -- "etched" now sorts before "spell" -- so each vector is
+    // sorted after the pushes, which is the invariant `filter.rs`'s binary_search containment needs.
+    let id_of = |v: &str| coll_ids_in(&data.coll_vocab, &[v])[0];
+    let (spell, rare_tag) = (id_of("spell"), id_of("etched"));
     for (i, p) in data.printings.iter_mut().enumerate() {
         // "spell" on half of all printings (2,400 = 50% > MAX_NARROW_FRACTION);
         // "etched" on 1 in 100 (48, sparse).
         if i % 2 == 0 { p.card_is_tags.push(spell); }
         if i % 100 == 0 { p.card_is_tags.push(rare_tag); }
+        p.card_is_tags.sort_unstable();
     }
     data.indexes.is_tags = build_hybrid_tag_index(&data.printings, &data.coll_vocab, |p| &p.card_is_tags);
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
@@ -10627,6 +10654,21 @@ fn regex_tier_classifies_pattern_shapes() {
     assert_eq!(regex_tier("(?i)draw (?!two)"), REGEX_BACKTRACK_NS100);
     assert_eq!(regex_tier("(?=.*sacrifice)draw"), REGEX_BACKTRACK_NS100);
     assert_eq!(regex_tier("(?<=draw )a card"), REGEX_BACKTRACK_NS100);
+}
+
+/// `pattern_requires_backtrack` walks bytes; it used to slice `&pattern[i..]` at every byte in a
+/// catch-all arm, which panics at the first byte inside a multibyte char. The arm was also dead for
+/// its purpose -- `(` is consumed by the `b'('` arm first -- so the named-backreference test lives
+/// there now, where the slice is at an ASCII byte and therefore a char boundary.
+#[test]
+fn pattern_requires_backtrack_never_slices_inside_a_char() {
+    use crate::filter::pattern_requires_backtrack;
+    for pat in ["dûl", "—", "[dûl]+", "dû(?P<n>l)", "é\\.û", "[—(?P=x)]"] {
+        assert!(!pattern_requires_backtrack(pat), "{pat:?} has no backtracking construct");
+    }
+    for pat in ["(?P=x)", "dû(?P=x)", "(?=a)b", "û(?!b)", "(?<=û)a", "(?>a)", "(?(1)a|b)", "(a)\\1", "\\k<n>"] {
+        assert!(pattern_requires_backtrack(pat), "{pat:?} needs the backtracking VM");
+    }
 }
 
 #[test]
@@ -13325,5 +13367,106 @@ fn compose_perm_three_phase_order_only_fires_when_enabled_and_sparse() {
             super::compose_perm_three_phase_order(&ctx, &params, set_printings_of(&pbits), mode, SortCol::EdhrecRank, false, total, true, KNOB).is_none(),
             "{label}: the promoted walk is Mode::Card-only, so this must never divert regardless of enabled"
         );
+    }
+}
+
+/// `limit=0` is the count-only page: zero rows, and the same total every other page size reports.
+/// Every walk-style executor terminated on `page.len() == limit` after a push, so a zero limit never
+/// hit the condition and the walk ran to exhaustion, returning the entire result set. Checked through
+/// the router and through every forced plan, at offset 0 and at a deep offset, in all three modes —
+/// and then below the router, driving the fast paths and executors directly, so the guard at the
+/// entry point is not the only thing standing between a zero limit and a full walk.
+#[test]
+fn limit_zero_yields_no_rows_and_the_full_total() {
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(9_000);
+    let data = fuzz_store_n(&mut rng, 1_500);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let ctx = QueryCtx::from(archived);
+    let full_limit = archived.printings.len().max(1);
+
+    // Hand-built to reach each executor family (see `force_plan_differential_agreement` for why each
+    // shape lands where it does), then random trees for breadth.
+    let mut cases: Vec<(FuzzSpec, &str, &str)> = vec![
+        (FuzzSpec::And(vec![fuzz_leaf_color(&mut rng), fuzz_leaf_type(&mut rng)]), "edhrec", "asc"), // PlanePopcountOrder
+        (FuzzSpec::Leaf(FuzzLeaf::Date { op: CmpOp::Gt, value: 1990_0000 }), "cmc", "asc"), // PrintingRangeScan walk / CardRangePopcount
+        (FuzzSpec::Leaf(FuzzLeaf::Price { field: NumField::PriceUsd, op: CmpOp::Lt, val: 100_000.0 }), "usd", "desc"), // aligned_page
+        (FuzzSpec::Leaf(FuzzLeaf::Cmc { op: CmpOp::Ge, val: 4.0 }), "cmc", "asc"), // StreamedSelect with a sort bound
+        (FuzzSpec::Leaf(FuzzLeaf::Border { value: "black".to_string() }), "edhrec", "asc"), // PrintingCompose perm walk
+        (FuzzSpec::Leaf(FuzzLeaf::Border { value: "black".to_string() }), "usd", "asc"), // PrintingCompose orderby walk
+    ];
+    for _ in 0..20 {
+        cases.push((fuzz_gen(&mut rng, 2), "edhrec", "asc"));
+    }
+    let all_plans = [
+        PhysicalPlan::PrintingRangeScan,
+        PhysicalPlan::PrintingCompose,
+        PhysicalPlan::PlanePopcountOrder,
+        PhysicalPlan::CardRangePopcount,
+        PhysicalPlan::StreamedSelect,
+        PhysicalPlan::GatheredScan,
+    ];
+
+    for (spec, orderby, direction) in &cases {
+        let sort_col = orderby_to_col(orderby);
+        let descending = *direction == "desc";
+        let sort_bound = sort_col_bound(&fuzz_bound_filter(spec, archived), sort_col);
+        for mode in ["card", "printing", "artwork"] {
+            let split = || {
+                split_planes(fuzz_bound_filter(spec, archived), &archived.indexes.planes, &archived.indexes.oracle_trigram.words, mode == "card")
+            };
+            let params_of = |limit: usize, offset: usize| {
+                QueryParams::from_strs(mode, "default", orderby, direction, limit, offset).with_sort_bound(sort_bound)
+            };
+            let what = |plan: &str, offset: usize| format!("{plan} (mode={mode}, orderby={orderby}, dir={direction}, offset={offset}, filter={})", fuzz_describe(spec));
+
+            let (pe, mut res) = split();
+            let (ref_total, _) = run_query_with_plan(PhysicalPlan::GatheredScan, &ctx, &params_of(full_limit, 0), &mut res, None, pe.as_ref())
+                .expect("GatheredScan is always applicable");
+
+            for offset in [0usize, 1, 2, 3, 7, 50, 999] {
+                let (pe, mut res) = split();
+                let (total, page) = run_query_routed(&ctx, &params_of(0, offset), &mut res, None, pe.as_ref());
+                assert_eq!(total, ref_total, "routed total: {}", what("router", offset));
+                assert!(page.is_empty(), "routed returned {} rows for limit=0: {}", page.len(), what("router", offset));
+                for &plan in &all_plans {
+                    let (pe, mut res) = split();
+                    let Some((total, page)) = run_query_with_plan(plan, &ctx, &params_of(0, offset), &mut res, None, pe.as_ref()) else { continue };
+                    assert_eq!(total, ref_total, "forced total: {}", what(&format!("{plan:?}"), offset));
+                    assert!(page.is_empty(), "{plan:?} returned {} rows for limit=0: {}", page.len(), what(&format!("{plan:?}"), offset));
+                }
+            }
+
+            // Below the router: the executors and fast paths themselves.
+            let params = params_of(0, 0);
+            let (pe, res) = split();
+            if printing_range_scan_applicable(params.mode, pe.as_ref(), &archived.cards)
+                && let Some((total, page)) = printing_range_fastpath(&ctx, &params, &res)
+            {
+                assert_eq!(total, ref_total, "{}", what("printing_range_fastpath", 0));
+                assert!(page.is_empty(), "printing_range_fastpath returned {} rows: {}", page.len(), what("", 0));
+            }
+            if super::printing_compose_applicable(&res, None, &archived.cards, pe.as_ref(), &archived.indexes)
+                && let Some((total, page)) = printing_compose_fastpath(&ctx, &params, &res, false)
+            {
+                assert_eq!(total, ref_total, "{}", what("printing_compose_fastpath", 0));
+                assert!(page.is_empty(), "printing_compose_fastpath returned {} rows: {}", page.len(), what("", 0));
+            }
+            if let Some(pe) = pe.as_ref()
+                && plane_popcount_order_applicable(&res, params.mode, &archived.cards, Some(pe), sort_col, descending, &archived.indexes)
+            {
+                let (total, page) = super::exec_plane_popcount_order(&ctx, &params, pe);
+                assert_eq!(total, ref_total, "{}", what("exec_plane_popcount_order", 0));
+                assert!(page.is_empty(), "exec_plane_popcount_order returned {} rows: {}", page.len(), what("", 0));
+            }
+            let (pe, mut res) = split();
+            if streamed_select_applicable(&archived.cards, sort_col, descending, &archived.indexes) {
+                let prep = prepare_candidates(&ctx, &params, &mut res, pe.as_ref());
+                let (total, page) = super::exec_streamed_select(&ctx, &params, &res, &prep, pe.as_ref());
+                assert_eq!(total, ref_total, "{}", what("exec_streamed_select", 0));
+                assert!(page.is_empty(), "exec_streamed_select returned {} rows: {}", page.len(), what("", 0));
+            }
+        }
     }
 }
