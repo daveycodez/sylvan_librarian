@@ -148,18 +148,36 @@ RESULT_FIELD_COLUMNS: dict[str, str] = {
     "legalities": "card_legalities",
 }
 
+# Result fields whose SQL column needs a cast to match the engine path's Python type.
+#
+# `scryfall_id`/`illustration_id` are `uuid` columns, so psycopg would decode them to `uuid.UUID`
+# while the engine emits the canonical lowercase-hyphenated text. Postgres renders `uuid::text` in
+# that same form, so the two paths agree and the JSON is identical either way.
+#
+# Applied to the OUTPUT projection only, never to the CTE: `illustration_id` is the `DISTINCT ON`
+# key for `unique=artwork`, and that dedup should keep comparing native uuids rather than their text.
+RESULT_FIELD_OUTPUT_CAST: dict[str, str] = {
+    "illustration_id": "::text",
+    "scryfall_id": "::text",
+}
+
 # Scryfall's canonical color order, used to reshape identity objects into lists.
 _COLOR_ORDER: tuple[str, ...] = ("W", "U", "B", "R", "G", "C")
 
 
-def _identity_letters(identity: dict[str, object] | None) -> list[str]:
-    """Reshape a JSONB color-identity object into Scryfall's WUBRG-ordered letter list."""
+def _identity_letters(identity: dict[str, object] | None) -> tuple[str, ...]:
+    """Reshape a JSONB color-identity object into Scryfall's WUBRG-ordered letter tuple.
+
+    A tuple, not a list, to stay identical to the engine path: `color_identity` is served there
+    from 64 cached tuples, one per color mask, which is only safe because tuples are immutable.
+    JSON output is unaffected -- orjson writes either as an array.
+    """
     if not identity:
-        return []
+        return ()
     if len(identity) == 1:
         # A single color is trivially already in WUBRG order -- no need to walk _COLOR_ORDER.
-        return list(identity)
-    return [letter for letter in _COLOR_ORDER if letter in identity]
+        return tuple(identity)
+    return tuple(letter for letter in _COLOR_ORDER if letter in identity)
 
 
 # `fields=None` resolves to these 9 — the fixed set every caller got before field selection
@@ -911,7 +929,9 @@ class APIResource:
             dict.fromkeys([RESULT_FIELD_COLUMNS[name] for name in resolved_fields] + ["edhrec_rank", "prefer_score"]),
         )
         _select_cols = "".join(f"\n                    {col}," for col in _cte_columns)
-        _result_cols = ",\n                    ".join(f"{RESULT_FIELD_COLUMNS[name]} AS {name}" for name in resolved_fields)
+        _result_cols = ",\n                    ".join(
+            f"{RESULT_FIELD_COLUMNS[name]}{RESULT_FIELD_OUTPUT_CAST.get(name, '')} AS {name}" for name in resolved_fields
+        )
         _order_by = f"""sort_value {sql_direction} NULLS LAST,
                     edhrec_rank ASC NULLS LAST,
                     prefer_score DESC NULLS LAST"""
