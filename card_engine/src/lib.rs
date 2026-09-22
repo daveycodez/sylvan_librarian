@@ -1,7 +1,9 @@
+use std::sync::OnceLock;
 use pyo3::create_exception;
+use pyo3::intern;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDate, PyDateAccess, PyDict, PyList, PyTuple};
+use pyo3::types::{PyDate, PyDateAccess, PyDict, PyList, PyString, PyTuple};
 use rkyv::{Archive, Archived, Deserialize, Serialize};
 use memmap2::Mmap;
 use memchr::memmem;
@@ -573,6 +575,25 @@ fn opt_uuid(d: &Bound<PyDict>, key: &str) -> u128 {
 /// meaningful for real UUID input — non-UUID strings went through the FNV-1a fallback in
 /// `parse_uuid_or_hash` and can't be recovered from their hash, which matters only for
 /// hand-built test ids, never real card data.
+/// The canonical lowercase-hyphenated text for a nonzero id, `None` for the absent sentinel.
+///
+/// Text rather than a `uuid.UUID`. Building the object cost 76 ns/row against 22 for the string,
+/// and orjson then spent a further ~29 ns/row per field turning it back into exactly this text on
+/// the way out -- the object was constructed only to be dismantled. This supersedes the
+/// `UuidFastPath` slot-assignment trick added in #1076, which is deleted with it: bypassing
+/// `UUID.__init__` was the best available answer while the type had to stay, and it no longer does.
+///
+/// `_search_sql` casts both columns with `::text` (see `RESULT_FIELD_OUTPUT_CAST`) so the two paths
+/// still agree, and Postgres renders a uuid in the same canonical form this does. JSON output is
+/// unchanged either way -- orjson writes a `uuid.UUID` as precisely this string.
+fn uuid_to_pyobject<'py>(py: Python<'py>, v: u128) -> PyResult<Bound<'py, PyAny>> {
+    let Some(id) = uuid_from_u128(v) else {
+        return Ok(py.None().into_bound(py));
+    };
+    let mut buf = uuid::Uuid::encode_buffer();
+    Ok(id.hyphenated().encode_lower(&mut buf).into_pyobject(py)?.into_any())
+}
+
 fn uuid_from_u128(v: u128) -> Option<uuid::Uuid> {
     if v == 0 {
         None
@@ -654,6 +675,53 @@ fn str_list_to_ids(d: &Bound<PyDict>, key: &str, vocab: &mut VocabInterner) -> P
 
 /// Interned vocab ids of a JSONB object's keys, sorted and deduped — the set-like
 /// collections (keywords, tags, frame data) as sorted `Vec<u16>`.
+/// Renumber the collection vocab into lexicographic order, remapping every row's ids, and return
+/// the sorted vocab. Called once at load, before any index is built from those ids.
+///
+/// `VocabInterner` hands out ids first-seen, which used to force two separate things: a
+/// string-sorted permutation for `bind` to binary-search, and a lexicographic re-sort of every
+/// row's strings at emit. Making id order BE string order retires both.
+///
+/// Three properties this establishes, each relied on downstream:
+///  - `coll_vocab` is alphabetically sorted, so `FilterExpr::bind` binary-searches it directly.
+///  - every set-like row vector stays sorted BY ID -- `jsonb_obj_to_ids` sorted and deduped it, and
+///    a remap plus re-sort preserves that -- which is what `filter.rs`'s `binary_search`
+///    containment test requires.
+///  - because id order is now string order, that same vector is ALSO alphabetically sorted, so
+///    emit returns a deterministic order without sorting anything (see `EmitStrCache::coll_list`).
+///
+/// `card_subtypes` is remapped but deliberately NOT re-sorted: it carries the printed order, which
+/// is why `filter.rs` linear-scans it instead of binary-searching.
+fn renumber_coll_vocab(cards: &mut [OracleCard], printings: &mut [Printing], coll_vocab: Vec<String>) -> Vec<String> {
+    let mut order: Vec<u16> = (0..coll_vocab.len() as u16).collect();
+    order.sort_unstable_by(|&a, &b| coll_vocab[a as usize].cmp(&coll_vocab[b as usize]));
+    // remap[old] = new. VocabInterner caps the vocab at u16::MAX so the cast cannot truncate.
+    let mut remap: Vec<u16> = vec![0; coll_vocab.len()];
+    for (new_id, &old_id) in order.iter().enumerate() {
+        remap[old_id as usize] = new_id as u16;
+    }
+    let sorted_vocab: Vec<String> = order.iter().map(|&old| coll_vocab[old as usize].clone()).collect();
+    let resort = |ids: &mut Vec<u16>| {
+        for id in ids.iter_mut() {
+            *id = remap[*id as usize];
+        }
+        ids.sort_unstable();
+    };
+    for card in cards.iter_mut() {
+        for id in card.card_subtypes.iter_mut() {
+            *id = remap[*id as usize];
+        }
+        resort(&mut card.card_keywords);
+        resort(&mut card.card_oracle_tags);
+    }
+    for printing in printings.iter_mut() {
+        resort(&mut printing.card_art_tags);
+        resort(&mut printing.card_is_tags);
+        resort(&mut printing.card_frame_data);
+    }
+    sorted_vocab
+}
+
 fn jsonb_obj_to_ids(d: &Bound<PyDict>, key: &str, vocab: &mut VocabInterner) -> PyResult<Vec<u16>> {
     let mut ids: Vec<u16> = d
         .get_item(key)
@@ -3819,9 +3887,6 @@ struct CardData {
     // Vocab table for the collection fields, indexed by their u16 ids
     // (see VocabInterner). ~16k entries / ~200 KB.
     coll_vocab: Vec<String>,
-    // Permutation of 0..coll_vocab.len() sorted by string, so query values
-    // resolve to vocab ids by binary search (FilterExpr::bind).
-    coll_vocab_sorted: Vec<u16>,
     // Distinct lowercase artist names, indexed by Printing.card_artist_vid.
     // Artist predicates (contains/exact/regex) evaluate against these ~2.2k
     // strings once per query instead of per printing.
@@ -6544,6 +6609,28 @@ fn build_card_range_bits(
     (card_bits, range_pbits)
 }
 
+/// Push a row onto a bounded page and report whether the page is complete.
+///
+/// Complete means no room left, asked twice because there are two ways to have none: a zero-limit
+/// page has none before any row is offered, and an N-page has none once its Nth row lands. Neither
+/// test is redundant. Drop the first and a zero limit never completes, so the walk runs to
+/// exhaustion. Hoist the second above the push and a filled page scans on to the next qualifying
+/// candidate, inflating `printings_examined`.
+#[inline]
+fn push_bounded<'a>(
+    page: &mut Vec<(&'a AOracleCard, &'a APrinting)>,
+    limit: usize,
+    row: Option<(&'a AOracleCard, &'a APrinting)>,
+) -> bool {
+    let len = page.len();
+    if len >= limit {
+        return true;
+    }
+    let Some(row) = row else { return false };
+    page.push(row);
+    len + 1 >= limit
+}
+
 /// Page for a `unique=printing` bare-range query ordered by a *card-level* key: walk that key's
 /// precomputed card permutation, emit each card's matching printings, stop once the page is full.
 /// A card-level sort key is shared by all of a card's printings, so card order is printing order;
@@ -6584,8 +6671,7 @@ fn walk_printing_page<'a>(
         }
         scratch.sort_unstable_by(page_cmp);
         for m in scratch.iter().skip(skip) {
-            page.push((&cards[m.1 as usize], &printings[m.2 as usize]));
-            if page.len() == limit {
+            if push_bounded(&mut page, limit, Some((&cards[m.1 as usize], &printings[m.2 as usize]))) {
                 return page;
             }
         }
@@ -6639,8 +6725,7 @@ fn aligned_page<'a>(
         for t in run.start + skip..run.end {
             let pid = idx.pid_at(t);
             let cid = u32::from(printing_to_card[pid]) as usize;
-            page.push((&cards[cid], &printings[pid]));
-            if page.len() == limit {
+            if push_bounded(&mut page, limit, Some((&cards[cid], &printings[pid]))) {
                 return page;
             }
         }
@@ -8244,9 +8329,9 @@ fn walk_value_orderby_page<'a>(
     let QueryCtx { cards, printings, offsets, indexes, .. } = *ctx;
     let QueryParams { mode, prefer, descending, limit, page_offset, .. } = *params;
     let printing_to_card = &indexes.printing_to_card;
-    let want = page_offset + limit;
     let mut page: Vec<(&AOracleCard, &APrinting)> = Vec::with_capacity(limit);
     let mut seen = 0usize; // group rows passed: skipped for the offset, then emitted
+    let mut complete = false;
     // The walk's real work: one `pbits` test per printing considered -- index entries and
     // representative-resolution probes alike. Not `seen`: the entries that miss are the cost
     // `printings_walked` has to predict, and on a clumped filter almost every entry misses.
@@ -8268,16 +8353,18 @@ fn walk_value_orderby_page<'a>(
                     continue;
                 }
             }
-            if seen >= page_offset {
-                page.push((&cards[cid], &printings[pid]));
-            }
+            // Offered on every pass, with no row while the offset is still being skipped, so a
+            // zero limit completes here rather than after walking `page_offset` rows to reach it.
+            let row = if seen >= page_offset { Some((&cards[cid], &printings[pid])) } else { None };
+            complete = push_bounded(&mut page, limit, row);
             seen += 1;
-            if seen == want {
+            if complete {
                 break 'walk;
             }
         }
     }
-    if seen < want && seen < total {
+    // Declining = this index could not finish the page, so the caller must fall back and materialize.
+    if !complete && seen < total {
         return None;
     }
     let pushed = page.len() as u64;
@@ -9718,8 +9805,7 @@ fn walk_grouped_page<'a>(
         }
         scratch.sort_unstable_by(page_cmp);
         for m in scratch.iter().skip(skip) {
-            page.push((&cards[m.1 as usize], &printings[m.2 as usize]));
-            if page.len() == limit {
+            if push_bounded(&mut page, limit, Some((&cards[m.1 as usize], &printings[m.2 as usize]))) {
                 return (page, work);
             }
         }
@@ -9843,8 +9929,7 @@ fn walk_card_page_via_popcount_skip<'a>(
                 }
             }
             let (bp, _) = best.expect("card_bits set this card because some printing of it matched");
-            page.push((card, &printings[bp as usize]));
-            if page.len() == limit {
+            if push_bounded(&mut page, limit, Some((card, &printings[bp as usize]))) {
                 break 'walk;
             }
         }
@@ -9944,8 +10029,7 @@ fn walk_printing_page_via_popcount_skip<'a>(
                 skip -= 1;
                 continue;
             }
-            page.push((card, &printings[pid]));
-            if page.len() == limit {
+            if push_bounded(&mut page, limit, Some((card, &printings[pid]))) {
                 break 'walk;
             }
         }
@@ -10090,8 +10174,7 @@ fn walk_artwork_page_via_popcount_skip<'a>(
         }
         scratch.sort_unstable_by(page_cmp);
         for m in scratch.iter().skip(skip) {
-            page.push((&cards[m.1 as usize], &printings[m.2 as usize]));
-            if page.len() == limit {
+            if push_bounded(&mut page, limit, Some((&cards[m.1 as usize], &printings[m.2 as usize]))) {
                 return (page, work);
             }
         }
@@ -12626,10 +12709,7 @@ fn run_query_streamed_popcount<'a>(
                     }
                     best.map(|(pid, _)| pid)
                 };
-                if let Some(pid) = chosen {
-                    page.push((card, &printings[pid as usize]));
-                }
-                if page.len() == limit {
+                if push_bounded(&mut page, limit, chosen.map(|pid| (card, &printings[pid as usize]))) {
                     break 'walk;
                 }
             }
@@ -12891,8 +12971,7 @@ fn run_query_streamed<'a>(
         );
         scratch.sort_unstable_by(page_cmp);
         for m in scratch.iter().skip(skip) {
-            page.push((&cards[m.1 as usize], &printings[m.2 as usize]));
-            if page.len() == limit {
+            if push_bounded(&mut page, limit, Some((&cards[m.1 as usize], &printings[m.2 as usize]))) {
                 break 'walk;
             }
         }
@@ -12912,45 +12991,116 @@ fn run_query_streamed<'a>(
 type FieldExtractor =
     for<'a> fn(Python<'a>, &'a AOracleCard, &'a APrinting, &'a AStrings, &'a AStrings) -> PyResult<Bound<'a, PyAny>>;
 
-const FIELD_TABLE: &[(&str, FieldExtractor)] = &[
-    ("name", |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.card_name_id)).into_pyobject(py)?.into_any())),
-    ("set_code", |py, _c, p, _s, _v| Ok(p.card_set_code.as_str().into_pyobject(py)?.into_any())),
-    ("collector_number", |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.collector_number_id)).into_pyobject(py)?.into_any())),
-    ("power", |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.creature_power_text_id)).into_pyobject(py)?.into_any())),
-    ("toughness", |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.creature_toughness_text_id)).into_pyobject(py)?.into_any())),
-    ("mana_cost", |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.mana_cost_text_id)).into_pyobject(py)?.into_any())),
-    ("oracle_text", |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.oracle_text_id)).into_pyobject(py)?.into_any())),
-    ("set_name", |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.set_name_id)).into_pyobject(py)?.into_any())),
-    ("type_line", |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.type_line_id)).into_pyobject(py)?.into_any())),
-    ("illustration_id", |py, _c, p, _s, _v| Ok(uuid_from_u128(u128::from(p.illustration_id)).into_pyobject(py)?.into_any())),
-    ("scryfall_id", |py, _c, p, _s, _v| Ok(uuid_from_u128(u128::from(p.scryfall_id)).into_pyobject(py)?.into_any())),
+/// The field's dict key, as the interpreter's one interned `PyString`.
+///
+/// `set_item` with a `&str` key builds a FRESH `PyUnicode` on every call: 9 allocations per row and
+/// 900 per 100-row page, for 9 constant strings, none of them shared -- measured 0 of 9 key objects
+/// identical across rows before this change, 24 of 24 after. `intern!` resolves through a static
+/// `GILOnceCell`, so the per-row cost is a cell read plus an incref.
+///
+/// The key fn belongs in the table rather than being interned once per query into a `Vec`: that
+/// revision was measured too, and it won the same ~12-16 ns/field on pages but cost +0.17-0.25 us on
+/// the 0-row and 1-row shapes, which is where most real traffic lands. Per-query setup has nowhere
+/// to amortize when the page holds one row.
+type FieldKey = for<'a> fn(Python<'a>) -> &'a Bound<'a, PyString>;
+
+/// Yields the interned string id a cacheable field reads, for `EmitStrCache`.
+type CachedStrId = for<'a> fn(&'a AOracleCard, &'a APrinting) -> u32;
+
+/// Yields the `coll_vocab` id vector a collection field reads.
+type CollIds = for<'a> fn(&'a AOracleCard, &'a APrinting) -> &'a Archived<Vec<u16>>;
+
+/// Where a resolved field's value comes from.
+#[derive(Clone, Copy)]
+enum CachedSource {
+    /// Not cacheable; the table's own extractor runs.
+    Extractor,
+    /// A `CardData.strings` id, served as one cached `PyString`.
+    Str(CachedStrId),
+    /// A `coll_vocab` id vector, served as a list of cached `PyString`s.
+    Coll(CollIds),
+}
+
+/// The collection fields, and the id vector each one emits.
+///
+/// All six are cached: their elements come from `coll_vocab` (~16k entries), a bounded vocabulary
+/// that repeats heavily across rows -- 11,278 elements over 1,946 distinct values in one 500-row
+/// sample, with no sharing at all before this. None of them needs a sort any more; see `coll_list`.
+const CACHED_COLL_FIELDS: &[(&str, CollIds)] = &[
+    ("card_subtypes", |c, _p| &c.card_subtypes),
+    ("card_keywords", |c, _p| &c.card_keywords),
+    ("card_oracle_tags", |c, _p| &c.card_oracle_tags),
+    ("card_art_tags", |_c, p| &p.card_art_tags),
+    ("card_is_tags", |_c, p| &p.card_is_tags),
+    ("card_frame_data", |_c, p| &p.card_frame_data),
+];
+
+/// The result fields served from `EmitStrCache`, and the id each one caches on.
+///
+/// Membership is decided by measured distinct-values-per-row over 100-row pages, not by type: a
+/// field earns a slot by repeating within a page. `name` (1.00 distinct/row) and `oracle_text`
+/// (0.96) are absent deliberately — a cache never hits for them, and admitting them would hold the
+/// whole string payload live as Python objects. `set_code` is absent for a different reason: it is
+/// an `InlineStr` on the printing, not an interned id, so there is no id to key on.
+///
+/// Every entry here must read a field that `str_at` resolves against `CardData.strings`; an id from
+/// any other table would cache the wrong text.
+/// One resolved result field: its name, its interned dict key, its extractor, and — for a field
+/// served from `EmitStrCache` — the id to cache on.
+type ResolvedField = (&'static str, FieldKey, FieldExtractor, CachedSource);
+
+const CACHED_STR_FIELDS: &[(&str, CachedStrId)] = &[
+    ("type_line", |c, _p| u32::from(c.type_line_id)),
+    ("set_name", |_c, p| u32::from(p.set_name_id)),
+    ("collector_number", |_c, p| u32::from(p.collector_number_id)),
+    ("power", |c, _p| u32::from(c.creature_power_text_id)),
+    ("toughness", |c, _p| u32::from(c.creature_toughness_text_id)),
+    ("mana_cost", |c, _p| u32::from(c.mana_cost_text_id)),
+    ("layout", |c, _p| u32::from(c.card_layout_id)),
+];
+
+const FIELD_TABLE: &[(&str, FieldKey, FieldExtractor)] = &[
+    ("name", |py| intern!(py, "name"), |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.card_name_id)).into_pyobject(py)?.into_any())),
+    ("set_code", |py| intern!(py, "set_code"), |py, _c, p, _s, _v| Ok(p.card_set_code.as_str().into_pyobject(py)?.into_any())),
+    ("collector_number", |py| intern!(py, "collector_number"), |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.collector_number_id)).into_pyobject(py)?.into_any())),
+    ("power", |py| intern!(py, "power"), |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.creature_power_text_id)).into_pyobject(py)?.into_any())),
+    ("toughness", |py| intern!(py, "toughness"), |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.creature_toughness_text_id)).into_pyobject(py)?.into_any())),
+    ("mana_cost", |py| intern!(py, "mana_cost"), |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.mana_cost_text_id)).into_pyobject(py)?.into_any())),
+    ("oracle_text", |py| intern!(py, "oracle_text"), |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.oracle_text_id)).into_pyobject(py)?.into_any())),
+    ("set_name", |py| intern!(py, "set_name"), |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.set_name_id)).into_pyobject(py)?.into_any())),
+    ("type_line", |py| intern!(py, "type_line"), |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.type_line_id)).into_pyobject(py)?.into_any())),
+    ("illustration_id", |py| intern!(py, "illustration_id"), |py, _c, p, _s, _v| uuid_to_pyobject(py, u128::from(p.illustration_id))),
+    ("scryfall_id", |py| intern!(py, "scryfall_id"), |py, _c, p, _s, _v| uuid_to_pyobject(py, u128::from(p.scryfall_id))),
     // Exact f64 dollars from the stored integer cents, not the old lossy f32 -- API consumers
     // now see the true price (e.g. 1.47, not the nearest f32 to 1.47) instead of an
     // approximation.
-    ("price_usd", |py, _c, p, _s, _v| Ok(p.price_usd.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).into_pyobject(py)?.into_any())),
-    ("prefer_score", |py, _c, p, _s, _v| Ok(p.prefer_score.as_ref().map(|v| f32::from(*v)).into_pyobject(py)?.into_any())),
+    ("price_usd", |py| intern!(py, "price_usd"), |py, _c, p, _s, _v| Ok(p.price_usd.as_ref().map(|v| f64::from(u32::from(*v)) / 100.0).into_pyobject(py)?.into_any())),
+    ("prefer_score", |py| intern!(py, "prefer_score"), |py, _c, p, _s, _v| Ok(p.prefer_score.as_ref().map(|v| f32::from(*v)).into_pyobject(py)?.into_any())),
     // card_subtypes preserves the printed order; the set-like collections are stored
     // sorted by vocab id (first-seen order), so they get re-sorted lexicographically
     // for deterministic output.
-    ("card_subtypes", |py, c, _p, _s, v| {
+    ("card_subtypes", |py| intern!(py, "card_subtypes"), |py, c, _p, _s, v| {
         let items: Vec<&str> = c.card_subtypes.iter().map(|id| coll_str(v, u16::from(*id))).collect();
         Ok(items.into_pyobject(py)?.into_any())
     }),
-    ("card_keywords", |py, c, _p, _s, v| Ok(sorted_strs(v, &c.card_keywords).into_pyobject(py)?.into_any())),
-    ("card_oracle_tags", |py, c, _p, _s, v| Ok(sorted_strs(v, &c.card_oracle_tags).into_pyobject(py)?.into_any())),
-    ("card_art_tags", |py, _c, p, _s, v| Ok(sorted_strs(v, &p.card_art_tags).into_pyobject(py)?.into_any())),
-    ("card_is_tags", |py, _c, p, _s, v| Ok(sorted_strs(v, &p.card_is_tags).into_pyobject(py)?.into_any())),
-    ("card_frame_data", |py, _c, p, _s, v| Ok(sorted_strs(v, &p.card_frame_data).into_pyobject(py)?.into_any())),
+    ("card_keywords", |py| intern!(py, "card_keywords"), |py, c, _p, _s, v| Ok(sorted_strs(v, &c.card_keywords).into_pyobject(py)?.into_any())),
+    ("card_oracle_tags", |py| intern!(py, "card_oracle_tags"), |py, c, _p, _s, v| Ok(sorted_strs(v, &c.card_oracle_tags).into_pyobject(py)?.into_any())),
+    ("card_art_tags", |py| intern!(py, "card_art_tags"), |py, _c, p, _s, v| Ok(sorted_strs(v, &p.card_art_tags).into_pyobject(py)?.into_any())),
+    ("card_is_tags", |py| intern!(py, "card_is_tags"), |py, _c, p, _s, v| Ok(sorted_strs(v, &p.card_is_tags).into_pyobject(py)?.into_any())),
+    ("card_frame_data", |py| intern!(py, "card_frame_data"), |py, _c, p, _s, v| Ok(sorted_strs(v, &p.card_frame_data).into_pyobject(py)?.into_any())),
     // Card-data fields for downstream filtering, in Scryfall JSON shapes (names and value
     // shapes match RESULT_FIELD_COLUMNS in api/api_resource.py, which reshapes the SQL
     // path's raw columns to agree with these).
-    ("layout", |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.card_layout_id)).into_pyobject(py)?.into_any())),
-    ("cmc", |py, c, _p, _s, _v| Ok(c.cmc.as_ref().copied().into_pyobject(py)?.into_any())),
-    ("rarity", |py, _c, p, _s, _v| {
-        Ok(p.card_rarity_int.as_ref().and_then(|v| rarity_int_to_text(*v)).into_pyobject(py)?.into_any())
+    ("layout", |py| intern!(py, "layout"), |py, c, _p, s, _v| Ok(str_at(s, u32::from(c.card_layout_id)).into_pyobject(py)?.into_any())),
+    ("cmc", |py| intern!(py, "cmc"), |py, c, _p, _s, _v| Ok(c.cmc.as_ref().copied().into_pyobject(py)?.into_any())),
+    ("rarity", |py| intern!(py, "rarity"), |py, _c, p, _s, _v| {
+        Ok(match p.card_rarity_int.as_ref().and_then(|v| rarity_pystring(py, *v)) {
+            Some(word) => word.bind(py).clone().into_any(),
+            None => py.None().into_bound(py),
+        })
     }),
-    ("color_identity", |py, c, _p, _s, _v| Ok(identity_letters(c.card_color_identity).into_pyobject(py)?.into_any())),
-    ("legalities", |py, c, p, _s, _v| {
+    ("color_identity", |py| intern!(py, "color_identity"), |py, c, _p, _s, _v| color_identity_tuple(py, c.card_color_identity)),
+    ("legalities", |py| intern!(py, "legalities"), |py, c, p, _s, _v| {
         // Printing-level word only for the ~556 divergence cards, same rule the filters use.
         let bits = if c.legality_divergent { u64::from(p.card_legalities) } else { u64::from(c.card_legalities) };
         Ok(legality_bits_to_pydict(py, bits)?.into_any())
@@ -12960,8 +13110,45 @@ const FIELD_TABLE: &[(&str, FieldExtractor)] = &[
 /// Mirror of magic.rarity_int_to_text -- the import stores 0-5, Scryfall speaks words.
 const RARITY_NAMES: [&str; 6] = ["common", "uncommon", "rare", "mythic", "special", "bonus"];
 
-fn rarity_int_to_text(value: u8) -> Option<&'static str> {
-    RARITY_NAMES.get(value as usize).copied()
+/// One rarity word as an interned `PyString`, or `None` for an int outside `RARITY_NAMES`.
+///
+/// Six values, so the words are interned once rather than rebuilt per row -- the same argument as
+/// the legality status words, and cheaper still because there is nothing to invalidate. Built FROM
+/// `RARITY_NAMES` so the spellings exist in exactly one place; an `intern!` arm per word would be a
+/// second copy of the table with nothing checking the two agree.
+fn rarity_pystring(py: Python<'_>, value: u8) -> Option<&'static Py<PyString>> {
+    static WORDS: OnceLock<Vec<Py<PyString>>> = OnceLock::new();
+    WORDS.get_or_init(|| RARITY_NAMES.iter().map(|name| PyString::intern(py, name).unbind()).collect())
+        .get(value as usize)
+}
+
+/// The WUBRG-ordered letters for a colour mask, as one shared tuple per mask.
+///
+/// The value is a pure function of the mask and there are six colour bits (`color_to_bit`: W=1 to
+/// C=32), so 64 tuples cover every value the field can hold. Building them once turns the field
+/// into an incref: `identity_letters` used to `collect()` into a Rust `Vec` and then build a
+/// `PyList`, two allocations on every emitted row, for one of 32 answers the corpus actually uses.
+///
+/// A tuple rather than a list, and that is the point rather than an incidental detail. A list
+/// cannot be shared -- one caller mutating a row's colour identity would change every other row
+/// carrying the same colours -- so a cache is only safe for an immutable type. Tuples also carry a
+/// GC property lists do not: CPython untracks a tuple whose items are all untracked, and a dict
+/// holding only untracked values stays untracked itself, so a row keeping this field out of GC
+/// tracking is possible where a list would force it in.
+///
+/// This is the first result field to return a tuple; the collection fields still return lists.
+fn color_identity_tuple<'py>(py: Python<'py>, mask: u8) -> PyResult<Bound<'py, PyAny>> {
+    /// Six colour bits, so every mask this field can hold indexes into the table.
+    const N_MASKS: u8 = 64;
+    static TUPLES: OnceLock<Vec<Py<PyTuple>>> = OnceLock::new();
+    let tuples = TUPLES.get_or_init(|| {
+        (0..N_MASKS).filter_map(|m| PyTuple::new(py, identity_letters(m)).ok().map(|t| t.unbind())).collect()
+    });
+    match tuples.get(mask as usize) {
+        Some(cached) => Ok(cached.bind(py).clone().into_any()),
+        // Only reachable if the one-time build above failed partway; correct, just uncached.
+        None => Ok(PyTuple::new(py, identity_letters(mask))?.into_any()),
+    }
 }
 
 /// Decode an identity bitmap into Scryfall's WUBRG-ordered letter list.
@@ -12990,7 +13177,7 @@ const DEFAULT_FIELDS: &[&str] =
 /// requested twice is only fetched/emitted once) and rejecting anything outside the vocabulary.
 /// `None` resolves to DEFAULT_FIELDS. Called once per query, before the per-row loop, so the
 /// per-row cost is a flat list of closure calls rather than a name comparison per field per card.
-fn resolve_fields(fields: Option<Vec<String>>) -> PyResult<Vec<(&'static str, FieldExtractor)>> {
+fn resolve_fields(fields: Option<Vec<String>>) -> PyResult<Vec<ResolvedField>> {
     let requested: Vec<&str> = match &fields {
         Some(v) => v.iter().map(String::as_str).collect(),
         None => DEFAULT_FIELDS.to_vec(),
@@ -13001,8 +13188,18 @@ fn resolve_fields(fields: Option<Vec<String>>) -> PyResult<Vec<(&'static str, Fi
         if !seen.insert(name) {
             continue;
         }
-        match FIELD_TABLE.iter().find(|(n, _)| *n == name) {
-            Some(entry) => resolved.push(*entry),
+        match FIELD_TABLE.iter().find(|(n, _, _)| *n == name) {
+            Some((n, key, extractor)) => {
+                let cached = CACHED_STR_FIELDS
+                    .iter()
+                    .find(|(cn, _)| cn == n)
+                    .map(|(_, id_of)| CachedSource::Str(*id_of))
+                    .or_else(|| {
+                        CACHED_COLL_FIELDS.iter().find(|(cn, _)| cn == n).map(|(_, ids_of)| CachedSource::Coll(*ids_of))
+                    })
+                    .unwrap_or(CachedSource::Extractor);
+                resolved.push((*n, *key, *extractor, cached));
+            }
             None => return Err(UnknownFieldError::new_err(format!("unknown field: {name:?}"))),
         }
     }
@@ -13015,11 +13212,17 @@ fn card_to_pydict<'py>(
     printing: &APrinting,
     strings: &AStrings,
     vocab: &AStrings,
-    fields: &[(&'static str, FieldExtractor)],
+    fields: &[ResolvedField],
+    str_cache: &EmitStrCache,
 ) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
-    for (name, extractor) in fields {
-        d.set_item(*name, extractor(py, card, printing, strings, vocab)?)?;
+    for (_, key, extractor, cached) in fields {
+        let value = match cached {
+            CachedSource::Str(id_of) => str_cache.get(py, strings, id_of(card, printing))?,
+            CachedSource::Coll(ids_of) => str_cache.coll_list(py, vocab, ids_of(card, printing))?.into_any(),
+            CachedSource::Extractor => extractor(py, card, printing, strings, vocab)?,
+        };
+        d.set_item(key(py), value)?;
     }
     Ok(d)
 }
@@ -13059,7 +13262,7 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 //
 // 2026082501 — `SortPermutations` gains per-order printing-span prefix sums, used to turn a bound on
 // cards visited into a sound O(1) bound on printings examined. Entirely inside `CardIndexes` again.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026082501;
+const ARCHIVE_FORMAT_VERSION: u32 = 2026090801;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -13081,6 +13284,90 @@ fn archive_payload(mmap: &Mmap) -> &[u8] {
 struct CachedMmap {
     mmap: Arc<Mmap>,
     inode: u64,
+    /// Emit-path `PyString` cache for this mapping. Rebuilt with the mapping, which is what makes
+    /// it safe: interned string ids are archive-relative, so a cache outliving its archive would
+    /// hand out the wrong text.
+    str_cache: Arc<EmitStrCache>,
+}
+
+/// One `PyString` per interned string id, for the result fields whose values repeat within a page.
+///
+/// Measured over 100-row pages of real queries, distinct values per row: `layout` 0.02, `rarity`
+/// 0.04, `power` 0.07, `toughness` 0.09, `mana_cost` 0.42, `set_code`/`set_name` 0.58, `type_line`
+/// 0.63 — against `name` 1.00 and `oracle_text` 0.96. The low-cardinality ones are rebuilt from
+/// UTF-8 on nearly every row for a vocabulary in the hundreds or low thousands, so one `PyString`
+/// per distinct value converges to a ~100% hit rate for a few hundred KB. `name` and `oracle_text`
+/// are deliberately NOT routed here (see `FieldSource`): at ~1.0 distinct per row a cache never
+/// hits, and covering all 160k interned strings would hold the entire string payload live as
+/// Python objects.
+///
+/// `type_line` is the single biggest entry and the reason this exists: every MTG type line carries
+/// an em dash ("Creature — Bird"), so it is 100% non-ASCII and CPython cannot use its compact ASCII
+/// representation — 39.5 ns of value construction for 25 characters, against 14.5 ns for
+/// `set_name`'s 20 ASCII ones.
+///
+/// `OnceLock` per slot rather than a `Mutex` over the whole table: a hit is one atomic load, and a
+/// race on a miss just builds the string twice and keeps the first.
+#[derive(Default)]
+struct EmitStrCache {
+    /// Sized on first use, when the archive's string count is known.
+    cells: OnceLock<Box<[OnceLock<Py<PyString>>]>>,
+    /// The same, keyed by `coll_vocab` id, for the collection fields. A separate array because it
+    /// is a different id space and far smaller -- ~16k entries against ~160k.
+    coll_cells: OnceLock<Box<[OnceLock<Py<PyString>>]>>,
+}
+
+impl EmitStrCache {
+    fn get<'py>(&self, py: Python<'py>, strings: &AStrings, id: u32) -> PyResult<Bound<'py, PyAny>> {
+        let Some(text) = str_at(strings, id) else {
+            return Ok(py.None().into_bound(py));
+        };
+        let cells = self.cells.get_or_init(|| (0..strings.len()).map(|_| OnceLock::new()).collect());
+        // An id past the table can only mean a cache built against a different archive, which the
+        // per-mapping lifetime rules out. Fall back rather than panic.
+        let Some(cell) = cells.get(id as usize) else {
+            return Ok(text.into_pyobject(py)?.into_any());
+        };
+        if let Some(hit) = cell.get() {
+            return Ok(hit.bind(py).clone().into_any());
+        }
+        let built = PyString::new(py, text);
+        let _ = cell.set(built.clone().unbind());
+        Ok(built.into_any())
+    }
+
+    /// One collection field as a tuple of cached `PyString`s, in stored order.
+    ///
+    /// No sort. The vocab is renumbered lexicographically at load, so a set-like collection's
+    /// id-sorted vector is already in alphabetical order -- the order this used to produce by
+    /// re-sorting every row's strings at emit. `card_subtypes` keeps its printed order for the same
+    /// reason it always did, and reaches this function the same way.
+    ///
+    /// A tuple rather than a list, for the empty case. Three of these fields are mostly empty --
+    /// `card_is_tags` 91.0% of printings, `card_keywords` 56.4%, `card_subtypes` 38.4% -- and
+    /// CPython caches the empty tuple as a singleton while every empty list is a fresh 56-byte
+    /// allocation. So the dominant row costs an incref instead, with no cache and no special case
+    /// to write. It also keeps those rows out of GC tracking: an empty list is tracked and forces
+    /// the row dict to be tracked with it, the empty tuple is not.
+    fn coll_list<'py>(&self, py: Python<'py>, vocab: &AStrings, ids: &Archived<Vec<u16>>) -> PyResult<Bound<'py, PyTuple>> {
+        let cells = self.coll_cells.get_or_init(|| (0..vocab.len()).map(|_| OnceLock::new()).collect());
+        let mut items: Vec<Bound<'py, PyString>> = Vec::with_capacity(ids.len());
+        for id in ids.iter() {
+            let idx = u16::from(*id) as usize;
+            let Some(text) = vocab.get(idx) else { continue };
+            match cells.get(idx).and_then(|cell| cell.get()) {
+                Some(hit) => items.push(hit.bind(py).clone()),
+                None => {
+                    let built = PyString::new(py, text.as_str());
+                    if let Some(cell) = cells.get(idx) {
+                        let _ = cell.set(built.clone().unbind());
+                    }
+                    items.push(built);
+                }
+            }
+        }
+        PyTuple::new(py, items)
+    }
 }
 
 /// In-progress staged reload: cards accumulated across add_batch() calls plus
@@ -13216,7 +13503,7 @@ fn bind_and_split_filter(
     sync_format_shifts(&data.format_shifts);
     clear_regex_match_failed();
     let mut filter_expr = build_filter(&json_val).map_err(map_build_filter_err)?;
-    filter_expr.bind(&data.coll_vocab, &data.coll_vocab_sorted, &data.artist_vocab, &data.mana_vocab, &data.indexes.flavor, &data.strings);
+    filter_expr.bind(&data.coll_vocab, &data.artist_vocab, &data.mana_vocab, &data.indexes.flavor, &data.strings);
     check_regex_match_failed()?;
 
     // Read before the split consumes the tree.
@@ -13333,6 +13620,12 @@ impl QueryEngine {
     // the last remap (i.e. another worker wrote a new archive via rename).
     // One stat(2) per query; remap only when the inode actually changes.
     fn get_mmap(&self) -> PyResult<Arc<Mmap>> {
+        Ok(self.get_mapping()?.0)
+    }
+
+    /// The mapping plus its emit cache. Both come from the same `CachedMmap`, so a remap replaces
+    /// them together and a cache can never be read against an archive it was not built for.
+    fn get_mapping(&self) -> PyResult<(Arc<Mmap>, Arc<EmitStrCache>)> {
         let path_inode = std::fs::metadata(&self.shm_path)
             .map(|m| m.ino())
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("stat shm: {e}")))?;
@@ -13341,7 +13634,7 @@ impl QueryEngine {
         if let Some(ref c) = *guard
             && c.inode == path_inode
         {
-            return Ok(Arc::clone(&c.mmap));
+            return Ok((Arc::clone(&c.mmap), Arc::clone(&c.str_cache)));
         }
         // Inode changed (new reload) or first call: open and map the current file.
         let file = std::fs::File::open(&self.shm_path)
@@ -13365,8 +13658,9 @@ impl QueryEngine {
                 self.shm_path.display(),
             )));
         }
-        *guard = Some(CachedMmap { mmap: Arc::clone(&mmap), inode });
-        Ok(mmap)
+        let str_cache = Arc::new(EmitStrCache::default());
+        *guard = Some(CachedMmap { mmap: Arc::clone(&mmap), inode, str_cache: Arc::clone(&str_cache) });
+        Ok((mmap, str_cache))
     }
 }
 
@@ -13593,10 +13887,22 @@ impl QueryEngine {
         drop(artists.map);
         let mana_vocab = mana.strings;
         drop(mana.map);
-        // String-sorted permutation of the vocab ids; VocabInterner caps the
-        // vocab at u16::MAX entries so the cast can't truncate.
-        let mut coll_vocab_sorted: Vec<u16> = (0..coll_vocab.len() as u16).collect();
-        coll_vocab_sorted.sort_unstable_by(|&a, &b| coll_vocab[a as usize].cmp(&coll_vocab[b as usize]));
+        // Renumber the collection vocab into lexicographic order, so a vocab id's numeric order IS
+        // its string's alphabetical order. `VocabInterner` hands out ids first-seen, which made two
+        // separate things necessary: a string-sorted permutation for `bind` to binary-search, and a
+        // lexicographic re-sort of every row's ids at emit. Renumbering here retires both.
+        //
+        // The three properties this establishes, all relied on downstream:
+        //  - `coll_vocab` is alphabetically sorted, so `bind` binary-searches it directly.
+        //  - every set-like row vector stays sorted BY ID (`jsonb_obj_to_ids` sorted+deduped it, and
+        //    a remap + re-sort preserves that), which is what `filter.rs`'s `binary_search`
+        //    containment test requires.
+        //  - because id order is now string order, that same vector is ALSO alphabetically sorted,
+        //    so emit hands back a list in a deterministic order without sorting anything.
+        //
+        // `card_subtypes` is remapped but NOT re-sorted: it carries the printed order deliberately,
+        // and `filter.rs` linear-scans it for exactly that reason.
+        let coll_vocab = renumber_coll_vocab(&mut cards, &mut printings, coll_vocab);
         // Assigns every printing's artwork_group_id in place; the returned counts
         // feed CardIndexes.artwork_groups below. Must run before printings is
         // borrowed by the builders in the CardIndexes literal.
@@ -13720,7 +14026,6 @@ impl QueryEngine {
             offsets,
             strings,
             coll_vocab,
-            coll_vocab_sorted,
             artist_vocab,
             mana_vocab,
             indexes,
@@ -13812,7 +14117,7 @@ impl QueryEngine {
         let resolved_fields = resolve_fields(fields)?;
         // get_mmap() remaps automatically if the on-disk inode has changed since
         // the last reload, keeping workers off stale (deleted) mappings.
-        let mmap = self.get_mmap()?;
+        let (mmap, str_cache) = self.get_mapping()?;
         // Safety: the archive is trusted by construction, so we skip validation.
         // This is the canonical justification for every access_unchecked in this
         // module (query_hashmap() and size() refer here):
@@ -13856,7 +14161,7 @@ impl QueryEngine {
 
         let matches: Vec<Bound<PyDict>> = page
             .iter()
-            .map(|(c, p)| card_to_pydict(py, c, p, &data.strings, &data.coll_vocab, &resolved_fields))
+            .map(|(c, p)| card_to_pydict(py, c, p, &data.strings, &data.coll_vocab, &resolved_fields, &str_cache))
             .collect::<PyResult<Vec<_>>>()?;
         let matches_list = PyList::new(py, matches)?;
         PyTuple::new(py, [total.into_pyobject(py)?.into_any(), matches_list.into_any()])
@@ -14046,7 +14351,7 @@ impl QueryEngine {
     #[pyo3(signature = (n, fields=None))]
     fn sample_preferred<'py>(&self, py: Python<'py>, n: usize, fields: Option<Vec<String>>) -> PyResult<Bound<'py, PyList>> {
         let resolved_fields = resolve_fields(fields)?;
-        let mmap = self.get_mmap()?;
+        let (mmap, str_cache) = self.get_mapping()?;
         // Safety: see the access_unchecked justification in query().
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
 
@@ -14064,7 +14369,7 @@ impl QueryEngine {
             .map(|&cid| {
                 let card = &data.cards[cid];
                 let preferred = u32::from(data.offsets[cid]) as usize;
-                card_to_pydict(py, card, &data.printings[preferred], &data.strings, &data.coll_vocab, &resolved_fields)
+                card_to_pydict(py, card, &data.printings[preferred], &data.strings, &data.coll_vocab, &resolved_fields, &str_cache)
             })
             .collect::<PyResult<_>>()?;
         PyList::new(py, dicts)

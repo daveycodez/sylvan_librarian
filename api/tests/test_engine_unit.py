@@ -1020,10 +1020,14 @@ class TestCardProperties:
         assert total == 2
         names = {c["name"] for c in results}
         assert names == {"UUID Card A", "UUID Card B"}
-        # scryfall_id and illustration_id are returned as uuid.UUID objects
+        # scryfall_id and illustration_id come back as canonical lowercase-hyphenated text, not
+        # uuid.UUID: the object cost 76 ns/row to build against 22 for the string, and orjson only
+        # turned it back into this text anyway. _search_sql casts both with ::text to match.
         for c in results:
-            assert isinstance(c["scryfall_id"], uuid.UUID)
-            assert isinstance(c["illustration_id"], uuid.UUID)
+            assert isinstance(c["scryfall_id"], str)
+            assert c["scryfall_id"] == str(uuid.UUID(c["scryfall_id"]))
+            assert isinstance(c["illustration_id"], str)
+            assert c["illustration_id"] == str(uuid.UUID(c["illustration_id"]))
         # unique=artwork groups by illustration_id *within an oracle card*. Scryfall
         # assigns each illustration_id to exactly one oracle_id, so two different
         # oracle cards sharing one (as this synthetic fixture does) is impossible in
@@ -1286,8 +1290,10 @@ class TestFieldSelection:
         assert card["layout"] == "normal"
         assert card["cmc"] == 1
         assert card["rarity"] == "common"
-        # WUBRG-ordered letter list, not the raw JSONB object.
-        assert card["color_identity"] == ["R"]
+        # WUBRG-ordered letter tuple, not the raw JSONB object. A tuple because the engine serves
+        # this field from one cached object per color mask, which only an immutable type allows;
+        # the SQL path's _identity_letters matches it, and orjson writes either as a JSON array.
+        assert card["color_identity"] == ("R",)
         legalities = card["legalities"]
         assert legalities["modern"] == "legal"
         assert set(legalities.values()) <= {"legal", "not_legal", "restricted", "banned"}
@@ -1298,7 +1304,7 @@ class TestFieldSelection:
         order = {letter: i for i, letter in enumerate("WUBRGC")}
         for card in cards:
             letters = card["color_identity"]
-            assert letters == sorted(letters, key=order.__getitem__)
+            assert letters == tuple(sorted(letters, key=order.__getitem__))
             assert {"R", "G"} <= set(letters)
 
 
