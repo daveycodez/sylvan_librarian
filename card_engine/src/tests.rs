@@ -14914,6 +14914,46 @@ fn name_lookups_agree_with_and_without_the_trigram_index() {
     assert_eq!(exact_name_match(idx, "insectile aberration", None).map(|(cid, _)| cid), Some(2));
 }
 
+/// Containment's pool leaves out the three layouts api.scryfall.com never answers it with (see
+/// `CONTAINMENT_EXCLUDED_LAYOUTS`): an emblem, an art series and a front card are neither an answer
+/// nor a competitor, so the real card they share words with is no longer ambiguous. A token stays
+/// in, both as an answer and as a competitor.
+#[test]
+fn containment_leaves_out_emblems_art_series_and_front_cards() {
+    let spec = [
+        ("liliana, the last hope", "normal"),
+        ("liliana, the last hope emblem", "emblem"),
+        ("jace, the mind sculptor", "normal"),
+        ("jace, the mind sculptor // jace, the mind sculptor", "art_series"),
+        ("great lakes avengers", "front_card"),
+        ("tuktuk the returned", "token"),
+        ("tuktuk rubblefort", "normal"),
+    ];
+    let mut vocab = VocabInterner::new();
+    let mut interner = Interner::new();
+    let mut cards = Vec::new();
+    for (i, (name, layout)) in spec.iter().enumerate() {
+        let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
+        c.card_name_lower = InlineStr::from_str(name);
+        c.card_layout_id = interner.intern((*layout).to_string());
+        cards.push(c);
+    }
+    let mut data = store_of(cards, &[1; 7], vocab);
+    data.strings = interner.strings;
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let names = |words: &[&str]| -> Vec<&str> {
+        let words: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+        names_containing_all_words(archived, &words, None, 2).into_iter().map(|(cid, _)| spec[cid].0).collect()
+    };
+    assert_eq!(names(&["lili", "last", "hope"]), ["liliana, the last hope"], "the emblem does not compete");
+    assert!(names(&["hope", "emblem"]).is_empty(), "nor does it answer alone");
+    assert_eq!(names(&["jace", "mind", "scul"]), ["jace, the mind sculptor"], "the art series does not compete");
+    assert!(names(&["lakes", "aveng"]).is_empty(), "a front card is no answer");
+    assert_eq!(names(&["tuktuk", "returned"]), ["tuktuk the returned"], "a token still answers");
+    assert_eq!(names(&["tuktuk"]).len(), 2, "and still competes");
+}
+
 /// A store of `names`, folded == lowered (the fixture leaves `card_name_folded_id` unset),
 /// with `printing_counts[i]` printings on card i. The by-name tests below all want the same shape,
 /// and the printed-name index stays empty in it, which is every pre-multilingual store.

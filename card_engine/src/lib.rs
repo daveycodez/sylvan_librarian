@@ -4628,9 +4628,26 @@ fn name_best_over(
     best.map(|(_, _, cid, pid)| (cid, pid))
 }
 
+/// The layouts `named?fuzzy=`'s containment stage never answers with, and so never counts as a
+/// competing name. Measured on api.scryfall.com 2026-09-25, each by a needle only that class
+/// contains: `fuzzy=hope emblem` and `last hope emblem` (Liliana's emblem), `lakes aveng` (the
+/// "Great Lakes Avengers" front card) and `mighty kobold` (the art-series "Minion of the Mighty //
+/// Kobold") are all 404s, and an emblem or art series sharing a real card's words does not make it
+/// ambiguous: `lili last hope`, `teferi hero`, `sun champ elspeth` and `jace mind scul` answer the
+/// card. Every other extras class stays in: `tuk returned` (a token), `antarc research` (a plane),
+/// `jaya avat` (a vanguard), `soil shake` (a scheme) and `welc austr` (an unk playtest card) each
+/// answer their card. The typo stage keeps emblems and front cards (`counter` is the `Counters`
+/// front card there).
+///
+/// Mirrored by `_IN_CONTAINMENT_POOL` in `api/scryfall_compat/routes.py`, the SQL
+/// fallback. This branch imports every extras class (see `preprocess_card`), so all three are in
+/// the store.
+pub(crate) const CONTAINMENT_EXCLUDED_LAYOUTS: [&str; 3] = ["art_series", "emblem", "front_card"];
+
 /// `named?fuzzy=`'s containment stage: one printing per DISTINCT card name whose folded name holds
 /// every query word. Two cards sharing a name are one answer, and more than one distinct name is
-/// what the caller reports as `ambiguous` rather than guessing between.
+/// what the caller reports as `ambiguous` rather than guessing between. A card whose layout is in
+/// `CONTAINMENT_EXCLUDED_LAYOUTS` is neither an answer nor a competitor.
 pub(crate) fn names_containing_all_words(
     data: &Archived<CardData>,
     words: &[String],
@@ -4643,8 +4660,13 @@ pub(crate) fn names_containing_all_words(
     let mut by_name: Vec<(&str, f32, usize, usize)> = Vec::new();
     for cid in name_scan_candidates(data, longest) {
         let cid = cid as usize;
-        let name = folded_name(&data.cards[cid], &data.strings);
+        let card = &data.cards[cid];
+        let name = folded_name(card, &data.strings);
         if !words.iter().all(|w| name.contains(w.as_str())) {
+            continue;
+        }
+        let layout = str_at(&data.strings, u32::from(card.card_layout_id));
+        if layout.is_some_and(|layout| CONTAINMENT_EXCLUDED_LAYOUTS.contains(&layout)) {
             continue;
         }
         let Some(pid) = best_printing_in_set(data, cid, set_code) else { continue };
