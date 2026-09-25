@@ -14954,6 +14954,57 @@ fn containment_leaves_out_emblems_art_series_and_front_cards() {
     assert_eq!(names(&["tuktuk"]).len(), 2, "and still competes");
 }
 
+/// An art-series card leaves the exact and typo stages too (see `ART_SERIES_LAYOUT`): `exact=` of
+/// its whole name is a miss, and a typo that spells it answers the real card. Emblems and front
+/// cards stay in both, and a collection identifier still reads an art series' face keys.
+#[test]
+fn art_series_leave_the_exact_and_typo_stages() {
+    let spec = [
+        ("lightning bolt", "normal"),
+        ("lightning bolt // lightning bolt", "art_series"),
+        ("minion of the mighty", "normal"),
+        ("minion of the mighty // kobold", "art_series"),
+        ("counters", "front_card"),
+        ("liliana, the last hope emblem", "emblem"),
+    ];
+    let mut vocab = VocabInterner::new();
+    let mut interner = Interner::new();
+    let mut cards = Vec::new();
+    for (i, (name, layout)) in spec.iter().enumerate() {
+        let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
+        c.card_name_lower = InlineStr::from_str(name);
+        c.card_layout_id = interner.intern((*layout).to_string());
+        cards.push(c);
+    }
+    let mut data = store_of(cards, &[1; 6], vocab);
+    data.strings = interner.strings;
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let exact = |needle: &str| exact_name_match(a, needle, None).map(|(cid, _)| spec[cid].0);
+    let fuzzy = |needle: &str| match fuzzy_name_match(a, needle, crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD) {
+        FuzzyOutcome::Hit { cid, .. } => Some(spec[cid as usize].0),
+        _ => None,
+    };
+
+    // `exact=Lightning Bolt // Lightning Bolt` and `exact=Minion of the Mighty // Kobold` are 404s.
+    assert_eq!(exact("lightning bolt // lightning bolt"), None);
+    assert_eq!(exact("minion of the mighty // kobold"), None);
+    assert_eq!(exact("kobold"), None, "nor does a face key reach it");
+    assert_eq!(exact("lightning bolt"), Some("lightning bolt"));
+    assert_eq!(exact("counters"), Some("counters"), "a front card is still an exact answer");
+    assert_eq!(exact("liliana, the last hope emblem"), Some("liliana, the last hope emblem"), "so is an emblem");
+    assert_eq!(
+        collection_name_match(a, "kobold", None).map(|(cid, _)| spec[cid].0),
+        Some("minion of the mighty // kobold"),
+        "the collection identifier is unmeasured and keeps them"
+    );
+
+    // `fuzzy=minion of the mighty kobold` is the afr card, not the art series it spells exactly.
+    assert_eq!(fuzzy("minion of the mighty kobold"), Some("minion of the mighty"));
+    assert_eq!(fuzzy("lightning bolt // lightning bolt"), Some("lightning bolt"));
+    assert_eq!(fuzzy("counter"), Some("counters"), "a front card still races");
+}
+
 /// A store of `names`, folded == lowered (the fixture leaves `card_name_folded_id` unset),
 /// with `printing_counts[i]` printings on card i. The by-name tests below all want the same shape,
 /// and the printed-name index stays empty in it, which is every pre-multilingual store.

@@ -4257,7 +4257,9 @@ fn build_printed_name_index(
 /// Scryfall answers Blightning with that card in its own corpus, so the metric's separation is
 /// real and the threshold was simply too coarse for it. 0.002 sits inside the 0.0005–0.003
 /// plateau the refit found, and still leaves an EXACT tie (difference 0) ambiguous, which is the
-/// only thing the lead has to catch.
+/// only thing the lead has to catch. (Art-series cards have since left the typo pool altogether --
+/// see `ART_SERIES_LAYOUT` -- so that particular runner-up is gone; the lead stays where the refit
+/// put it.)
 pub(crate) const FUZZY_SCORE_FLOOR: f32 = 0.625;
 pub(crate) const FUZZY_SCORE_LEAD: f32 = 0.002;
 
@@ -4550,6 +4552,9 @@ fn prefer_of(data: &Archived<CardData>, pid: usize) -> f32 {
 /// column in this corpus carries a printing's flavor name. It is a pre-existing gap, not one the
 /// scope split opens -- and it happens to leave the COLLECTION surface right, since a flavor name
 /// is not a collection identifier's key either.
+///
+/// An ART-SERIES card is never the answer, whichever of its keys the needle spells
+/// (`ART_SERIES_LAYOUT`).
 pub(crate) fn exact_name_match(data: &Archived<CardData>, folded: &str, set_code: Option<&str>) -> Option<(usize, usize)> {
     name_best(data, folded, set_code, NameScope::Exact)
 }
@@ -4619,6 +4624,11 @@ fn name_best_over(
         let cid = cid as usize;
         let stored = folded_name(&data.cards[cid], &data.strings);
         let Some(tier) = name_key_tier(stored, needle, scope) else { continue };
+        // `named?exact=` never answers an art-series card (see `ART_SERIES_LAYOUT`). A collection
+        // identifier is not measured and keeps them.
+        if scope == NameScope::Exact && is_art_series(data, cid) {
+            continue;
+        }
         let Some(pid) = best_printing_in_set(data, cid, set_code) else { continue };
         let score = prefer_of(data, pid);
         if best.is_none_or(|(bt, bs, _, _)| (tier, score) > (bt, bs)) {
@@ -4636,13 +4646,39 @@ fn name_best_over(
 /// ambiguous: `lili last hope`, `teferi hero`, `sun champ elspeth` and `jace mind scul` answer the
 /// card. Every other extras class stays in: `tuk returned` (a token), `antarc research` (a plane),
 /// `jaya avat` (a vanguard), `soil shake` (a scheme) and `welc austr` (an unk playtest card) each
-/// answer their card. The typo stage keeps emblems and front cards (`counter` is the `Counters`
-/// front card there).
+/// answer their card. The typo and exact stages keep emblems and front cards (`counter` is the
+/// `Counters` front card there); art series leave those too (`ART_SERIES_LAYOUT`).
 ///
 /// Mirrored by `_IN_CONTAINMENT_POOL` in `api/scryfall_compat/routes.py`, the SQL
 /// fallback. This branch imports every extras class (see `preprocess_card`), so all three are in
 /// the store.
 pub(crate) const CONTAINMENT_EXCLUDED_LAYOUTS: [&str; 3] = ["art_series", "emblem", "front_card"];
+
+/// The one layout `/cards/named` never answers by name, at ANY stage. Measured on
+/// api.scryfall.com 2026-09-25:
+///
+///   - `exact=Lightning Bolt // Lightning Bolt` and `exact=Minion of the Mighty // Kobold` are
+///     404s, although each is an art-series card's whole name.
+///   - `fuzzy=minion of the mighty kobold` answers the afr card Minion of the Mighty, although the
+///     art series spells the query exactly once separators fold, and `fuzzy=lightning bolt //
+///     lightning bolt` and `fuzzy=jace, the mind sculptor // jace, the mind sculptor` answer the
+///     real card the same way.
+///   - `fuzzy=mighty kobold`, which only the art series contains, is a 404.
+///
+/// Emblems and front cards are NOT this: `exact=` and `fuzzy=` of `Liliana, the Last Hope Emblem`
+/// answer the emblem, and `exact=Counters`, `fuzzy=Counters` and `fuzzy=counter` the front card.
+/// They leave the containment stage only (`CONTAINMENT_EXCLUDED_LAYOUTS`).
+///
+/// So an art-series card is out of `exact_name_match` (the `Exact` scope of `name_best`; a
+/// collection identifier is not measured and keeps it) and out of `fuzzy_name_match`'s pool.
+/// Mirrored by `_NOT_ART_SERIES` in `api/scryfall_compat/routes.py`, which the SQL fallback's
+/// exact, whole-name and similarity stages carry.
+pub(crate) const ART_SERIES_LAYOUT: &str = "art_series";
+
+/// Whether card `cid` is an art-series card (see `ART_SERIES_LAYOUT`).
+fn is_art_series(data: &Archived<CardData>, cid: usize) -> bool {
+    str_at(&data.strings, u32::from(data.cards[cid].card_layout_id)) == Some(ART_SERIES_LAYOUT)
+}
 
 /// `named?fuzzy=`'s containment stage: one printing per DISTINCT card name whose folded name holds
 /// every query word. Two cards sharing a name are one answer, and more than one distinct name is
@@ -4777,6 +4813,9 @@ fn fuzzy_needle(needle: &str) -> Option<(Vec<u8>, Vec<[u8; 3]>)> {
 /// runner-up rule is FuzzyRace's: only a different name on a different CARD competes — several
 /// printings of one card are the same answer, a card's own foreign and English names are too,
 /// and two cards sharing a name stay one answer.
+///
+/// An art-series card is neither a winner nor a competitor (see `ART_SERIES_LAYOUT`); every other
+/// extras class races.
 pub(crate) fn fuzzy_name_match(
     data: &Archived<CardData>,
     needle: &str,
@@ -4798,6 +4837,11 @@ pub(crate) fn fuzzy_name_match(
         if let Some(score) =
             fuzzy_score_cleared(&name_tg, &needle_tg, &name_bytes, &needle_bytes, floor, &mut dp)
         {
+            // Checked only on a name that cleared the floor, so the layout compare stays off the
+            // scan's hot path.
+            if is_art_series(data, cid) {
+                continue;
+            }
             // An English-name hit materializes what it always has: the card's preferred printing.
             if let Some(vpid) = preferred_vpid(data, cid) {
                 race.offer(score, cid as u32, vpid, name);

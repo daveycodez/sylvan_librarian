@@ -727,6 +727,14 @@ def _unseparated(word: str) -> str:
 # as jsonb.
 _IN_CONTAINMENT_POOL = "coalesce(card_layout, '') NOT IN ('art_series', 'emblem', 'front_card')"
 
+# The one layout `/cards/named` never answers by name at ANY stage: api.scryfall.com 404s
+# `exact=Lightning Bolt // Lightning Bolt` and `exact=Minion of the Mighty // Kobold`, and answers
+# `fuzzy=minion of the mighty kobold` with the afr card although the art series spells it exactly
+# (measured 2026-09-25). Emblems and front cards stay in the exact, whole-name and similarity
+# stages -- `fuzzy=counter` is the `Counters` front card. The engine's `ART_SERIES_LAYOUT` is the
+# same rule, with the measurements written out.
+_NOT_ART_SERIES = "coalesce(card_layout, '') <> 'art_series'"
+
 # Returned by the similarity stage when two names are too close to choose between. A distinct
 # object rather than a flag so the caller compares with `is` and cannot confuse it with a row.
 _AMBIGUOUS: dict[str, Any] = {"ambiguous": True}
@@ -1856,7 +1864,7 @@ class ScryfallCardsRoutes:
             # named "What", so `exact=What` answered und/75 where Scryfall 404s.
             params["folded"] = fold_accents(exact.strip().lower())
             params["collated"] = _collate_name(exact)
-            clauses.append(_EXACT_NAME_MATCH)
+            clauses.extend((_EXACT_NAME_MATCH, _NOT_ART_SERIES))
             # The ENGINE first, same as the fuzzy stages below and `_cards_by_ids`. This was the
             # last by-name lookup still answering from SQL, and it is the one a scan hurts most:
             # `named?exact=` is a single-card fetch that walked all ~31,700 folded names. It takes
@@ -2061,7 +2069,9 @@ class ScryfallCardsRoutes:
         params = {**base_params, "needle": _unseparated(needle)}
         oracle = f"{_UNSEPARATED.format(column='card_name_folded')} = %(needle)s"
         printed = f"{_UNSEPARATED.format(column='printed_name_folded')} = %(needle)s"
-        clauses = [*base_clauses, f"({oracle} OR {printed})"]
+        # Never an art-series card (`_NOT_ART_SERIES`): `fuzzy=minion of the mighty kobold` spells
+        # "Minion of the Mighty // Kobold" exactly and answers the afr card on api.scryfall.com.
+        clauses = [*base_clauses, _NOT_ART_SERIES, f"({oracle} OR {printed})"]
         # An ORACLE name that is the query outranks a PRINTED one that is: `exact=` is scoped to
         # oracle names (measured -- `exact=Ego à Deriva` is a 404 there while `fuzzy=` resolves
         # it), so when both exist the English card is the one the query names.
@@ -2205,7 +2215,7 @@ class ScryfallCardsRoutes:
         # `%%` escapes psycopg's placeholder marker: the bare `%` operator would be read as the
         # start of one. OPERATOR(magic.%) is pg_trgm's similarity match, which the folded-name GIN
         # index serves.
-        clauses = [*base_clauses, "lower(card_name_folded) OPERATOR(magic.%%) %(needle)s"]
+        clauses = [*base_clauses, _NOT_ART_SERIES, "lower(card_name_folded) OPERATOR(magic.%%) %(needle)s"]
         rows = self._run_query(
             query=(
                 "SELECT DISTINCT ON (card_name) card_name, scryfall_id, "

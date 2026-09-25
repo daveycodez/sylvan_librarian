@@ -63,7 +63,11 @@ VAULT_NAME = "Compat Lim-Dûl's Vault"
 POOL_SET_CODE = "sfp"
 POOL_EMBLEM_ID = "13131313-1313-4313-8313-131313131313"
 POOL_TOKEN_ID = "14141414-1414-4414-8414-141414141414"
+POOL_ART_SERIES_ID = "15151515-1515-4515-8515-151515151515"
 WARDEN_NAME = "Hollowmere Warden"
+# Shaped like "Minion of the Mighty // Kobold": the real card's name plus a word only the art series
+# carries.
+WARDEN_ART_SERIES_NAME = f"{WARDEN_NAME} // Wisp"
 
 
 def _pool_card(card_id: str, number: str, name: str, layout: str, type_line: str) -> dict:
@@ -83,6 +87,16 @@ def _pool_card(card_id: str, number: str, name: str, layout: str, type_line: str
         "oracle_text": "",
         "lang": "en",
     }
+    return card
+
+
+def _pool_art_series() -> dict:
+    """The pool's ART-SERIES card, two faces like every real one."""
+    card = _pool_card(POOL_ART_SERIES_ID, "4", WARDEN_ART_SERIES_NAME, "art_series", "Card // Card")
+    card["card_faces"] = [
+        {"object": "card_face", "name": name, "mana_cost": "", "type_line": "Card", "oracle_text": ""}
+        for name in WARDEN_ART_SERIES_NAME.split(" // ")
+    ]
     return card
 
 
@@ -311,6 +325,7 @@ def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
         _pool_card("12121212-1212-4212-8212-121212121212", "1", WARDEN_NAME, "normal", "Creature — Human"),
         _pool_card(POOL_EMBLEM_ID, "2", f"{WARDEN_NAME} Emblem", "emblem", "Emblem — Hollowmere"),
         _pool_card(POOL_TOKEN_ID, "3", "Hollowmere Sentry", "token", "Token Creature — Spirit"),
+        _pool_art_series(),
     )
     api_resource.admin._upsert_cards([copy.deepcopy(card) for card in cards])
     with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
@@ -592,7 +607,7 @@ class TestSearch:
         body = payload(
             dispatch(compat_corpus, "/cards/search", "q=is%3Aextra&include_extras=false"),
         )
-        assert {card["id"] for card in body["data"]} == {EXTRA_ID, POOL_EMBLEM_ID, POOL_TOKEN_ID}
+        assert {card["id"] for card in body["data"]} == {EXTRA_ID, POOL_EMBLEM_ID, POOL_TOKEN_ID, POOL_ART_SERIES_ID}
 
     @pytest.mark.parametrize(
         "query",
@@ -1122,6 +1137,33 @@ class TestNamed:
         assert resp.status == falcon.HTTP_404
         assert payload(resp)["type"] == "ambiguous"
 
+    @pytest.mark.parametrize("name", [WARDEN_ART_SERIES_NAME, "Hollowmere Warden Wisp", "Wisp"])
+    def test_exact_never_answers_an_art_series(self, by_name_paths: APIResource, name):
+        """No key of an art-series card is an `exact=` answer, its whole name included.
+
+        Measured on api.scryfall.com 2026-09-25: `exact=Lightning Bolt // Lightning Bolt` and
+        `exact=Minion of the Mighty // Kobold` are 404s.
+        """
+        resp = dispatch(by_name_paths, "/cards/named", urlencode({"exact": name}))
+        assert resp.status == falcon.HTTP_404
+        assert payload(resp)["code"] == "not_found"
+
+    @pytest.mark.parametrize("name", [WARDEN_ART_SERIES_NAME, "hollowmere warden wisp"])
+    def test_fuzzy_spelling_an_art_series_answers_the_real_card(self, by_name_paths: APIResource, name):
+        """An art series is out of the whole-name and typo stages too, so the real card answers.
+
+        Measured on api.scryfall.com 2026-09-25: `fuzzy=minion of the mighty kobold` answers the afr
+        card Minion of the Mighty, and `fuzzy=lightning bolt // lightning bolt` Lightning Bolt.
+        """
+        body = payload(dispatch(by_name_paths, "/cards/named", urlencode({"fuzzy": name})))
+        assert body["name"] == WARDEN_NAME
+
+    def test_fuzzy_words_only_an_art_series_carries_are_not_found(self, by_name_paths: APIResource):
+        """`fuzzy=mighty kobold` is a 404 on api.scryfall.com (2026-09-25): not found, not ambiguous."""
+        resp = dispatch(by_name_paths, "/cards/named", "fuzzy=warden+wisp")
+        assert resp.status == falcon.HTTP_404
+        assert "type" not in payload(resp)
+
     def test_neither_parameter_is_a_400(self, compat_corpus: APIResource):
         resp = dispatch(compat_corpus, "/cards/named")
         assert resp.status == falcon.HTTP_400
@@ -1334,7 +1376,7 @@ class TestRandom:
         it — a query that names the class can never answer nothing.
         """
         body = payload(dispatch(compat_corpus, "/cards/random", "q=is%3Aextra&include_extras=false"))
-        assert body["id"] in {EXTRA_ID, POOL_EMBLEM_ID, POOL_TOKEN_ID}
+        assert body["id"] in {EXTRA_ID, POOL_EMBLEM_ID, POOL_TOKEN_ID, POOL_ART_SERIES_ID}
 
     def test_a_set_term_on_an_extras_set_is_the_conditional_trigger(self, compat_corpus: APIResource, monkeypatch):
         """The one trigger that asks the store: a set term enables extras iff that set holds one.
