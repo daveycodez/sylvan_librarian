@@ -350,6 +350,12 @@ class TestEnvelopes:
             "details": "nope",
         }
 
+    def test_error_object_writes_a_type_between_code_and_status(self):
+        """Scryfall's ambiguous-name 404, key for key: `type` refines `code` and sits right after it."""
+        error = error_object(code="not_found", error_type="ambiguous", status=404, details="nope")
+        assert list(error) == ["object", "code", "type", "status", "details"]
+        assert error["type"] == "ambiguous"
+
     def test_error_object_carries_warnings(self):
         error = error_object(code="bad_request", status=400, details="nope", warnings=["heads up"])
         assert error["warnings"] == ["heads up"]

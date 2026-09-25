@@ -531,6 +531,19 @@ class TestNamed:
         body = payload(dispatch(compat_corpus, "/cards/named", "fuzzy=compat+bears"))
         assert body["name"] == "Compat Bears"
 
+    def test_fuzzy_ambiguity_is_scryfalls_body_byte_for_byte(self, compat_corpus: APIResource):
+        """A not_found carrying `type: ambiguous`, keys in Scryfall's order, as it answers `aust com`.
+
+        `compat` is contained in more than one card name, so the containment stage cannot choose.
+        """
+        resp = dispatch(compat_corpus, "/cards/named", "fuzzy=compat")
+        assert resp.status == falcon.HTTP_404
+        expected = (
+            '{"object":"error","code":"not_found","type":"ambiguous","status":404,'
+            '"details":"Too many cards match ambiguous name “compat”. Add more words to refine your search."}'
+        )
+        assert orjson.dumps(payload(resp)) == expected.encode()
+
     def test_fuzzy_tolerates_a_typo(self, compat_corpus: APIResource):
         body = payload(dispatch(compat_corpus, "/cards/named", "fuzzy=Compat+Bolzt"))
         assert body["name"] == "Compat Bolt"

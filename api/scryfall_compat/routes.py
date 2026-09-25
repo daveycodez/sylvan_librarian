@@ -1209,7 +1209,15 @@ class ScryfallCardsRoutes:
         )
 
     def _ambiguous(self, falcon_response: falcon.Response | None, name: str, *, pretty: bool) -> dict[str, Any] | None:
-        """Emit Scryfall's `ambiguous` error.
+        """Emit Scryfall's `ambiguous` error, which is a `not_found` carrying a `type`.
+
+        Measured on api.scryfall.com 2026-08-16, `/cards/named?fuzzy=aust com`, byte for byte:
+
+            {"object":"error","code":"not_found","type":"ambiguous","status":404,
+             "details":"Too many cards match ambiguous name “aust com”. Add more words to refine your search."}
+
+        This sent `"code":"ambiguous"` with no `type`: the same 404 with a different body, so a
+        client branching on `code == "not_found"` missed it.
 
         Args:
             falcon_response: The Falcon response to write to.
@@ -1222,7 +1230,8 @@ class ScryfallCardsRoutes:
         return self._scryfall_respond(
             falcon_response,
             error_object(
-                code="ambiguous",
+                code="not_found",
+                error_type="ambiguous",
                 status=404,
                 details=f"Too many cards match ambiguous name “{name}”. Add more words to refine your search.",
             ),
