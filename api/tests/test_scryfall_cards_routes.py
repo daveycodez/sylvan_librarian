@@ -317,13 +317,15 @@ def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
         cursor.execute("DELETE FROM magic.rulings WHERE oracle_id = %(oracle_id)s", {"oracle_id": BOLT_ORACLE_ID})
         # Three rulings across two dates, two of them same-day: a single ruling cannot tell one
         # ordering from another, which is how the ascending sort went unnoticed. Inserted oldest
-        # first so the expected answer is not the insertion order either.
+        # first so the expected answer is not the insertion order either. The fourth repeats the
+        # first verbatim, as the bulk file does 37 times, and Scryfall serves both copies.
         cursor.executemany(
             "INSERT INTO magic.rulings (oracle_id, source, published_at, comment) VALUES (%s, %s, %s, %s)",
             [
                 (BOLT_ORACLE_ID, "wotc", "2004-10-04", "Any target means any target."),
                 (BOLT_ORACLE_ID, "wotc", "2021-02-05", "Zero damage is still damage."),
                 (BOLT_ORACLE_ID, "wotc", "2021-02-05", "A later clarification."),
+                (BOLT_ORACLE_ID, "wotc", "2004-10-04", "Any target means any target."),
             ],
         )
         conn.commit()
@@ -1069,11 +1071,23 @@ class TestRulings:
             ("2021-02-05", "A later clarification."),
             ("2021-02-05", "Zero damage is still damage."),
             ("2004-10-04", "Any target means any target."),
+            ("2004-10-04", "Any target means any target."),
         ]
+
+    def test_a_repeated_ruling_is_served_as_often_as_scryfall_serves_it(self, compat_corpus: APIResource):
+        """The bulk file's verbatim repeats are rulings, not export noise.
+
+        Measured 2026-09-25: the file repeats 37 whole tuples across 11 cards, and api.scryfall.com
+        answered all 11 with every repeat in place -- Varis, Silverymoon Ranger 21 rulings of which
+        11 are distinct, Expand the Sphere 12 of 6. A unique index on the tuple dropped all 37.
+        """
+        body = payload(dispatch(compat_corpus, f"/cards/{BOLT_ID}/rulings"))
+        comments = [row["comment"] for row in body["data"]]
+        assert comments.count("Any target means any target.") == 2
 
     def test_rulings_by_set_and_collector_number(self, compat_corpus: APIResource):
         body = payload(dispatch(compat_corpus, f"/cards/{SET_CODE}/1/rulings"))
-        assert len(body["data"]) == 3
+        assert len(body["data"]) == 4  # three rulings, one of them served twice
 
     @pytest.mark.parametrize(
         ("namespace", "external_id"),
@@ -1081,7 +1095,7 @@ class TestRulings:
     )
     def test_rulings_by_external_id(self, compat_corpus: APIResource, namespace, external_id):
         body = payload(dispatch(compat_corpus, f"/cards/{namespace}/{external_id}/rulings"))
-        assert len(body["data"]) == 3
+        assert len(body["data"]) == 4  # three rulings, one of them served twice
 
     def test_a_card_with_no_rulings_returns_an_empty_list(self, compat_corpus: APIResource):
         body = payload(dispatch(compat_corpus, f"/cards/{BEAR_ID}/rulings"))

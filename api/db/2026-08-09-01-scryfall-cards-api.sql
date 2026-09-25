@@ -76,9 +76,11 @@ CREATE TABLE IF NOT EXISTS magic.rulings (
 );
 
 COMMENT ON TABLE magic.rulings IS
-    'Scryfall rulings bulk data, keyed by oracle_id. One row per ruling; a card has zero or more.';
+    'Scryfall rulings bulk data, keyed by oracle_id. One row per bulk-file entry; a card has zero or more.';
 
--- The bulk file carries no ruling id, so identity is the tuple itself. md5() rather than the raw
--- comment because a btree entry is capped at ~2700 bytes and rulings run longer than that.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_rulings_identity
-    ON magic.rulings USING btree (oracle_id, source, published_at, md5(comment));
+-- The rulings routes' lookup. NOT unique: the bulk file repeats a whole (oracle_id, source,
+-- published_at, comment) tuple 37 times across 11 cards, and api.scryfall.com serves every one of
+-- those repeats (measured 2026-09-25 -- Varis, Silverymoon Ranger has 21 rulings, 11 distinct), so a
+-- repeat is two rulings Scryfall holds with the same text, and a unique index would drop one.
+CREATE INDEX IF NOT EXISTS idx_rulings_oracle_id
+    ON magic.rulings USING btree (oracle_id);
