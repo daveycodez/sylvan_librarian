@@ -337,6 +337,15 @@ _UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F
 FUZZY_SIMILARITY_FLOOR = 0.4
 FUZZY_SIMILARITY_LEAD = 0.05
 
+# The layouts the containment stage of `?fuzzy=` never answers with, and so never counts as a
+# competing name: api.scryfall.com 404s `fuzzy=hope emblem`, `lakes aveng` (a front card) and
+# `mighty kobold` (an art series), and answers `lili last hope` and `jace mind scul` with the real
+# card rather than calling them ambiguous (measured 2026-09-25). Tokens, planes, schemes and every
+# other extras class stay in. The engine's `CONTAINMENT_EXCLUDED_LAYOUTS` is the same list; the
+# measurements are written out there. A literal rather than a bound list: `_run_query` binds a list
+# as jsonb.
+_IN_CONTAINMENT_POOL = "coalesce(card_layout, '') NOT IN ('art_series', 'emblem', 'front_card')"
+
 # Returned by the similarity stage when two names are too close to choose between. A distinct
 # object rather than a flag so the caller compares with `is` and cannot confuse it with a row.
 _AMBIGUOUS: dict[str, Any] = {"ambiguous": True}
@@ -1292,6 +1301,9 @@ class ScryfallCardsRoutes:
     ) -> list[dict[str, Any]]:
         """Return one printing per distinct card name containing every query word.
 
+        Emblems, art series and front cards are left out (`_IN_CONTAINMENT_POOL`): they
+        neither answer this stage nor make a real card ambiguous.
+
         Args:
             words: The folded query, split into words.
             base_clauses: Predicates already established (the set filter).
@@ -1320,7 +1332,7 @@ class ScryfallCardsRoutes:
                 return [{"scryfall_id": row["scryfall_id"], "card_name": row["name"]} for row in rows]
 
         params = dict(base_params)
-        clauses = list(base_clauses)
+        clauses = [*base_clauses, _IN_CONTAINMENT_POOL]
         for index, word in enumerate(words):
             params[f"word_{index}"] = f"%{word}%"
             clauses.append(f"lower(card_name_folded) LIKE %(word_{index})s")

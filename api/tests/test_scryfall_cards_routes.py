@@ -64,6 +64,32 @@ SCOPE_B_ID = "88888888-8888-4888-8888-888888888888"
 SCOPE_SET_X = "asfa"
 SCOPE_X_ID = "99999999-9999-4999-8999-999999999999"
 
+# The fuzzy containment pool wants a card, its EMBLEM and a TOKEN sharing its words, in a set of
+# their own so nothing else here counts them.
+POOL_SET_CODE = "sfp"
+WARDEN_NAME = "Hollowmere Warden"
+
+
+def _pool_card(card_id: str, number: str, name: str, layout: str, type_line: str) -> dict:
+    """One card of the containment-pool trio, its class carried by `layout`.
+
+    The token's type line is a plain creature's: this branch's importer drops a `Token` type
+    line, and what the containment pool reads is the layout.
+    """
+    card = make_raw_card(card_id=card_id, name=name)
+    card |= {
+        "object": "card",
+        "set": POOL_SET_CODE,
+        "set_name": "Scryfall Compat Pool",
+        "collector_number": number,
+        "layout": layout,
+        "type_line": type_line,
+        "oracle_text": "",
+        "lang": "en",
+    }
+    return card
+
+
 # The language rule wants an address NO English printing carries and an address TWO languages
 # share, in a set of their own so nothing else here counts them. Modelled on The Hobbit Eternal,
 # which prints five of its 158 cards only in Dwarvish: on api.scryfall.com `/cards/hoc/95` is the
@@ -298,6 +324,9 @@ def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
         _signet(),
         _amber(AMBER_JA_ID, "ja", "2021-06-01"),
         _amber(AMBER_EN_ID, "en", "2020-01-01"),
+        _pool_card("12121212-1212-4212-8212-121212121212", "1", WARDEN_NAME, "normal", "Creature — Human"),
+        _pool_card("13131313-1313-4313-8313-131313131313", "2", f"{WARDEN_NAME} Emblem", "emblem", "Emblem — Hollowmere"),
+        _pool_card("14141414-1414-4414-8414-141414141414", "3", "Hollowmere Sentry", "token", "Creature — Spirit"),
     )
     api_resource.admin._upsert_cards([copy.deepcopy(card) for card in cards])
     with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
@@ -551,6 +580,21 @@ class TestNamed:
     def test_fuzzy_miss_is_a_404(self, compat_corpus: APIResource):
         resp = dispatch(compat_corpus, "/cards/named", "fuzzy=qqqqzzzzxxxx")
         assert resp.status == falcon.HTTP_404
+
+    def test_fuzzy_containment_leaves_out_an_emblem(self, by_name_paths: APIResource):
+        """An emblem sharing a card's words neither answers containment nor makes the card ambiguous.
+
+        Measured on api.scryfall.com 2026-09-25: `fuzzy=lili last hope` and `teferi hero` answer
+        the planeswalker although its emblem's name holds the same words.
+        """
+        body = payload(dispatch(by_name_paths, "/cards/named", "fuzzy=hollowmere+ward"))
+        assert body["name"] == WARDEN_NAME
+
+    def test_fuzzy_containment_keeps_a_token(self, by_name_paths: APIResource):
+        """A token stays in the pool: `hollowmere` is carried by the card and the token alike."""
+        resp = dispatch(by_name_paths, "/cards/named", "fuzzy=hollowmere")
+        assert resp.status == falcon.HTTP_404
+        assert payload(resp)["type"] == "ambiguous"
 
     def test_neither_parameter_is_a_400(self, compat_corpus: APIResource):
         resp = dispatch(compat_corpus, "/cards/named")
