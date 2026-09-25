@@ -5,8 +5,9 @@ here is stronger than convention: `import_rulings` opens with an unconditional
 `DELETE FROM magic.rulings`, and the postgres container is shared across the whole session, so a
 database-backed test would wipe the row test_scryfall_cards_routes.py inserts for its own rulings
 assertions and leave that module dependent on file ordering. What the mocks cannot reach -- the
-`::date` cast, `ON CONFLICT DO NOTHING` against idx_rulings_identity -- is covered by running the
-importer against the live bulk file, which is not something the suite should do on every run.
+`::date` cast, and a repeated tuple landing as two rows -- is covered by running the importer against
+the live bulk file, which is not something the suite should do on every run, and the repeat is also
+pinned end to end by test_scryfall_cards_routes.py's rulings fixture.
 """
 
 from __future__ import annotations
@@ -129,17 +130,23 @@ class TestImportRulings:
         assert len(inserts) == 3  # 3 + 3 + 1
         assert [len(call.args[1]["rows"].obj) for call in inserts] == [3, 3, 1]
 
-    def test_the_count_is_rows_inserted_not_rows_sent(self) -> None:
-        """ON CONFLICT DO NOTHING drops tuples the file repeats; those must not be counted.
+    def test_a_repeated_entry_is_inserted_as_often_as_the_file_repeats_it(self) -> None:
+        """Scryfall serves the file's verbatim repeats, so the load must not drop them.
 
-        The live file carried 37 such duplicates out of 77,998 entries on 2026-08-11, so reporting
-        len(batch) claimed a row total the table did not hold.
+        The live file repeats 37 whole tuples across 11 cards (2026-09-25), and api.scryfall.com
+        answered every one of those cards with every repeat in it -- Varis, Silverymoon Ranger with
+        21 rulings, 11 distinct. The load used to insert ON CONFLICT DO NOTHING against a unique
+        index on the tuple, which lost all 37.
         """
-        pool, _, _ = _make_mock_conn_pool(rowcount=1)
+        pool, _, cursor = _make_mock_conn_pool(rowcount=3)
+        entries = [RULINGS_FIXTURE[0], RULINGS_FIXTURE[1], dict(RULINGS_FIXTURE[0])]
 
-        loaded = import_rulings(pool, _make_fetcher(RULINGS_FIXTURE))
+        loaded = import_rulings(pool, _make_fetcher(entries))
 
-        assert loaded == 1  # one INSERT of two rows, of which the server accepted one
+        (insert,) = [call for call in cursor.execute.call_args_list if "INSERT" in call.args[0]]
+        assert "ON CONFLICT" not in insert.args[0]
+        assert insert.args[1]["rows"].obj == entries
+        assert loaded == 3
 
     def test_an_empty_bulk_file_still_clears_the_table(self) -> None:
         pool, conn, cursor = _make_mock_conn_pool()

@@ -10,6 +10,11 @@ retracted, so "insert what is there" would accumulate rows that Scryfall has wit
 also cannot get the pruning wrong when one card's rulings straddle a batch boundary, which is the
 failure an incremental prune invites. `DELETE` rather than `TRUNCATE` so readers keep seeing the
 previous contents through MVCC instead of blocking on an ACCESS EXCLUSIVE lock for the load.
+
+Every entry becomes a row, including the ones the file repeats verbatim -- 37 of 78,948 entries on
+2026-09-25, across 11 cards. api.scryfall.com serves each of those repeats (Varis, Silverymoon
+Ranger answers 21 rulings, 11 distinct), so dropping them would lose rulings a client that changed
+only its base URL would have seen.
 """
 
 from __future__ import annotations
@@ -45,7 +50,6 @@ SELECT
     (entry ->> 'published_at')::date,
     entry ->> 'comment'
 FROM jsonb_array_elements(%(rows)s) AS entry
-ON CONFLICT DO NOTHING
 """
 
 _REQUIRED_FIELDS = ("oracle_id", "source", "published_at", "comment")
@@ -93,9 +97,7 @@ def import_rulings(conn_pool: psycopg_pool.ConnectionPool, fetcher: ScryfallBulk
             cursor.execute("DELETE FROM magic.rulings")
             for batch in itertools.batched(_valid_rulings(fetcher.stream_data_for_key(BulkDataKey.RULINGS)), _BATCH_SIZE):
                 cursor.execute(_INSERT_SQL, {"rows": Jsonb(list(batch))})
-                # rowcount, not len(batch): the file repeats a tuple often enough to matter -- 37 of
-                # 77,998 entries on 2026-08-11 -- and ON CONFLICT DO NOTHING drops those. Counting
-                # what was sent would report a row total the table does not hold.
+                # rowcount: what the table holds, which is every entry sent -- repeats included.
                 loaded += cursor.rowcount
         conn.commit()
 

@@ -86,6 +86,11 @@ previous contents through MVCC instead of blocking on an `ACCESS EXCLUSIVE` lock
 failure is logged rather than raised: rulings are the only thing in the import sequence nothing else
 reads, and aborting the corpus refresh to save a rulings refresh is the wrong trade.
 
+Every entry is a row, including the ones the file repeats verbatim. The file repeats 37 whole
+tuples across 11 cards (2026-09-25), and api.scryfall.com serves every one of those repeats —
+Varis, Silverymoon Ranger answers 21 rulings of which 11 are distinct — so the table carries no
+unique index on the tuple, only the `oracle_id` index the routes look up by.
+
 ## Indexes
 
 The identifiers Scryfall routes by live inside `raw_card_blob`, not in columns, so the lookups need
