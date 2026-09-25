@@ -4547,16 +4547,69 @@ fn prefer_of(data: &Archived<CardData>, pid: usize) -> f32 {
 /// `exact=Lightning Bolt` would otherwise answer "Emeritus of Conflict // Lightning Bolt", whose
 /// prefer_score is the higher of the two. Ranked on (tier, prefer_score), in that order.
 ///
-/// FLAVOR NAMES are the one part of Scryfall's `exact=` rule this cannot express: `exact=Godzilla,
-/// King of the Monsters` answers Zilortha, Strength Incarnate there and 404s here, because no
-/// column in this corpus carries a printing's flavor name. It is a pre-existing gap, not one the
-/// scope split opens -- and it happens to leave the COLLECTION surface right, since a flavor name
-/// is not a collection identifier's key either.
+/// A needle that is no card's name key falls back to the FLAVOR NAMES, and answers the printing that
+/// carries one (`flavor_name_best`). A collection identifier never reads them.
 ///
 /// An ART-SERIES card is never the answer, whichever of its keys the needle spells
 /// (`ART_SERIES_LAYOUT`).
 pub(crate) fn exact_name_match(data: &Archived<CardData>, folded: &str, set_code: Option<&str>) -> Option<(usize, usize)> {
-    name_best(data, folded, set_code, NameScope::Exact)
+    name_best(data, folded, set_code, NameScope::Exact).or_else(|| flavor_name_best(data, &collate_name(folded), set_code))
+}
+
+/// `named?exact=`'s FLAVOR-NAME key: the best canonical printing whose flavor name COLLATES to
+/// `needle`, within `set`. Asked only when no card's own name is the needle.
+///
+/// Measured on api.scryfall.com 2026-09-25:
+///
+///   exact=Godzilla, King of the Monsters     -> Zilortha, Strength Incarnate iko/275
+///   exact=Mothra, Supersonic Queen           -> Luminous Broodmoth prm/80915 (with `set=iko`,
+///                                               iko/371; with `set=2xm`, 404)
+///   exact=godzillaprimevalchampion           -> Titanoth Rex prm/80925 (collated, like the names)
+///   exact=Egg Pawn, exact=Lunch 1:00 PM      -> the Myr and Food TOKENS carrying them
+///   exact=Megatron // Megatron               -> Blightsteel Colossus sld/1079, whose two FACES
+///                                               carry "Megatron"; `exact=Megatron` is a 404
+///   exact=Chucky                             -> Kardur, Doomscourge sld/1807, whose front face
+///                                               alone carries one
+///
+/// So the key is the printing's flavor name -- or, on a card whose FACES carry them, the faces'
+/// names joined " // " -- which is exactly what `flavor_name_folded` stores (see
+/// `_flavor_name_folded` in api/card_processing.py). And it answers the printing that carries it,
+/// not the card's default printing. No flavor name in the corpus is also an oracle name (525
+/// distinct flavor names, 0 hits as collection identifiers), so asking the flavor names second
+/// never changes an answer.
+///
+/// CANONICAL PRINTINGS ONLY: the route re-fetches the answer by scryfall_id, which reads canonical
+/// printings. A flavor name only an annex printing carries is left to the SQL fallback, which the
+/// route asks on a miss.
+fn flavor_name_best(data: &Archived<CardData>, needle: &str, set_code: Option<&str>) -> Option<(usize, usize)> {
+    if needle.is_empty() {
+        return None;
+    }
+    let idx = &data.indexes.flavor_names;
+    let n_printings = data.printings.len() as u32;
+    let mut best: Option<(f32, usize, usize)> = None;
+    for (rec, collated) in data.indexes.flavor_names_collated.iter().enumerate() {
+        if collated.as_str() != needle {
+            continue;
+        }
+        let (from, to) = (u32::from(idx.offsets[rec]) as usize, u32::from(idx.offsets[rec + 1]) as usize);
+        // Best prefer first within a record, so the first printing through the filters is its answer.
+        let found = idx.vpids[from..to].iter().map(|v| u32::from(*v)).filter(|&vpid| vpid < n_printings).find_map(|vpid| {
+            let pid = vpid as usize;
+            let printing = &data.printings[pid];
+            if set_code.is_some_and(|code| !printing.card_set_code.as_str().eq_ignore_ascii_case(code)) {
+                return None;
+            }
+            let cid = card_of_vpid(data, vpid);
+            (!is_art_series(data, cid)).then_some((prefer_of(data, pid), cid, pid))
+        });
+        if let Some(candidate) = found
+            && best.is_none_or(|(score, _, _)| candidate.0 > score)
+        {
+            best = Some(candidate);
+        }
+    }
+    best.map(|(_, cid, pid)| (cid, pid))
 }
 
 /// `POST /cards/collection`'s `{"name": ...}` identifier: the best printing it names, within `set`.
@@ -4773,20 +4826,64 @@ fn card_of_vpid(data: &Archived<CardData>, vpid: u32) -> usize {
 /// `ambiguous` rather than guessing between. A card whose layout is in
 /// `CONTAINMENT_EXCLUDED_LAYOUTS` is neither an answer nor a competitor.
 ///
+/// FLAVOR NAMES ARE IN THIS TIER, beside the oracle names. Measured on api.scryfall.com 2026-09-25:
+///
+///   - A flavor name competes with an oracle name, and with another flavor name, as an equal:
+///     `fuzzy=assaultron` (the oracle Assaultron Dominator and Walking Ballista's "Assaultron
+///     Invader"), `cordyceps` (two cards' flavor names), `bloodbender` (Hama, the Bloodbender and
+///     Bloodchief Ascension's "Bloodbender's Rise"), `mothra`, `mechagodzilla` and
+///     `spacegodzilla` are each ambiguous, with and without `set=` (`assaultron&set=pip`).
+///   - A flavor name that alone carries the words answers the PRINTING carrying it:
+///     `fuzzy=supersonic` is Luminous Broodmoth prm/80915 ("Mothra, Supersonic Queen"),
+///     `excision` Cabal Ritual sld/2199, `sheepsquatch` Gemrazer pip/351, and with `set=iko`
+///     `mothra supersonic` is iko/371.
+///   - The words POOL across a printing's flavor name and its card's oracle name, as they do
+///     across a printed name and the oracle name in the second tier: `titanoth champion` and
+///     `rex godzilla` are Titanoth Rex prm/80925, `containment android` Containment Construct
+///     msc/284, `ballista assaultron` Walking Ballista pip/352.
+///   - A FACE-level flavor name counts, as the faces' names joined " // " (what
+///     `flavor_name_folded` stores): `lord of bats` and `recyclops` answer vow/338 and sld/2169,
+///     `dracula blood` is ambiguous between two cards, `megatron` between Blightsteel Colossus's
+///     faces and the oracle Megatron, Tyrant.
+///   - An `is:extra` printing's flavor name does NOT count: `lunch`, `afternoon tea` and
+///     `awoken avatar` (flavor names of Food and Marit Lage TOKENS) are 404s, `aaargh` is Dark
+///     Depths sld/1680 alone although a Marit Lage token is "The Black Beast of Aaargh", and
+///     `breakfast` and `supper` answer Second Breakfast and Supper for Spiders rather than
+///     ambiguous with a Food token's "Breakfast 7:00 AM" and "Supper 8:00 PM". A default search
+///     draws the same line: `name:aaargh` is Dark Depths alone until `include_extras=true`. The
+///     token's ORACLE name still counts (`CONTAINMENT_EXCLUDED_LAYOUTS` keeps tokens), and
+///     `named?exact=` and the whole-name stage read every flavor name, tokens included.
+///
+/// A card the oracle pass already answers keeps that answer, its preferred printing: the oracle
+/// name alone carries the words, so no flavor name was needed. Otherwise the printing is the one
+/// whose flavor name is SHORTEST, then the best prefer score -- the second tier's rule. The flavor
+/// names are ~546 records at corpus scale and already collated (`flavor_names_collated`), so the
+/// pass is a scan, not an index probe.
+///
 /// The second tier, printed names, is `printed_names_containing_all_words`, and the caller asks it
-/// only when this one finds nothing.
+/// only when this one finds nothing. Returned as `(cid, vpid)`: a flavor name's printing may be an
+/// annex row.
 pub(crate) fn names_containing_all_words(
     data: &Archived<CardData>,
     words: &[String],
     set_code: Option<&str>,
     limit: usize,
-) -> Vec<(usize, usize)> {
+) -> Vec<(usize, u32)> {
+    // (oracle name, flavor-name length -- 0 for an oracle-name answer, prefer score, cid, vpid)
+    type Answer<'a> = (&'a str, usize, f32, usize, u32);
+    fn offer<'a>(by_name: &mut Vec<Answer<'a>>, answer: Answer<'a>) {
+        match by_name.iter_mut().find(|slot| slot.0 == answer.0) {
+            Some(slot) if (answer.1, -answer.2) < (slot.1, -slot.2) => *slot = answer,
+            Some(_) => {}
+            None => by_name.push(answer),
+        }
+    }
     // Narrow on the LONGEST word: every word must be contained, so any one is a sound filter, and
     // the longest has the most trigrams to intersect and so the fewest postings to survive them.
     // Sound for the unseparated test too: `name_trigram` windows the COLLATED name, and a
     // separator-free word inside a name unseparated is a window of it collated.
     let longest = words.iter().max_by_key(|w| w.len()).map(String::as_str).unwrap_or("");
-    let mut by_name: Vec<(&str, f32, usize, usize)> = Vec::new();
+    let mut by_name: Vec<Answer> = Vec::new();
     for cid in name_scan_candidates(data, longest) {
         let cid = cid as usize;
         let name = folded_name(&data.cards[cid], &data.strings);
@@ -4794,19 +4891,48 @@ pub(crate) fn names_containing_all_words(
             continue;
         }
         let Some(pid) = best_printing_in_set(data, cid, set_code) else { continue };
-        let score = prefer_of(data, pid);
-        match by_name.iter_mut().find(|(n, _, _, _)| *n == name) {
-            Some(slot) if score > slot.1 => *slot = (name, score, cid, pid),
-            Some(_) => {}
-            None => by_name.push((name, score, cid, pid)),
-        }
+        offer(&mut by_name, (name, 0, prefer_of(data, pid), cid, pid as u32));
         // One past the limit distinguishes "one match" from "ambiguous"; the caller needs no more.
         if by_name.len() > limit {
             break;
         }
     }
-    by_name.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-    by_name.into_iter().take(limit).map(|(_, _, cid, pid)| (cid, pid)).collect()
+    // THE FLAVOR PASS. A record none of whose words is in its flavor name is skipped outright: its
+    // printings could only complete through the oracle name alone, which the pass above has asked.
+    let flavor = &data.indexes.flavor_names;
+    let extra_vid = data.coll_vocab.iter().position(|s| s.as_str() == EXTRA_IS_TAG).map(|p| p as u16);
+    for (rec, collated) in data.indexes.flavor_names_collated.iter().enumerate() {
+        if by_name.len() > limit {
+            break;
+        }
+        if !words.iter().any(|w| collated.contains(w.as_str())) {
+            continue;
+        }
+        // CHARACTERS, as the fallback's `length(flavor_name_folded)` counts them.
+        let length = str_at(&data.strings, u32::from(flavor.name_ids[rec])).map_or(0, |s| s.chars().count());
+        let (from, to) = (u32::from(flavor.offsets[rec]) as usize, u32::from(flavor.offsets[rec + 1]) as usize);
+        for vpid in flavor.vpids[from..to].iter().map(|v| u32::from(*v)) {
+            let printing = printing_at(data, vpid);
+            if set_code.is_some_and(|code| !printing.card_set_code.as_str().eq_ignore_ascii_case(code))
+                || extra_vid.is_some_and(|extra| printing.card_is_tags.iter().any(|t| u16::from(*t) == extra))
+            {
+                continue;
+            }
+            let cid = card_of_vpid(data, vpid);
+            let name = folded_name(&data.cards[cid], &data.strings);
+            // The printing's whole pool: this flavor name OR the oracle name it prints. The words
+            // are separator-free, so a window of the collated flavor name is an unseparated match.
+            if !words.iter().all(|w| collated.contains(w.as_str()) || contains_unseparated(name, w))
+                || outside_containment_pool(data, cid)
+            {
+                continue;
+            }
+            let score = printing.prefer_score.as_ref().map_or(f32::MIN, |v| v.to_native());
+            offer(&mut by_name, (name, length, score, cid, vpid));
+        }
+    }
+    by_name.sort_unstable_by(|a, b| b.2.total_cmp(&a.2));
+    by_name.into_iter().take(limit).map(|(_, _, _, cid, vpid)| (cid, vpid)).collect()
 }
 
 /// `named?fuzzy=`'s containment stage, SECOND TIER: the printed (foreign) names. The caller asks it
@@ -18559,6 +18685,9 @@ impl QueryEngine {
     /// `card_name_folded` was at import (`fold_accents`); the COLLATING is done here, so the caller
     /// passes the needle as typed and does not have to know the rule.
     ///
+    /// A needle no card is named answers the canonical printing whose FLAVOR name it is
+    /// (`flavor_name_best`); a collection identifier never reads one.
+    ///
     /// `named?exact=` is the last lookup on this surface that answered from SQL. It is a scan of
     /// every card's folded name, which is what `name_trigram` exists to avoid: measured on a
     /// ~31.7k-card corpus, 884 us of scan against 4 us through the index.
@@ -18590,7 +18719,8 @@ impl QueryEngine {
         self.card_by_name(py, folded, set_code, fields, collection_name_match)
     }
 
-    /// One printing per DISTINCT card name whose folded name contains every one of `words`.
+    /// One printing per DISTINCT card name whose folded name -- or the flavor name of one of its
+    /// printings, pooled with it -- contains every one of `words`.
     ///
     /// The containment stage of `named?fuzzy=`, which ran as a LIKE per word. The caller asks for 2
     /// and reads the count: more than one distinct name is `ambiguous`, which Scryfall reports
@@ -18616,7 +18746,7 @@ impl QueryEngine {
         let found: Vec<(usize, u32)> = if printed {
             printed_names_containing_all_words(data, &words, set_code, limit)
         } else {
-            names_containing_all_words(data, &words, set_code, limit).into_iter().map(|(cid, pid)| (cid, pid as u32)).collect()
+            names_containing_all_words(data, &words, set_code, limit)
         };
         found
             .into_iter()

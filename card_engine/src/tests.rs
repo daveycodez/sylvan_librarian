@@ -15047,6 +15047,109 @@ fn containment_ranks_oracle_names_above_printed_names() {
     assert!(printed(&["emblema"], None).is_empty());
 }
 
+/// FLAVOR NAMES on the two name stages that read them, as measured on api.scryfall.com
+/// 2026-09-25 (see `names_containing_all_words` and `flavor_name_best`): containment's FIRST tier
+/// holds them beside the oracle names, pooled with the card's oracle name and answering the printing
+/// that carries one, but never an `is:extra` printing's; `exact=` falls back to them, extras
+/// included, and a collection identifier never reads them.
+#[test]
+fn flavor_names_are_containments_first_tier_and_exacts_fallback() {
+    /// (set, flavor name, is:extra) for one printing.
+    type Row<'a> = (&'a str, Option<&'a str>, bool);
+    // (oracle name, layout, its printings, best prefer first)
+    let spec: [(&str, &str, &[Row]); 11] = [
+        ("assaultron dominator", "normal", &[("pip", None, false)]),
+        ("walking ballista", "normal", &[("2xm", None, false), ("pip", Some("assaultron invader"), false)]),
+        ("mycoloth", "normal", &[("sld", Some("cordyceps rat king"), false)]),
+        ("cabal ritual", "normal", &[("sld", Some("cordyceps excision"), false)]),
+        (
+            "luminous broodmoth",
+            "normal",
+            &[("iko", None, false), ("prm", Some("mothra, supersonic queen"), false), ("iko", Some("mothra, supersonic queen"), false)],
+        ),
+        ("titanoth rex", "normal", &[("iko", None, false), ("prm", Some("godzilla, primeval champion"), false)]),
+        ("food", "token", &[("sld", Some("lunch 1:00 pm"), true), ("sld", Some("breakfast 7:00 am"), true)]),
+        ("dark depths", "normal", &[("sld", Some("castle of aaargh"), false)]),
+        ("marit lage", "token", &[("sld", Some("the black beast of aaargh"), true)]),
+        ("second breakfast", "normal", &[("ltr", None, false)]),
+        // A face-level flavor name, stored as the faces' names joined (`_flavor_name_folded`).
+        ("blightsteel colossus // blightsteel colossus", "reversible_card", &[("sld", Some("megatron // megatron"), false)]),
+    ];
+    let mut vocab = VocabInterner::new();
+    vocab.intern("extra".to_string()).unwrap();
+    let mut interner = Interner::new();
+    let mut cards = Vec::new();
+    for (i, (name, layout, _)) in spec.iter().enumerate() {
+        let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
+        c.card_name_lower = InlineStr::from_str(name);
+        c.card_layout_id = interner.intern((*layout).to_string());
+        cards.push(c);
+    }
+    let counts: Vec<usize> = spec.iter().map(|(_, _, printings)| printings.len()).collect();
+    let mut data = store_of(cards, &counts, vocab);
+    let extra = data.coll_vocab.iter().position(|s| s == "extra").expect("interned") as u16;
+    for (cid, (_, _, printings)) in spec.iter().enumerate() {
+        for (k, &(set, flavor, is_extra)) in printings.iter().enumerate() {
+            let p = &mut data.printings[data.offsets[cid] as usize + k];
+            p.card_set_code = InlineStr::from_str(set);
+            if let Some(flavor) = flavor {
+                p.flavor_name_folded_id = interner.intern(flavor.to_string());
+            }
+            if is_extra {
+                p.card_is_tags = vec![extra];
+            }
+        }
+    }
+    data.strings = interner.strings;
+    data.indexes.flavor_names =
+        build_printed_name_index(&data.printings, &data.foreign, &data.strings, |p| p.flavor_name_folded_id);
+    data.indexes.flavor_names_collated =
+        data.indexes.flavor_names.name_ids.iter().map(|&id| crate::collate_name(&data.strings[id as usize])).collect();
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    // (oracle name, set of the printing answering)
+    let answer = |cid: usize, pid: u32| (spec[cid].0, crate::printing_at(a, pid).card_set_code.as_str());
+    let contained = |words: &[&str], set: Option<&str>| -> Vec<(&str, &str)> {
+        let words: Vec<String> = words.iter().map(|w| (*w).to_owned()).collect();
+        names_containing_all_words(a, &words, set, 2).into_iter().map(|(cid, vpid)| answer(cid, vpid)).collect()
+    };
+
+    // A flavor name competes as an equal: with an oracle name, with another flavor name, in a set.
+    assert_eq!(contained(&["assaultron"], None).len(), 2, "assaultron is ambiguous");
+    assert_eq!(contained(&["assaultron"], Some("pip")).len(), 2, "in its set too");
+    assert_eq!(contained(&["cordyceps"], None).len(), 2, "two cards' flavor names");
+    assert_eq!(contained(&["megatron"], None), [("blightsteel colossus // blightsteel colossus", "sld")]);
+    // Alone, it answers the PRINTING carrying it -- the best one, or the one in the set.
+    assert_eq!(contained(&["supersonic"], None), [("luminous broodmoth", "prm")]);
+    assert_eq!(contained(&["mothra", "supersonic"], Some("IKO")), [("luminous broodmoth", "iko")]);
+    assert!(contained(&["supersonic"], Some("2xm")).is_empty());
+    // The words pool across the flavor name and the oracle name of the card it prints.
+    assert_eq!(contained(&["titanoth", "champion"], None), [("titanoth rex", "prm")]);
+    assert_eq!(contained(&["ballista", "assaultron"], None), [("walking ballista", "pip")]);
+    // An oracle name carrying every word keeps the card's own preferred printing.
+    assert_eq!(contained(&["broodmoth"], None), [("luminous broodmoth", "iko")]);
+    // An `is:extra` printing's flavor name is neither an answer nor a competitor.
+    assert!(contained(&["lunch"], None).is_empty(), "a token's flavor name answers nothing");
+    assert_eq!(contained(&["aaargh"], None), [("dark depths", "sld")]);
+    assert_eq!(contained(&["breakfast"], None), [("second breakfast", "ltr")]);
+
+    // `exact=`: the flavor name, COLLATED, answers its printing; extras included; faces joined.
+    let exact = |needle: &str, set: Option<&str>| exact_name_match(a, needle, set).map(|(cid, pid)| answer(cid, pid as u32));
+    assert_eq!(exact("godzilla, primeval champion", None), Some(("titanoth rex", "prm")));
+    assert_eq!(exact("godzillaprimevalchampion", None), Some(("titanoth rex", "prm")));
+    assert_eq!(exact("titanoth rex", None), Some(("titanoth rex", "iko")), "the oracle name is still the default");
+    assert_eq!(exact("mothra, supersonic queen", None), Some(("luminous broodmoth", "prm")));
+    assert_eq!(exact("mothra, supersonic queen", Some("iko")), Some(("luminous broodmoth", "iko")));
+    assert_eq!(exact("mothra, supersonic queen", Some("2xm")), None);
+    assert_eq!(exact("lunch 1:00 pm", None), Some(("food", "sld")));
+    assert_eq!(exact("megatron // megatron", None), Some(("blightsteel colossus // blightsteel colossus", "sld")));
+    assert_eq!(exact("megatron", None), None, "one face's flavor name is not the key");
+    assert_eq!(exact("mothra", None), None, "a part of a flavor name is not the key");
+    // A collection identifier reads none of it.
+    assert_eq!(collection_name_match(a, "godzilla, primeval champion", None), None);
+    assert_eq!(collection_name_match(a, "titanoth rex", None).map(|(cid, _)| cid), Some(5));
+}
+
 /// An art-series card leaves the exact and typo stages too (see `ART_SERIES_LAYOUT`): `exact=` of
 /// its whole name is a miss, and a typo that spells it answers the real card. Emblems and front
 /// cards stay in both, and a collection identifier still reads an art series' face keys.

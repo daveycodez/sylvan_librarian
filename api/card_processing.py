@@ -167,6 +167,8 @@ def extract_frame_data_from_raw_card(raw_card: dict) -> dict[str, bool]:
         frame_data[effect.title()] = True
 
     return frame_data
+
+
 # Face-merge policy for multi-face cards (#400, #873). Scryfall AND's search predicates at the
 # CARD level, each satisfiable by any face — measured against api.scryfall.com 2026-08-08:
 # `t:sorcery t:land` returns the MDFC lands (no single face is both), o: conjunctions match
@@ -290,6 +292,33 @@ def _printed_name_folded(card: dict[str, Any], face_records: list[dict[str, Any]
         if not full:
             return None
     return fold_accents(full.lower())
+
+
+def _flavor_name_folded(card: dict[str, Any], face_records: list[dict[str, Any]]) -> str | None:
+    """The printing's flavor-name KEY, folded like the other two name keys, or None.
+
+    The card-level `flavor_name` when there is one. Otherwise the flavor names its FACES carry,
+    joined " // " in face order -- only the faces that carry one, which is what api.scryfall.com
+    matches (measured 2026-09-25): `exact=Megatron // Megatron` answers Blightsteel Colossus sld/1079,
+    whose two faces are each "Megatron", while `exact=Megatron` is a 404; `exact=Chucky` answers
+    Kardur, Doomscourge sld/1807, whose front face alone carries one; and `name:megatron` and
+    `!"Megatron // Megatron"` find sld/1079 on /cards/search. A printing carries the key at one level
+    or the other, never both.
+
+    Only the KEY is joined. `flavor_name` itself stays the card-level value, since that is where the
+    card object emits it; the faces' own values ride `card_faces`.
+
+    Args:
+        card: The card-level object.
+        face_records: The `_face_records` snapshot, front first (empty for single-faced cards).
+
+    Returns:
+        The lowercased, accent-folded key, or None when the printing carries no flavor name.
+    """
+    if card.get("flavor_name"):
+        return _fold_name(card["flavor_name"])
+    faces = [face["flavor_name"] for face in face_records if face.get("flavor_name")]
+    return _fold_name(" // ".join(faces)) if faces else None
 
 
 # Keys that do NOT go in card_compat_blob, because a column already holds them or they are a pure
@@ -620,7 +649,7 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
         merged_row["printed_type_line"] = card.get("printed_type_line")
         merged_row["printed_text"] = card.get("printed_text")
         merged_row["printed_name_folded"] = _printed_name_folded(card, merged_row["card_faces"])
-        merged_row["flavor_name_folded"] = _fold_name(merged_row["flavor_name"])
+        merged_row["flavor_name_folded"] = _flavor_name_folded(card, merged_row["card_faces"])
         return [merged_row]
 
     # Single face case - set defaults
@@ -724,7 +753,7 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
     card["printed_type_line"] = card.get("printed_type_line")
     card["printed_text"] = card.get("printed_text")
     card["printed_name_folded"] = _printed_name_folded(card, [])
-    card["flavor_name_folded"] = _fold_name(card["flavor_name"])
+    card["flavor_name_folded"] = _flavor_name_folded(card, [])
 
     mana_cost_text = card.get("mana_cost", "")
     card["mana_cost_jsonb"] = mana_cost_str_to_dict(mana_cost_text)

@@ -718,6 +718,45 @@ def _unseparated(word: str) -> str:
     return "".join(char for char in word if char.isalnum())
 
 
+# A printing's FLAVOR NAME with its separators gone -- the third name `/cards/named` reads, beside the
+# oracle name and the printed name. `api/db/2026-09-25-01-flavor-name-lookup.sql` indexes this
+# expression, PARTIALLY, over the rows that carry one, which is why every predicate reading it also
+# says `flavor_name_folded IS NOT NULL`. `flavor_name_folded` is the printing's key: its
+# `flavor_name`, or the flavor names its faces carry joined " // " (`_flavor_name_folded` in
+# api/card_processing.py). Measured on api.scryfall.com 2026-09-25, and written out on the
+# engine's `flavor_name_best` and `names_containing_all_words`:
+#
+#   - `exact=` and the fuzzy whole-name stage read it, after the oracle names: `exact=Godzilla, King
+#     of the Monsters` is Zilortha, Strength Incarnate, `fuzzy=egg pawn` a Myr token, `fuzzy=bag end`
+#     Horizon Canopy ltc/366 rather than Bag End Porter, which merely contains the words.
+#   - Containment's FIRST tier reads it beside the oracle names, pooled with the card's oracle name,
+#     but not on an `is:extra` printing (`_FLAVOR_POOLED`).
+#   - The typo stage never does: `fuzzy=godzila king of the monsters` and `fuzzy=mothra supersonic
+#     quen` are 404s.
+_FLAVOR_UNSEPARATED = _UNSEPARATED.format(column="flavor_name_folded")
+
+
+def _flavor_name_is(param: str) -> str:
+    """The predicate "this printing's flavor name, separators gone, IS the bound `param`".
+
+    Args:
+        param: The name of the bound parameter holding the collated needle.
+
+    Returns:
+        A SQL predicate the partial flavor-name index serves.
+    """
+    return f"(flavor_name_folded IS NOT NULL AND {_FLAVOR_UNSEPARATED} = %({param})s)"
+
+
+# The printings whose flavor name containment reads: those carrying one that a default search
+# shows. An `is:extra` printing's flavor name is no containment key on api.scryfall.com (measured
+# 2026-09-25): `fuzzy=lunch` and `fuzzy=awoken avatar`, which only Food and Marit Lage TOKENS'
+# flavor names carry, are 404s, and `fuzzy=aaargh` is Dark Depths alone although a Marit Lage token
+# is "The Black Beast of Aaargh" -- the line `name:aaargh` draws on /cards/search until
+# `include_extras=true`. A literal rather than a bound value: `_run_query` binds a dict as jsonb.
+_FLAVOR_POOLED = f"flavor_name_folded IS NOT NULL AND NOT card_is_tags @> '{{\"{EXTRA_IS_TAG}\": true}}'::jsonb"
+
+
 # The layouts the containment stage of `?fuzzy=` never answers with, and so never counts as a
 # competing name: api.scryfall.com 404s `fuzzy=hope emblem`, `lakes aveng` (a front card) and
 # `mighty kobold` (an art series), and answers `lili last hope` and `jace mind scul` with the real
@@ -1864,7 +1903,12 @@ class ScryfallCardsRoutes:
             # named "What", so `exact=What` answered und/75 where Scryfall 404s.
             params["folded"] = fold_accents(exact.strip().lower())
             params["collated"] = _collate_name(exact)
-            clauses.extend((_EXACT_NAME_MATCH, _NOT_ART_SERIES))
+            # A FLAVOR NAME is `exact=`'s last key, and answers the printing carrying it:
+            # `exact=Godzilla, King of the Monsters` is Zilortha, Strength Incarnate iko/275 and
+            # `exact=Mothra, Supersonic Queen&set=iko` is Luminous Broodmoth iko/371 (measured
+            # 2026-09-25). A card's own name keys outrank it (`rank_first` below), which no needle in
+            # the corpus can tell apart: no flavor name is also a card's name.
+            clauses.extend((f"({_EXACT_NAME_MATCH} OR {_flavor_name_is('collated')})", _NOT_ART_SERIES))
             # The ENGINE first, same as the fuzzy stages below and `_cards_by_ids`. This was the
             # last by-name lookup still answering from SQL, and it is the one a scan hurts most:
             # `named?exact=` is a single-card fetch that walked all ~31,700 folded names. It takes
@@ -1875,7 +1919,11 @@ class ScryfallCardsRoutes:
                 found = self._cards_by_ids([str(chosen["scryfall_id"])])
                 card = found[0] if found else None
             if card is None:
-                card = self._fetch_one_card(" AND ".join(clauses), params, rank_first=_WHOLE_NAME_FIRST)
+                card = self._fetch_one_card(
+                    " AND ".join(clauses),
+                    params,
+                    rank_first=f"{_EXACT_NAME_MATCH} DESC, {_WHOLE_NAME_FIRST}",
+                )
             if card is None:
                 return self._scryfall_respond(
                     falcon_response,
@@ -1919,7 +1967,8 @@ class ScryfallCardsRoutes:
         The three stages mirror what Scryfall resolves in practice — `lightning bolt` exactly,
         `bolt` by containment, `lighning bolt` by trigram distance — and each stage that finds more
         than one distinct card name reports `ambiguous` rather than guessing between them. The first
-        two run over oracle names, then again over printed names, before the third.
+        two run over oracle and flavor names, then again over printed names, before the third, which
+        reads oracle names alone.
 
         Args:
             fuzzy: The name fragment to match.
@@ -1946,8 +1995,8 @@ class ScryfallCardsRoutes:
                 pretty=pretty,
             )
 
-        # The whole-name and containment stages run TWICE, oracle names first and printed names
-        # second, and the printed tier is asked only when the oracle tier answered nothing -- see
+        # The whole-name and containment stages run TWICE, oracle and flavor names first and printed
+        # names second, and the printed tier is asked only when the first tier answered nothing -- see
         # `_fuzzy_containment_candidates` for the measurements. So a printed name that IS the query
         # still yields to an oracle name that merely CONTAINS it: `fuzzy=inganno` is Wedding
         # Announcement on api.scryfall.com, not Guile, whose Italian name is "Inganno".
@@ -2065,7 +2114,8 @@ class ScryfallCardsRoutes:
 
         Oracle names and printed names are asked SEPARATELY (`printed`), because they are two
         tiers: a printed name that is the query answers only when no oracle name even contains it
-        (`_named_fuzzy` runs the oracle tier's containment in between).
+        (`_named_fuzzy` runs the oracle tier's containment in between). A FLAVOR name that is the
+        query belongs to the first tier, after the oracle names.
 
         Args:
             needle: The accent-folded, lowercased query.
@@ -2089,7 +2139,17 @@ class ScryfallCardsRoutes:
         # "Minion of the Mighty // Kobold" exactly and answers the afr card on api.scryfall.com.
         clauses = [*base_clauses, _NOT_ART_SERIES, f"{_UNSEPARATED.format(column=column)} = %(needle)s"]
         if not printed:
-            return self._best_printing(" AND ".join(clauses), params)
+            chosen = self._best_printing(" AND ".join(clauses), params)
+            if chosen is not None:
+                return chosen
+            # A FLAVOR NAME that is the query is this tier's too, after the oracle names, and it
+            # answers the printing carrying it, extras included: `fuzzy=mothra supersonic queen` is
+            # Luminous Broodmoth prm/80915, `fuzzy=egg pawn` a Myr token, and `fuzzy=bag end` is
+            # Horizon Canopy ltc/366 although the oracle Bag End Porter contains both words
+            # (measured 2026-09-25). Rendered here like a printed name's answer, for the same reason.
+            flavor = [*base_clauses, _NOT_ART_SERIES, _flavor_name_is("needle")]
+            card = self._fetch_one_card(" AND ".join(flavor), params)
+            return {"scryfall_id": card["id"], "card_name": card["name"], "card": card} if card else None
         # A printed name's answer is RENDERED here, not handed back as an id: it is usually a
         # non-canonical printing, and `_cards_by_ids` asks the engine first, whose by-id lookup
         # reads canonical printings only -- so with the engine serving, `fuzzy=blitzschlag` found
@@ -2131,13 +2191,20 @@ class ScryfallCardsRoutes:
         Emblems, art series and front cards are left out (`_IN_CONTAINMENT_POOL`): they
         neither answer this stage nor make a real card ambiguous.
 
-        PRINTED NAMES ARE A SECOND TIER (`printed`), asked only when no ORACLE name carries every
-        word -- which is why the pooling rule above is the printed tier's alone. Measured on
-        api.scryfall.com 2026-09-25, 23 of 23 needles: `fuzzy=austere` is Austere Command, not
-        ambiguous with Dour Port-Mage's French "Portmage austère", and so are `redress`, `captor`,
-        `pixies` and fourteen more; `inganno`, `verfall` and four more are each a WHOLE foreign
-        name and each answers the one English name containing it; and `red goad`, which no English
-        name carries, is still the Portuguese Unmoored Ego. The engine's
+        FLAVOR NAMES ARE IN THE FIRST TIER, beside the oracle names and pooled with them the same
+        way (`_FLAVOR_POOLED`, which leaves out an `is:extra` printing's). Measured on
+        api.scryfall.com 2026-09-25: `fuzzy=assaultron`, `cordyceps` and `bloodbender` are ambiguous
+        (an oracle name and a flavor name, two flavor names, an oracle name and a flavor name), and
+        `supersonic`, `titanoth champion` and `containment android` answer the printing whose flavor
+        name completes the words. A card whose oracle name alone carries them answers its own
+        preferred printing; otherwise the SHORTEST completing flavor name answers, then the score.
+
+        PRINTED NAMES ARE A SECOND TIER (`printed`), asked only when no ORACLE or FLAVOR name carries
+        every word. Measured on api.scryfall.com 2026-09-25, 23 of 23 needles: `fuzzy=austere` is
+        Austere Command, not ambiguous with Dour Port-Mage's French "Portmage austère", and so are
+        `redress`, `captor`, `pixies` and fourteen more; `inganno`, `verfall` and four more are each
+        a WHOLE foreign name and each answers the one English name containing it; and `red goad`,
+        which no English name carries, is still the Portuguese Unmoored Ego. The engine's
         `printed_names_containing_all_words` has the full list.
 
         Args:
@@ -2176,20 +2243,34 @@ class ScryfallCardsRoutes:
         params = dict(base_params)
         clauses = [*base_clauses, _IN_CONTAINMENT_POOL]
         oracle = _UNSEPARATED.format(column="card_name_folded")
+        oracle_words = []
         for index, word in enumerate(words):
             params[f"word_{index}"] = f"%{word}%"
-            if printed:
-                clauses.append(
-                    f"({oracle} LIKE %(word_{index})s "
-                    f"OR {_UNSEPARATED.format(column='printed_name_folded')} LIKE %(word_{index})s)",
-                )
-            else:
-                clauses.append(f"{oracle} LIKE %(word_{index})s")
+            oracle_words.append(f"{oracle} LIKE %(word_{index})s")
+            other = (
+                f"{_UNSEPARATED.format(column='printed_name_folded')} LIKE %(word_{index})s"
+                if printed
+                else f"({_FLAVOR_POOLED} AND {_FLAVOR_UNSEPARATED} LIKE %(word_{index})s)"
+            )
+            clauses.append(f"({oracle_words[-1]} OR {other})")
+        # The first tier's printing: the card's own preferred one when its ORACLE name carries every
+        # word -- no flavor name was needed -- and otherwise the SHORTEST completing flavor name,
+        # then the best score. `oracle_words` holds for every row of a card or none, so the two
+        # never compete inside one DISTINCT ON group. The engine's `names_containing_all_words` is
+        # the same rule.
+        shortest = (
+            "length(coalesce(printed_name_folded, ''))"
+            if printed
+            else (
+                f"CASE WHEN {' AND '.join(oracle_words)} THEN length(coalesce(printed_name_folded, '')) "
+                "ELSE length(flavor_name_folded) END"
+            )
+        )
         return self._run_query(
             query=(
                 "SELECT DISTINCT ON (card_name) card_name, scryfall_id "
                 f"FROM magic.cards AS card WHERE {' AND '.join(clauses)} "
-                "ORDER BY card_name, length(coalesce(printed_name_folded, '')), "
+                f"ORDER BY card_name, {shortest}, "
                 "prefer_score DESC NULLS LAST LIMIT 2"
             ),
             params=params,

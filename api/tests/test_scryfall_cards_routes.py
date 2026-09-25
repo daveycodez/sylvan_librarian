@@ -157,6 +157,97 @@ def _tier_cards() -> list[dict]:
     return cards
 
 
+# FLAVOR NAMES want cards whose printings carry them, beside oracle names sharing their words, in a
+# set of their own so nothing else here counts them. Modelled on the needles measured on
+# api.scryfall.com 2026-09-25: `vexgrit` is `assaultron` (an oracle name and another card's flavor
+# name), `spindlecap` is `cordyceps` (two cards' flavor names), `hypersonic` is `supersonic` (a
+# word only a flavor name carries, answering the printing that carries it), `ballista vexgrit` is
+# `ballista assaultron` (the words pooled across the flavor name and the oracle name), `cinder
+# hollow` is `bag end` (a whole flavor name beating an oracle name that contains it), `nuncheon`
+# is `breakfast` (a token's flavor name, which containment does not read), and `gearlord` is
+# `megatron`'s faces.
+FLAVOR_SET_CODE = "sfv"
+FLAVOR_INVADER_ID = "21212121-2121-4121-8121-212121212121"
+FLAVOR_QUEEN_ID = "22222222-2121-4121-8121-212121212121"
+FLAVOR_QUEEN_DEFAULT_ID = "23232323-2121-4121-8121-212121212121"
+FLAVOR_GLADE_ID = "24242424-2121-4121-8121-212121212121"
+FLAVOR_NUNCHEON_ID = "25252525-2121-4121-8121-212121212121"
+FLAVOR_TOKEN_ID = "26262626-2121-4121-8121-212121212121"
+FLAVOR_COLOSSUS_ID = "27272727-2121-4121-8121-212121212121"
+# The printings a card's DEFAULT printing outscores, so an answer carrying a flavor name is that
+# printing by the flavor rule and not by score.
+FLAVOR_PRINTING_IDS = (FLAVOR_INVADER_ID, FLAVOR_QUEEN_ID)
+
+
+def _flavor_cards() -> list[dict]:
+    """Oracle names and flavor names sharing words, one card with its flavor name on its faces."""
+    rows = [
+        # (id, oracle name, oracle group, collector number, layout, type line, flavor name)
+        ("28282828-2121-4121-8121-212121212121", "Vexgrit Dominator", 1, "1", "normal", "Artifact Creature — Robot", None),
+        ("29292929-2121-4121-8121-212121212121", "Rattle Ballista", 2, "2", "normal", "Artifact Creature — Construct", None),
+        (FLAVOR_INVADER_ID, "Rattle Ballista", 2, "3", "normal", "Artifact Creature — Construct", "Vexgrit Invader"),
+        (FLAVOR_QUEEN_DEFAULT_ID, "Quellmoth Beacon", 3, "4", "normal", "Creature — Insect", None),
+        (FLAVOR_QUEEN_ID, "Quellmoth Beacon", 3, "5", "normal", "Creature — Insect", "Zorvath, Hypersonic Queen"),
+        ("2a2a2a2a-2121-4121-8121-212121212121", "Brine Ritual", 4, "6", "normal", "Instant", "Spindlecap Excision"),
+        (
+            "2b2b2b2b-2121-4121-8121-212121212121",
+            "Thornback Mycoloth",
+            5,
+            "7",
+            "normal",
+            "Creature — Fungus",
+            "Spindlecap Rat King",
+        ),
+        (FLAVOR_GLADE_ID, "Horizon Glade", 6, "8", "normal", "Land", "Cinder Hollow"),
+        ("2c2c2c2c-2121-4121-8121-212121212121", "Cinder Hollow Porter", 7, "9", "normal", "Creature — Hobbit", None),
+        (FLAVOR_NUNCHEON_ID, "Midnight Nuncheon", 8, "10", "normal", "Sorcery", None),
+        (FLAVOR_TOKEN_ID, "Pantry Food", 9, "11", "token", "Token Artifact — Food", "Nuncheon 1:00 PM"),
+    ]
+    cards = []
+    for card_id, name, group, number, layout, type_line, flavor_name in rows:
+        card = make_raw_card(card_id=card_id, name=name)
+        card |= {
+            "object": "card",
+            "oracle_id": f"3f3f3f3f-3f3f-4f3f-8f3f-00000000000{group}",
+            "set": FLAVOR_SET_CODE,
+            "set_name": "Scryfall Compat Flavor",
+            "collector_number": number,
+            "layout": layout,
+            "type_line": type_line,
+            "oracle_text": "",
+            "lang": "en",
+        }
+        if flavor_name:
+            card["flavor_name"] = flavor_name
+        cards.append(card)
+    # Blightsteel Colossus sld/1079's shape: a reversible card whose FACES each carry the flavor name.
+    colossus = make_raw_card(card_id=FLAVOR_COLOSSUS_ID, name="Ironhull Colossus // Ironhull Colossus")
+    colossus |= {
+        "object": "card",
+        "oracle_id": "3f3f3f3f-3f3f-4f3f-8f3f-00000000000a",
+        "set": FLAVOR_SET_CODE,
+        "set_name": "Scryfall Compat Flavor",
+        "collector_number": "12",
+        "layout": "reversible_card",
+        "type_line": "Artifact Creature — Golem // Artifact Creature — Golem",
+        "lang": "en",
+        "card_faces": [
+            {
+                "object": "card_face",
+                "name": "Ironhull Colossus",
+                "flavor_name": "Gearlord",
+                "mana_cost": "{11}",
+                "type_line": "Artifact Creature — Golem",
+                "oracle_text": "",
+            }
+            for _ in range(2)
+        ],
+    }
+    colossus.pop("image_uris", None)
+    cards.append(colossus)
+    return cards
+
+
 # The language rule wants an address NO English printing carries and an address TWO languages
 # share, in a set of their own so nothing else here counts them. Modelled on The Hobbit Eternal,
 # which prints five of its 158 cards only in Dwarvish: on api.scryfall.com `/cards/hoc/95` is the
@@ -384,6 +475,7 @@ def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
         _pool_card(POOL_TOKEN_ID, "3", "Hollowmere Sentry", "token", "Token Creature — Spirit"),
         _pool_art_series(),
         *_tier_cards(),
+        *_flavor_cards(),
     )
     api_resource.admin._upsert_cards([copy.deepcopy(card) for card in cards])
     with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
@@ -414,6 +506,16 @@ def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
         cursor.execute(
             "UPDATE magic.cards SET prefer_score = %(score)s WHERE scryfall_id = %(id)s",
             {"score": 10, "id": TIER_EGO_PT_ID},
+        )
+        # A flavor-named printing scores BELOW its card's default printing, as a Secret Lair or
+        # promo usually does, so answering it is the flavor rule and not the score.
+        cursor.execute(
+            "UPDATE magic.cards SET prefer_score = 10 WHERE scryfall_id = ANY(%(ids)s::uuid[])",
+            {"ids": list(FLAVOR_PRINTING_IDS)},
+        )
+        cursor.execute(
+            "UPDATE magic.cards SET prefer_score = 100 WHERE card_set_code = %(set)s AND NOT scryfall_id = ANY(%(ids)s::uuid[])",
+            {"set": FLAVOR_SET_CODE, "ids": list(FLAVOR_PRINTING_IDS)},
         )
         cursor.execute("DELETE FROM magic.rulings WHERE oracle_id = %(oracle_id)s", {"oracle_id": BOLT_ORACLE_ID})
         # Three rulings across two dates, two of them same-day: a single ruling cannot tell one
@@ -680,7 +782,13 @@ class TestSearch:
         body = payload(
             dispatch(compat_corpus, "/cards/search", "q=is%3Aextra&include_extras=false"),
         )
-        assert {card["id"] for card in body["data"]} == {EXTRA_ID, POOL_EMBLEM_ID, POOL_TOKEN_ID, POOL_ART_SERIES_ID}
+        assert {card["id"] for card in body["data"]} == {
+            EXTRA_ID,
+            POOL_EMBLEM_ID,
+            POOL_TOKEN_ID,
+            POOL_ART_SERIES_ID,
+            FLAVOR_TOKEN_ID,
+        }
 
     @pytest.mark.parametrize(
         "query",
@@ -1278,6 +1386,122 @@ class TestNamed:
         assert body["id"] == TIER_EGO_PT_ID
         assert body["lang"] == "pt"
 
+    @pytest.mark.parametrize(
+        ("name", "expected"),
+        [
+            ("Zorvath, Hypersonic Queen", FLAVOR_QUEEN_ID),
+            ("zorvathhypersonicqueen", FLAVOR_QUEEN_ID),
+            ("Nuncheon 1:00 PM", FLAVOR_TOKEN_ID),
+            ("Gearlord // Gearlord", FLAVOR_COLOSSUS_ID),
+        ],
+    )
+    def test_exact_answers_a_flavor_name_with_its_printing(self, by_name_paths: APIResource, name, expected):
+        """A flavor name is an `exact=` key, collated, extras included, and answers its printing.
+
+        Measured on api.scryfall.com 2026-09-25: `exact=Mothra, Supersonic Queen` is Luminous
+        Broodmoth prm/80915 (not its default printing), `exact=godzillaprimevalchampion` is Titanoth
+        Rex prm/80925, `exact=Egg Pawn` a Myr token, and `exact=Megatron // Megatron` Blightsteel
+        Colossus sld/1079, whose two faces each carry "Megatron".
+        """
+        body = payload(dispatch(by_name_paths, "/cards/named", urlencode({"exact": name})))
+        assert body["id"] == expected
+
+    def test_exact_flavor_name_honours_the_set(self, by_name_paths: APIResource):
+        """`exact=Mothra, Supersonic Queen&set=iko` is iko/371 on api.scryfall.com, `set=2xm` a 404."""
+
+        def exact(set_code: str) -> falcon.Response:
+            return dispatch(by_name_paths, "/cards/named", urlencode({"exact": "Zorvath, Hypersonic Queen", "set": set_code}))
+
+        assert payload(exact(FLAVOR_SET_CODE))["id"] == FLAVOR_QUEEN_ID
+        assert exact(SET_CODE).status == falcon.HTTP_404
+
+    def test_only_the_whole_flavor_name_is_an_exact_key(self, by_name_paths: APIResource):
+        """The faces' names JOINED are the key, and neither one face's name nor a part of one is.
+
+        Measured on api.scryfall.com 2026-09-25: `exact=Megatron // Megatron` is Blightsteel Colossus
+        sld/1079 and `exact=Megatron` a 404.
+        """
+        assert payload(dispatch(by_name_paths, "/cards/named", urlencode({"exact": "Gearlord // Gearlord"})))["id"] == (
+            FLAVOR_COLOSSUS_ID
+        )
+        for name in ("Gearlord", "Zorvath"):
+            assert dispatch(by_name_paths, "/cards/named", urlencode({"exact": name})).status == falcon.HTTP_404, name
+
+    def test_a_flavor_name_is_exacts_key_and_not_a_collection_identifiers(self, by_name_paths: APIResource):
+        """`{"name":"Godzilla, King of the Monsters"}` is not_found where `exact=` answers Zilortha."""
+        name = "Zorvath, Hypersonic Queen"
+        assert payload(dispatch(by_name_paths, "/cards/named", urlencode({"exact": name})))["id"] == FLAVOR_QUEEN_ID
+        body = payload(dispatch(by_name_paths, "/cards/collection", method="POST", body={"identifiers": [{"name": name}]}))
+        assert body["data"] == []
+        assert body["not_found"] == [{"name": name}]
+
+    @pytest.mark.parametrize(
+        ("needle", "expected"),
+        [
+            ("zorvath hypersonic queen", FLAVOR_QUEEN_ID),
+            ("cinder hollow", FLAVOR_GLADE_ID),
+            ("nuncheon 1:00 pm", FLAVOR_TOKEN_ID),
+        ],
+    )
+    def test_fuzzy_whole_flavor_name_answers_its_printing(self, by_name_paths: APIResource, needle, expected):
+        """A flavor name that IS the query answers first, over an oracle name containing it.
+
+        Measured on api.scryfall.com 2026-09-25: `fuzzy=mothra supersonic queen` is prm/80915,
+        `fuzzy=egg pawn` a Myr token, and `fuzzy=bag end` Horizon Canopy ltc/366 rather than the
+        oracle Bag End Porter, which only contains the words.
+        """
+        body = payload(dispatch(by_name_paths, "/cards/named", urlencode({"fuzzy": needle})))
+        assert body["id"] == expected
+
+    @pytest.mark.parametrize(
+        ("needle", "expected"),
+        [
+            ("hypersonic", FLAVOR_QUEEN_ID),
+            ("ballista vexgrit", FLAVOR_INVADER_ID),
+            ("invader rattle", FLAVOR_INVADER_ID),
+            ("gearlord", FLAVOR_COLOSSUS_ID),
+        ],
+    )
+    def test_fuzzy_containment_reads_flavor_names(self, by_name_paths: APIResource, needle, expected):
+        """Containment's FIRST tier holds the flavor names, pooled with the card's oracle name.
+
+        Measured on api.scryfall.com 2026-09-25: `fuzzy=supersonic` is Luminous Broodmoth prm/80915,
+        `ballista assaultron` Walking Ballista pip/352, `recyclops` a face's flavor name on sld/2169.
+        """
+        body = payload(dispatch(by_name_paths, "/cards/named", urlencode({"fuzzy": needle})))
+        assert body["id"] == expected
+
+    @pytest.mark.parametrize("needle", ["vexgrit", "spindlecap"])
+    def test_fuzzy_flavor_name_competes_as_an_equal(self, by_name_paths: APIResource, needle):
+        """A flavor name makes containment ambiguous, with an oracle name or with another flavor name.
+
+        Measured on api.scryfall.com 2026-09-25: `fuzzy=assaultron` (the oracle Assaultron Dominator
+        and Walking Ballista's "Assaultron Invader") and `cordyceps` (two cards' flavor names).
+        """
+        resp = dispatch(by_name_paths, "/cards/named", urlencode({"fuzzy": needle}))
+        assert resp.status == falcon.HTTP_404
+        assert payload(resp)["type"] == "ambiguous"
+
+    def test_an_oracle_name_carrying_the_words_keeps_its_own_printing(self, by_name_paths: APIResource):
+        """Only a flavor name the words NEED picks the printing: `quellmoth` is the card's default.
+
+        Measured on api.scryfall.com 2026-09-25: `fuzzy=broodmoth supersonic` is prm/80915, and
+        `fuzzy=luminous broodmoth mothra`, whose oracle name alone nearly spells it, iko/21.
+        """
+        assert payload(dispatch(by_name_paths, "/cards/named", "fuzzy=quellmoth+hypersonic"))["id"] == FLAVOR_QUEEN_ID
+        assert payload(dispatch(by_name_paths, "/cards/named", "fuzzy=quellmoth"))["id"] == FLAVOR_QUEEN_DEFAULT_ID
+
+    def test_an_extras_flavor_name_is_a_whole_name_key_but_no_containment_key(self, by_name_paths: APIResource):
+        """A token's flavor name answers as a WHOLE name, and neither answers nor competes in containment.
+
+        Measured on api.scryfall.com 2026-09-25: `fuzzy=egg pawn` is the Myr token carrying it, while
+        `fuzzy=lunch` is a 404 and `fuzzy=breakfast` is Second Breakfast, not ambiguous with the Food
+        token "Breakfast 7:00 AM".
+        """
+        assert payload(dispatch(by_name_paths, "/cards/named", "fuzzy=nuncheon+1%3A00+pm"))["id"] == FLAVOR_TOKEN_ID
+        assert payload(dispatch(by_name_paths, "/cards/named", "fuzzy=nuncheon"))["id"] == FLAVOR_NUNCHEON_ID
+        assert dispatch(by_name_paths, "/cards/named", "fuzzy=1%3A00+pm").status == falcon.HTTP_404
+
     def test_neither_parameter_is_a_400(self, compat_corpus: APIResource):
         resp = dispatch(compat_corpus, "/cards/named")
         assert resp.status == falcon.HTTP_400
@@ -1490,7 +1714,7 @@ class TestRandom:
         it — a query that names the class can never answer nothing.
         """
         body = payload(dispatch(compat_corpus, "/cards/random", "q=is%3Aextra&include_extras=false"))
-        assert body["id"] in {EXTRA_ID, POOL_EMBLEM_ID, POOL_TOKEN_ID, POOL_ART_SERIES_ID}
+        assert body["id"] in {EXTRA_ID, POOL_EMBLEM_ID, POOL_TOKEN_ID, POOL_ART_SERIES_ID, FLAVOR_TOKEN_ID}
 
     def test_a_set_term_on_an_extras_set_is_the_conditional_trigger(self, compat_corpus: APIResource, monkeypatch):
         """The one trigger that asks the store: a set term enables extras iff that set holds one.
