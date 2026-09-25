@@ -248,6 +248,64 @@ def _flavor_cards() -> list[dict]:
     return cards
 
 
+# THE STAGE ORDER of `?fuzzy=` (typo before containment, unless the typo winner is weak) wants names
+# whose scores sit where the measured needles' do, on BOTH metrics -- the engine's and pg_trgm's. So
+# these are the measured needles' own names, ROT13-encoded: a letter-for-letter substitution keeps
+# every trigram and every edit, so each needle scores here exactly what it scores against the real
+# corpus (`vadhvfvgbe free` is `inquisitor serr`, 0.714 against "Inquisitor's Ox"), while no other
+# module's card can come near them. In a set of their own so nothing else here counts them.
+ORDER_SET_CODE = "sfo"
+ORDER_TITANOTH_FLAVOR_ID = "31313131-3131-4131-8131-313131313131"
+
+
+def _stage_order_cards() -> list[dict]:
+    """Typo winners and the cards containing their needles' words, measured pairs in ROT13."""
+    rows = [
+        # (oracle name, flavor name), and the needle each pair answers, in the clear.
+        ("Cevzriny Gvgna", None),  # primeval titanoth: the typo winner, 0.799 / pg_trgm 0.737
+        ("Gvgnabgu Erk", None),  # ... over Titanoth Rex, which carries "titanoth"
+        ("Gvgnabgu Erk", "Tbqmvyyn, Cevzriny Punzcvba"),  # ... and "primeval" in a flavor name
+        ("Zvaq Fphycg", None),  # mind scul: the typo winner, 0.775 / 0.692
+        ("Wnpr, gur Zvaq Fphycgbe", None),  # ... over two names containing both words
+        ("Oyvtugavat", None),  # bolt lightning: the typo winner, 0.676
+        ("Yvtugavat Obyg", None),  # ... over two names containing both words
+        ("Rzrevghf bs Pbasyvpg Yvtugavat Obyg", None),
+        ("Nffnhyg Qebar", None),  # assaultron: the typo winner, 0.667
+        ("Nffnhygeba Qbzvangbe", None),  # ... under two names containing it, one a flavor name
+        ("Jnyxvat Onyyvfgn", "Nffnhygeba Vainqre"),
+        ("Vadhvfvgbe'f Bk", None),  # inquisitor serr: the typo winner, 0.714
+        ("Freen Vadhvfvgbef", None),  # ... over the one card containing both words
+        ("Qvfvagrtengr", None),  # hyd disintegrat: the typo winner, 0.703
+        ("ULQEN Qvfvagrtengbe", None),  # ... under the one card containing both words
+        ("Neran", None),  # arenare: the typo winner, 0.732 / pg_trgm 0.625
+        ("Neran Erpgbe", None),  # ... over the one card containing it
+        ("Grsrev", None),  # teferi hero: the pg_trgm winner, 0.583 (the engine's floor drops it)
+        ("Grsrev, Ureb bs Qbzvanevn", None),  # ... under the one card containing both words
+    ]
+    groups: dict[str, int] = {}
+    cards = []
+    for number, (name, flavor_name) in enumerate(rows, start=1):
+        group = groups.setdefault(name, len(groups) + 1)
+        card_id = (
+            ORDER_TITANOTH_FLAVOR_ID if flavor_name == "Tbqmvyyn, Cevzriny Punzcvba" else f"3a3a3a3a-3a3a-4a3a-8a3a-{number:012d}"
+        )
+        card = make_raw_card(card_id=card_id, name=name)
+        card |= {
+            "object": "card",
+            "oracle_id": f"3b3b3b3b-3b3b-4b3b-8b3b-{group:012d}",
+            "set": ORDER_SET_CODE,
+            "set_name": "Scryfall Compat Stage Order",
+            "collector_number": str(number),
+            "type_line": "Creature — Construct",
+            "oracle_text": "",
+            "lang": "en",
+        }
+        if flavor_name:
+            card["flavor_name"] = flavor_name
+        cards.append(card)
+    return cards
+
+
 # The language rule wants an address NO English printing carries and an address TWO languages
 # share, in a set of their own so nothing else here counts them. Modelled on The Hobbit Eternal,
 # which prints five of its 158 cards only in Dwarvish: on api.scryfall.com `/cards/hoc/95` is the
@@ -476,6 +534,7 @@ def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
         _pool_art_series(),
         *_tier_cards(),
         *_flavor_cards(),
+        *_stage_order_cards(),
     )
     api_resource.admin._upsert_cards([copy.deepcopy(card) for card in cards])
     with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
@@ -1501,6 +1560,69 @@ class TestNamed:
         assert payload(dispatch(by_name_paths, "/cards/named", "fuzzy=nuncheon+1%3A00+pm"))["id"] == FLAVOR_TOKEN_ID
         assert payload(dispatch(by_name_paths, "/cards/named", "fuzzy=nuncheon"))["id"] == FLAVOR_NUNCHEON_ID
         assert dispatch(by_name_paths, "/cards/named", "fuzzy=1%3A00+pm").status == falcon.HTTP_404
+
+    def test_fuzzy_a_strong_typo_winner_outranks_the_card_containing_every_word(self, by_name_paths: APIResource):
+        """The typo stage runs BEFORE containment, even where one card carries every word.
+
+        Measured on api.scryfall.com 2026-09-25: `fuzzy=primeval titanoth` is Primeval Titan, although
+        Titanoth Rex carries "titanoth" and its Godzilla printing's flavor name carries "primeval";
+        and `fuzzy=arenare` is Arena, not Arena Rector. Both needles are in ROT13, as their names are.
+        """
+        body = payload(dispatch(by_name_paths, "/cards/named", "fuzzy=cevzriny+gvgnabgu"))
+        assert body["name"] == "Cevzriny Gvgna"
+        assert payload(dispatch(by_name_paths, "/cards/named", "fuzzy=neraner"))["name"] == "Neran"
+
+    def test_fuzzy_a_strong_typo_winner_outranks_several_cards_containing_every_word(
+        self,
+        by_name_paths: APIResource,
+    ):
+        """Several containing names do not make a strong typo winner `ambiguous`.
+
+        Measured on api.scryfall.com 2026-09-25: `fuzzy=mind scul` is Mind Sculpt, although Jace, the
+        Mind Sculptor contains both words too.
+        """
+        assert payload(dispatch(by_name_paths, "/cards/named", "fuzzy=zvaq+fphy"))["name"] == "Zvaq Fphycg"
+
+    def test_fuzzy_a_weak_typo_winner_yields_to_the_one_card_containing_every_word(self, by_name_paths: APIResource):
+        """Under the line, the one card carrying every word answers; over it, the typo winner.
+
+        pg_trgm's line (`FUZZY_SIMILARITY_YIELD`, 0.6): `fuzzy=teferi hero` is Teferi, Hero of
+        Dominaria on api.scryfall.com (2026-09-25), over a typo winner Teferi at 0.583, and
+        `fuzzy=arenare` is Arena at 0.625. Through the engine, Teferi is under the floor, and
+        `hyd disintegrat` answers HYDRA Disintegrator through either path.
+        """
+        body = payload(dispatch(by_name_paths, "/cards/named", "fuzzy=grsrev+ureb"))
+        assert body["name"] == "Grsrev, Ureb bs Qbzvanevn"
+        assert payload(dispatch(by_name_paths, "/cards/named", "fuzzy=ulq+qvfvagrteng"))["name"] == "ULQEN Qvfvagrtengbe"
+        assert payload(dispatch(by_name_paths, "/cards/named", "fuzzy=neraner"))["name"] == "Neran"
+
+    @pytest.mark.usefixtures("engine_enabled")
+    def test_fuzzy_the_engines_line_between_typo_and_containment(self, compat_corpus: APIResource):
+        """The engine metric's line, `FUZZY_WEAK_BELOW` (0.71), between two measured needles.
+
+        On api.scryfall.com (2026-09-25), `fuzzy=inquisitor serr` is Inquisitor's Ox, the typo
+        winner at 0.714, over Serra Inquisitors; `fuzzy=hyd disintegrat` is HYDRA Disintegrator,
+        the one card containing both words, over the typo winner Disintegrate at 0.703. pg_trgm
+        scores Serra Inquisitors highest itself, so the SQL path answers it and is not asked here.
+        """
+        body = payload(dispatch(compat_corpus, "/cards/named", "fuzzy=vadhvfvgbe+free"))
+        assert body["name"] == "Vadhvfvgbe'f Bk"
+        assert payload(dispatch(compat_corpus, "/cards/named", "fuzzy=ulq+qvfvagrteng"))["name"] == "ULQEN Qvfvagrtengbe"
+
+    @pytest.mark.usefixtures("engine_enabled")
+    def test_fuzzy_the_engines_line_for_several_containing_cards(self, compat_corpus: APIResource):
+        """A weak typo winner still outranks SEVERAL containing names, down to `FUZZY_FAINT_BELOW`.
+
+        On api.scryfall.com (2026-09-25), `fuzzy=bolt lightning` is Blightning at 0.676, although
+        Lightning Bolt and "Emeritus of Conflict // Lightning Bolt" both contain the words, and
+        `fuzzy=assaultron` is ambiguous under a typo winner Assault Drone at 0.667. pg_trgm scores
+        `bolt lightning` 1.0 against Lightning Bolt, since its trigrams are a set of WORDS, so the
+        SQL path answers Lightning Bolt and is not asked here.
+        """
+        assert payload(dispatch(compat_corpus, "/cards/named", "fuzzy=obyg+yvtugavat"))["name"] == "Oyvtugavat"
+        resp = dispatch(compat_corpus, "/cards/named", "fuzzy=nffnhygeba")
+        assert resp.status == falcon.HTTP_404
+        assert payload(resp)["type"] == "ambiguous"
 
     def test_neither_parameter_is_a_400(self, compat_corpus: APIResource):
         resp = dispatch(compat_corpus, "/cards/named")

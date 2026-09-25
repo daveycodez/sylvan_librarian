@@ -698,6 +698,21 @@ _COLLECTION_NOT_AN_ARRAY_DETAILS = "The `identifiers` list must be a JSON array.
 FUZZY_SIMILARITY_FLOOR = 0.4
 FUZZY_SIMILARITY_LEAD = 0.05
 
+# The pg_trgm score below which the typo winner no longer outranks the containment stage: whatever
+# containment answers -- one card, or `ambiguous` for several -- answers instead. Scryfall runs the
+# typo stage BEFORE containment, but a weak winner loses there to the cards that carry every query
+# word; the engine's `FUZZY_WEAK_BELOW` has the measurements on its own metric. This is the same
+# line on pg_trgm's scale, calibrated separately against the needles probed on api.scryfall.com
+# 2026-09-25: containment answered where the pg_trgm winner scored 0.583 or less (`teferi hero`
+# over Teferi at 0.583, `bloodbender` over Hama, the Bloodbender at 0.571, `assaultron` over
+# Assaultron Dominator at 0.524), and the typo winner everywhere from 0.607 up (`walking ballista
+# assaultron` 0.607, `arenare` 0.625, `paralyzing` 0.647, `primeval titanoth` over Primeval Titan
+# 0.737). One needle is on the wrong side: `insolent` answers Insolence (0.583) on Scryfall, the
+# same score `teferi hero`'s winner loses at. pg_trgm scores a name that CONTAINS the query low,
+# since every trigram the name adds counts against it, which is why several containing names outrank
+# a winner here where the engine's metric keeps it (`FUZZY_FAINT_BELOW`).
+FUZZY_SIMILARITY_YIELD = 0.6
+
 # A name column with every non-alphanumeric character removed, which is what the containment stage
 # matches against (see `_fuzzy_containment_candidates`). NULL folds to '' so a row with no printed
 # name simply carries nothing, rather than making the whole predicate NULL. Spelled once, because
@@ -774,9 +789,25 @@ _IN_CONTAINMENT_POOL = "coalesce(card_layout, '') NOT IN ('art_series', 'emblem'
 # same rule, with the measurements written out.
 _NOT_ART_SERIES = "coalesce(card_layout, '') <> 'art_series'"
 
-# Returned by the similarity stage when two names are too close to choose between. A distinct
-# object rather than a flag so the caller compares with `is` and cannot confuse it with a row.
-_AMBIGUOUS: dict[str, Any] = {"ambiguous": True}
+
+class _TypoMatch(NamedTuple):
+    """What the typo stage of `?fuzzy=` found, and whether the containment stage outranks it."""
+
+    row: dict[str, Any] | None
+    """The winning printing, or None for a miss or a tie."""
+
+    tie: bool
+    """Two names too close to choose between: `ambiguous`, unless containment names one card."""
+
+    yields_to_one: bool
+    """A card that alone carries every query word answers instead (a weak winner, a tie, a miss)."""
+
+    yields_to_several: bool
+    """So do several such cards, as `ambiguous` (a faint winner, a tie, a miss)."""
+
+
+_TYPO_MISS = _TypoMatch(row=None, tie=False, yields_to_one=True, yields_to_several=True)
+_TYPO_TIE = _TypoMatch(row=None, tie=True, yields_to_one=True, yields_to_several=True)
 
 # How long a /cards/* answer may be reused, measured against api.scryfall.com rather than chosen:
 # it sends `public, max-age=57600` on search, named, autocomplete and every by-id addressing, and
@@ -1962,13 +1993,22 @@ class ScryfallCardsRoutes:
         version: str,
         pretty: bool,
     ) -> dict[str, Any] | None:
-        """Resolve a fuzzy name: exact, then all-words-present, then typo-tolerant similarity.
+        """Resolve a fuzzy name: exact, then typo-tolerant similarity, then all-words-present.
 
         The three stages mirror what Scryfall resolves in practice — `lightning bolt` exactly,
-        `bolt` by containment, `lighning bolt` by trigram distance — and each stage that finds more
-        than one distinct card name reports `ambiguous` rather than guessing between them. The first
-        two run over oracle and flavor names, then again over printed names, before the third, which
-        reads oracle names alone.
+        `lighning bolt` by typo distance, `bolt` by containment — and each stage that finds more
+        than one distinct card name reports `ambiguous` rather than guessing between them.
+
+        THE TYPO STAGE RUNS BEFORE CONTAINMENT, as on api.scryfall.com: `fuzzy=primeval titanoth`
+        is Primeval Titan there, although Titanoth Rex carries both words (one in its flavor name),
+        and `fuzzy=soulcatchers` is Soulcatcher, not Soulcatchers' Aerie. But a WEAK typo winner
+        loses to containment: `fuzzy=hyd disintegrat` is the one card carrying both words, not
+        Disintegrate. How weak is the typo lane's to say (`_TypoMatch`, `FUZZY_SIMILARITY_YIELD`,
+        and the engine's `FUZZY_WEAK_BELOW`), and a tie is the weakest winner of all.
+
+        The exact stage reads oracle and flavor names. Containment reads them too, then a printed
+        name that IS the query, then printed names that carry every word. The typo stage reads
+        oracle names alone.
 
         Args:
             fuzzy: The name fragment to match.
@@ -1995,27 +2035,20 @@ class ScryfallCardsRoutes:
                 pretty=pretty,
             )
 
-        # The whole-name and containment stages run TWICE, oracle and flavor names first and printed
-        # names second, and the printed tier is asked only when the first tier answered nothing -- see
-        # `_fuzzy_containment_candidates` for the measurements. So a printed name that IS the query
-        # still yields to an oracle name that merely CONTAINS it: `fuzzy=inganno` is Wedding
-        # Announcement on api.scryfall.com, not Guile, whose Italian name is "Inganno".
-        chosen = None
-        for printed in (False, True):
-            chosen = self._fuzzy_exact_candidate(needle, base_clauses, base_params, printed=printed)
-            if chosen is not None:
-                break
-            candidates = self._fuzzy_containment_candidates(words, base_clauses, base_params, printed=printed)
-            if len(candidates) > 1:
-                return self._ambiguous(falcon_response, fuzzy, pretty=pretty)
-            if candidates:
-                chosen = candidates[0]
-                break
-
+        chosen = self._fuzzy_exact_candidate(needle, base_clauses, base_params, printed=False)
         if chosen is None:
-            chosen = self._fuzzy_similarity_candidate(needle, base_clauses, base_params)
-            if chosen is _AMBIGUOUS:
-                return self._ambiguous(falcon_response, fuzzy, pretty=pretty)
+            typo = self._fuzzy_similarity_candidate(needle, base_clauses, base_params)
+            if typo.row is not None and not typo.yields_to_one:
+                chosen = typo.row
+            else:
+                candidates = self._fuzzy_contained(needle, words, base_clauses, base_params)
+                if len(candidates) == 1:
+                    chosen = candidates[0]
+                elif (candidates and typo.yields_to_several) or typo.tie:
+                    return self._ambiguous(falcon_response, fuzzy, pretty=pretty)
+                else:
+                    # A weak winner outranks several containing names, and a miss is a 404.
+                    chosen = typo.row
 
         if not chosen:
             return self._scryfall_respond(
@@ -2114,7 +2147,7 @@ class ScryfallCardsRoutes:
 
         Oracle names and printed names are asked SEPARATELY (`printed`), because they are two
         tiers: a printed name that is the query answers only when no oracle name even contains it
-        (`_named_fuzzy` runs the oracle tier's containment in between). A FLAVOR name that is the
+        (`_fuzzy_contained` runs the oracle tier's containment in between). A FLAVOR name that is the
         query belongs to the first tier, after the oracle names.
 
         Args:
@@ -2156,6 +2189,37 @@ class ScryfallCardsRoutes:
         # the German printing here and then answered 404 when the id did not resolve.
         card = self._fetch_one_card(" AND ".join(clauses), params)
         return {"scryfall_id": card["id"], "card_name": card["name"], "card": card} if card else None
+
+    def _fuzzy_contained(
+        self,
+        needle: str,
+        words: list[str],
+        base_clauses: list[str],
+        base_params: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """The containment stage whole: its first tier, then a whole printed name, then its second.
+
+        Oracle and flavor names are asked first and printed names only when they answered nothing
+        -- see `_fuzzy_containment_candidates` for the measurements. So a printed name that IS the
+        query still yields to an oracle name that merely CONTAINS it: `fuzzy=inganno` is Wedding
+        Announcement on api.scryfall.com, not Guile, whose Italian name is "Inganno".
+
+        Args:
+            needle: The accent-folded, lowercased query.
+            words: The folded query, split into words.
+            base_clauses: Predicates already established (the set filter).
+            base_params: Their bound parameters.
+
+        Returns:
+            Up to two rows, one per distinct card name.
+        """
+        candidates = self._fuzzy_containment_candidates(words, base_clauses, base_params, printed=False)
+        if candidates:
+            return candidates
+        whole = self._fuzzy_exact_candidate(needle, base_clauses, base_params, printed=True)
+        if whole is not None:
+            return [whole]
+        return self._fuzzy_containment_candidates(words, base_clauses, base_params, printed=True)
 
     def _fuzzy_containment_candidates(
         self,
@@ -2282,13 +2346,15 @@ class ScryfallCardsRoutes:
         needle: str,
         base_clauses: list[str],
         base_params: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        """Return the typo-tolerant match, `_AMBIGUOUS` when two names are too close to separate.
+    ) -> _TypoMatch:
+        """Return the typo-tolerant match, and whether the containment stage outranks it.
 
         A candidate must clear FUZZY_SIMILARITY_FLOOR, and the best must lead the next distinct
-        card name by FUZZY_SIMILARITY_LEAD. The floor sits above pg_trgm's default 0.3 threshold,
-        so the index-assisted `%` prefilter is always a strict superset of what the floor admits
-        and no decision rests on a row the prefilter dropped.
+        card name by FUZZY_SIMILARITY_LEAD, or it is a tie. The floor sits above pg_trgm's default
+        0.3 threshold, so the index-assisted `%` prefilter is always a strict superset of what the
+        floor admits and no decision rests on a row the prefilter dropped. A winner under
+        FUZZY_SIMILARITY_YIELD yields to containment; the engine lane reports its own winner's
+        strength on its own metric.
 
         Args:
             needle: The accent-folded, lowercased query.
@@ -2296,7 +2362,7 @@ class ScryfallCardsRoutes:
             base_params: Their bound parameters.
 
         Returns:
-            The matching printing, `_AMBIGUOUS`, or None.
+            The winner, if any, and what outranks it.
         """
         # The ENGINE first, like every other lookup on this surface. `fuzzy_name_match`
         # reimplements pg_trgm's similarity() exactly for this, and until now nothing called it:
@@ -2311,7 +2377,8 @@ class ScryfallCardsRoutes:
                 try:
                     # No thresholds: they belong to the engine's own metric, which is not
                     # pg_trgm's, and passing the SQL path's would score one metric by the other's
-                    # bar. See FUZZY_SIMILARITY_FLOOR above.
+                    # bar. See FUZZY_SIMILARITY_FLOOR above. That includes where a winner yields to
+                    # containment: "weak" to one containing card, "faint" to several.
                     status, row = engine.fuzzy_card_by_name(needle, fields=list(CARD_OBJECT_FIELDS))
                 # Any engine failure falls back to SQL; it never 500s.
                 except Exception:
@@ -2323,15 +2390,19 @@ class ScryfallCardsRoutes:
                     # returned. Reading the row in `else` is what makes the next such mismatch a
                     # test failure rather than a silent permanent fallback.
                     if status == "ambiguous":
-                        return _AMBIGUOUS
-                    if status == "miss":
-                        return None
-                    if row:
-                        # The whole rendered card rides along, not just its id: a foreign-name hit
-                        # resolves to the FOREIGN printing ("ego à deriva" materializes the
-                        # Portuguese object), and re-fetching by scryfall_id would re-resolve
-                        # through the canonical lookups and lose the printing the engine chose.
-                        return {"scryfall_id": row["scryfall_id"], "card_name": row["name"], "card": to_scryfall_card(row)}
+                        return _TYPO_TIE
+                    if status == "miss" or not row:
+                        return _TYPO_MISS
+                    # The whole rendered card rides along, not just its id: a foreign-name hit
+                    # resolves to the FOREIGN printing ("ego à deriva" materializes the Portuguese
+                    # object), and re-fetching by scryfall_id would re-resolve through the
+                    # canonical lookups and lose the printing the engine chose.
+                    return _TypoMatch(
+                        row={"scryfall_id": row["scryfall_id"], "card_name": row["name"], "card": to_scryfall_card(row)},
+                        tie=False,
+                        yields_to_one=status in ("weak", "faint"),
+                        yields_to_several=status == "faint",
+                    )
 
         params = {**base_params, "needle": needle, "floor": FUZZY_SIMILARITY_FLOOR}
         # `%%` escapes psycopg's placeholder marker: the bare `%` operator would be read as the
@@ -2350,11 +2421,12 @@ class ScryfallCardsRoutes:
             explain=False,
         )["result"]
         if not rows:
-            return None
+            return _TYPO_MISS
         ranked = sorted(rows, key=lambda row: row["score"], reverse=True)
         if len(ranked) > 1 and ranked[0]["score"] - ranked[1]["score"] < FUZZY_SIMILARITY_LEAD:
-            return _AMBIGUOUS
-        return ranked[0]
+            return _TYPO_TIE
+        weak = ranked[0]["score"] < FUZZY_SIMILARITY_YIELD
+        return _TypoMatch(row=ranked[0], tie=False, yields_to_one=weak, yields_to_several=weak)
 
     # ---------------------------------------------------------------- GET /cards/autocomplete
 

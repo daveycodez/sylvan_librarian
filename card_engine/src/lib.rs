@@ -4231,6 +4231,12 @@ fn build_printed_name_index(
 // stage can produce. Reordering without the metric change is not an option either: it turns
 // `bolt` and `jac bel`, which Scryfall calls ambiguous, into hits.
 //
+// TYPO FIRST IS NOT UNCONDITIONAL. A winner that scores WEAKLY loses to the containment stage:
+// under `FUZZY_WEAK_BELOW` to a card that alone carries every query word, under
+// `FUZZY_FAINT_BELOW` to several of them, which is `ambiguous`. `fuzzy_card_by_name` reports the
+// winner's strength and the route asks containment only for a weak one. The measurements are
+// on the two constants.
+//
 // THE TYPO STAGE IS ENGLISH-ONLY. Scryfall gives foreign printed names no typo tolerance at all:
 // `fuzzy=blitzschlag` resolves the German printing of Lightning Bolt, `fuzzy=blitzschlagg`
 // answers 404, and `fuzzy=ego a derva` (one letter off the Portuguese name) answers 404 while
@@ -4262,6 +4268,33 @@ fn build_printed_name_index(
 /// put it.)
 pub(crate) const FUZZY_SCORE_FLOOR: f32 = 0.625;
 pub(crate) const FUZZY_SCORE_LEAD: f32 = 0.002;
+
+/// The score below which a typo winner no longer outranks the containment stage: the one card
+/// whose names carry every query word answers instead. Scryfall runs the typo stage first, but a
+/// WEAK winner loses to a card that alone contains the words. Measured on api.scryfall.com
+/// 2026-09-25 over 33 needles where exactly one card contains every word and the typo race picks
+/// another: the typo winner answered 20 of the 22 scoring 0.714 or more on this metric
+/// (`inquisitor serr` is the lowest, `soulcatchers` 0.908 the highest) and the contained card all
+/// 11 scoring 0.703 or less (`hyd disintegrat` the highest, `prophesi` 0.625 the lowest). 0.71
+/// sits between.
+///
+/// The other two sit on the wrong side and are left there: `ugin spirit` (Inspirit, 0.775) and
+/// `mindstat` (Mindstab, 0.795) answer the contained card on Scryfall. No line on this metric
+/// takes them without giving up the needles around them it gets right -- `stranglero` (0.775),
+/// `snorti` (0.792) and eleven more answer the typo winner there.
+pub(crate) const FUZZY_WEAK_BELOW: f32 = 0.71;
+
+/// The score below which a typo winner yields to an AMBIGUOUS containment too, so the lookup is
+/// `ambiguous`. Where more than one card carries every word, Scryfall still answers the typo winner
+/// for `bolt lightning` (Blightning, 0.676: Lightning Bolt and "Emeritus of Conflict // Lightning
+/// Bolt" both contain the words), `lightning bolt // lightning bolt` (0.673) and `insolent` (0.701),
+/// and answers `ambiguous` for `assaultron` (Assault Drone, 0.667) and `jace sculpt` (Resculpt,
+/// 0.628) -- measured 2026-09-25. 0.67 is the line between 0.667 and 0.673. Two needles below it
+/// answer the typo winner on Scryfall and stay ambiguous here, `ancestral` (Ancestral Mask, 0.664)
+/// and `paralyzing` (Paralyzing Grasp, 0.641); a line under them would put `assaultron` and
+/// `jace sculpt` on the wrong side instead, as many needles either way, and those two answer
+/// correctly with the containment stage first.
+pub(crate) const FUZZY_FAINT_BELOW: f32 = 0.67;
 
 /// `s` with every non-alphanumeric ASCII byte removed, written into a caller-owned buffer.
 ///
@@ -4356,14 +4389,30 @@ pub(crate) enum FuzzyOutcome {
     /// The card that won outright, and the printing that carries the matched name: the card's
     /// preferred printing for an English-name hit, the best printing of the matched printed
     /// name for a foreign hit — which is how "ego à deriva" materializes the Portuguese
-    /// printing object rather than the English card.
-    Hit { cid: u32, vpid: u32 },
+    /// printing object rather than the English card. `score` is the winner's own, which decides
+    /// whether a containment answer outranks it (`FUZZY_WEAK_BELOW`).
+    Hit { cid: u32, vpid: u32, score: f32 },
     /// Two distinct names on two distinct CARDS scored too close to choose between; Scryfall
     /// answers `ambiguous`. A card's own English and foreign names never read ambiguous, and
     /// neither do two cards sharing one name (they are one answer, the pre-multilingual rule).
     Ambiguous,
     /// Nothing cleared the floor.
     Miss,
+}
+
+impl FuzzyOutcome {
+    /// The status `fuzzy_card_by_name` reports: "hit", "weak" (a winner under `weak_below`, which
+    /// a unique containment answer outranks), "faint" (under `faint_below`, which an ambiguous one
+    /// outranks too), "ambiguous" or "miss". See `FUZZY_WEAK_BELOW`.
+    pub(crate) fn status(&self, weak_below: f32, faint_below: f32) -> &'static str {
+        match *self {
+            FuzzyOutcome::Miss => "miss",
+            FuzzyOutcome::Ambiguous => "ambiguous",
+            FuzzyOutcome::Hit { score, .. } if score < faint_below => "faint",
+            FuzzyOutcome::Hit { score, .. } if score < weak_below => "weak",
+            FuzzyOutcome::Hit { .. } => "hit",
+        }
+    }
 }
 
 /// The running best and runner-up of the fuzzy scan, under the competition rule above: a
@@ -4395,7 +4444,7 @@ impl<'a> FuzzyRace<'a> {
         match (self.best, self.runner_up) {
             (None, _) => FuzzyOutcome::Miss,
             (Some((score, _, _, _)), Some(second)) if score - second < lead => FuzzyOutcome::Ambiguous,
-            (Some((_, cid, vpid, _)), _) => FuzzyOutcome::Hit { cid, vpid },
+            (Some((score, cid, vpid, _)), _) => FuzzyOutcome::Hit { cid, vpid, score },
         }
     }
 }
@@ -18640,13 +18689,24 @@ impl QueryEngine {
 
     /// Scryfall's `?fuzzy=` name lookup, typo-tolerant.
     ///
-    /// Returns `(status, card)` where status is "hit", "ambiguous" or "miss". Ambiguous is a
-    /// distinct answer rather than a miss: Scryfall reports it with the candidates it could not
-    /// separate, and collapsing it to "not found" would tell the client the card does not exist.
-    /// `floor` and `lead` DEFAULT to the fitted thresholds (see the `Fuzzy name matching` module
-    /// comment): they belong to the metric, not to the caller, and a Python-side copy of them
-    /// drifts the moment the metric is refitted. They stay arguments so a test can sweep them.
-    #[pyo3(signature = (name, floor=FUZZY_SCORE_FLOOR, lead=FUZZY_SCORE_LEAD, fields=None))]
+    /// Returns `(status, card)` where status is "hit", "weak", "faint", "ambiguous" or "miss".
+    /// Ambiguous is a distinct answer rather than a miss: Scryfall reports it with the candidates it
+    /// could not separate, and collapsing it to "not found" would tell the client the card does not
+    /// exist. "weak" and "faint" carry the winner too, and say what it yields to: a weak winner
+    /// loses to a card that alone contains every query word, a faint one to several
+    /// (`FUZZY_WEAK_BELOW`, `FUZZY_FAINT_BELOW`). The caller asks the containment stage for those.
+    /// Every threshold DEFAULTS to its fitted value (see the `Fuzzy name matching` module comment):
+    /// they belong to the metric, not to the caller, and a Python-side copy of them drifts the
+    /// moment the metric is refitted. They stay arguments so a test can sweep them.
+    #[pyo3(signature = (
+        name,
+        floor=FUZZY_SCORE_FLOOR,
+        lead=FUZZY_SCORE_LEAD,
+        fields=None,
+        weak_below=FUZZY_WEAK_BELOW,
+        faint_below=FUZZY_FAINT_BELOW,
+    ))]
+    #[allow(clippy::too_many_arguments)]
     fn fuzzy_card_by_name<'py>(
         &self,
         py: Python<'py>,
@@ -18654,15 +18714,18 @@ impl QueryEngine {
         floor: f32,
         lead: f32,
         fields: Option<Vec<String>>,
+        weak_below: f32,
+        faint_below: f32,
     ) -> PyResult<(String, Option<Bound<'py, PyDict>>)> {
         let resolved_fields = resolve_fields(fields)?;
         let (mmap, str_cache) = self.get_mapping()?;
         // Safety: see the access_unchecked justification in query().
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
-        match fuzzy_name_match(data, name, floor, lead) {
-            FuzzyOutcome::Miss => Ok(("miss".to_string(), None)),
-            FuzzyOutcome::Ambiguous => Ok(("ambiguous".to_string(), None)),
-            FuzzyOutcome::Hit { cid, vpid } => {
+        let outcome = fuzzy_name_match(data, name, floor, lead);
+        let status = outcome.status(weak_below, faint_below).to_string();
+        match outcome {
+            FuzzyOutcome::Miss | FuzzyOutcome::Ambiguous => Ok((status, None)),
+            FuzzyOutcome::Hit { cid, vpid, .. } => {
                 // The card's preferred printing for an English hit; the matched printed name's
                 // best printing for a foreign one — the vpid encodes which.
                 let dict = card_to_pydict(
@@ -18674,7 +18737,7 @@ impl QueryEngine {
                     &resolved_fields,
                     &str_cache,
                 )?;
-                Ok(("hit".to_string(), Some(dict)))
+                Ok((status, Some(dict)))
             }
         }
     }

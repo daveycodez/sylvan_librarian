@@ -15346,7 +15346,7 @@ fn a_typo_resolves_to_the_intended_card() {
     let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
 
     match fuzzy_name_match(a, "lightnig bolt", crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD) {
-        FuzzyOutcome::Hit { cid, vpid } => {
+        FuzzyOutcome::Hit { cid, vpid, .. } => {
             assert_eq!(cid, 0, "a one-letter typo still finds Lightning Bolt");
             assert_eq!(vpid, 0, "an English hit carries the card's preferred printing");
         }
@@ -15370,6 +15370,38 @@ fn two_close_names_are_ambiguous_not_a_guess() {
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
     assert!(matches!(fuzzy_name_match(a, "fire dragen", crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD), FuzzyOutcome::Ambiguous));
+}
+
+/// A typo winner's STRENGTH, which decides whether the containment stage outranks it
+/// (`FUZZY_WEAK_BELOW`, `FUZZY_FAINT_BELOW`), on needles measured on api.scryfall.com 2026-09-25
+/// that sit either side of each line. Each winner is the one the real corpus picks, alone here so
+/// the score is its own.
+#[test]
+fn a_typo_winners_strength_is_read_against_the_two_lines() {
+    let names = ["primeval titan", "inquisitor's ox", "disintegrate", "blightning", "assault drone", "resculpt"];
+    let data = name_store(&names, &[1; 6]);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let strength = |needle: &str| {
+        let outcome = fuzzy_name_match(a, needle, crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD);
+        let winner = match outcome {
+            FuzzyOutcome::Hit { cid, .. } => names[cid as usize],
+            _ => "",
+        };
+        (winner, outcome.status(crate::FUZZY_WEAK_BELOW, crate::FUZZY_FAINT_BELOW))
+    };
+
+    // Strong: Scryfall answers these over the one card containing every word.
+    assert_eq!(strength("primeval titanoth"), ("primeval titan", "hit"), "0.799, over Titanoth Rex");
+    assert_eq!(strength("inquisitor serr"), ("inquisitor's ox", "hit"), "0.714, the lowest typo answer");
+    // Weak: the one containing card answers instead, but several do not.
+    assert_eq!(strength("hyd disintegrat"), ("disintegrate", "weak"), "0.703, the highest containment answer");
+    assert_eq!(strength("bolt lightning"), ("blightning", "weak"), "0.676, over two containing names");
+    // Faint: several containing names are `ambiguous`.
+    assert_eq!(strength("assaultron"), ("assault drone", "faint"), "0.667");
+    assert_eq!(strength("jace sculpt"), ("resculpt", "faint"), "0.628");
+
+    assert_eq!(fuzzy_name_match(a, "zzzzzzzz", crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD).status(0.71, 0.67), "miss");
 }
 
 #[test]
