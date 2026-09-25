@@ -2088,7 +2088,14 @@ class ScryfallCardsRoutes:
         # Never an art-series card (`_NOT_ART_SERIES`): `fuzzy=minion of the mighty kobold` spells
         # "Minion of the Mighty // Kobold" exactly and answers the afr card on api.scryfall.com.
         clauses = [*base_clauses, _NOT_ART_SERIES, f"{_UNSEPARATED.format(column=column)} = %(needle)s"]
-        return self._best_printing(" AND ".join(clauses), params)
+        if not printed:
+            return self._best_printing(" AND ".join(clauses), params)
+        # A printed name's answer is RENDERED here, not handed back as an id: it is usually a
+        # non-canonical printing, and `_cards_by_ids` asks the engine first, whose by-id lookup
+        # reads canonical printings only -- so with the engine serving, `fuzzy=blitzschlag` found
+        # the German printing here and then answered 404 when the id did not resolve.
+        card = self._fetch_one_card(" AND ".join(clauses), params)
+        return {"scryfall_id": card["id"], "card_name": card["name"], "card": card} if card else None
 
     def _fuzzy_containment_candidates(
         self,

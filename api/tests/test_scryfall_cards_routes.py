@@ -1266,6 +1266,18 @@ class TestNamed:
         assert body["id"] == TIER_EGO_PT_ID
         assert body["lang"] == "pt"
 
+    @pytest.mark.parametrize("needle", ["Ego à Deriva", "ego a deriva"])
+    def test_a_whole_printed_name_answers_its_foreign_printing(self, by_name_paths: APIResource, needle):
+        """A printed name that IS the query answers that printing, through the engine path too.
+
+        Measured on api.scryfall.com 2026-09-25: `fuzzy=ego a deriva` is grn/212/pt and
+        `fuzzy=blitzschlag` the German Lightning Bolt. The printing is not canonical, which the
+        engine's by-id lookup does not reach, so the stage hands back the card it found.
+        """
+        body = payload(dispatch(by_name_paths, "/cards/named", urlencode({"fuzzy": needle})))
+        assert body["id"] == TIER_EGO_PT_ID
+        assert body["lang"] == "pt"
+
     def test_neither_parameter_is_a_400(self, compat_corpus: APIResource):
         resp = dispatch(compat_corpus, "/cards/named")
         assert resp.status == falcon.HTTP_400
