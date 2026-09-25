@@ -1918,7 +1918,8 @@ class ScryfallCardsRoutes:
 
         The three stages mirror what Scryfall resolves in practice — `lightning bolt` exactly,
         `bolt` by containment, `lighning bolt` by trigram distance — and each stage that finds more
-        than one distinct card name reports `ambiguous` rather than guessing between them.
+        than one distinct card name reports `ambiguous` rather than guessing between them. The first
+        two run over oracle names, then again over printed names, before the third.
 
         Args:
             fuzzy: The name fragment to match.
@@ -1945,13 +1946,22 @@ class ScryfallCardsRoutes:
                 pretty=pretty,
             )
 
-        chosen = self._fuzzy_exact_candidate(needle, base_clauses, base_params)
-        if chosen is None:
-            candidates = self._fuzzy_containment_candidates(words, base_clauses, base_params)
+        # The whole-name and containment stages run TWICE, oracle names first and printed names
+        # second, and the printed tier is asked only when the oracle tier answered nothing -- see
+        # `_fuzzy_containment_candidates` for the measurements. So a printed name that IS the query
+        # still yields to an oracle name that merely CONTAINS it: `fuzzy=inganno` is Wedding
+        # Announcement on api.scryfall.com, not Guile, whose Italian name is "Inganno".
+        chosen = None
+        for printed in (False, True):
+            chosen = self._fuzzy_exact_candidate(needle, base_clauses, base_params, printed=printed)
+            if chosen is not None:
+                break
+            candidates = self._fuzzy_containment_candidates(words, base_clauses, base_params, printed=printed)
             if len(candidates) > 1:
                 return self._ambiguous(falcon_response, fuzzy, pretty=pretty)
             if candidates:
                 chosen = candidates[0]
+                break
 
         if chosen is None:
             chosen = self._fuzzy_similarity_candidate(needle, base_clauses, base_params)
@@ -2041,6 +2051,8 @@ class ScryfallCardsRoutes:
         needle: str,
         base_clauses: list[str],
         base_params: dict[str, Any],
+        *,
+        printed: bool,
     ) -> dict[str, Any] | None:
         """Return the card one of whose names IS the query, separators aside, if there is one.
 
@@ -2051,10 +2063,15 @@ class ScryfallCardsRoutes:
         `fuzzy=blitzschlag` answers the German Lightning Bolt, `fuzzy=ego à deriva` the
         Portuguese Unmoored Ego -- while `exact=` stays scoped to oracle names.
 
+        Oracle names and printed names are asked SEPARATELY (`printed`), because they are two
+        tiers: a printed name that is the query answers only when no oracle name even contains it
+        (`_named_fuzzy` runs the oracle tier's containment in between).
+
         Args:
             needle: The accent-folded, lowercased query.
             base_clauses: Predicates already established (the set filter).
             base_params: Their bound parameters.
+            printed: Match printed names rather than oracle names.
 
         Returns:
             The matching printing, or None.
@@ -2067,21 +2084,19 @@ class ScryfallCardsRoutes:
         # whole-name match at all under the measured rule), so calling it here would answer a
         # different card, not the same card sooner. `named?exact=` still goes to the engine first.
         params = {**base_params, "needle": _unseparated(needle)}
-        oracle = f"{_UNSEPARATED.format(column='card_name_folded')} = %(needle)s"
-        printed = f"{_UNSEPARATED.format(column='printed_name_folded')} = %(needle)s"
+        column = "printed_name_folded" if printed else "card_name_folded"
         # Never an art-series card (`_NOT_ART_SERIES`): `fuzzy=minion of the mighty kobold` spells
         # "Minion of the Mighty // Kobold" exactly and answers the afr card on api.scryfall.com.
-        clauses = [*base_clauses, _NOT_ART_SERIES, f"({oracle} OR {printed})"]
-        # An ORACLE name that is the query outranks a PRINTED one that is: `exact=` is scoped to
-        # oracle names (measured -- `exact=Ego à Deriva` is a 404 there while `fuzzy=` resolves
-        # it), so when both exist the English card is the one the query names.
-        return self._best_printing(" AND ".join(clauses), params, rank_first=f"({oracle}) DESC, ")
+        clauses = [*base_clauses, _NOT_ART_SERIES, f"{_UNSEPARATED.format(column=column)} = %(needle)s"]
+        return self._best_printing(" AND ".join(clauses), params)
 
     def _fuzzy_containment_candidates(
         self,
         words: list[str],
         base_clauses: list[str],
         base_params: dict[str, Any],
+        *,
+        printed: bool,
     ) -> list[dict[str, Any]]:
         """Return one printing per distinct card name whose NAMES carry every query word.
 
@@ -2109,10 +2124,20 @@ class ScryfallCardsRoutes:
         Emblems, art series and front cards are left out (`_IN_CONTAINMENT_POOL`): they
         neither answer this stage nor make a real card ambiguous.
 
+        PRINTED NAMES ARE A SECOND TIER (`printed`), asked only when no ORACLE name carries every
+        word -- which is why the pooling rule above is the printed tier's alone. Measured on
+        api.scryfall.com 2026-09-25, 23 of 23 needles: `fuzzy=austere` is Austere Command, not
+        ambiguous with Dour Port-Mage's French "Portmage austère", and so are `redress`, `captor`,
+        `pixies` and fourteen more; `inganno`, `verfall` and four more are each a WHOLE foreign
+        name and each answers the one English name containing it; and `red goad`, which no English
+        name carries, is still the Portuguese Unmoored Ego. The engine's
+        `printed_names_containing_all_words` has the full list.
+
         Args:
             words: The folded query, split into words.
             base_clauses: Predicates already established (the set filter).
             base_params: Their bound parameters.
+            printed: Ask the printed-name tier rather than the oracle-name tier.
 
         Returns:
             Up to two rows -- enough to tell "one match" from "ambiguous" without fetching more.
@@ -2127,23 +2152,32 @@ class ScryfallCardsRoutes:
                     base_params.get("set_code"),
                     2,
                     list(CARD_OBJECT_FIELDS),
+                    printed=printed,
                 )
             # Any engine failure falls back to SQL; it never 500s.
             except Exception:
                 logger.exception("Engine containment match failed, falling back to SQL")
             else:
                 # `else`, not the `try` body: a key error here is a shape mismatch, not an engine
-                # failure, and must not be swallowed into a silent fallback.
-                return [{"scryfall_id": row["scryfall_id"], "card_name": row["name"]} for row in rows]
+                # failure, and must not be swallowed into a silent fallback. The rendered card
+                # rides along, as the similarity stage's does: a printed-tier answer is a FOREIGN
+                # printing, which the by-id lookups (canonical printings only) could not find again.
+                return [
+                    {"scryfall_id": row["scryfall_id"], "card_name": row["name"], "card": to_scryfall_card(row)} for row in rows
+                ]
 
         params = dict(base_params)
         clauses = [*base_clauses, _IN_CONTAINMENT_POOL]
+        oracle = _UNSEPARATED.format(column="card_name_folded")
         for index, word in enumerate(words):
             params[f"word_{index}"] = f"%{word}%"
-            clauses.append(
-                f"({_UNSEPARATED.format(column='card_name_folded')} LIKE %(word_{index})s "
-                f"OR {_UNSEPARATED.format(column='printed_name_folded')} LIKE %(word_{index})s)",
-            )
+            if printed:
+                clauses.append(
+                    f"({oracle} LIKE %(word_{index})s "
+                    f"OR {_UNSEPARATED.format(column='printed_name_folded')} LIKE %(word_{index})s)",
+                )
+            else:
+                clauses.append(f"{oracle} LIKE %(word_{index})s")
         return self._run_query(
             query=(
                 "SELECT DISTINCT ON (card_name) card_name, scryfall_id "

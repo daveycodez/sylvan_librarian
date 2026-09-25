@@ -22,7 +22,7 @@ use super::{
     build_printing_by_scryfall_id, build_oracle_by_oracle_id, find_printing_by_scryfall_id, find_oracle_by_oracle_id,
     build_external_id_index, find_printing_by_external_id, EXT_MULTIVERSE, EXT_MTGO, EXT_ARENA, EXT_TCGPLAYER,
     fuzzy_similarity, fuzzy_name_match, autocomplete_names, iso8601_utc_to_epoch_secs, FuzzyOutcome,
-    exact_name_match, collection_name_match, names_containing_all_words,
+    exact_name_match, collection_name_match, names_containing_all_words, printed_names_containing_all_words,
     VOCAB_NONE, COMPAT_PROMO, COMPAT_REPRINT, COMPAT_TEXTLESS, GAME_PAPER, GAME_ARENA, FINISH_FOIL, FINISH_NONFOIL,
     TextField, TextSearchField, Tri, SortedTrigramIndex, VocabInterner, ARTIST_NONE, NONE_STR, TYPE_ARTIFACT, TYPE_CREATURE,
     TYPE_ENCHANTMENT, TYPE_INSTANT, TYPE_LAND, TYPE_LEGENDARY, TYPE_PLANESWALKER, TYPE_SNOW, TYPE_SORCERY,
@@ -14952,6 +14952,99 @@ fn containment_leaves_out_emblems_art_series_and_front_cards() {
     assert!(names(&["lakes", "aveng"]).is_empty(), "a front card is no answer");
     assert_eq!(names(&["tuktuk", "returned"]), ["tuktuk the returned"], "a token still answers");
     assert_eq!(names(&["tuktuk"]).len(), 2, "and still competes");
+}
+
+/// Containment's TWO TIERS, as measured on api.scryfall.com 2026-09-25 (see
+/// `printed_names_containing_all_words`): the oracle names first, where a word is matched with the
+/// name's separators gone, and the printed names only as a second tier, where each word may come
+/// from the printed name or the oracle name of the card it prints. The caller asks the second tier
+/// only when the first finds nothing; here each is asked directly.
+#[test]
+fn containment_ranks_oracle_names_above_printed_names() {
+    let spec = [
+        ("austere command", "normal"),
+        ("dour port-mage", "normal"),
+        ("wedding announcement", "normal"),
+        ("guile", "normal"),
+        ("unmoored ego", "normal"),
+        ("liliana, the last hope emblem", "emblem"),
+    ];
+    let mut vocab = VocabInterner::new();
+    let mut interner = Interner::new();
+    let mut cards = Vec::new();
+    for (i, (name, layout)) in spec.iter().enumerate() {
+        let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
+        c.card_name_lower = InlineStr::from_str(name);
+        c.card_layout_id = interner.intern((*layout).to_string());
+        cards.push(c);
+    }
+    // (card, printed name, set, prefer). Unmoored Ego's Portuguese name is the SHORTEST that
+    // carries `ego deriva` and scores lowest, so the printing chosen is chosen by length.
+    let annex = [
+        (1, "portmage austere", "mkm", 50.0),
+        (3, "inganno", "fdn", 50.0),
+        (4, "ego a deriva", "grn", 1.0),
+        (4, "ego a la deriva", "grn", 90.0),
+        (4, "ego alla deriva", "grn", 80.0),
+        (5, "emblema di liliana", "t2x2", 50.0),
+    ];
+    let mut foreign = Vec::new();
+    let mut foreign_offsets = vec![0u32];
+    for cid in 0..spec.len() {
+        for (i, &(_, printed, set, prefer)) in annex.iter().enumerate().filter(|(_, a)| a.0 == cid) {
+            let mut p = stub_printing(100 + i as u128, 100 + i as u128, Some(prefer));
+            p.card_set_code = InlineStr::from_str(set);
+            p.printed_name_folded_id = interner.intern(printed.to_string());
+            foreign.push(p);
+        }
+        foreign_offsets.push(foreign.len() as u32);
+    }
+    let mut data = store_of(cards, &[1; 6], vocab);
+    data.strings = interner.strings;
+    data.foreign = foreign;
+    data.foreign_offsets = foreign_offsets;
+    data.indexes.foreign_to_card = build_printing_to_card(&data.foreign_offsets);
+    data.indexes.printed_names =
+        build_printed_name_index(&data.printings, &data.foreign, &data.strings, |p| p.printed_name_folded_id);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let owned = |words: &[&str]| -> Vec<String> { words.iter().map(|w| (*w).to_owned()).collect() };
+    let oracle = |words: &[&str]| -> Vec<&str> {
+        names_containing_all_words(a, &owned(words), None, 2).into_iter().map(|(cid, _)| spec[cid].0).collect()
+    };
+    let printed = |words: &[&str], set: Option<&str>| -> Vec<(&str, &str)> {
+        printed_names_containing_all_words(a, &owned(words), set, 2)
+            .into_iter()
+            .map(|(cid, vpid)| {
+                let p = crate::printing_at(a, vpid);
+                (spec[cid].0, crate::str_at(&a.strings, u32::from(p.printed_name_folded_id)).unwrap_or(""))
+            })
+            .collect()
+    };
+
+    // The first tier. `austere` is Austere Command alone, and `inganno` is Wedding Announcement,
+    // which carries it across a space -- separators do not count, on either side of a hyphen too.
+    assert_eq!(oracle(&["austere"]), ["austere command"]);
+    assert_eq!(oracle(&["inganno"]), ["wedding announcement"]);
+    assert_eq!(oracle(&["portmage"]), ["dour port-mage"]);
+    // What the second tier would add is why it comes second: each would make these ambiguous.
+    assert_eq!(printed(&["austere"], None), [("dour port-mage", "portmage austere")]);
+    assert_eq!(printed(&["inganno"], None), [("guile", "inganno")]);
+
+    // Where the first tier holds nothing, the printed names answer. `red goad` pools the oracle
+    // name's `red` with `goad`, which spans "ego a deriva"'s separators; `unmoored goad` is found
+    // through the ORACLE name's `unmoored`, the longest word, which no printed name carries.
+    assert!(oracle(&["red", "goad"]).is_empty());
+    assert_eq!(printed(&["red", "goad"], None), [("unmoored ego", "ego a deriva")]);
+    assert_eq!(printed(&["unmoored", "goad"], None), [("unmoored ego", "ego a deriva")]);
+    assert_eq!(printed(&["goad"], None), [("unmoored ego", "ego a deriva")]);
+    // Three printed names carry `ego deriva`; they are one answer, the shortest name, although it
+    // scores lowest.
+    assert_eq!(printed(&["ego", "deriva"], None), [("unmoored ego", "ego a deriva")]);
+    // A set scopes it, and an emblem stays out of this tier as it does the first.
+    assert_eq!(printed(&["red", "goad"], Some("GRN")), [("unmoored ego", "ego a deriva")]);
+    assert!(printed(&["red", "goad"], Some("m19")).is_empty());
+    assert!(printed(&["emblema"], None).is_empty());
 }
 
 /// An art-series card leaves the exact and typo stages too (see `ART_SERIES_LAYOUT`): `exact=` of

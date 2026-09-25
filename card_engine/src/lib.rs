@@ -4680,10 +4680,101 @@ fn is_art_series(data: &Archived<CardData>, cid: usize) -> bool {
     str_at(&data.strings, u32::from(data.cards[cid].card_layout_id)) == Some(ART_SERIES_LAYOUT)
 }
 
-/// `named?fuzzy=`'s containment stage: one printing per DISTINCT card name whose folded name holds
-/// every query word. Two cards sharing a name are one answer, and more than one distinct name is
-/// what the caller reports as `ambiguous` rather than guessing between. A card whose layout is in
+/// Whether card `cid` lies outside the containment stage's pool (`CONTAINMENT_EXCLUDED_LAYOUTS`).
+fn outside_containment_pool(data: &Archived<CardData>, cid: usize) -> bool {
+    str_at(&data.strings, u32::from(data.cards[cid].card_layout_id))
+        .is_some_and(|layout| CONTAINMENT_EXCLUDED_LAYOUTS.contains(&layout))
+}
+
+/// Whether `word` -- already separator-free, as the route hands it over -- occurs in `hay` once
+/// `hay`'s non-alphanumeric characters are dropped. The engine side of the SQL fallback's
+/// `_UNSEPARATED LIKE '%word%'`, without collating `hay` into a `String` per candidate.
+///
+/// Measured on api.scryfall.com 2026-08-16 (see `_fuzzy_containment_candidates`): separators do
+/// not count, so `fuzzy=goad` is inside "Ego à Deriva" ("eg|o a d|eriva") and `fuzzy=yawgmoths
+/// will` is Yawgmoth's Will. A plain `contains` missed both, so the engine and the fallback
+/// answered those needles differently.
+fn contains_unseparated(hay: &str, word: &str) -> bool {
+    // The common case, and a sound one: a word inside the name as stored is inside it unseparated.
+    if hay.contains(word) {
+        return true;
+    }
+    let mut rest = hay;
+    while let Some(at) = rest.find(char::is_alphanumeric) {
+        let tail = &rest[at..];
+        let mut letters = tail.chars().filter(|c| c.is_alphanumeric());
+        if word.chars().all(|w| letters.next() == Some(w)) {
+            return true;
+        }
+        rest = &tail[tail.chars().next().map_or(1, char::len_utf8)..];
+    }
+    false
+}
+
+/// The separator runs a folded printed name can spell BETWEEN two characters of one query word.
+/// A space covers nearly everything; the rest are what names put inside themselves -- an
+/// apostrophe, a hyphen, and comma-space, the one multi-byte run common enough to matter.
+const NAME_SEPARATORS: [&str; 4] = [" ", "'", "-", ", "];
+
+/// How a printed name could SPELL `word`, for narrowing through `PrintedNameIndex::trigrams`:
+/// the word itself, then the word with one or two separator runs put between its characters.
+///
+/// That index windows names AS STORED, separators included, so a word that spans one shares no
+/// window with the name carrying it -- `goad` has none in common with "ego a deriva". Each variant
+/// is an ordinary contiguous probe and their union covers every occurrence with up to two
+/// separator runs inside the word; a variant no name spells dies on its first window lookup.
+///
+/// KNOWN EDGE: three or more runs inside ONE query word (a four-word name typed as a single token)
+/// is not enumerated, and past `TWO_SEPARATOR_MAX_LEN` bytes only one run is: the count grows
+/// quadratically in the word's length, and a word that long identifies its name by a contiguous
+/// half anyway. Such a printed name is not found by the printed tier and the query falls through
+/// to the typo stage. The SQL fallback's expression index is over the unseparated name and has no
+/// such edge.
+fn unseparated_variants(word: &str) -> Vec<String> {
+    /// Past this many bytes, only the one-separator variants are enumerated.
+    const TWO_SEPARATOR_MAX_LEN: usize = 20;
+    let chars: Vec<&str> = word.char_indices().map(|(i, c)| &word[i..i + c.len_utf8()]).collect();
+    let mut out = vec![word.to_owned()];
+    for first in 1..chars.len() {
+        for sep in NAME_SEPARATORS {
+            out.push(format!("{}{sep}{}", chars[..first].concat(), chars[first..].concat()));
+        }
+        // The two-run variants are SPACES ONLY: two runs inside one query word means the name spelt
+        // it across three of its own words -- "ego a deriva" carrying `goad`.
+        if word.len() > TWO_SEPARATOR_MAX_LEN {
+            continue;
+        }
+        for second in first + 1..chars.len() {
+            out.push(format!(
+                "{} {} {}",
+                chars[..first].concat(),
+                chars[first..second].concat(),
+                chars[second..].concat(),
+            ));
+        }
+    }
+    out
+}
+
+/// The card a VIRTUAL printing id belongs to, through whichever space's direct array holds it.
+fn card_of_vpid(data: &Archived<CardData>, vpid: u32) -> usize {
+    let n = data.printings.len() as u32;
+    let cid = if vpid < n {
+        data.indexes.printing_to_card[vpid as usize]
+    } else {
+        data.indexes.foreign_to_card[(vpid - n) as usize]
+    };
+    u32::from(cid) as usize
+}
+
+/// `named?fuzzy=`'s containment stage, FIRST TIER: one printing per DISTINCT card name whose
+/// folded name holds every query word, separators aside (`contains_unseparated`). Two cards
+/// sharing a name are one answer, and more than one distinct name is what the caller reports as
+/// `ambiguous` rather than guessing between. A card whose layout is in
 /// `CONTAINMENT_EXCLUDED_LAYOUTS` is neither an answer nor a competitor.
+///
+/// The second tier, printed names, is `printed_names_containing_all_words`, and the caller asks it
+/// only when this one finds nothing.
 pub(crate) fn names_containing_all_words(
     data: &Archived<CardData>,
     words: &[String],
@@ -4692,17 +4783,14 @@ pub(crate) fn names_containing_all_words(
 ) -> Vec<(usize, usize)> {
     // Narrow on the LONGEST word: every word must be contained, so any one is a sound filter, and
     // the longest has the most trigrams to intersect and so the fewest postings to survive them.
+    // Sound for the unseparated test too: `name_trigram` windows the COLLATED name, and a
+    // separator-free word inside a name unseparated is a window of it collated.
     let longest = words.iter().max_by_key(|w| w.len()).map(String::as_str).unwrap_or("");
     let mut by_name: Vec<(&str, f32, usize, usize)> = Vec::new();
     for cid in name_scan_candidates(data, longest) {
         let cid = cid as usize;
-        let card = &data.cards[cid];
-        let name = folded_name(card, &data.strings);
-        if !words.iter().all(|w| name.contains(w.as_str())) {
-            continue;
-        }
-        let layout = str_at(&data.strings, u32::from(card.card_layout_id));
-        if layout.is_some_and(|layout| CONTAINMENT_EXCLUDED_LAYOUTS.contains(&layout)) {
+        let name = folded_name(&data.cards[cid], &data.strings);
+        if !words.iter().all(|w| contains_unseparated(name, w)) || outside_containment_pool(data, cid) {
             continue;
         }
         let Some(pid) = best_printing_in_set(data, cid, set_code) else { continue };
@@ -4719,6 +4807,110 @@ pub(crate) fn names_containing_all_words(
     }
     by_name.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
     by_name.into_iter().take(limit).map(|(_, _, cid, pid)| (cid, pid)).collect()
+}
+
+/// `named?fuzzy=`'s containment stage, SECOND TIER: the printed (foreign) names. The caller asks it
+/// only when `names_containing_all_words` found nothing, because on api.scryfall.com a printed
+/// name answers containment only when no oracle name carries the words -- even when the printed
+/// name IS the query. Measured 2026-09-25, 23 of 23 needles:
+///
+///   - `fuzzy=austere` is Austere Command, not ambiguous with Dour Port-Mage's French name
+///     "Portmage austère"; likewise `redress`, `nerada`, `allegra`, `extremis`, `atoner`, `captor`,
+///     `realist`, `circular`, `reverie`, `officiant`, `combustible`, `symbiont`, `violet`,
+///     `courtier`, `diadem` and `pixies` each answer their one English name.
+///   - `inganno`, `verfall`, `velocita`, `disputa`, `nautilo` and `fusione` are each a WHOLE
+///     foreign printed name (Guile's Italian, ...) and each answers the one English name containing
+///     it (`inganno` is Wedding Announcement).
+///   - Where no English name carries the words, the printed name answers: `fuzzy=red goad` is the
+///     Portuguese Unmoored Ego ("Ego à Deriva"), re-measured 2026-09-25.
+///
+/// THE POOL IS THE PRINTING'S NAMES: each word may land in the printed name or in the oracle name
+/// of the card it prints, independently -- `red goad` takes `red` from "Unmoo|red| Ego" and `goad`
+/// from "Ego à Deriva". One answer per distinct oracle name, as in the first tier, and its printing
+/// is the one whose printed name is SHORTEST, then the best prefer score: a name that spells the
+/// query and nothing else is the one the query meant (`fuzzy=ego à deriva` is the Portuguese
+/// printing, not the Spanish "Ego a la deriva"). The SQL fallback's `ORDER BY` is the same rule.
+///
+/// Returned as `(cid, vpid)`: the answer is often an annex printing.
+pub(crate) fn printed_names_containing_all_words(
+    data: &Archived<CardData>,
+    words: &[String],
+    set_code: Option<&str>,
+    limit: usize,
+) -> Vec<(usize, u32)> {
+    let pn = &data.indexes.printed_names;
+    let longest = words.iter().max_by_key(|w| w.len()).map(String::as_str).unwrap_or("");
+    if longest.is_empty() || pn.name_ids.is_empty() {
+        return Vec::new();
+    }
+    // CANDIDATES, from the longest word, which a completing printing carries in one of two places:
+    //   - in its PRINTED name: the records `PrintedNameIndex::trigrams` finds for any spelling of
+    //     the word with separators inside it (`unseparated_variants`);
+    //   - in its card's ORACLE name: every printed printing of the cards `name_trigram` finds for
+    //     it, which is sound on its own (see `names_containing_all_words`).
+    // A word under 3 bytes has no trigrams, and then every record is a candidate.
+    let mut vpids: Vec<u32> = Vec::new();
+    let all_records = || 0..pn.name_ids.len() as u32;
+    let mut records: Vec<u32> = Vec::new();
+    if longest.len() < 3 {
+        records.extend(all_records());
+    } else {
+        for variant in unseparated_variants(longest) {
+            match trigram_candidates(&pn.trigrams, &variant) {
+                Some(found) => records.extend(found),
+                None => records.extend(all_records()),
+            }
+        }
+        records.sort_unstable();
+        records.dedup();
+        // Verified before expanding, so a needle the index cannot narrow (a CJK word) costs a pass
+        // over the oracle names rather than over every printing.
+        for cid in name_scan_candidates(data, longest)
+            .into_iter()
+            .filter(|&cid| contains_unseparated(folded_name(&data.cards[cid as usize], &data.strings), longest))
+        {
+            vpids.extend(
+                widened_rows(data, cid as usize)
+                    .filter(|(_, p)| u32::from(p.printed_name_folded_id) != NONE_STR)
+                    .map(|(vpid, _)| vpid),
+            );
+        }
+    }
+    for rec in records {
+        let (from, to) = (u32::from(pn.offsets[rec as usize]) as usize, u32::from(pn.offsets[rec as usize + 1]) as usize);
+        vpids.extend(pn.vpids[from..to].iter().map(|&v| u32::from(v)));
+    }
+    vpids.sort_unstable();
+    vpids.dedup();
+
+    // (oracle name, printed-name length, prefer score, cid, vpid)
+    let mut by_name: Vec<(&str, usize, f32, usize, u32)> = Vec::new();
+    for vpid in vpids {
+        let printing = printing_at(data, vpid);
+        if set_code.is_some_and(|code| !printing.card_set_code.as_str().eq_ignore_ascii_case(code)) {
+            continue;
+        }
+        let Some(printed) = str_at(&data.strings, u32::from(printing.printed_name_folded_id)) else { continue };
+        let cid = card_of_vpid(data, vpid);
+        let name = folded_name(&data.cards[cid], &data.strings);
+        if !words.iter().all(|w| contains_unseparated(printed, w) || contains_unseparated(name, w))
+            || outside_containment_pool(data, cid)
+        {
+            continue;
+        }
+        // CHARACTERS, as the fallback's `length(printed_name_folded)` counts them.
+        let (length, score) = (printed.chars().count(), printing.prefer_score.as_ref().map_or(f32::MIN, |v| v.to_native()));
+        match by_name.iter_mut().find(|slot| slot.0 == name) {
+            Some(slot) if (length, -score) < (slot.1, -slot.2) => *slot = (name, length, score, cid, vpid),
+            Some(_) => {}
+            None => by_name.push((name, length, score, cid, vpid)),
+        }
+        if by_name.len() > limit {
+            break;
+        }
+    }
+    by_name.sort_unstable_by(|a, b| b.2.total_cmp(&a.2));
+    by_name.into_iter().take(limit).map(|(_, _, _, cid, vpid)| (cid, vpid)).collect()
 }
 
 /// `(J + L) / 2` for one candidate, or None when it cannot clear `floor`.
@@ -18403,7 +18595,11 @@ impl QueryEngine {
     /// The containment stage of `named?fuzzy=`, which ran as a LIKE per word. The caller asks for 2
     /// and reads the count: more than one distinct name is `ambiguous`, which Scryfall reports
     /// rather than guessing between. 1,303 us of scan against 11 us through the index.
-    #[pyo3(signature = (words, set_code=None, limit=2, fields=None))]
+    ///
+    /// `printed` asks the stage's SECOND tier instead, the printed names
+    /// (`printed_names_containing_all_words`), whose answer may be an annex printing. The caller
+    /// asks it only when the first tier answered nothing: that ordering IS the rule.
+    #[pyo3(signature = (words, set_code=None, limit=2, fields=None, printed=false))]
     fn cards_containing_all_words<'py>(
         &self,
         py: Python<'py>,
@@ -18411,18 +18607,24 @@ impl QueryEngine {
         set_code: Option<&str>,
         limit: usize,
         fields: Option<Vec<String>>,
+        printed: bool,
     ) -> PyResult<Vec<Bound<'py, PyDict>>> {
         let resolved_fields = resolve_fields(fields)?;
         let (mmap, str_cache) = self.get_mapping()?;
         // Safety: see the access_unchecked justification in query().
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
-        names_containing_all_words(data, &words, set_code, limit)
+        let found: Vec<(usize, u32)> = if printed {
+            printed_names_containing_all_words(data, &words, set_code, limit)
+        } else {
+            names_containing_all_words(data, &words, set_code, limit).into_iter().map(|(cid, pid)| (cid, pid as u32)).collect()
+        };
+        found
             .into_iter()
-            .map(|(cid, pid)| {
+            .map(|(cid, vpid)| {
                 card_to_pydict(
                     py,
                     &data.cards[cid],
-                    &data.printings[pid],
+                    printing_at(data, vpid),
                     &data.strings,
                     &data.coll_vocab,
                     &resolved_fields,

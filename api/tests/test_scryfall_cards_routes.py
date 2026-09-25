@@ -100,6 +100,63 @@ def _pool_art_series() -> dict:
     return card
 
 
+# The containment TIERS want English names and foreign printed names sharing words, in a set of
+# their own so nothing else here counts them. Modelled on the needles measured on api.scryfall.com
+# 2026-09-25: `velmora` is `austere` (an English name and another card's French name carry it),
+# `tveilan` is `inganno` (a WHOLE Italian name that an English name contains across a space), and
+# `bound goad` is `red goad` (one word from the English name, one spanning the Portuguese name's
+# separators, and no English name carrying both).
+TIER_SET_CODE = "sft"
+TIER_SENTINEL_ID = "16161616-1616-4616-8616-161616161616"
+TIER_ANNOUNCER_ID = "17171717-1717-4717-8717-171717171717"
+TIER_GUILE_IT_ID = "18181818-1818-4818-8818-181818181818"
+TIER_EGO_PT_ID = "19191919-1919-4919-8919-191919191919"
+TIER_EGO_ES_ID = "1a1a1a1a-1a1a-4a1a-8a1a-1a1a1a1a1a1a"
+TIER_FOREIGN_IDS = (
+    "1b1b1b1b-1b1b-4b1b-8b1b-1b1b1b1b1b1b",
+    TIER_GUILE_IT_ID,
+    TIER_EGO_PT_ID,
+    TIER_EGO_ES_ID,
+)
+
+
+def _tier_cards() -> list[dict]:
+    """Three English cards and four foreign printings of two of them.
+
+    The foreign rows share their English card's oracle id and are made NON-canonical after the
+    upsert, so the engine stores them in its annex, as an import does.
+    """
+    rows = [
+        # (id, English name, oracle group, collector number, lang, printed name)
+        (TIER_SENTINEL_ID, "Velmora Sentinel", 1, "1", "en", None),
+        ("1c1c1c1c-1c1c-4c1c-8c1c-1c1c1c1c1c1c", "Grim Harbinger", 2, "2", "en", None),
+        (TIER_FOREIGN_IDS[0], "Grim Harbinger", 2, "2", "fr", "Héraut de Velmora"),
+        (TIER_ANNOUNCER_ID, "Glintveil Announcer", 3, "3", "en", None),
+        ("1d1d1d1d-1d1d-4d1d-8d1d-1d1d1d1d1d1d", "Quiet Guile", 4, "4", "en", None),
+        (TIER_GUILE_IT_ID, "Quiet Guile", 4, "4", "it", "Tveilan"),
+        ("1e1e1e1e-1e1e-4e1e-8e1e-1e1e1e1e1e1e", "Moorbound Ego", 5, "5", "en", None),
+        (TIER_EGO_PT_ID, "Moorbound Ego", 5, "5", "pt", "Ego à Deriva"),
+        (TIER_EGO_ES_ID, "Moorbound Ego", 5, "5", "es", "Ego a la deriva"),
+    ]
+    cards = []
+    for card_id, name, group, number, lang, printed_name in rows:
+        card = make_raw_card(card_id=card_id, name=name)
+        card |= {
+            "object": "card",
+            "oracle_id": f"2f2f2f2f-2f2f-4f2f-8f2f-00000000000{group}",
+            "set": TIER_SET_CODE,
+            "set_name": "Scryfall Compat Tiers",
+            "collector_number": number,
+            "type_line": "Creature — Human",
+            "oracle_text": "",
+            "lang": lang,
+        }
+        if printed_name:
+            card["printed_name"] = printed_name
+        cards.append(card)
+    return cards
+
+
 # The language rule wants an address NO English printing carries and an address TWO languages
 # share, in a set of their own so nothing else here counts them. Modelled on The Hobbit Eternal,
 # which prints five of its 158 cards only in Dwarvish: on api.scryfall.com `/cards/hoc/95` is the
@@ -326,6 +383,7 @@ def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
         _pool_card(POOL_EMBLEM_ID, "2", f"{WARDEN_NAME} Emblem", "emblem", "Emblem — Hollowmere"),
         _pool_card(POOL_TOKEN_ID, "3", "Hollowmere Sentry", "token", "Token Creature — Spirit"),
         _pool_art_series(),
+        *_tier_cards(),
     )
     api_resource.admin._upsert_cards([copy.deepcopy(card) for card in cards])
     with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
@@ -341,6 +399,21 @@ def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
         cursor.execute(
             "UPDATE magic.cards SET prefer_score = %(score)s WHERE scryfall_id = %(id)s",
             {"score": 100, "id": AMBER_EN_ID},
+        )
+        # The containment tiers' foreign rows are annex printings, as default_cards leaves them. The
+        # Spanish "Ego a la deriva" outscores the Portuguese "Ego à Deriva", so the shorter name
+        # answering is the length rule and not the score.
+        cursor.execute(
+            "UPDATE magic.cards SET is_canonical = false WHERE scryfall_id = ANY(%(ids)s::uuid[])",
+            {"ids": list(TIER_FOREIGN_IDS)},
+        )
+        cursor.execute(
+            "UPDATE magic.cards SET prefer_score = %(score)s WHERE scryfall_id = %(id)s",
+            {"score": 300, "id": TIER_EGO_ES_ID},
+        )
+        cursor.execute(
+            "UPDATE magic.cards SET prefer_score = %(score)s WHERE scryfall_id = %(id)s",
+            {"score": 10, "id": TIER_EGO_PT_ID},
         )
         cursor.execute("DELETE FROM magic.rulings WHERE oracle_id = %(oracle_id)s", {"oracle_id": BOLT_ORACLE_ID})
         # Three rulings across two dates, two of them same-day: a single ruling cannot tell one
@@ -1163,6 +1236,35 @@ class TestNamed:
         resp = dispatch(by_name_paths, "/cards/named", "fuzzy=warden+wisp")
         assert resp.status == falcon.HTTP_404
         assert "type" not in payload(resp)
+
+    def test_an_english_name_outranks_a_printed_name_containing_the_words(self, by_name_paths: APIResource):
+        """Printed names are containment's SECOND tier: `velmora` is the English card alone.
+
+        Measured on api.scryfall.com 2026-09-25: `fuzzy=austere` is Austere Command, not ambiguous
+        with Dour Port-Mage's French name "Portmage austère".
+        """
+        body = payload(dispatch(by_name_paths, "/cards/named", "fuzzy=velmora"))
+        assert body["id"] == TIER_SENTINEL_ID
+
+    def test_an_english_name_containing_the_query_outranks_a_whole_printed_name(self, by_name_paths: APIResource):
+        """Even a printed name that IS the query yields to an English name that contains it.
+
+        Measured on api.scryfall.com 2026-09-25: `fuzzy=inganno` is Wedding Announcement, not Guile,
+        whose Italian printed name is "Inganno".
+        """
+        body = payload(dispatch(by_name_paths, "/cards/named", "fuzzy=tveilan"))
+        assert body["id"] == TIER_ANNOUNCER_ID
+
+    @pytest.mark.parametrize("needle", ["bound goad", "ego deriva"])
+    def test_printed_names_answer_where_no_english_name_does(self, by_name_paths: APIResource, needle):
+        """With no English name carrying the words, the printed tier answers, pooling both names.
+
+        Measured on api.scryfall.com 2026-09-25: `fuzzy=red goad` is the Portuguese Unmoored Ego.
+        Three printed names carry `ego deriva`; the SHORTEST answers, though it scores lowest.
+        """
+        body = payload(dispatch(by_name_paths, "/cards/named", urlencode({"fuzzy": needle})))
+        assert body["id"] == TIER_EGO_PT_ID
+        assert body["lang"] == "pt"
 
     def test_neither_parameter_is_a_400(self, compat_corpus: APIResource):
         resp = dispatch(compat_corpus, "/cards/named")
