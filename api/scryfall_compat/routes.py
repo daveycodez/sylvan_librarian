@@ -325,6 +325,19 @@ FUZZY_SIMILARITY_LEAD = 0.05
 _UNSEPARATED = "regexp_replace(lower(coalesce({column}, '')), '[^[:alnum:]]', '', 'g')"
 
 
+# `_EXACT_NAME_MATCH` against `%(needle)s`, spelled so that every arm is an index probe: the whole
+# name through the unseparated-name trigram index's `=`, each face through its own partial btree
+# (api/db/2026-09-26-01-face-name-lookup.sql, which repeats these expressions character for
+# character). `_EXACT_NAME_MATCH` itself, whose arms no index serves, is a sequential scan of every
+# printing: ~260ms a needle on the full all_cards corpus, where this is under 1.5ms for every needle
+# measured, a two-letter one included.
+_ORACLE_KEY_IS_NEEDLE = (
+    f"({_UNSEPARATED.format(column='card_name_folded')} = %(needle)s"
+    f" OR ({_NAME_SPLITS_IN_TWO} AND {_collated_sql(_NAME_FRONT)} = %(needle)s)"
+    f" OR ({_NAME_SPLITS_IN_TWO} AND {_collated_sql(_NAME_BACK)} = %(needle)s))"
+)
+
+
 def _unseparated(word: str) -> str:
     """Return `word` with every non-alphanumeric character removed -- `_UNSEPARATED`'s query side.
 
@@ -1154,6 +1167,9 @@ class ScryfallCardsRoutes:
         `fuzzy=blitzschlag` answers the German Lightning Bolt, `fuzzy=ego à deriva` the
         Portuguese Unmoored Ego -- while `exact=` stays scoped to oracle names.
 
+        An oracle name is `exact=`'s keys: the whole name, or EITHER FACE of a name that splits in
+        exactly two, a whole-name match first. A printed name is its whole name only.
+
         Args:
             needle: The accent-folded, lowercased query.
             base_clauses: Predicates already established (the set filter).
@@ -1165,11 +1181,22 @@ class ScryfallCardsRoutes:
         params = {**base_params, "needle": _unseparated(needle)}
         oracle = f"{_UNSEPARATED.format(column='card_name_folded')} = %(needle)s"
         printed = f"{_UNSEPARATED.format(column='printed_name_folded')} = %(needle)s"
-        clauses = [*base_clauses, f"({oracle} OR {printed})"]
-        # An ORACLE name that is the query outranks a PRINTED one that is: `exact=` is scoped to
-        # oracle names (measured -- `exact=Ego à Deriva` is a 404 there while `fuzzy=` resolves
-        # it), so when both exist the English card is the one the query names.
-        return self._best_printing(" AND ".join(clauses), params, rank_first=f"({oracle}) DESC, ")
+        # THE ORACLE KEYS ARE `exact=`'s (`_EXACT_NAME_MATCH`): the whole name, or EITHER FACE of a
+        # name that splits in exactly two. Measured on api.scryfall.com 2026-09-26: `fuzzy=fire` and
+        # `fuzzy=ice` are Fire // Ice, `tear` Wear // Tear, `boom` and `bust` Boom // Bust, `life`
+        # Life // Death and `appeal` Appeal // Authority -- face names that other names merely
+        # contain, which this stage matched only whole and so left to containment to call
+        # ambiguous. `exact=fire` answers the same card.
+        clauses = [*base_clauses, f"({_ORACLE_KEY_IS_NEEDLE} OR {printed})"]
+        # Three tiers, each ahead of prefer_score. A WHOLE oracle name outranks a FACE whatever the
+        # scores: `fuzzy=jump` is Jump m10/59 over Encouraging Aviator // Jump, `bind` Bind over
+        # the playtest Bind // Liberate, and `chaos` the front card Chaos fj25/46 over Order //
+        # Chaos, each of those out-scoring the whole-name card, the last an extra. Between two
+        # faces the score decides: `fuzzy=start` is Start // Finish over the playtest Start // Fire.
+        # And any ORACLE key outranks a PRINTED name: `exact=` is scoped to oracle names
+        # (measured -- `exact=Ego à Deriva` is a 404 there while `fuzzy=` resolves it), so when
+        # both exist the English card is the one the query names.
+        return self._best_printing(" AND ".join(clauses), params, rank_first=f"({oracle}) DESC, {_ORACLE_KEY_IS_NEEDLE} DESC, ")
 
     def _fuzzy_containment_candidates(
         self,

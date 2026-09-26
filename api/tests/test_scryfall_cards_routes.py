@@ -188,11 +188,74 @@ def _vault() -> dict:
     return card
 
 
+# THE FUZZY EXACT STAGE'S FACE NAMES, on measured cards' own names in ROT13, in a set of their own.
+# On api.scryfall.com (2026-09-26) `fuzzy=fire` and `fuzzy=ice` are Fire // Ice, although Fireball
+# contains "fire" and the playtest Start // Fire, which scores lower, carries it as a face too;
+# `fuzzy=jump` is Jump over Encouraging Aviator // Jump, and `fuzzy=chaos` the front card Chaos over
+# Order // Chaos, although both two-faced cards score higher. So a face name is a key, a whole name
+# outranks a face, and between two faces the score decides.
+FACE_SET_CODE = "sff"
+FACE_FIRE_ICE_ID = "6c6c6c6c-6c6c-4c6c-8c6c-000000000001"
+FACE_JUMP_ID = "6c6c6c6c-6c6c-4c6c-8c6c-000000000004"
+FACE_CHAOS_ID = "6c6c6c6c-6c6c-4c6c-8c6c-000000000006"
+FACE_SCORES = {
+    FACE_FIRE_ICE_ID: 300,
+    "6c6c6c6c-6c6c-4c6c-8c6c-000000000002": 200,
+    "6c6c6c6c-6c6c-4c6c-8c6c-000000000003": 100,
+    FACE_JUMP_ID: 100,
+    "6c6c6c6c-6c6c-4c6c-8c6c-000000000005": 300,
+    FACE_CHAOS_ID: 100,
+    "6c6c6c6c-6c6c-4c6c-8c6c-000000000007": 300,
+}
+
+
+def _face_name_cards() -> list[dict]:
+    """Two-faced cards whose face names are needles, with the whole-name cards they lose to."""
+    rows = [
+        ("Sver // Vpr", "split", "Instant // Instant"),  # Fire // Ice
+        ("Fgneg // Sver", "split", "Sorcery // Instant"),  # Start // Fire, a playtest card
+        ("Svernyy", "normal", "Sorcery"),  # Fireball, which contains "sver"
+        ("Whzc", "normal", "Instant"),  # Jump
+        ("Rapbhentvat Nivngbe // Whzc", "adventure", "Creature — Bird Wizard // Instant"),
+        ("Punbf", "front_card", "Card"),  # Chaos, an extra
+        ("Beqre // Punbf", "split", "Instant // Instant"),  # Order // Chaos
+    ]
+    cards = []
+    for number, (name, layout, type_line) in enumerate(rows, start=1):
+        card = make_raw_card(card_id=f"6c6c6c6c-6c6c-4c6c-8c6c-{number:012d}", name=name)
+        card |= {
+            "object": "card",
+            "oracle_id": f"6d6d6d6d-6d6d-4d6d-8d6d-{number:012d}",
+            "set": FACE_SET_CODE,
+            "set_name": "Scryfall Compat Faces",
+            "collector_number": str(number),
+            "layout": layout,
+            "type_line": type_line,
+            "oracle_text": "",
+            "lang": "en",
+        }
+        if " // " in name:
+            card["card_faces"] = [
+                {"object": "card_face", "name": face, "mana_cost": "{R}", "type_line": face_type, "oracle_text": ""}
+                for face, face_type in zip(name.split(" // "), type_line.split(" // "), strict=True)
+            ]
+            card.pop("image_uris", None)
+        cards.append(card)
+    return cards
+
+
 @pytest.fixture(name="compat_corpus", scope="module")
 def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
     """Load this module's cards and their rulings once, then hand back the resource."""
-    api_resource.admin._upsert_cards([copy.deepcopy(card) for card in (_bolt(), _bear(), _delver(), _who(), _vault())])
+    cards = (_bolt(), _bear(), _delver(), _who(), _vault(), *_face_name_cards())
+    api_resource.admin._upsert_cards([copy.deepcopy(card) for card in cards])
     with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
+        # Each whole-name card scores BELOW the two-faced card carrying its name as a face, so its
+        # answering is the tier and not the score.
+        cursor.executemany(
+            "UPDATE magic.cards SET prefer_score = %(score)s WHERE scryfall_id = %(id)s",
+            [{"score": score, "id": card_id} for card_id, score in FACE_SCORES.items()],
+        )
         cursor.execute("DELETE FROM magic.rulings WHERE oracle_id = %(oracle_id)s", {"oracle_id": BOLT_ORACLE_ID})
         # Three rulings across two dates, two of them same-day: a single ruling cannot tell one
         # ordering from another, which is how the ascending sort went unnoticed. Inserted oldest
@@ -435,6 +498,36 @@ class TestNamed:
     def test_fuzzy_miss_is_a_404(self, compat_corpus: APIResource):
         resp = dispatch(compat_corpus, "/cards/named", "fuzzy=qqqqzzzzxxxx")
         assert resp.status == falcon.HTTP_404
+
+    @pytest.mark.parametrize("needle", ["sver", "vpr", "SVER"])
+    def test_fuzzy_a_face_name_is_an_exact_key(self, by_name_paths: APIResource, needle):
+        """Either face of a two-part name answers in the exact stage, before containment is asked.
+
+        Measured on api.scryfall.com 2026-09-26: `fuzzy=fire` and `fuzzy=ice` are Fire // Ice, and
+        so are `tear` Wear // Tear, `boom` and `bust` Boom // Bust, `life` Life // Death and
+        `appeal` Appeal // Authority. Matching whole names only, the stage left `sver` to
+        containment, where Svernyy and Fgneg // Sver contain it too, and answered `ambiguous`.
+        Fgneg // Sver carries the same face and scores lower, so Sver // Vpr answers, as the playtest
+        Start // Fire loses `fuzzy=fire` there.
+        """
+        assert payload(dispatch(by_name_paths, "/cards/named", f"fuzzy={needle}"))["id"] == FACE_FIRE_ICE_ID
+
+    @pytest.mark.parametrize(("needle", "expected"), [("whzc", FACE_JUMP_ID), ("punbf", FACE_CHAOS_ID)])
+    def test_fuzzy_a_whole_name_outranks_a_face_that_scores_higher(self, by_name_paths: APIResource, needle, expected):
+        """The whole-name tier leads the score, and an extra's whole name leads a served card's face.
+
+        Measured on api.scryfall.com 2026-09-26: `fuzzy=jump` is Jump m10/59, not Encouraging
+        Aviator // Jump, and `fuzzy=chaos` the front card Chaos fj25/46, not Order // Chaos --
+        although each two-faced card has the higher prefer score, and Chaos is an extra.
+        """
+        assert payload(dispatch(by_name_paths, "/cards/named", f"fuzzy={needle}"))["id"] == expected
+
+    @pytest.mark.parametrize("needle", ["sver", "vpr", "fgneg", "whzc", "punbf", "Sver // Vpr"])
+    def test_fuzzy_and_exact_read_the_same_oracle_keys(self, by_name_paths: APIResource, needle):
+        """`exact=fire` is Fire // Ice and `exact=chaos` Chaos on api.scryfall.com too (2026-09-26)."""
+        fuzzy = payload(dispatch(by_name_paths, "/cards/named", urlencode({"fuzzy": needle})))
+        exact = payload(dispatch(by_name_paths, "/cards/named", urlencode({"exact": needle})))
+        assert fuzzy["id"] == exact["id"]
 
     def test_neither_parameter_is_a_400(self, compat_corpus: APIResource):
         resp = dispatch(compat_corpus, "/cards/named")
