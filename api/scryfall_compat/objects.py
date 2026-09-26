@@ -213,10 +213,17 @@ def _slug(name: str) -> str:
          percent-encoded per _SLUG_LITERAL.
     """
     cleaned = "".join(c for c in name.lower() if c not in _SLUG_DELETED)
-    hyphenated = re.sub(" +", "-", cleaned)
-    return "".join(
-        chr(b) if chr(b) in _SLUG_LITERAL else f"%{b:02X}" for b in hyphenated.encode("utf-8")
-    )
+    return _percent_encode_path(re.sub(" +", "-", cleaned))
+
+
+def _percent_encode_path(text: str) -> str:
+    """UTF-8 percent-encoding, uppercase hex, sparing exactly _SLUG_LITERAL.
+
+    Shared by the slug and the collector-number segment, which Scryfall encodes the same way: oarc's
+    `1★` is `/card/oarc/1%E2%98%85/...` and arn's `2†` is `/card/arn/2%E2%80%A0/...` (both live,
+    2026-09-26), where this used to serve the raw UTF-8.
+    """
+    return "".join(chr(b) if chr(b) in _SLUG_LITERAL else f"%{b:02X}" for b in text.encode("utf-8"))
 
 
 def _scryfall_uri(name: str, set_code: str, number: str, lang: str) -> str:
@@ -229,6 +236,7 @@ def _scryfall_uri(name: str, set_code: str, number: str, lang: str) -> str:
     row does not carry yet, and the English fallback is what it serves until then.
     """
     segment = f"{lang}/" if lang in _SLUG_LANG_SEGMENTS else ""
+    number = _percent_encode_path(number)
     return f"https://scryfall.com/card/{set_code}/{number}/{segment}{_slug(name)}?utm_source=api"
 
 
@@ -268,8 +276,50 @@ _REVERSIBLE_LAYOUT = "reversible_card"
 # the joined name on EVERY layout, so those two and this are deliberately not one string.
 _JOINED_SEARCH_LAYOUTS = frozenset({"double_faced_token", "reversible_card", "split"})
 
+# Top-level keys a two-image layout does not carry, because they belong to a face there -- the
+# twin of card_object.rs's `is_face_owned_key`.
+_FACE_OWNED_KEYS = frozenset(
+    {"colors", "card_back_id", "illustration_id", "power", "toughness", "loyalty", "flavor_text", "color_indicator"},
+)
 
-def _related_uris(name: str, search_name: str, multiverse_ids: list[Any], lang: str) -> dict[str, str]:
+# The glyph languages whose printings link Gatherer's UNTRANSLATED page. Measured on
+# api.scryfall.com 2026-09-26: every `lang:ph` and `lang:qya` printing that links to Gatherer at all
+# says `printed=false` (19 and 3 of them), as every English one does.
+_GATHERER_UNTRANSLATED_LANGS = frozenset({"en", "ph", "qya"})
+
+# A face's keys in Scryfall's own order -- `object` (and, on a reversible printing, the card's
+# `oracle_id`) lead, a reversible face's `cmc` follows `mana_cost`, and `image_uris` closes. Merged
+# from every face object in a 63-printing api.scryfall.com sample (2026-09-26, zero ordering
+# conflicts), plus the corpus-wide `name -> flavor_name -> mana_cost` and `flavor_text -> watermark
+# -> artist` measurements. The same list as card_object.rs's FACE_KEY_ORDER; a key it does not
+# name follows these rather than being dropped.
+_FACE_KEY_ORDER = (
+    "layout", "name", "printed_name", "flavor_name", "mana_cost", "type_line", "printed_type_line",
+    "oracle_text", "printed_text", "colors", "color_indicator", "power", "toughness", "loyalty",
+    "defense", "flavor_text", "watermark", "artist", "artist_id", "illustration_id",
+)  # fmt: skip
+
+# A related card's keys in Scryfall's order. `uri` closes it and is derived -- the card's own
+# `/cards/:id` on this host, exactly as the top-level `uri` is -- so the stored one is never read.
+_RELATED_KEY_ORDER = ("object", "id", "component", "name", "type_line")
+
+# Scryfall's order of the formats in `legalities`: fixed, and the same on every card object (63 of
+# 63 in the sample). A format this list does not know yet follows these rather than being dropped.
+_LEGALITY_ORDER = (
+    "standard", "future", "historic", "timeless", "gladiator", "pioneer", "modern", "legacy",
+    "pauper", "vintage", "penny", "commander", "oathbreaker", "standardbrawl", "brawl",
+    "competitivebrawl", "alchemy", "paupercommander", "duel", "oldschool", "premodern", "predh", "tlr",
+)  # fmt: skip
+
+
+def _related_uris(
+    name: str,
+    search_name: str,
+    multiverse_ids: list[Any],
+    lang: str,
+    *,
+    content_warning: bool = False,
+) -> dict[str, str]:
     """Scryfall's `related_uris`, pointing at the destinations directly.
 
     Scryfall wraps the TCGplayer entries in `partner.tcgplayer.com/...?u=<encoded real URL>` with
@@ -277,22 +327,25 @@ def _related_uris(name: str, search_name: str, multiverse_ids: list[Any], lang: 
     host would route another service's affiliate revenue to Scryfall.
 
     `gatherer` LEADS the object when the printing has multiverse ids, built from the FIRST id, with
-    `printed=true` for every non-English printing and `printed=false` for English -- verified
-    against the bulk corpus at 540,430 of 540,484 printings. The 54 exceptions are foreign-only
-    promos (dd2-ja, snc launch, one-ph, ltc-qya) whose Gatherer entries carry no translation; that
-    fact lives on Scryfall's side of the wire and is not derivable from the row.
+    `printed=true` for every translated printing and `printed=false` for English -- verified
+    against the bulk corpus at 540,430 of 540,484 printings. Most of the 54 exceptions were the
+    Phyrexian and Quenya printings, and they are a rule (_GATHERER_UNTRANSLATED_LANGS). What is
+    left (dd2's two ja printings) lives on Scryfall's side of the wire and is not derivable from
+    the row.
+
+    A printing with a `content_warning` keeps the gatherer link and NOTHING ELSE: Scryfall sends no
+    tcgplayer or edhrec entry for it (leg/62, Invoke Prejudice), just as it sends no
+    `purchase_uris` -- the marketplace links are what the warning withdraws.
     """
     out: dict[str, str] = {}
     first_id = multiverse_ids[0] if multiverse_ids else None
     if isinstance(first_id, int):
-        printed = "false" if lang == "en" else "true"
-        out["gatherer"] = (
-            f"https://gatherer.wizards.com/Pages/Card/Details.aspx?multiverseid={first_id}&printed={printed}"
-        )
+        printed = "false" if lang in _GATHERER_UNTRANSLATED_LANGS else "true"
+        out["gatherer"] = f"https://gatherer.wizards.com/Pages/Card/Details.aspx?multiverseid={first_id}&printed={printed}"
+    if content_warning:
+        return out
     quoted = urllib.parse.quote_plus(name)
-    out["tcgplayer_infinite_articles"] = (
-        f"https://www.tcgplayer.com/search/articles?productLineName=magic&q={quoted}"
-    )
+    out["tcgplayer_infinite_articles"] = f"https://www.tcgplayer.com/search/articles?productLineName=magic&q={quoted}"
     out["tcgplayer_infinite_decks"] = f"https://www.tcgplayer.com/search/decks?productLineName=magic&q={quoted}"
     out["edhrec"] = f"https://edhrec.com/route/?cc={urllib.parse.quote_plus(search_name)}"
     return out
@@ -355,6 +408,27 @@ def _prices(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _face_emits(key: str, value: object, *, two_image: bool) -> bool:
+    """Whether a face carries `key` -- the twin of `emits` in card_object.rs's `write_faces`.
+
+    Absent stays absent: None, "" and [] mean Scryfall did not send this face that key -- EXCEPT
+    for `mana_cost` and `oracle_text`, where "" is a value: every face of every multi-face printing
+    in the corpus carries both keys (8,620 of 8,620 transform faces, 4,356 of them with an empty
+    cost). `colors` is a face key only where the faces own their own art: every face of every
+    two-image printing carries one, empty included (Agadeem, the Undercrypt sends `"colors": []`),
+    and no face of a split, flip, adventure or prepare printing carries one at all.
+    """
+    if key == "colors":
+        return two_image and value is not None
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value != "" or key in ("mana_cost", "oracle_text")
+    if isinstance(value, list):
+        return bool(value)
+    return True
+
+
 def _faces(row: dict[str, Any], *, two_image: bool, reversible: bool) -> list[dict[str, Any]]:
     """The card's faces, with the keys the engine deliberately does not store re-added.
 
@@ -363,25 +437,26 @@ def _faces(row: dict[str, Any], *, two_image: bool, reversible: bool) -> list[di
 
     `image_uris` is gated on the LAYOUT rather than on the face count: only a two-image layout has
     a second picture, and giving one to a split or adventure face invents a URL with nothing behind
-    it. An empty `mana_cost` or `oracle_text` on a face is a VALUE, not an omission -- every face
-    of every multi-face printing in the corpus carries both keys (8,620 of 8,620 transform faces,
-    4,356 of them with an empty cost), so an empty string there is a costless back face.
+    it. Keys in Scryfall's order (_FACE_KEY_ORDER), never the row's: the engine's face dict and the
+    SQL lane's jsonb (which stores keys shortest-first) are both in some other order.
     """
     faces = row.get("card_faces") or []
     out = []
     for index, face in enumerate(faces):
         built: dict[str, Any] = {"object": "card_face"}
-        built.update(
-            {
-                key: value
-                for key, value in face.items()
-                if value is not None and (value not in ("", []) or key in ("mana_cost", "oracle_text"))
-            }
-        )
         if reversible:
-            # Both faces of a reversible printing carry the CARD's oracle_id and cmc.
-            built.setdefault("oracle_id", str(row.get("oracle_id") or ""))
-            built.setdefault("cmc", _decimal(row.get("cmc")))
+            # Both faces of a reversible printing carry the CARD's oracle_id and cmc: the id right
+            # after `object`, the cmc right after `mana_cost`.
+            built["oracle_id"] = str(row.get("oracle_id") or "")
+        for key in _FACE_KEY_ORDER:
+            if key in face and _face_emits(key, face[key], two_image=two_image):
+                built[key] = face[key]
+            if key == "mana_cost" and reversible:
+                built["cmc"] = _decimal(row.get("cmc"))
+        derived = {"object", "image_uris"} | ({"oracle_id", "cmc"} if reversible else set())
+        for key, value in face.items():
+            if key not in _FACE_KEY_ORDER and key not in derived and _face_emits(key, value, two_image=two_image):
+                built[key] = value
         if two_image:
             built["image_uris"] = _image_uris(
                 row.get("scryfall_id", ""),
@@ -390,6 +465,42 @@ def _faces(row: dict[str, Any], *, two_image: bool, reversible: bool) -> list[di
             )
         out.append(built)
     return out
+
+
+def _ordered(mapping: dict[str, Any], order: tuple[str, ...]) -> dict[str, Any]:
+    """A mapping's members in a fixed key order, then any member the order does not name."""
+    return {key: mapping[key] for key in order if key in mapping} | {
+        key: value for key, value in mapping.items() if key not in order
+    }
+
+
+def _all_parts(parts: list[Any], base_url: str) -> list[Any]:
+    """`all_parts`, each related card in Scryfall's key order and closed by its derived `uri`."""
+    out: list[Any] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            out.append(part)
+            continue
+        built = {key: part[key] for key in _RELATED_KEY_ORDER if key in part}
+        if part.get("id"):
+            built["uri"] = f"{base_url}/cards/{part['id']}"
+        built |= {key: value for key, value in part.items() if key not in _RELATED_KEY_ORDER and key != "uri"}
+        out.append(built)
+    return out
+
+
+def _image_updated_at(value: object) -> str | None:
+    """Scryfall's `image_updated_at`: ISO-8601 UTC to the second, `Z`-suffixed.
+
+    The engine carries epoch seconds (the image cache-buster is the same number), so the string is
+    rebuilt from them. A row that already holds Scryfall's own string -- the SQL lane reads the
+    residue verbatim -- passes it through.
+    """
+    if isinstance(value, str):
+        return value or None
+    if isinstance(value, int) and not isinstance(value, bool) and value:
+        return datetime.datetime.fromtimestamp(value, tz=datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return None
 
 
 def _decimal(value: float | int | None) -> float | None:
@@ -418,8 +529,8 @@ def _decimal(value: float | int | None) -> float | None:
     return None if value is None else float(value)
 
 
-def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfall.com") -> dict[str, Any]:
-    """Build the Scryfall card object for one engine row.
+def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfall.com") -> dict[str, Any]:  # noqa: C901, PLR0912, PLR0915
+    """Build the Scryfall card object for one engine row, in api.scryfall.com's own key order.
 
     BUILDS rather than unwraps a stored copy, which is the whole reason /cards/* can be served from
     the engine: an object assembled from columns is answerable from the store, while one recovered
@@ -428,8 +539,14 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
 
     Three sources, and every one of Scryfall's keys comes from exactly one: 29 stored columns, 12
     derived (every *_uri and image_uris, pure functions of the id/set/collector number/oracle id),
-    and the 33-key residue carried in card_compat_blob. Only `resource_id` is dropped — an
-    undocumented Scryfall internal with no stable meaning.
+    and the 33-key residue carried in card_compat_blob.
+
+    THE ORDER IS SCRYFALL'S (2026-09-26), the same sequence card_object.rs writes: this used to be
+    its own dict literal, and every object it built differed from api.scryfall.com's in key order
+    at the top level, on every face, on every related card and in `legalities` -- 63 of 63
+    printings in a differential against the live API. The keys the store does not hold yet
+    (`resource_id`, `artist_ids`, `preview`, `variation_of`, `attraction_lights`,
+    `content_warning`, a non-shared `card_back_id`) are absent from it.
 
     Args:
         row: An engine row carrying CARD_OBJECT_FIELDS, or a SQL row through sql_row_to_engine_row.
@@ -457,27 +574,76 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
     # front face (see _JOINED_SEARCH_LAYOUTS). `related_uris.edhrec` and every `purchase_uris`
     # fallback take THIS string; the two `tcgplayer_infinite_*` links take the joined `name`.
     search_name = name.split(" // ", 1)[0] if faces and layout not in _JOINED_SEARCH_LAYOUTS else name
+    # Scryfall's `content_warning`, when the row carries it (the SQL lane's residue does; the store
+    # does not hold it yet). True withdraws every marketplace link -- see `_related_uris`.
+    content_warning = row.get("content_warning") is True
+    is_tags = row.get("card_is_tags") or []
+    image_updated_at = row.get("image_updated_at")
 
-    card: dict[str, Any] = {
-        "object": "card",
-        "id": scryfall_id,
-        "oracle_id": oracle_id,
-        "multiverse_ids": row.get("multiverse_ids") or [],
+    card: dict[str, Any] = {"object": "card", "id": scryfall_id}
+    # A REVERSIBLE printing keeps NOTHING of the card at top level: no oracle_id, cmc or type_line,
+    # all three of which its faces carry instead (see _REVERSIBLE_LAYOUT).
+    if not reversible:
+        card["oracle_id"] = oracle_id
+    card["multiverse_ids"] = row.get("multiverse_ids") or []
+    # The marketplace and client ids, where Scryfall puts them: straight after the multiverse ids.
+    for key in ("mtgo_id", "mtgo_foil_id", "arena_id", "tcgplayer_id", "tcgplayer_etched_id", "cardmarket_id"):
+        if row.get(key) is not None:
+            card[key] = row[key]
+    card |= {
         "name": name,
         "lang": lang,
         "released_at": row.get("released_at"),
         "uri": f"{base_url}/cards/{scryfall_id}",
         "scryfall_uri": _scryfall_uri(name, set_code, number, lang),
-        "layout": row.get("card_layout") or row.get("layout"),
+        "layout": layout,
         "highres_image": bool(row.get("highres_image")),
         "image_status": row.get("image_status"),
-        "cmc": _decimal(row.get("cmc")),
-        "type_line": row.get("type_line"),
-        "colors": row.get("colors") or [],
-        "color_identity": row.get("color_identity") or [],
-        "keywords": row.get("card_keywords") or [],
+    }
+    if (updated := _image_updated_at(image_updated_at)) is not None:
+        card["image_updated_at"] = updated
+    # A multi-face card carries its faces and NOT the top-level text they replace; a single-faced
+    # one carries the text and no `card_faces`. ONE image and one cost: a split/flip/adventure/
+    # prepare printing keeps both at top level, the cost joined " // " between the faces that HAVE
+    # one, skipping the ones that do not -- flipped Erayo, whose back face carries an empty cost,
+    # is `{1}{U}` and not `{1}{U} // `. Checked against all 3,654 such printings with zero misses.
+    if not faces or not two_image:
+        card["image_uris"] = _image_uris(scryfall_id, image_updated_at)
+    if not faces:
+        card["mana_cost"] = row.get("mana_cost")
+    elif not two_image:
+        card["mana_cost"] = " // ".join(f["mana_cost"] for f in (row.get("card_faces") or []) if f.get("mana_cost"))
+    if not reversible:
+        card["cmc"] = _decimal(row.get("cmc"))
+        card["type_line"] = row.get("type_line")
+    if not faces:
+        card["oracle_text"] = row.get("oracle_text")
+    # Keys Scryfall sends only when the card has them -- and, on a two-image layout, only on a face.
+    # Where Scryfall puts `loyalty`: beside the creature stats it is the planeswalker analogue of,
+    # as the PRINTED string (`planeswalker_loyalty` is a u8 in the engine and cannot hold "X").
+    for key in ("power", "toughness", "loyalty"):
+        if row.get(key) and not (two_image and key in _FACE_OWNED_KEYS):
+            card[key] = row[key]
+    # `colors` is one of the values a two-image layout keeps on its faces alone.
+    if not two_image:
+        card["colors"] = row.get("colors") or []
+    card["color_identity"] = row.get("color_identity") or []
+    card["keywords"] = row.get("card_keywords") or []
+    if faces:
+        card["card_faces"] = faces
+    if row.get("all_parts"):
+        card["all_parts"] = _all_parts(row["all_parts"], base_url)
+    legalities = row.get("legalities")
+    if legalities is not None:
+        card["legalities"] = _ordered(legalities, _LEGALITY_ORDER) if isinstance(legalities, dict) else legalities
+    card |= {
         "games": row.get("games") or [],
-        "reserved": "reserved" in (row.get("card_is_tags") or []),
+        # Tags rather than columns: both are properties of the card, stored in the is-tag set.
+        "reserved": "reserved" in is_tags,
+        "game_changer": "gamechanger" in is_tags,
+        # Deprecated by `finishes`, and still on every object api.scryfall.com serves.
+        "foil": bool(row.get("foil")),
+        "nonfoil": bool(row.get("nonfoil")),
         "finishes": row.get("finishes") or [],
         "oversized": bool(row.get("oversized")),
         "promo": bool(row.get("promo")),
@@ -495,84 +661,48 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
         "collector_number": number,
         "digital": bool(row.get("digital")),
         "rarity": row.get("rarity"),
-        "card_back_id": CARD_BACK_ID,
-        "artist": row.get("artist"),
-        "illustration_id": str(row["illustration_id"]) if row.get("illustration_id") else None,
-        "border_color": row.get("border_color"),
+    }
+    if row.get("watermark"):
+        card["watermark"] = row["watermark"]
+    if row.get("flavor_text") and not two_image:
+        card["flavor_text"] = row["flavor_text"]
+    # A two-image layout keeps `card_back_id` and `illustration_id` on its FACES alone -- there is
+    # no shared back and no card-level illustration when the card is two pictures -- and Scryfall
+    # omits the top-level keys entirely rather than nulling them.
+    if not two_image:
+        card["card_back_id"] = CARD_BACK_ID
+    card["artist"] = row.get("artist")
+    if not two_image:
+        card["illustration_id"] = str(row["illustration_id"]) if row.get("illustration_id") else None
+    card["border_color"] = row.get("border_color")
+    if row.get("frame"):
+        card["frame"] = row["frame"]
+    if row.get("frame_effects"):
+        card["frame_effects"] = row["frame_effects"]
+    if row.get("security_stamp"):
+        card["security_stamp"] = row["security_stamp"]
+    card |= {
         "full_art": bool(row.get("full_art")),
         "textless": bool(row.get("textless")),
         "booster": bool(row.get("booster")),
         "story_spotlight": bool(row.get("story_spotlight")),
-        "prices": _prices(row),
-        "related_uris": _related_uris(name, search_name, row.get("multiverse_ids") or [], lang),
     }
+    if row.get("promo_types"):
+        card["promo_types"] = row["promo_types"]
+    for key in ("edhrec_rank", "penny_rank"):
+        if row.get(key) is not None:
+            card[key] = row[key]
+    card["prices"] = _prices(row)
+    card["related_uris"] = _related_uris(name, search_name, row.get("multiverse_ids") or [], lang, content_warning=content_warning)
     # A printing NO MARKETPLACE SELLS omits the key rather than carrying three dead links. The
     # rule is the marketplaces, not `digital` -- measured 2026-08-16: prm/80925 (games ["mtgo"],
     # digital true) HAS purchase_uris and ymid/59 and khm/A-198 (games ["arena"], digital true) do
     # not, so it is "paper or mtgo". An ABSENT `games` list emits: the omission is a positive claim
-    # about the printing rather than a gap.
+    # about the printing rather than a gap. A `content_warning` printing is sold nowhere either, as
+    # far as Scryfall's links go.
     games = row.get("games")
-    if games is None or not games or any(g in ("paper", "mtgo") for g in games):
+    if not content_warning and (games is None or not games or any(g in ("paper", "mtgo") for g in games)):
         card["purchase_uris"] = _purchase_uris(row, search_name)
-
-    # A two-image layout keeps `colors`, `card_back_id` and `illustration_id` on its FACES alone --
-    # there is no shared back and no card-level illustration when the card is two pictures --
-    # and Scryfall omits the top-level keys entirely rather than nulling them.
-    if two_image:
-        for key in ("colors", "card_back_id", "illustration_id"):
-            card.pop(key, None)
-    # ...and a reversible printing drops the three the other two-image layouts keep.
-    if reversible:
-        for key in ("oracle_id", "cmc", "type_line"):
-            card.pop(key, None)
-
-    # A multi-face card carries its faces and NOT the top-level text they replace; a single-faced
-    # one carries the text and no `card_faces`. Which keys sit at top level varies by LAYOUT, which
-    # is why this is a branch rather than a fixed key set.
-    if faces:
-        card["card_faces"] = faces
-        if not two_image:
-            # ONE image and one cost: a split/flip/adventure/prepare printing keeps both at top
-            # level, the cost joined " // " between the faces that HAVE one, skipping the ones
-            # that do not -- flipped Erayo, whose back face carries an empty cost, is `{1}{U}` and
-            # not `{1}{U} // `. Checked against all 3,654 such printings with zero misses.
-            card["mana_cost"] = " // ".join(
-                f["mana_cost"] for f in (row.get("card_faces") or []) if f.get("mana_cost")
-            )
-            card["image_uris"] = _image_uris(scryfall_id, row.get("image_updated_at"))
-    else:
-        card["mana_cost"] = row.get("mana_cost")
-        card["oracle_text"] = row.get("oracle_text")
-        card["image_uris"] = _image_uris(scryfall_id, row.get("image_updated_at"))
-
-    # Keys Scryfall sends only when the card has them. Emitting null instead would differ from
-    # Scryfall on every card that lacks them, which for most of these is most cards.
-    for key, value in (
-        ("power", row.get("power")),
-        ("toughness", row.get("toughness")),
-        # Where Scryfall puts it, beside the creature stats it is the planeswalker analogue of. The
-        # PRINTED string: `planeswalker_loyalty` is a u8 in the engine and cannot hold "X" or "1+*".
-        ("loyalty", row.get("loyalty")),
-        ("flavor_text", row.get("flavor_text") or None),
-        ("watermark", row.get("watermark")),
-        ("frame", row.get("frame")),
-        ("edhrec_rank", row.get("edhrec_rank")),
-        ("penny_rank", row.get("penny_rank")),
-        ("arena_id", row.get("arena_id")),
-        ("mtgo_id", row.get("mtgo_id")),
-        ("mtgo_foil_id", row.get("mtgo_foil_id")),
-        ("tcgplayer_id", row.get("tcgplayer_id")),
-        ("tcgplayer_etched_id", row.get("tcgplayer_etched_id")),
-        ("cardmarket_id", row.get("cardmarket_id")),
-        ("security_stamp", row.get("security_stamp")),
-        ("promo_types", row.get("promo_types") or None),
-        ("frame_effects", row.get("frame_effects") or None),
-        ("all_parts", row.get("all_parts") or None),
-        ("legalities", row.get("legalities")),
-    ):
-        if value is not None:
-            card[key] = value
-
     return card
 
 

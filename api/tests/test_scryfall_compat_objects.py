@@ -332,12 +332,246 @@ class TestToScryfallCard:
         assert all(f["oracle_id"] == "11111111-2222-3333-4444-555555555555" for f in card["card_faces"])
         assert all(f["cmc"] == 1.0 for f in card["card_faces"])
 
-    def test_related_cards_pass_through_when_present(self):
-        parts = [{"object": "related_card", "id": "x", "component": "token", "name": "Goblin", "type_line": "Token"}]
-        assert to_scryfall_card(row(all_parts=parts))["all_parts"] == parts
+    def test_related_cards_close_with_their_derived_uri(self):
+        """Each related card in Scryfall's key order, closed by its own `uri` on this host.
+
+        Derived like the top-level `uri`, and never the stored copy: the SQL lane's residue holds
+        Scryfall's, which names api.scryfall.com, and its jsonb reorders the keys.
+        """
+        stored = {
+            "type_line": "Token",
+            "uri": "https://api.scryfall.com/cards/x",
+            "name": "Goblin",
+            "id": "x",
+            "component": "token",
+            "object": "related_card",
+        }
+        parts = to_scryfall_card(row(all_parts=[stored]), base_url="https://example.test")["all_parts"]
+        assert json.dumps(parts) == json.dumps(
+            [
+                {
+                    "object": "related_card",
+                    "id": "x",
+                    "component": "token",
+                    "name": "Goblin",
+                    "type_line": "Token",
+                    "uri": "https://example.test/cards/x",
+                }
+            ]
+        )
 
     def test_card_back_id_is_the_shared_constant(self):
         assert to_scryfall_card(row())["card_back_id"] == "0aeebaf5-8c7d-4636-9e82-8c27447861f7"
+
+
+class TestScryfallKeyOrderAndKeys:
+    """api.scryfall.com's key order at every level, and the keys it sends that this used to drop.
+
+    The sequences are read off Scryfall's own objects (2026-09-26), never off either writer; the
+    parity fixture holds eight of those objects whole. `card_object.rs` asserts the same cases.
+    """
+
+    # Lightning Bolt msc/806's top level as api.scryfall.com served it, minus the three keys this
+    # branch's store does not hold yet (`resource_id`, `artist_ids`, `preview`).
+    MSC_806_KEYS = (
+        "object", "id", "oracle_id", "multiverse_ids", "mtgo_id", "arena_id", "tcgplayer_id", "cardmarket_id",
+        "name", "lang", "released_at", "uri", "scryfall_uri", "layout", "highres_image", "image_status",
+        "image_updated_at", "image_uris", "mana_cost", "cmc", "type_line", "oracle_text", "colors",
+        "color_identity", "keywords", "all_parts", "legalities", "games", "reserved", "game_changer", "foil",
+        "nonfoil", "finishes", "oversized", "promo", "reprint", "variation", "set_id", "set", "set_name",
+        "set_type", "set_uri", "set_search_uri", "scryfall_set_uri", "rulings_uri", "prints_search_uri",
+        "collector_number", "digital", "rarity", "flavor_text", "card_back_id", "artist", "illustration_id",
+        "border_color", "frame", "full_art", "textless", "booster", "story_spotlight", "promo_types", "edhrec_rank",
+        "prices", "related_uris", "purchase_uris",
+    )  # fmt: skip
+
+    def test_a_single_faced_card_carries_scryfalls_keys_in_scryfalls_order(self):
+        # The row alphabetical, as the engine's own map and the SQL lane's jsonb both hand it over.
+        engine_row = dict(
+            sorted(
+                row(
+                    arena_id=2,
+                    multiverse_ids=[],
+                    highres_image=True,
+                    image_status="highres_scan",
+                    card_keywords=[],
+                    all_parts=[{"object": "related_card", "id": "x", "component": "combo_piece", "name": "n", "type_line": "t"}],
+                    legalities={"vintage": "legal", "standard": "not_legal", "modern": "legal"},
+                    games=["paper"],
+                    card_is_tags=["gamechanger"],
+                    finishes=["nonfoil"],
+                    flavor_text="Zap.",
+                    artist="Milivoj Ćeran",
+                    illustration_id="22222222-0000-0000-0000-000000000002",
+                    border_color="black",
+                    frame="2015",
+                    promo_types=["universesbeyond"],
+                    edhrec_rank=157,
+                ).items()
+            )
+        )
+        card = to_scryfall_card(engine_row)
+        assert list(card) == list(self.MSC_806_KEYS)
+        assert list(card["legalities"]) == ["standard", "modern", "vintage"]
+
+    @pytest.mark.parametrize(
+        ("before", "after"),
+        [
+            ("multiverse_ids", "mtgo_id"),
+            ("mtgo_id", "mtgo_foil_id"),
+            ("mtgo_foil_id", "arena_id"),
+            ("arena_id", "tcgplayer_id"),
+            ("tcgplayer_id", "tcgplayer_etched_id"),
+            ("tcgplayer_etched_id", "cardmarket_id"),
+            ("cardmarket_id", "name"),
+            ("oracle_text", "power"),
+            ("power", "toughness"),
+            ("toughness", "colors"),
+            ("rarity", "watermark"),
+            ("watermark", "flavor_text"),
+            ("flavor_text", "card_back_id"),
+            ("frame", "frame_effects"),
+            ("frame_effects", "security_stamp"),
+            ("security_stamp", "full_art"),
+            ("edhrec_rank", "penny_rank"),
+            ("penny_rank", "prices"),
+        ],
+    )
+    def test_the_conditional_keys_take_scryfalls_positions(self, before: str, after: str):
+        keys = list(
+            to_scryfall_card(
+                row(
+                    multiverse_ids=[1],
+                    mtgo_foil_id=2,
+                    arena_id=3,
+                    tcgplayer_etched_id=5,
+                    power="1",
+                    toughness="1",
+                    watermark="set",
+                    flavor_text="x",
+                    frame="2015",
+                    frame_effects=["legendary"],
+                    security_stamp="oval",
+                    edhrec_rank=7,
+                    penny_rank=8,
+                )
+            )
+        )
+        assert keys.index(after) == keys.index(before) + 1, keys
+
+    def test_faces_carry_scryfalls_key_order(self):
+        """Delver of Secrets inr/60's front face on api.scryfall.com, minus the `artist_id` not stored."""
+        face = {
+            "artist": "Nils Hamm",
+            "colors": ["U"],
+            "color_indicator": [],
+            "illustration_id": "1c2fee9b-89ea-4ab1-a751-451c3cd65a88",
+            "mana_cost": "{U}",
+            "name": "Delver of Secrets",
+            "oracle_text": "Upkeep.",
+            "power": "1",
+            "toughness": "1",
+            "type_line": "Creature — Human Wizard",
+        }
+        card = to_scryfall_card(row(layout="transform", card_faces=[face, {"name": "Insectile Aberration", "mana_cost": ""}]))
+        assert list(card["card_faces"][0]) == [
+            "object",
+            "name",
+            "mana_cost",
+            "type_line",
+            "oracle_text",
+            "colors",
+            "power",
+            "toughness",
+            "artist",
+            "illustration_id",
+            "image_uris",
+        ]
+
+    def test_a_reversible_face_carries_cmc_after_its_mana_cost(self):
+        """Zndrsplt sld/379's faces: the card's oracle_id after `object`, its cmc after `mana_cost`."""
+        # The SQL lane's faces carry Scryfall's own oracle_id and cmc; the card's are written instead.
+        face = {"type_line": "Land", "oracle_id": "stale", "name": "Temple Garden", "mana_cost": "", "layout": "normal", "cmc": 9.0}
+        card = to_scryfall_card(row(layout="reversible_card", cmc=0, card_faces=[face, dict(face)]))
+        built = card["card_faces"][0]
+        assert list(built)[:7] == ["object", "oracle_id", "layout", "name", "mana_cost", "cmc", "type_line"]
+        assert (built["oracle_id"], built["cmc"]) == ("11111111-2222-3333-4444-555555555555", 0.0)
+
+    def test_a_split_face_carries_no_colors_and_a_two_image_face_always_does(self):
+        """`card_object.rs` gates face `colors` on the layout; this used to pass them through as they came."""
+        split = to_scryfall_card(
+            row(layout="split", card_faces=[{"name": "Fire", "colors": ["R"]}, {"name": "Ice", "colors": ["U"]}])
+        )
+        assert all("colors" not in face for face in split["card_faces"])
+        mdfc = to_scryfall_card(row(layout="modal_dfc", card_faces=[{"name": "a", "colors": ["B"]}, {"name": "b", "colors": []}]))
+        assert [face["colors"] for face in mdfc["card_faces"]] == [["B"], []]
+
+    def test_a_two_image_card_keeps_its_stats_and_flavor_on_its_faces(self):
+        """The engine overlays the front face's stats onto the row; Scryfall sends them on the faces alone."""
+        card = to_scryfall_card(
+            row(layout="transform", power="1", toughness="1", flavor_text="x", card_faces=[{"name": "a"}, {"name": "b"}])
+        )
+        for key in ("power", "toughness", "flavor_text"):
+            assert key not in card
+
+    def test_an_unknown_format_follows_scryfalls_known_ones(self):
+        card = to_scryfall_card(row(legalities={"aaa_new": "legal", "vintage": "legal", "standard": "legal"}))
+        assert list(card["legalities"]) == ["standard", "vintage", "aaa_new"]
+
+    def test_game_changer_foil_and_nonfoil_are_always_written(self):
+        plain = to_scryfall_card(row())
+        assert (plain["game_changer"], plain["foil"], plain["nonfoil"]) == (False, False, False)
+        tagged = to_scryfall_card(row(card_is_tags=["gamechanger"], foil=True, nonfoil=True))
+        assert (tagged["game_changer"], tagged["foil"], tagged["nonfoil"]) == (True, True, True)
+        assert tagged["reserved"] is False
+
+    @pytest.mark.parametrize(
+        ("stored", "expected"),
+        [
+            (1783903008, "2026-07-13T00:36:48Z"),
+            (951782400, "2000-02-29T00:00:00Z"),
+            (1704067199, "2023-12-31T23:59:59Z"),
+            # The SQL lane reads the residue verbatim, which already holds Scryfall's string.
+            ("2026-07-13T01:47:06Z", "2026-07-13T01:47:06Z"),
+        ],
+    )
+    def test_image_updated_at_renders_iso8601_utc(self, stored: object, expected: str):
+        assert to_scryfall_card(row(image_updated_at=stored))["image_updated_at"] == expected
+
+    def test_no_stored_image_updated_at_omits_the_key(self):
+        assert "image_updated_at" not in to_scryfall_card(row(image_updated_at=None))
+
+    @pytest.mark.parametrize(
+        ("set_code", "number", "name", "path"),
+        [
+            ("oarc", "1★", "All in Good Time", "oarc/1%E2%98%85/all-in-good-time"),
+            ("arn", "2†", "Army of Allah", "arn/2%E2%80%A0/army-of-allah"),
+            ("unf", "200a", "x", "unf/200a/x"),
+        ],
+    )
+    def test_the_collector_number_is_percent_encoded(self, set_code: str, number: str, name: str, path: str):
+        card = to_scryfall_card(row(set_code=set_code, collector_number=number, name=name))
+        assert card["scryfall_uri"] == f"https://scryfall.com/card/{path}?utm_source=api"
+
+    @pytest.mark.parametrize(
+        ("lang", "printed"), [("ph", "false"), ("qya", "false"), ("en", "false"), ("ja", "true"), ("de", "true")]
+    )
+    def test_glyph_languages_link_gatherer_untranslated(self, lang: str, printed: str):
+        card = to_scryfall_card(row(lang=lang, multiverse_ids=[604957]))
+        assert card["related_uris"]["gatherer"] == (
+            f"https://gatherer.wizards.com/Pages/Card/Details.aspx?multiverseid=604957&printed={printed}"
+        )
+
+    def test_a_content_warning_withdraws_the_marketplace_links(self):
+        """leg/62, Invoke Prejudice: gatherer and nothing else, and no purchase_uris."""
+        warned = to_scryfall_card(row(multiverse_ids=[485302], games=["paper"], content_warning=True))
+        assert warned["related_uris"] == {
+            "gatherer": "https://gatherer.wizards.com/Pages/Card/Details.aspx?multiverseid=485302&printed=false"
+        }
+        assert "purchase_uris" not in warned
+        plain = to_scryfall_card(row(multiverse_ids=[485302], games=["paper"], content_warning=False))
+        assert "edhrec" in plain["related_uris"]
+        assert "purchase_uris" in plain
 
 
 class TestEnvelopes:
@@ -524,27 +758,43 @@ class TestCardToText:
 _PARITY_FIXTURE = pathlib.Path(__file__).resolve().parents[1] / "scryfall_compat" / "fixtures" / "card_object_parity.json"
 
 
-def _parity_cases() -> list[tuple[str, dict, dict]]:
+def _wire(obj: object) -> str:
+    """The compact bytes both writers emit: no whitespace, UTF-8 unescaped, keys in dict order."""
+    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def _parity_cases() -> list[object]:
     doc = json.loads(_PARITY_FIXTURE.read_text(encoding="utf-8"))
-    return [(c["case"], c["row"], c["expected"]) for c in doc["cases"]]
+    return [
+        pytest.param(c["case"], c["row"], c["expected"], c.get("base_url", doc["base_url"]), id=c["case"]) for c in doc["cases"]
+    ]
 
 
 class TestCardObjectParityWithTheRustBuilder:
-    """The SAME cases `card_engine/src/card_object.rs` asserts, from the same file.
+    """The SAME cases `card_engine/src/card_object.rs` asserts, from the same file -- to the BYTE.
 
     Two implementations build this object -- `objects.py` for the SQL path, `card_object.rs` for
     the engine path -- and both answer `/cards/*`, so a difference between them is one a client can
     see. Nothing else compares them: the Python suite and the Rust suite are separate CI jobs that
     never meet. A shared fixture is what makes each job fail on its own drift.
 
-    Values and key PRESENCE, not key order: both sides compare parsed objects. The wire order is
-    pinned by the position assertions in card_object.rs.
+    Key ORDER included, at every level: `json` keeps the fixture's order, and the compact bytes
+    must match. Eight of the cases are api.scryfall.com's own objects (see the fixture's
+    `_comment`), so the order both writers are held to is Scryfall's rather than either writer's.
     """
 
     def test_the_fixture_carries_cases(self):
         assert _parity_cases(), "the parity fixture must not be empty"
 
-    @pytest.mark.parametrize(("case", "row", "expected"), _parity_cases(), ids=lambda v: v if isinstance(v, str) else "")
-    def test_the_card_object_matches_the_rust_builder(self, case: str, row: dict, expected: dict):
+    def test_the_fixture_carries_scryfalls_own_objects(self):
         doc = json.loads(_PARITY_FIXTURE.read_text(encoding="utf-8"))
-        assert to_scryfall_card(dict(row), base_url=doc["base_url"]) == expected, case
+        sourced = [c for c in doc["cases"] if "scryfall" in c]
+        assert len(sourced) >= 8
+        for case in sourced:
+            assert case["expected"]["uri"] == case["scryfall"]["uri"], case["case"]
+
+    @pytest.mark.parametrize(("case", "row", "expected", "base_url"), _parity_cases())
+    def test_the_card_object_matches_the_rust_builder(self, case: str, row: dict, expected: dict, base_url: str):
+        card = to_scryfall_card(dict(row), base_url=base_url)
+        assert card == expected, case
+        assert _wire(card) == _wire(expected), f"{case}: same values, different key order"
