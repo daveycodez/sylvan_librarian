@@ -82,9 +82,16 @@ logger = logging.getLogger(__name__)
 _CARD_COLUMNS = (
     "scryfall_id, oracle_id, card_name, card_layout, mana_cost_text, cmc, type_line, oracle_text, "
     "creature_power_text AS power, creature_toughness_text AS toughness, card_colors, "
+    # The printed-language triple and produced_mana: columns the card object reads on this branch,
+    # none of them in card_compat_blob. A foreign printing served from SQL had no printed name, and
+    # so the English slug in its scryfall_uri; a land had no produced_mana.
+    "printed_name, printed_type_line, printed_text, produced_mana, "
     "card_color_identity, card_keywords, card_set_code, set_name, collector_number, "
     "card_rarity_int, flavor_text, card_artist AS artist, illustration_id, released_at, "
     "card_legalities, card_border, card_watermark, card_frame_data, card_is_tags, "
+    # Stored in columns, so absent from card_compat_blob, and read by the engine from these same
+    # columns: without them every SQL-lane card had null prices and no loyalty or edhrec_rank.
+    "price_usd, price_eur, price_tix, edhrec_rank, planeswalker_loyalty_text AS loyalty, "
     "card_compat_blob, card_faces"
 )
 

@@ -48,6 +48,9 @@ ENGINE_COLUMNS: list[str] = [
     "card_border",
     "card_color_identity",
     "card_colors",
+    # Scryfall's top-level `color_indicator` (Dryad Arbor's green dot), which the loader reads into
+    # OracleCard.color_indicator and the card object emits: without it every card read as having none.
+    "color_indicator",
     "card_compat_blob",
     "card_faces",
     "card_frame_data",

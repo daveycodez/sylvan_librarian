@@ -120,7 +120,109 @@ _SQL_COLUMN_ALIASES = {
     "card_border": "border_color",
 }
 
-_RARITY_BY_INT = {0: "common", 1: "uncommon", 2: "rare", 3: "mythic", 4: "special", 5: "bonus"}
+# card_rarity_int -> Scryfall's rarity: the inverse of card_processing.rarity_text_to_int, which is
+# what wrote the column, and the same table as the engine's RARITY_NAMES. It had 3 and 4 swapped, so
+# the SQL lane served every mythic as "special" and every special as "mythic".
+_RARITY_BY_INT = {0: "common", 1: "uncommon", 2: "rare", 3: "special", 4: "mythic", 5: "bonus"}
+
+# card_frame_data key -> Scryfall's `frame`. The column holds the frame version title-cased beside the
+# frame effects (`{"2015": true, "Legendary": true}`), and no column holds `frame` itself; the
+# engine's `frame` field reads it back through this same table (`frame_of` in card_engine/src/lib.rs).
+_FRAME_BY_FRAME_DATA_KEY = {"1993": "1993", "1997": "1997", "2003": "2003", "2015": "2015", "Future": "future"}
+
+# The members of card_compat_blob's `prices` that no column holds -> the engine's field for each.
+# `usd`, `eur` and `tix` are columns (price_usd, price_eur, price_tix) and are selected as such.
+_BLOB_PRICE_FIELDS = {"usd_foil": "price_usd_foil", "usd_etched": "price_usd_etched", "eur_foil": "price_eur_foil"}
+
+# The keys of an engine face, in the order the engine writes them (`faces_to_pylist` in
+# card_engine/src/lib.rs). The stored face is jsonb, which keeps neither Scryfall's key order nor
+# the engine's, and carries `artist_id`, which the engine does not emit.
+_ENGINE_FACE_KEYS = (
+    "name", "mana_cost", "type_line", "oracle_text", "power", "toughness", "loyalty", "defense",
+    "colors", "color_indicator", "artist", "illustration_id", "flavor_text", "flavor_name",
+    "printed_name", "printed_type_line", "printed_text",
+)  # fmt: skip
+
+# Face keys the engine writes only when the face has one; every other key it writes on every face.
+_ENGINE_FACE_OPTIONAL_KEYS = frozenset({"flavor_name", "printed_name", "printed_type_line", "printed_text"})
+
+# The keys of an engine `all_parts` entry, in its order (the `all_parts` arm of FIELD_TABLE). The
+# stored entry also carries Scryfall's `uri`, which the engine does not keep.
+_ENGINE_PART_KEYS = ("object", "id", "component", "name", "type_line")
+
+
+def _price_dollars(value: object) -> float | None:
+    """One `prices` member as the engine reads it: whole cents, and a zero is no price.
+
+    Scryfall sends these as decimal STRINGS ("60.00"); the engine parses them into a NonZeroU32 of
+    cents (`opt_price_cents`), so "0.00" and an unparseable value both read as absent.
+    """
+    try:
+        cents = round(float(str(value)) * 100)
+    except (TypeError, ValueError):
+        return None
+    return cents / 100 if cents > 0 else None
+
+
+def _epoch_seconds(value: object) -> int | None:
+    """`image_updated_at` as the engine carries it: epoch seconds, not Scryfall's ISO-8601 string.
+
+    The value is the cache-buster on every image URL (`.../id.jpg?1783903008`), and the engine
+    converts it at load (`opt_image_updated_at`); passed through as the string, every SQL-lane image
+    URL ended `?2026-07-13T00:36:48Z` where the engine's and Scryfall's end `?1783903008`. The same
+    narrow shape the engine accepts, `YYYY-MM-DDTHH:MM:SS` with an optional `Z`; anything else is
+    absent, and an already-numeric value is kept.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value or None
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.datetime.strptime(f"{value.removesuffix('Z')}+0000", "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:
+        return None
+    return int(parsed.timestamp()) or None
+
+
+def _engine_face(face: dict[str, Any]) -> dict[str, Any]:
+    """One stored face in the shape the engine emits it: its keys, its order, its sorted colours."""
+    out = {key: face.get(key) for key in _ENGINE_FACE_KEYS if key in face or key not in _ENGINE_FACE_OPTIONAL_KEYS}
+    out["colors"] = sorted(face.get("colors") or [])
+    out["color_indicator"] = sorted(face.get("color_indicator") or [])
+    return out
+
+
+def _as_the_engine_emits(row: dict[str, Any], blob: dict[str, Any]) -> dict[str, Any]:
+    """The fields the engine derives at load, or emits in its own order, derived the same way.
+
+    Each one was missing or different on every card the SQL lane served: the three blob-only price
+    variants, `frame`, the epoch `image_updated_at` every image URL carries, and the order of the
+    faces' keys, the legalities, each related card's keys and the colour indicator -- jsonb keeps an
+    object's keys ordered by length, not as written, and the engine emits legalities alphabetically
+    (`format_order`).
+
+    Args:
+        row: The `magic.cards` row.
+        blob: Its card_compat_blob.
+
+    Returns:
+        The engine's value for each of those fields.
+    """
+    prices = blob.get("prices") or {}
+    out: dict[str, Any] = {field: _price_dollars(prices.get(member)) for member, field in _BLOB_PRICE_FIELDS.items()}
+    frame_data = row.get("card_frame_data") or {}
+    out["frame"] = next((frame for key, frame in _FRAME_BY_FRAME_DATA_KEY.items() if key in frame_data), None)
+    out["image_updated_at"] = _epoch_seconds(blob.get("image_updated_at"))
+    if row.get("card_faces"):
+        out["card_faces"] = [_engine_face(face) for face in row["card_faces"]]
+    if isinstance(row.get("card_legalities"), dict):
+        out["legalities"] = dict(sorted(row["card_legalities"].items()))
+    if blob.get("all_parts"):
+        out["all_parts"] = [{key: part.get(key) for key in _ENGINE_PART_KEYS} for part in blob["all_parts"]]
+    # The blob keeps Scryfall's order; the engine's colour lists are alphabetical (`identity_letters`).
+    if blob.get("color_indicator"):
+        out["color_indicator"] = sorted(blob["color_indicator"])
+    return out
 
 
 def sql_row_to_engine_row(row: dict[str, Any]) -> dict[str, Any]:
@@ -157,7 +259,7 @@ def sql_row_to_engine_row(row: dict[str, Any]) -> dict[str, Any]:
     for target, column in (("colors", "card_colors"), ("color_identity", "card_color_identity")):
         value = row.get(column)
         out[target] = sorted(value) if isinstance(value, dict) else []
-    for key in ("card_keywords", "card_is_tags"):
+    for key in ("card_keywords", "card_is_tags", "produced_mana"):
         if isinstance(row.get(key), dict):
             out[key] = sorted(row[key])
 
@@ -165,7 +267,9 @@ def sql_row_to_engine_row(row: dict[str, Any]) -> dict[str, Any]:
         out["rarity"] = _RARITY_BY_INT.get(row["card_rarity_int"])
 
     # The residue is one column here and individual fields on an engine row.
-    out.update(row.get("card_compat_blob") or {})
+    blob = row.get("card_compat_blob") or {}
+    out.update(blob)
+    out.update(_as_the_engine_emits(row, blob))
     return out
 
 
