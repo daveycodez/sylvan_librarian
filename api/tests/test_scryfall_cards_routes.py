@@ -890,7 +890,7 @@ class TestSearch:
 
     @pytest.mark.parametrize(
         "query",
-        ["t:creature", "o:damage", 'name:"compat"', "cn:1", "border:black", "is:funny", '!"Compat Bolt"'],
+        ["t:creature", "o:damage", 'name:"compat"', "cn:1", "border:black", "is:convention", '!"Compat Bolt"'],
         ids=["type", "oracle", "name-literal", "collector-number", "border", "is-other", "exact-name"],
     )
     def test_a_non_trigger_term_leaves_the_flag_alone(self, compat_corpus: APIResource, monkeypatch, query):
@@ -1274,7 +1274,7 @@ class TestExtrasTriggers:
             "year:1993",
             "border:black",
             "frame:2003",
-            "is:funny",
+            "is:convention",
             'name:"lightning"',
             "name:lightning",
             '!"Lightning Bolt"',
