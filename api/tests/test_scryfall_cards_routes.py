@@ -2494,6 +2494,83 @@ class TestAllCards:
         assert body["has_more"] is True
         assert body["next_page"] == "http://falconframework.org/cards?page=2"
 
+    # A Japanese printing of Compat Bolt, inserted by one test and removed again.
+    FOREIGN_BOLT_ID = "9f9f9f9f-1111-4111-8111-9f9f9f9f9f9f"
+
+    @staticmethod
+    def _every_page(api: APIResource) -> tuple[list[dict], dict]:
+        """Walk the listing from page 1 by `has_more`; return every card and the last page."""
+        listed: list[dict] = []
+        page = 1
+        while True:
+            body = payload(dispatch(api, "/cards", f"page={page}"))
+            listed.extend(body["data"])
+            if not body["has_more"]:
+                return listed, body
+            page += 1
+
+    def test_a_listed_card_carries_its_fields(self, compat_corpus: APIResource):
+        """The cards in the listing are whole cards, not empty objects in a valid envelope.
+
+        The listing passed `magic.cards` rows straight to `to_scryfall_card`, which reads the
+        engine's field names (`name`, `set_code`, `mana_cost`), not the table's (`card_name`,
+        `card_set_code`, `mana_cost_text`). Every card came out with an empty name and set, and
+        without its mana cost, rarity, legalities, prices or marketplace ids. The tests above check
+        only the envelope, so they passed.
+        """
+        listed, _ = self._every_page(compat_corpus)
+        owned = [card for card in listed if card.get("id") in {BOLT_ID, BEAR_ID, DELVER_ID, WHO_ID, VAULT_ID}]
+        assert len(owned) == 5
+        assert all(card["name"] and card["set"] and card["collector_number"] for card in owned)
+        bolt = next(card for card in listed if card.get("id") == BOLT_ID)
+        assert (bolt["name"], bolt["set"], bolt["collector_number"]) == ("Compat Bolt", SET_CODE, "1")
+        assert (bolt["oracle_id"], bolt["mana_cost"], bolt["multiverse_ids"]) == (BOLT_ORACLE_ID, "{R}", [900001])
+        assert bolt["prices"]["usd"] == "0.10"
+        assert bolt["image_uris"]["normal"].endswith(f"/{BOLT_ID}.jpg")
+        delver = next(card for card in listed if card.get("id") == DELVER_ID)
+        assert [face["name"] for face in delver["card_faces"]] == ["Compat Delver", "Compat Aberration"]
+
+    def test_a_listed_card_is_the_object_its_id_answers(self, by_name_paths: APIResource, monkeypatch):
+        """Each card on every page is the same object `/cards/:id` returns, on both paths.
+
+        Comparing whole objects catches any field the listing renders differently, not only the
+        few named above. A page size of 2 puts page 2 and later under the comparison, and the walk
+        checks that no card is listed twice or skipped. Only this module's cards are compared by
+        id: the database is shared, and another module's cards are not guaranteed to be in the
+        store the engine path reads.
+        """
+        monkeypatch.setattr("api.scryfall_compat.routes.PAGE_SIZE", 2)
+        listed, last = self._every_page(by_name_paths)
+        listed_ids = [card.get("id") for card in listed]
+        assert len(listed) > 2
+        assert last["total_cards"] == len(listed) == len(set(listed_ids))
+        owned = {BOLT_ID, BEAR_ID, DELVER_ID, WHO_ID, VAULT_ID}
+        assert owned <= set(listed_ids)
+        for card in listed:
+            if card["id"] in owned:
+                assert card == payload(dispatch(by_name_paths, f"/cards/{card['id']}"))
+
+    def test_a_foreign_printing_is_not_listed(self, compat_corpus: APIResource):
+        """The listing is the canonical printings, the default of every other lane on this branch.
+
+        magic.cards holds every language since all_cards became the feed: about 540k rows, where
+        default_cards is about 114k. Without `is_canonical` the listing grew by every foreign
+        printing, and the engine's by-id lookup, which reads canonical printings only, does not
+        find those cards.
+        """
+        before, _ = self._every_page(compat_corpus)
+        foreign = _bolt() | {"id": self.FOREIGN_BOLT_ID, "lang": "ja", "printed_name": "コンパット・ボルト"}
+        compat_corpus.admin._upsert_cards([foreign], canonical_ids=set())
+        compat_corpus.admin._clear_caches()
+        try:
+            listed, last = self._every_page(compat_corpus)
+        finally:
+            with compat_corpus.app_context.writer_pool.connection() as conn:
+                conn.execute("DELETE FROM magic.cards WHERE scryfall_id = %s", (self.FOREIGN_BOLT_ID,))
+            compat_corpus.admin._clear_caches()
+        assert self.FOREIGN_BOLT_ID not in {card.get("id") for card in listed}
+        assert last["total_cards"] == len(listed) == len(before)
+
 
 class TestThroughTheFullApp:
     """The same routes through a real Falcon app, which `_handle` alone does not exercise.
