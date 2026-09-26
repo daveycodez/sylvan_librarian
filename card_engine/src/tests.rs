@@ -13949,7 +13949,7 @@ fn a_typo_resolves_to_the_intended_card() {
     let strs = rkyv::access::<Archived<Vec<String>>, Error>(&sbytes).expect("access strings");
 
     match fuzzy_name_match(a, strs, "lightnig bolt", 0.4, 0.05) {
-        FuzzyOutcome::Hit(cid) => assert_eq!(cid, 0, "a one-letter typo still finds Lightning Bolt"),
+        FuzzyOutcome::Hit(cid, _) => assert_eq!(cid, 0, "a one-letter typo still finds Lightning Bolt"),
         _ => panic!("expected a hit"),
     }
     // Nothing close enough clears the floor.
@@ -13976,6 +13976,41 @@ fn two_close_names_are_ambiguous_not_a_guess() {
     assert!(matches!(fuzzy_name_match(a, strs, "fire dragen", 0.4, 0.05), FuzzyOutcome::Ambiguous));
 }
 
+/// A typo winner scoring under `weak_below` reports "weak", which the containment stage outranks.
+/// The needles sit either side of the route's 0.6 (`FUZZY_SIMILARITY_YIELD`), measured on
+/// api.scryfall.com 2026-09-25: `teferi hero` is Teferi, Hero of Dominaria there, over a typo winner
+/// Teferi at 0.583, and `arenare` is Arena at 0.625, over Arena Rector.
+#[test]
+fn a_typo_winner_under_the_line_is_weak() {
+    let names = ["teferi", "arena", "concentrate"];
+    let mut vocab = VocabInterner::new();
+    let mut cards = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        let mut c = stub_card(i as u128 + 1, 0, &[], &mut vocab);
+        c.card_name_lower = InlineStr::from_str(name);
+        cards.push(c);
+    }
+    let bytes = rkyv::to_bytes::<Error>(&cards).expect("serialize");
+    let a = rkyv::access::<Archived<Vec<OracleCard>>, Error>(&bytes).expect("access");
+    // Every card here carries NONE_STR (folded == lower), so an EMPTY table is the right one.
+    let sbytes = rkyv::to_bytes::<Error>(&Vec::<String>::new()).expect("serialize strings");
+    let strs = rkyv::access::<Archived<Vec<String>>, Error>(&sbytes).expect("access strings");
+    let strength = |needle: &str| {
+        let outcome = fuzzy_name_match(a, strs, needle, 0.4, 0.05);
+        let winner = match outcome {
+            FuzzyOutcome::Hit(cid, _) => names[cid as usize],
+            _ => "",
+        };
+        (winner, outcome.status(0.6))
+    };
+    assert_eq!(strength("teferi hero"), ("teferi", "weak"), "0.583");
+    assert_eq!(strength("arenare"), ("arena", "hit"), "0.625");
+    assert_eq!(strength("fir concentrate"), ("concentrate", "hit"), "0.75");
+    // The default line is 0.0, under which every winner is a hit.
+    assert_eq!(fuzzy_name_match(a, strs, "teferi hero", 0.4, 0.05).status(0.0), "hit");
+    assert_eq!(fuzzy_name_match(a, strs, "zzzzzzzz", 0.4, 0.05).status(0.6), "miss");
+}
+
 #[test]
 fn printings_of_one_card_do_not_look_ambiguous() {
     // Several cards sharing a NAME are one answer, not competing ones. Without the distinct-name
@@ -13994,7 +14029,7 @@ fn printings_of_one_card_do_not_look_ambiguous() {
     // `folded_name` never reaches it, and a populated one would prove nothing extra.
     let sbytes = rkyv::to_bytes::<Error>(&Vec::<String>::new()).expect("serialize strings");
     let strs = rkyv::access::<Archived<Vec<String>>, Error>(&sbytes).expect("access strings");
-    assert!(matches!(fuzzy_name_match(a, strs, "lightning bolt", 0.4, 0.05), FuzzyOutcome::Hit(_)));
+    assert!(matches!(fuzzy_name_match(a, strs, "lightning bolt", 0.4, 0.05), FuzzyOutcome::Hit(..)));
 }
 
 #[test]

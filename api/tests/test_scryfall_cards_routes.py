@@ -90,6 +90,47 @@ def _pool_card(card_id: str, number: str, name: str, layout: str, type_line: str
     return card
 
 
+# THE STAGE ORDER of `?fuzzy=` (typo before containment, unless the typo winner is weak) wants names
+# whose scores sit where the measured needles' do. So these are the measured needles' own names,
+# ROT13-encoded: a letter-for-letter substitution keeps every trigram, so each needle scores here
+# exactly what it scores against the real corpus (`fgenatyreb` is `stranglero`, 0.667 against
+# "Strangle"), while no other module's card can come near them. In a set of their own so nothing
+# else here counts them.
+ORDER_SET_CODE = "sfo"
+
+
+def _stage_order_cards() -> list[dict]:
+    """Typo winners and the cards containing their needles' words, measured pairs in ROT13."""
+    names = [
+        # The needle each group answers, in the clear.
+        "Fgenatyr",  # stranglero: the typo winner, 0.667
+        "Fgenatyrebbg Trvfg",  # ... over the one card containing it
+        "Zvaq Fphycg",  # mind scul: the typo winner, 0.692
+        "Wnpr, gur Zvaq Fphycgbe",  # ... over two names containing both words
+        "Obyg Oraq",  # bolt: a weak typo winner, 0.556
+        "Ornpba Obyg",  # ... under two names containing it, itself one of them
+        "Fabeg",  # snorti: the typo winner, 0.625
+        "Fabegvat Tnue",  # ... over the one card containing it
+        "Grsrev",  # teferi hero: a weak typo winner, 0.583
+        "Grsrev, Ureb bs Qbzvanevn",  # ... under the one card containing both words
+    ]
+    cards = []
+    for number, name in enumerate(names, start=1):
+        card = make_raw_card(card_id=f"3a3a3a3a-3a3a-4a3a-8a3a-{number:012d}", name=name)
+        card |= {
+            "object": "card",
+            "oracle_id": f"3b3b3b3b-3b3b-4b3b-8b3b-{number:012d}",
+            "set": ORDER_SET_CODE,
+            "set_name": "Scryfall Compat Stage Order",
+            "collector_number": str(number),
+            "type_line": "Creature — Construct",
+            "oracle_text": "",
+            "lang": "en",
+        }
+        cards.append(card)
+    return cards
+
+
 # The language rule wants an address NO English printing carries and an address TWO languages
 # share, in a set of their own so nothing else here counts them. Modelled on The Hobbit Eternal,
 # which prints five of its 158 cards only in Dwarvish: on api.scryfall.com `/cards/hoc/95` is the
@@ -327,6 +368,7 @@ def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
         _pool_card("12121212-1212-4212-8212-121212121212", "1", WARDEN_NAME, "normal", "Creature — Human"),
         _pool_card("13131313-1313-4313-8313-131313131313", "2", f"{WARDEN_NAME} Emblem", "emblem", "Emblem — Hollowmere"),
         _pool_card("14141414-1414-4414-8414-141414141414", "3", "Hollowmere Sentry", "token", "Creature — Spirit"),
+        *_stage_order_cards(),
     )
     api_resource.admin._upsert_cards([copy.deepcopy(card) for card in cards])
     with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
@@ -595,6 +637,37 @@ class TestNamed:
         resp = dispatch(by_name_paths, "/cards/named", "fuzzy=hollowmere")
         assert resp.status == falcon.HTTP_404
         assert payload(resp)["type"] == "ambiguous"
+
+    def test_fuzzy_a_strong_typo_winner_outranks_the_card_containing_every_word(self, by_name_paths: APIResource):
+        """The typo stage runs BEFORE containment, even where one card carries every word.
+
+        Measured on api.scryfall.com 2026-09-25: `fuzzy=stranglero` is Strangle, not Strangleroot
+        Geist, and `fuzzy=fir concentrate` is Concentrate, not Concentrated Fire. The needle is in
+        ROT13, as its names are.
+        """
+        assert payload(dispatch(by_name_paths, "/cards/named", "fuzzy=fgenatyreb"))["name"] == "Fgenatyr"
+
+    def test_fuzzy_the_line_for_several_cards_containing_every_word(self, by_name_paths: APIResource):
+        """Several containing names outrank a WEAK typo winner as `ambiguous`, and not a strong one.
+
+        Measured on api.scryfall.com 2026-09-25: `fuzzy=mind scul` is Mind Sculpt (0.692), although
+        Jace, the Mind Sculptor contains both words too, and `fuzzy=bolt` is ambiguous over a typo
+        winner Bolt Bend at 0.556.
+        """
+        assert payload(dispatch(by_name_paths, "/cards/named", "fuzzy=zvaq+fphy"))["name"] == "Zvaq Fphycg"
+        resp = dispatch(by_name_paths, "/cards/named", "fuzzy=obyg")
+        assert resp.status == falcon.HTTP_404
+        assert payload(resp)["type"] == "ambiguous"
+
+    def test_fuzzy_the_line_for_the_one_card_containing_every_word(self, by_name_paths: APIResource):
+        """Under FUZZY_SIMILARITY_YIELD (0.6) the one card carrying every word answers; over it, the typo winner.
+
+        Measured on api.scryfall.com 2026-09-25: `fuzzy=teferi hero` is Teferi, Hero of Dominaria,
+        over a typo winner Teferi at 0.583, and `fuzzy=snorti` is Snort at 0.625, over Snorting Gahr.
+        """
+        body = payload(dispatch(by_name_paths, "/cards/named", "fuzzy=grsrev+ureb"))
+        assert body["name"] == "Grsrev, Ureb bs Qbzvanevn"
+        assert payload(dispatch(by_name_paths, "/cards/named", "fuzzy=fabegv"))["name"] == "Fabeg"
 
     def test_neither_parameter_is_a_400(self, compat_corpus: APIResource):
         resp = dispatch(compat_corpus, "/cards/named")

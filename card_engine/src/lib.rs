@@ -3343,12 +3343,26 @@ pub(crate) fn trigram_similarity(a: &str, b: &str) -> f32 {
 
 /// What a `?fuzzy=` lookup resolved to.
 pub(crate) enum FuzzyOutcome {
-    /// The card index that won outright.
-    Hit(u32),
+    /// The card index that won outright, and its score, which decides whether a containment answer
+    /// outranks it (see `status`).
+    Hit(u32, f32),
     /// Two distinct names scored too close to choose between; Scryfall answers `ambiguous`.
     Ambiguous,
     /// Nothing cleared the floor.
     Miss,
+}
+
+impl FuzzyOutcome {
+    /// The status `fuzzy_card_by_name` reports: "hit", "weak" (a winner scoring under
+    /// `weak_below`, which the containment stage outranks), "ambiguous" or "miss".
+    pub(crate) fn status(&self, weak_below: f32) -> &'static str {
+        match *self {
+            FuzzyOutcome::Miss => "miss",
+            FuzzyOutcome::Ambiguous => "ambiguous",
+            FuzzyOutcome::Hit(_, score) if score < weak_below => "weak",
+            FuzzyOutcome::Hit(..) => "hit",
+        }
+    }
 }
 
 /// The typo-tolerant name match, with #912's thresholds.
@@ -3436,7 +3450,7 @@ pub(crate) fn fuzzy_name_match(
     match (best, runner_up) {
         (None, _) => FuzzyOutcome::Miss,
         (Some((score, _, _)), Some(second)) if score - second < lead => FuzzyOutcome::Ambiguous,
-        (Some((_, cid, _)), _) => FuzzyOutcome::Hit(cid),
+        (Some((score, cid, _)), _) => FuzzyOutcome::Hit(cid, score),
     }
 }
 
@@ -16672,10 +16686,12 @@ impl QueryEngine {
 
     /// Scryfall's `?fuzzy=` name lookup, typo-tolerant.
     ///
-    /// Returns `(status, card)` where status is "hit", "ambiguous" or "miss". Ambiguous is a
-    /// distinct answer rather than a miss: Scryfall reports it with the candidates it could not
+    /// Returns `(status, card)` where status is "hit", "weak", "ambiguous" or "miss". Ambiguous is
+    /// a distinct answer rather than a miss: Scryfall reports it with the candidates it could not
     /// separate, and collapsing it to "not found" would tell the client the card does not exist.
-    #[pyo3(signature = (name, floor, lead, fields=None))]
+    /// "weak" carries the winner too: it scored under `weak_below`, so the caller asks the
+    /// containment stage, which outranks it. The default 0.0 makes every winner a "hit".
+    #[pyo3(signature = (name, floor, lead, fields=None, weak_below=0.0))]
     fn fuzzy_card_by_name<'py>(
         &self,
         py: Python<'py>,
@@ -16683,15 +16699,17 @@ impl QueryEngine {
         floor: f32,
         lead: f32,
         fields: Option<Vec<String>>,
+        weak_below: f32,
     ) -> PyResult<(String, Option<Bound<'py, PyDict>>)> {
         let resolved_fields = resolve_fields(fields)?;
         let (mmap, str_cache) = self.get_mapping()?;
         // Safety: see the access_unchecked justification in query().
         let data = unsafe { rkyv::access_unchecked::<Archived<CardData>>(archive_payload(&mmap)) };
-        match fuzzy_name_match(&data.cards, &data.strings, name, floor, lead) {
-            FuzzyOutcome::Miss => Ok(("miss".to_string(), None)),
-            FuzzyOutcome::Ambiguous => Ok(("ambiguous".to_string(), None)),
-            FuzzyOutcome::Hit(cid) => {
+        let outcome = fuzzy_name_match(&data.cards, &data.strings, name, floor, lead);
+        let status = outcome.status(weak_below).to_string();
+        match outcome {
+            FuzzyOutcome::Miss | FuzzyOutcome::Ambiguous => Ok((status, None)),
+            FuzzyOutcome::Hit(cid, _) => {
                 let cid = cid as usize;
                 // The card's default-preferred printing, the same one every other by-name path shows.
                 let preferred = u32::from(data.offsets[cid]) as usize;
@@ -16704,7 +16722,7 @@ impl QueryEngine {
                     &resolved_fields,
                     &str_cache,
                 )?;
-                Ok(("hit".to_string(), Some(dict)))
+                Ok((status, Some(dict)))
             }
         }
     }
