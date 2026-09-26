@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import uuid
 from typing import TYPE_CHECKING
 from urllib.parse import urlencode
@@ -244,10 +245,52 @@ def _face_name_cards() -> list[dict]:
     return cards
 
 
+# THE TYPO STAGE'S ENGINE LANE, on measured cards' names in ROT13, in a set of their own. On
+# api.scryfall.com (2026-09-26) `fuzzy=luminous broodmoth mothra` is Luminous Broodmoth iko/21. The
+# art-series card Luminous Broodmoth // Luminous Broodmoth has the same WORDS, so pg_trgm over the
+# word-split name ties the two (0.792 each) and the SQL lane calls it ambiguous; over the COLLATED
+# name the engine scores them 0.739 and 0.680 and answers the one card. "mothra" is in neither
+# name, so containment does not answer first.
+TYPO_SET_CODE = "sft"
+TYPO_MOTH_ID = "7a7a7a7a-7a7a-4a7a-8a7a-000000000001"
+TYPO_MOTH_ART_ID = "7a7a7a7a-7a7a-4a7a-8a7a-000000000002"
+
+
+def _typo_cards() -> list[dict]:
+    """A card, and the art-series card whose name spells its name twice."""
+    moth = make_raw_card(card_id=TYPO_MOTH_ID, name="Yhzvabhf Oebbqzbgu")  # Luminous Broodmoth
+    moth |= {
+        "object": "card",
+        "set": TYPO_SET_CODE,
+        "set_name": "Scryfall Compat Typos",
+        "collector_number": "1",
+        "type_line": "Creature — Insect",
+        "oracle_text": "",
+        "lang": "en",
+    }
+    art = make_raw_card(card_id=TYPO_MOTH_ART_ID, name="Yhzvabhf Oebbqzbgu // Yhzvabhf Oebbqzbgu")
+    art |= {
+        "object": "card",
+        "set": TYPO_SET_CODE,
+        "set_name": "Scryfall Compat Typos",
+        "collector_number": "2",
+        "layout": "art_series",
+        "type_line": "Card // Card",
+        "oracle_text": "",
+        "lang": "en",
+        "card_faces": [
+            {"object": "card_face", "name": "Yhzvabhf Oebbqzbgu", "mana_cost": "", "type_line": "Card", "oracle_text": ""}
+            for _ in range(2)
+        ],
+    }
+    art.pop("image_uris", None)
+    return [moth, art]
+
+
 @pytest.fixture(name="compat_corpus", scope="module")
 def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
     """Load this module's cards and their rulings once, then hand back the resource."""
-    cards = (_bolt(), _bear(), _delver(), _who(), _vault(), *_face_name_cards())
+    cards = (_bolt(), _bear(), _delver(), _who(), _vault(), *_face_name_cards(), *_typo_cards())
     api_resource.admin._upsert_cards([copy.deepcopy(card) for card in cards])
     with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
         # Each whole-name card scores BELOW the two-faced card carrying its name as a face, so its
@@ -494,6 +537,20 @@ class TestNamed:
     def test_fuzzy_tolerates_a_typo(self, compat_corpus: APIResource):
         body = payload(dispatch(compat_corpus, "/cards/named", "fuzzy=Compat+Bolzt"))
         assert body["name"] == "Compat Bolt"
+
+    @pytest.mark.usefixtures("engine_enabled")
+    def test_fuzzy_typo_answers_through_the_engine(self, compat_corpus: APIResource, caplog):
+        """The engine's typo lane answers, rather than raising and falling back to SQL.
+
+        It read the hit's id as `row["id"]`, where CARD_OBJECT_FIELDS names it `scryfall_id`, so
+        every hit raised KeyError, was logged as an engine failure, and the SQL lane answered --
+        here `ambiguous`, which is not what api.scryfall.com says (see TYPO_SET_CODE).
+        """
+        with caplog.at_level(logging.ERROR, logger="api.scryfall_compat.routes"):
+            resp = dispatch(compat_corpus, "/cards/named", urlencode({"fuzzy": "yhzvabhf oebbqzbgu zbguen"}))
+        assert "Engine fuzzy match failed" not in caplog.text
+        assert resp.status == falcon.HTTP_200
+        assert payload(resp)["id"] == TYPO_MOTH_ID
 
     def test_fuzzy_miss_is_a_404(self, compat_corpus: APIResource):
         resp = dispatch(compat_corpus, "/cards/named", "fuzzy=qqqqzzzzxxxx")

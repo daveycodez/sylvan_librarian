@@ -1290,15 +1290,20 @@ class ScryfallCardsRoutes:
                     # pg_trgm's, and passing the SQL path's would score one metric by the other's
                     # bar. See FUZZY_SIMILARITY_FLOOR above.
                     status, row = engine.fuzzy_card_by_name(needle, fields=list(CARD_OBJECT_FIELDS))
-                    if status == "ambiguous":
-                        return _AMBIGUOUS
-                    if status == "miss":
-                        return None
-                    if row:
-                        return {"scryfall_id": row["id"], "card_name": row["name"]}
                 # Any engine failure falls back to SQL; it never 500s.
                 except Exception:
                     logger.exception("Engine fuzzy match failed, falling back to SQL")
+                else:
+                    # The key is `scryfall_id`, which is what CARD_OBJECT_FIELDS asks for. It read
+                    # `id` before, so every hit raised KeyError INSIDE the try above, was logged as
+                    # an engine failure and fell through to SQL -- this fast path had never once
+                    # returned. Reading the row in `else` is what makes the next such mismatch a
+                    # test failure rather than a silent permanent fallback.
+                    if status == "ambiguous":
+                        return _AMBIGUOUS
+                    if status == "miss" or not row:
+                        return None
+                    return {"scryfall_id": row["scryfall_id"], "card_name": row["name"]}
 
         params = {**base_params, "needle": needle, "floor": FUZZY_SIMILARITY_FLOOR}
         # `%%` escapes psycopg's placeholder marker: the bare `%` operator would be read as the
