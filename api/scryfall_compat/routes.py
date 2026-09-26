@@ -73,6 +73,9 @@ _CARD_COLUMNS = (
     "card_color_identity, card_keywords, card_set_code, set_name, collector_number, "
     "card_rarity_int, flavor_text, card_artist AS artist, illustration_id, released_at, "
     "card_legalities, card_border, card_watermark, card_frame_data, card_is_tags, "
+    # Stored in columns, so absent from card_compat_blob, and read by the engine from these same
+    # columns: without them every SQL-lane card had null prices and no loyalty or edhrec_rank.
+    "price_usd, price_eur, price_tix, edhrec_rank, planeswalker_loyalty_text AS loyalty, "
     "card_compat_blob, card_faces"
 )
 
