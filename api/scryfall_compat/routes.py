@@ -760,6 +760,19 @@ FUZZY_SIMILARITY_YIELD = 0.0
 _UNSEPARATED = "regexp_replace(lower(coalesce({column}, '')), '[^[:alnum:]]', '', 'g')"
 
 
+# `_EXACT_NAME_MATCH` against `%(needle)s`, spelled so that every arm is an index probe: the whole
+# name through the unseparated-name trigram index's `=`, each face through its own partial btree
+# (api/db/2026-09-26-01-face-name-lookup.sql, which repeats these expressions character for
+# character). `_EXACT_NAME_MATCH` itself, whose arms no index serves, is a sequential scan of every
+# printing: ~260ms a needle on the full all_cards corpus, where this is under 1.5ms for every needle
+# measured, a two-letter one included.
+_ORACLE_KEY_IS_NEEDLE = (
+    f"({_UNSEPARATED.format(column='card_name_folded')} = %(needle)s"
+    f" OR ({_NAME_SPLITS_IN_TWO} AND {_collated_sql(_NAME_FRONT)} = %(needle)s)"
+    f" OR ({_NAME_SPLITS_IN_TWO} AND {_collated_sql(_NAME_BACK)} = %(needle)s))"
+)
+
+
 def _unseparated(word: str) -> str:
     """Return `word` with every non-alphanumeric character removed -- `_UNSEPARATED`'s query side.
 
@@ -2051,9 +2064,9 @@ class ScryfallCardsRoutes:
         between two (Assault Drone 0.500). `_TypoMatch` can still say a winner yields to
         containment, under a positive `FUZZY_SIMILARITY_YIELD` or engine line; both are retired.
 
-        The exact stage reads oracle and flavor names. Containment reads them too, then a printed
-        name that IS the query, then printed names that carry every word. The typo stage reads
-        oracle names alone.
+        The exact stage reads oracle and flavor names, an oracle name's faces included (`fuzzy=fire`
+        is Fire // Ice). Containment reads them too, then a printed name that IS the query, then
+        printed names that carry every word. The typo stage reads oracle names alone.
 
         Args:
             fuzzy: The name fragment to match.
@@ -2195,6 +2208,9 @@ class ScryfallCardsRoutes:
         (`_fuzzy_contained` runs the oracle tier's containment in between). A FLAVOR name that is the
         query belongs to the first tier, after the oracle names.
 
+        An oracle name is `exact=`'s keys: the whole name, or EITHER FACE of a name that splits in
+        exactly two, a whole-name match first. A printed name is its whole name only.
+
         Args:
             needle: The accent-folded, lowercased query.
             base_clauses: Predicates already established (the set filter).
@@ -2204,20 +2220,31 @@ class ScryfallCardsRoutes:
         Returns:
             The matching printing, or None.
         """
-        # NO ENGINE FAST PATH HERE, deliberately, and it is the one by-name lookup that keeps
-        # answering from SQL. `exact_card_by_name` implements `named?exact=`'s rule -- ORACLE names
-        # only, separators intact, either side of a `" // "` join -- and this stage's rule is the
-        # other one: separators do not count, and a PRINTED name counts. The two disagree on real
-        # queries (`fuzzy=fire` would resolve to "Fire // Ice" through the engine and is not a
-        # whole-name match at all under the measured rule), so calling it here would answer a
-        # different card, not the same card sooner. `named?exact=` still goes to the engine first.
+        # NO ENGINE FAST PATH HERE, and it is the one by-name lookup that keeps answering from SQL.
+        # The oracle keys below are the ones `exact_card_by_name` reads, but its flavor-name
+        # fallback reads canonical printings only, where this tier's answers any printing carrying
+        # the name, extras included. `named?exact=` still goes to the engine first.
         params = {**base_params, "needle": _unseparated(needle)}
         column = "printed_name_folded" if printed else "card_name_folded"
         # Never an art-series card (`_NOT_ART_SERIES`): `fuzzy=minion of the mighty kobold` spells
         # "Minion of the Mighty // Kobold" exactly and answers the afr card on api.scryfall.com.
         clauses = [*base_clauses, _NOT_ART_SERIES, f"{_UNSEPARATED.format(column=column)} = %(needle)s"]
         if not printed:
-            chosen = self._best_printing(" AND ".join(clauses), params)
+            # THE ORACLE KEYS ARE `exact=`'s (`_EXACT_NAME_MATCH`): the whole name, or EITHER FACE of
+            # a name that splits in exactly two. Measured on api.scryfall.com 2026-09-26: `fuzzy=fire`
+            # and `fuzzy=ice` are Fire // Ice, `tear` Wear // Tear, `boom` and `bust` Boom // Bust,
+            # `life` Life // Death and `appeal` Appeal // Authority -- face names that other names
+            # merely contain, which this stage matched only whole and so left to containment to
+            # call ambiguous. A WHOLE NAME OUTRANKS A FACE whatever the scores (`_WHOLE_NAME_FIRST`):
+            # `fuzzy=jump` is Jump m10/59 over Encouraging Aviator // Jump, `bind` Bind over the
+            # playtest Bind // Liberate, and `chaos` the front card Chaos fj25/46 over Order // Chaos,
+            # each of those out-scoring the whole-name card, the last an extra. Between two faces the
+            # score decides: `fuzzy=fire` is Fire // Ice and `start` Start // Finish, both over the
+            # playtest Start // Fire. `exact=fire` and `exact=chaos` answer the same two cards.
+            oracle = [*base_clauses, _NOT_ART_SERIES, _ORACLE_KEY_IS_NEEDLE]
+            chosen = self._best_printing(
+                " AND ".join(oracle), {**params, "collated": params["needle"]}, rank_first=_WHOLE_NAME_FIRST
+            )
             if chosen is not None:
                 return chosen
             # A FLAVOR NAME that is the query is this tier's too, after the oracle names, and it
