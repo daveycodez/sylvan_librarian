@@ -723,39 +723,34 @@ _COLLECTION_SCHEMA_KEYS = (*_COLLECTION_SOLE_KEYS, "set", "collector_number")
 _COLLECTION_COUNT_DETAILS = "The `identifiers` list must have at least 1 and no more than 75 references."
 _COLLECTION_NOT_AN_ARRAY_DETAILS = "The `identifiers` list must be a JSON array."
 
-# Thresholds for the SQL fallback's typo-tolerant `?fuzzy=` stage, which scores with pg_trgm. A
-# candidate must score at least the floor, and the best must lead the next distinct card name by at
-# least the lead — closer than that and the query does not identify either card, so it is
-# `ambiguous` rather than a guess. The floor sits deliberately above pg_trgm's default 0.3
-# similarity_threshold, so the index-assisted `%` prefilter always admits a strict superset of what
-# the floor keeps.
+# Thresholds for the SQL fallback's typo-tolerant `?fuzzy=` stage. It scores what the engine scores
+# -- Scryfall's metric, pg_trgm's `similarity()` of the COLLATED name (lowercased, accents folded,
+# every non-alphanumeric removed, so the whole name is ONE pg_trgm word and word order survives:
+# `fuzzy=bolt lightning` is Blightning 9/16 over Lightning Bolt 9/19, where word-split pg_trgm,
+# which this lane scored before, rated Lightning Bolt 1.0). Measured against 212 cached
+# api.scryfall.com answers and five probes; card_engine's `Fuzzy name matching` module comment has
+# the measurements, and its FUZZY_SCORE_FLOOR / FUZZY_SCORE_LEAD are these same two numbers.
 #
-# THESE ARE NO LONGER THE ENGINE'S. The engine scores Scryfall's metric — pg_trgm's similarity of
-# the COLLATED name (every non-alphanumeric removed, so the name is one word and word order
-# survives), measured against 212 cached api.scryfall.com answers and five probes; see
-# card_engine's `Fuzzy name matching` module comment — with its own floor (0.55) and no lead,
-# which it supplies as the defaults of `fuzzy_card_by_name`. This query scores pg_trgm over the
-# raw name, which splits it into words, so the two paths resolve a handful of needles differently
-# (`fuzzy=bolt lightning` is Blightning through the engine and Lightning Bolt through the word
-# sets here, and Scryfall says Blightning). That is deliberate: the engine is the path that
-# serves, and matching Scryfall is what this surface is for.
-FUZZY_SIMILARITY_FLOOR = 0.4
-FUZZY_SIMILARITY_LEAD = 0.05
+#   - A candidate must score at least the FLOOR: `fuzzy=deadeall` scores 6/11 = 0.545 against
+#     Deadfall and is a 404 on api.scryfall.com, `fuzzy=lightning blow&set=m11` 5/9 = 0.556
+#     against Lightning Bolt and answers it. The floor sits above pg_trgm's default 0.3
+#     similarity_threshold, so the index-assisted `%` prefilter always admits a strict superset of
+#     what the floor keeps.
+#   - There is NO LEAD: Scryfall answers every tie measured (`illusionary`, `parallax`, `thoughts`,
+#     `sculptor`, `haunting`), so the best candidate answers, ranked by the tiebreaks in
+#     `_fuzzy_similarity_candidate`. The lead check stays for a positive value.
+FUZZY_SIMILARITY_FLOOR = 0.55
+FUZZY_SIMILARITY_LEAD = 0.0
 
-# The pg_trgm score below which the typo winner no longer outranks the containment stage: whatever
-# containment answers -- one card, or `ambiguous` for several -- answers instead. Scryfall runs the
-# typo stage BEFORE containment, but a weak winner loses there to the cards that carry every query
-# word; the engine's `FUZZY_WEAK_BELOW` has the measurements on its own metric. This is the same
-# line on pg_trgm's scale, calibrated separately against the needles probed on api.scryfall.com
-# 2026-09-25: containment answered where the pg_trgm winner scored 0.583 or less (`teferi hero`
-# over Teferi at 0.583, `bloodbender` over Hama, the Bloodbender at 0.571, `assaultron` over
-# Assaultron Dominator at 0.524), and the typo winner everywhere from 0.607 up (`walking ballista
-# assaultron` 0.607, `arenare` 0.625, `paralyzing` 0.647, `primeval titanoth` over Primeval Titan
-# 0.737). One needle is on the wrong side: `insolent` answers Insolence (0.583) on Scryfall, the
-# same score `teferi hero`'s winner loses at. pg_trgm scores a name that CONTAINS the query low,
-# since every trigram the name adds counts against it, which is why several containing names outrank
-# a winner here where the engine's metric keeps it (`FUZZY_FAINT_BELOW`).
-FUZZY_SIMILARITY_YIELD = 0.6
+# The score below which the typo winner no longer outranks the containment stage: whatever
+# containment answers -- one card, or `ambiguous` for several -- answers instead. RETIRED (0.0),
+# like the engine's `FUZZY_WEAK_BELOW` and `FUZZY_FAINT_BELOW`: it was calibrated at 0.6 on
+# word-split pg_trgm's scale (containment answered `teferi hero`, `bloodbender`, `assaultron`; the
+# typo winner answered from `walking ballista assaultron` up). On the collated similarity every
+# needle it moved to containment has no candidate over the floor (`teferi hero`'s Teferi 0.500,
+# `assaultron`'s Assault Drone 0.500), so containment answers it with no line at all, and the
+# typo winners Scryfall answers clear the floor (`primeval titanoth` 0.722, `arenare` 0.625).
+FUZZY_SIMILARITY_YIELD = 0.0
 
 # A name column with every non-alphanumeric character removed, which is what the containment stage
 # matches against (see `_fuzzy_containment_candidates`). NULL folds to '' so a row with no printed
@@ -814,6 +809,11 @@ def _flavor_name_is(param: str) -> str:
 # is "The Black Beast of Aaargh" -- the line `name:aaargh` draws on /cards/search until
 # `include_extras=true`. A literal rather than a bound value: `_run_query` binds a dict as jsonb.
 _FLAVOR_POOLED = f"flavor_name_folded IS NOT NULL AND NOT card_is_tags @> '{{\"{EXTRA_IS_TAG}\": true}}'::jsonb"
+
+# "This printing is an extra", over the `printing` alias the typo stage's tiebreak reads: a card is
+# SERVED when any canonical printing is not one, the same card-level reading of `-is:extra` the
+# engine's `any_printing_is_served` makes. A literal for the same reason `_FLAVOR_POOLED` is.
+_EXTRA_PRINTING = f"printing.card_is_tags @> '{{\"{EXTRA_IS_TAG}\": true}}'::jsonb"
 
 
 # The layouts the containment stage of `?fuzzy=` never answers with, and so never counts as a
@@ -2045,10 +2045,11 @@ class ScryfallCardsRoutes:
 
         THE TYPO STAGE RUNS BEFORE CONTAINMENT, as on api.scryfall.com: `fuzzy=primeval titanoth`
         is Primeval Titan there, although Titanoth Rex carries both words (one in its flavor name),
-        and `fuzzy=soulcatchers` is Soulcatcher, not Soulcatchers' Aerie. But a WEAK typo winner
-        loses to containment: `fuzzy=hyd disintegrat` is the one card carrying both words, not
-        Disintegrate. How weak is the typo lane's to say (`_TypoMatch`, `FUZZY_SIMILARITY_YIELD`,
-        and the engine's `FUZZY_WEAK_BELOW`), and a tie is the weakest winner of all.
+        and `fuzzy=soulcatchers` is Soulcatcher, not Soulcatchers' Aerie. A needle with NO typo
+        candidate over the floor falls to containment: `fuzzy=hyd disintegrat` is the one card
+        carrying both words (Disintegrate scores 0.474), and `fuzzy=assaultron` is `ambiguous`
+        between two (Assault Drone 0.500). `_TypoMatch` can still say a winner yields to
+        containment, under a positive `FUZZY_SIMILARITY_YIELD` or engine line; both are retired.
 
         The exact stage reads oracle and flavor names. Containment reads them too, then a printed
         name that IS the query, then printed names that carry every word. The typo stage reads
@@ -2393,12 +2394,17 @@ class ScryfallCardsRoutes:
     ) -> _TypoMatch:
         """Return the typo-tolerant match, and whether the containment stage outranks it.
 
-        A candidate must clear FUZZY_SIMILARITY_FLOOR, and the best must lead the next distinct
-        card name by FUZZY_SIMILARITY_LEAD, or it is a tie. The floor sits above pg_trgm's default
-        0.3 threshold, so the index-assisted `%` prefilter is always a strict superset of what the
-        floor admits and no decision rests on a row the prefilter dropped. A winner under
-        FUZZY_SIMILARITY_YIELD yields to containment; the engine lane reports its own winner's
-        strength on its own metric.
+        Both lanes score Scryfall's metric, pg_trgm's similarity of the COLLATED name (see
+        FUZZY_SIMILARITY_FLOOR). A candidate must clear FUZZY_SIMILARITY_FLOOR; the floor sits
+        above pg_trgm's default 0.3 threshold, so the index-assisted `%` prefilter is always a
+        strict superset of what the floor admits and no decision rests on a row the prefilter
+        dropped. The best candidate answers, and a TIE is broken as api.scryfall.com breaks it
+        (measured 2026-09-26 on the five ties among its answers): a served card first -- one with a
+        printing a default search shows -- then the card FIRST PRINTED most recently (`thoughts` is
+        Thought Scour, 2012, over Thoughtseize, 2007), then the name that sorts last (`parallax` is
+        Parallax Wave, which shares Nemesis with Parallax Tide). FUZZY_SIMILARITY_LEAD and
+        FUZZY_SIMILARITY_YIELD are 0, so a tie is never `ambiguous` and no winner yields to
+        containment; both checks stay for a positive value.
 
         Args:
             needle: The accent-folded, lowercased query.
@@ -2419,10 +2425,10 @@ class ScryfallCardsRoutes:
             engine = self._engine_for_lookup()
             if engine is not None:
                 try:
-                    # No thresholds: they belong to the engine's own metric, which is not
-                    # pg_trgm's, and passing the SQL path's would score one metric by the other's
-                    # bar. See FUZZY_SIMILARITY_FLOOR above. That includes where a winner yields to
-                    # containment: "weak" to one containing card, "faint" to several.
+                    # No thresholds: they belong to the engine's metric, and it supplies them as
+                    # its own defaults -- the same metric and the same numbers as this lane's (see
+                    # FUZZY_SIMILARITY_FLOOR above), with its lines for "weak" and "faint" winners
+                    # retired to 0 as FUZZY_SIMILARITY_YIELD is.
                     status, row = engine.fuzzy_card_by_name(needle, fields=list(CARD_OBJECT_FIELDS))
                 # Any engine failure falls back to SQL; it never 500s.
                 except Exception:
@@ -2448,29 +2454,55 @@ class ScryfallCardsRoutes:
                         yields_to_several=status == "faint",
                     )
 
-        params = {**base_params, "needle": needle, "floor": FUZZY_SIMILARITY_FLOOR}
+        # COLLATED, as the engine collates: the whole needle is one pg_trgm word, so its windows run
+        # across its own word boundaries and keep their order.
+        collated = _unseparated(needle)
+        if not collated:
+            return _TYPO_MISS
+        name = _UNSEPARATED.format(column="card_name_folded")
+        params = {**base_params, "needle": collated, "floor": FUZZY_SIMILARITY_FLOOR}
         # `%%` escapes psycopg's placeholder marker: the bare `%` operator would be read as the
-        # start of one. OPERATOR(magic.%) is pg_trgm's similarity match, which the folded-name GIN
-        # index serves.
-        clauses = [*base_clauses, _NOT_ART_SERIES, "lower(card_name_folded) OPERATOR(magic.%%) %(needle)s"]
+        # start of one. OPERATOR(magic.%) is pg_trgm's similarity match, which the unseparated-name
+        # GIN index (`api/db/2026-08-16-01-unseparated-name-search.sql`) serves -- `name` is that
+        # index's expression character for character.
+        clauses = [
+            *base_clauses,
+            _NOT_ART_SERIES,
+            f"{name} OPERATOR(magic.%%) %(needle)s",
+            f"magic.similarity({name}, %(needle)s) >= %(floor)s",
+        ]
+        # One row per CARD (its best printing under the base clauses), then the tiebreaks, which
+        # read the card's CANONICAL printings whatever the base clauses kept: "first printed" is the
+        # card's own first day, not the first day inside `set=`.
         rows = self._run_query(
             query=(
-                "SELECT DISTINCT ON (card_name) card_name, scryfall_id, "
-                "magic.similarity(lower(card_name_folded), %(needle)s) AS score "
+                "SELECT best.card_name, best.scryfall_id, best.score FROM ("
+                "SELECT DISTINCT ON (oracle_id) oracle_id, card_name, scryfall_id, "
+                f"lower(card_name_folded) AS name_key, magic.similarity({name}, %(needle)s) AS score "
                 f"FROM magic.cards AS card WHERE {' AND '.join(clauses)} "
-                "AND magic.similarity(lower(card_name_folded), %(needle)s) >= %(floor)s "
-                "ORDER BY card_name, prefer_score DESC NULLS LAST"
+                "ORDER BY oracle_id, prefer_score DESC NULLS LAST"
+                ") AS best CROSS JOIN LATERAL ("
+                f"SELECT coalesce(bool_or(NOT coalesce({_EXTRA_PRINTING}, false)), false) AS served, "
+                "min(printing.released_at) AS first_printed "
+                "FROM magic.cards AS printing "
+                "WHERE printing.oracle_id = best.oracle_id AND printing.is_canonical"
+                ") AS facts "
+                "ORDER BY best.score DESC, facts.served DESC, facts.first_printed DESC NULLS LAST, "
+                'best.name_key COLLATE "C" DESC'
             ),
             params=params,
             explain=False,
         )["result"]
         if not rows:
             return _TYPO_MISS
-        ranked = sorted(rows, key=lambda row: row["score"], reverse=True)
-        if len(ranked) > 1 and ranked[0]["score"] - ranked[1]["score"] < FUZZY_SIMILARITY_LEAD:
+        best = rows[0]
+        # The competition rule the engine's race keeps: only a different NAME competes, so two cards
+        # sharing one name are one answer, never a tie with each other.
+        runner_up = next((row for row in rows[1:] if row["card_name"] != best["card_name"]), None)
+        if runner_up is not None and best["score"] - runner_up["score"] < FUZZY_SIMILARITY_LEAD:
             return _TYPO_TIE
-        weak = ranked[0]["score"] < FUZZY_SIMILARITY_YIELD
-        return _TypoMatch(row=ranked[0], tie=False, yields_to_one=weak, yields_to_several=weak)
+        weak = best["score"] < FUZZY_SIMILARITY_YIELD
+        return _TypoMatch(row=best, tie=False, yields_to_one=weak, yields_to_several=weak)
 
     # ---------------------------------------------------------------- GET /cards/autocomplete
 

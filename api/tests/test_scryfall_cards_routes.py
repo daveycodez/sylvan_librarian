@@ -254,12 +254,13 @@ def _flavor_cards() -> list[dict]:
     return cards
 
 
-# THE STAGE ORDER of `?fuzzy=` (typo before containment, unless the typo winner is weak) wants names
-# whose scores sit where the measured needles' do, on BOTH metrics -- the engine's and pg_trgm's. So
-# these are the measured needles' own names, ROT13-encoded: a letter-for-letter substitution keeps
-# every trigram and every edit, so each needle scores here exactly what it scores against the real
-# corpus (`vadhvfvgbe free` is `inquisitor serr`, 0.714 against "Inquisitor's Ox"), while no other
-# module's card can come near them. In a set of their own so nothing else here counts them.
+# THE STAGE ORDER of `?fuzzy=` (typo before containment, which answers when no typo candidate clears
+# the floor) wants names whose scores sit where the measured needles' do, on the metric both lanes
+# score -- pg_trgm's similarity of the collated name. So these are the measured needles' own names,
+# ROT13-encoded: a letter-for-letter substitution keeps every trigram, so each needle scores here
+# exactly what it scores against the real corpus (`vadhvfvgbe free` is `inquisitor serr`, 0.611
+# against "Inquisitor's Ox"), while no other module's card can come near them. In a set of their
+# own so nothing else here counts them.
 ORDER_SET_CODE = "sfo"
 ORDER_TITANOTH_FLAVOR_ID = "31313131-3131-4131-8131-313131313131"
 
@@ -268,25 +269,25 @@ def _stage_order_cards() -> list[dict]:
     """Typo winners and the cards containing their needles' words, measured pairs in ROT13."""
     rows = [
         # (oracle name, flavor name), and the needle each pair answers, in the clear.
-        ("Cevzriny Gvgna", None),  # primeval titanoth: the typo winner, 0.799 / pg_trgm 0.737
+        ("Cevzriny Gvgna", None),  # primeval titanoth: the typo winner, 0.722
         ("Gvgnabgu Erk", None),  # ... over Titanoth Rex, which carries "titanoth"
         ("Gvgnabgu Erk", "Tbqmvyyn, Cevzriny Punzcvba"),  # ... and "primeval" in a flavor name
-        ("Zvaq Fphycg", None),  # mind scul: the typo winner, 0.775 / 0.692
+        ("Zvaq Fphycg", None),  # mind scul: the typo winner, 0.667
         ("Wnpr, gur Zvaq Fphycgbe", None),  # ... over two names containing both words
-        ("Oyvtugavat", None),  # bolt lightning: the typo winner, 0.676
+        ("Oyvtugavat", None),  # bolt lightning: the typo winner, 0.5625
         ("Yvtugavat Obyg", None),  # ... over two names containing both words
         ("Rzrevghf bs Pbasyvpg Yvtugavat Obyg", None),
-        ("Nffnhyg Qebar", None),  # assaultron: the typo winner, 0.667
-        ("Nffnhygeba Qbzvangbe", None),  # ... under two names containing it, one a flavor name
+        ("Nffnhyg Qebar", None),  # assaultron: 0.500, under the floor
+        ("Nffnhygeba Qbzvangbe", None),  # ... so two names containing it answer, one a flavor name
         ("Jnyxvat Onyyvfgn", "Nffnhygeba Vainqre"),
-        ("Vadhvfvgbe'f Bk", None),  # inquisitor serr: the typo winner, 0.714
+        ("Vadhvfvgbe'f Bk", None),  # inquisitor serr: the typo winner, 0.611
         ("Freen Vadhvfvgbef", None),  # ... over the one card containing both words
-        ("Qvfvagrtengr", None),  # hyd disintegrat: the typo winner, 0.703
-        ("ULQEN Qvfvagrtengbe", None),  # ... under the one card containing both words
-        ("Neran", None),  # arenare: the typo winner, 0.732 / pg_trgm 0.625
+        ("Qvfvagrtengr", None),  # hyd disintegrat: 0.474, under the floor
+        ("ULQEN Qvfvagrtengbe", None),  # ... so the one card containing both words answers
+        ("Neran", None),  # arenare: the typo winner, 0.625
         ("Neran Erpgbe", None),  # ... over the one card containing it
-        ("Grsrev", None),  # teferi hero: the pg_trgm winner, 0.583 (the engine's floor drops it)
-        ("Grsrev, Ureb bs Qbzvanevn", None),  # ... under the one card containing both words
+        ("Grsrev", None),  # teferi hero: 0.500, under the floor
+        ("Grsrev, Ureb bs Qbzvanevn", None),  # ... so the one card containing both words answers
     ]
     groups: dict[str, int] = {}
     cards = []
@@ -308,6 +309,42 @@ def _stage_order_cards() -> list[dict]:
         }
         if flavor_name:
             card["flavor_name"] = flavor_name
+        cards.append(card)
+    return cards
+
+
+# THE TYPO STAGE'S TIEBREAK AND FLOOR, on measured needles' own names in ROT13 (see the stage order
+# above), each with its real card's first-printed day. On api.scryfall.com (2026-09-26) every tie
+# answers: the card first printed most recently -- `thoughts` is Thought Scour (2012) over
+# Thoughtseize (2007), both 8/14, although "Gubhtugfrvmr" sorts last -- and on one first day the
+# name that sorts last: `parallax` is Parallax Wave over Parallax Tide (Nemesis, both 8/14). And
+# `deadeall` scores 6/11 = 0.545 against Deadfall, just under the floor, and is a 404.
+TIE_SET_CODE = "sfk"
+
+
+def _typo_tie_cards() -> list[dict]:
+    """Two measured ties and the floor's lower bracket, with first-printed days."""
+    rows = [
+        ("Gubhtug Fpbhe", "2012-02-03"),  # Thought Scour, Dark Ascension
+        ("Gubhtugfrvmr", "2007-10-12"),  # Thoughtseize, Lorwyn
+        ("Cnenyynk Jnir", "2000-02-14"),  # Parallax Wave, Nemesis
+        ("Cnenyynk Gvqr", "2000-02-14"),  # Parallax Tide, Nemesis
+        ("Qrnqsnyy", "1999-06-07"),  # Deadfall, Urza's Destiny
+    ]
+    cards = []
+    for number, (name, released_at) in enumerate(rows, start=1):
+        card = make_raw_card(card_id=f"4a4a4a4a-4a4a-4a4a-8a4a-{number:012d}", name=name)
+        card |= {
+            "object": "card",
+            "oracle_id": f"4b4b4b4b-4b4b-4b4b-8b4b-{number:012d}",
+            "set": TIE_SET_CODE,
+            "set_name": "Scryfall Compat Typo Ties",
+            "collector_number": str(number),
+            "released_at": released_at,
+            "type_line": "Instant",
+            "oracle_text": "",
+            "lang": "en",
+        }
         cards.append(card)
     return cards
 
@@ -542,6 +579,7 @@ def compat_corpus_fixture(api_resource: APIResource) -> APIResource:
         *_tier_cards(),
         *_flavor_cards(),
         *_stage_order_cards(),
+        *_typo_tie_cards(),
     )
     api_resource.admin._upsert_cards([copy.deepcopy(card) for card in cards])
     with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
@@ -1535,10 +1573,16 @@ class TestNamed:
         assert body["name"] == WARDEN_NAME
 
     def test_fuzzy_containment_keeps_a_token(self, by_name_paths: APIResource):
-        """A token stays in the pool: `hollowmere` is carried by the card and the token alike."""
-        resp = dispatch(by_name_paths, "/cards/named", "fuzzy=hollowmere")
+        """A token stays in the pool: `mere` is carried by the card and the token alike.
+
+        Not `hollowmere`, which the typo stage now answers before containment is asked: it scores
+        10/18 against Hollowmere Warden and the token Hollowmere Sentry alike, over the floor, and
+        a typo tie answers (the served card, here also the name that sorts last).
+        """
+        resp = dispatch(by_name_paths, "/cards/named", "fuzzy=mere")
         assert resp.status == falcon.HTTP_404
         assert payload(resp)["type"] == "ambiguous"
+        assert payload(dispatch(by_name_paths, "/cards/named", "fuzzy=hollowmere"))["name"] == WARDEN_NAME
 
     @pytest.mark.parametrize("name", [WARDEN_ART_SERIES_NAME, "Hollowmere Warden Wisp", "Wisp"])
     def test_exact_never_answers_an_art_series(self, by_name_paths: APIResource, name):
@@ -1746,46 +1790,59 @@ class TestNamed:
         """
         assert payload(dispatch(by_name_paths, "/cards/named", "fuzzy=zvaq+fphy"))["name"] == "Zvaq Fphycg"
 
-    def test_fuzzy_a_weak_typo_winner_yields_to_the_one_card_containing_every_word(self, by_name_paths: APIResource):
-        """Under the line, the one card carrying every word answers; over it, the typo winner.
+    def test_fuzzy_under_the_floor_the_one_card_containing_every_word_answers(self, by_name_paths: APIResource):
+        """No typo candidate over the floor, so containment answers; over it, the typo winner does.
 
-        pg_trgm's line (`FUZZY_SIMILARITY_YIELD`, 0.6): `fuzzy=teferi hero` is Teferi, Hero of
-        Dominaria on api.scryfall.com (2026-09-25), over a typo winner Teferi at 0.583, and
-        `fuzzy=arenare` is Arena at 0.625. Through the engine, Teferi is under the floor, and
-        `hyd disintegrat` answers HYDRA Disintegrator through either path.
+        On api.scryfall.com (2026-09-25): `fuzzy=teferi hero` is Teferi, Hero of Dominaria, Teferi
+        scoring 0.500; `fuzzy=hyd disintegrat` is HYDRA Disintegrator, Disintegrate scoring 0.474;
+        `fuzzy=arenare` is Arena at 0.625, over Arena Rector; and `fuzzy=inquisitor serr` is
+        Inquisitor's Ox at 0.611, over Serra Inquisitors, which contains both words. Word-split
+        pg_trgm scored Serra Inquisitors highest itself, so the SQL path answered it until both
+        lanes scored the collated name.
         """
         body = payload(dispatch(by_name_paths, "/cards/named", "fuzzy=grsrev+ureb"))
         assert body["name"] == "Grsrev, Ureb bs Qbzvanevn"
         assert payload(dispatch(by_name_paths, "/cards/named", "fuzzy=ulq+qvfvagrteng"))["name"] == "ULQEN Qvfvagrtengbe"
         assert payload(dispatch(by_name_paths, "/cards/named", "fuzzy=neraner"))["name"] == "Neran"
+        assert payload(dispatch(by_name_paths, "/cards/named", "fuzzy=vadhvfvgbe+free"))["name"] == "Vadhvfvgbe'f Bk"
 
-    @pytest.mark.usefixtures("engine_enabled")
-    def test_fuzzy_the_engines_line_between_typo_and_containment(self, compat_corpus: APIResource):
-        """The engine metric's line, `FUZZY_WEAK_BELOW` (0.71), between two measured needles.
+    def test_fuzzy_word_order_counts_and_several_containing_names_are_ambiguous(self, by_name_paths: APIResource):
+        """The collated name keeps word order, on both lanes; under the floor several names tie.
 
-        On api.scryfall.com (2026-09-25), `fuzzy=inquisitor serr` is Inquisitor's Ox, the typo
-        winner at 0.714, over Serra Inquisitors; `fuzzy=hyd disintegrat` is HYDRA Disintegrator,
-        the one card containing both words, over the typo winner Disintegrate at 0.703. pg_trgm
-        scores Serra Inquisitors highest itself, so the SQL path answers it and is not asked here.
+        On api.scryfall.com (2026-09-25), `fuzzy=bolt lightning` is Blightning at 9/16, although
+        Lightning Bolt (9/19) and "Emeritus of Conflict // Lightning Bolt" both contain the words --
+        word-split pg_trgm, which the SQL path scored before, rated Lightning Bolt 1.0 -- and
+        `fuzzy=assaultron` is ambiguous: Assault Drone scores 0.500, under the floor, and two names
+        contain the word, one a flavor name.
         """
-        body = payload(dispatch(compat_corpus, "/cards/named", "fuzzy=vadhvfvgbe+free"))
-        assert body["name"] == "Vadhvfvgbe'f Bk"
-        assert payload(dispatch(compat_corpus, "/cards/named", "fuzzy=ulq+qvfvagrteng"))["name"] == "ULQEN Qvfvagrtengbe"
-
-    @pytest.mark.usefixtures("engine_enabled")
-    def test_fuzzy_the_engines_line_for_several_containing_cards(self, compat_corpus: APIResource):
-        """A weak typo winner still outranks SEVERAL containing names, down to `FUZZY_FAINT_BELOW`.
-
-        On api.scryfall.com (2026-09-25), `fuzzy=bolt lightning` is Blightning at 0.676, although
-        Lightning Bolt and "Emeritus of Conflict // Lightning Bolt" both contain the words, and
-        `fuzzy=assaultron` is ambiguous under a typo winner Assault Drone at 0.667. pg_trgm scores
-        `bolt lightning` 1.0 against Lightning Bolt, since its trigrams are a set of WORDS, so the
-        SQL path answers Lightning Bolt and is not asked here.
-        """
-        assert payload(dispatch(compat_corpus, "/cards/named", "fuzzy=obyg+yvtugavat"))["name"] == "Oyvtugavat"
-        resp = dispatch(compat_corpus, "/cards/named", "fuzzy=nffnhygeba")
+        assert payload(dispatch(by_name_paths, "/cards/named", "fuzzy=obyg+yvtugavat"))["name"] == "Oyvtugavat"
+        resp = dispatch(by_name_paths, "/cards/named", "fuzzy=nffnhygeba")
         assert resp.status == falcon.HTTP_404
         assert payload(resp)["type"] == "ambiguous"
+
+    def test_fuzzy_a_tie_answers_the_card_first_printed_last(self, by_name_paths: APIResource):
+        """A typo tie is never `ambiguous`: the newer card answers, then the name that sorts last.
+
+        Measured on api.scryfall.com 2026-09-26: `fuzzy=thoughts` is Thought Scour (first printed
+        2012) over Thoughtseize (2007), and `fuzzy=parallax` is Parallax Wave over Parallax Tide,
+        which share Nemesis's release day. Each pair scores 8/14 here as there.
+        """
+        assert payload(dispatch(by_name_paths, "/cards/named", "fuzzy=gubhtugf"))["name"] == "Gubhtug Fpbhe"
+        assert payload(dispatch(by_name_paths, "/cards/named", "fuzzy=cnenyynk"))["name"] == "Cnenyynk Jnir"
+
+    def test_fuzzy_the_floor_sits_between_two_probes(self, by_name_paths: APIResource):
+        """0.55, bracketed on api.scryfall.com (2026-09-26) by a 404 and an answer.
+
+        `fuzzy=deadeall` scores 6/11 = 0.545 against Deadfall and is a 404; `fuzzy=lightning blow`
+        scores 5/9 = 0.556 against Lightning Bolt and answers it -- and does inside a set too, which
+        is the SQL lane on both paths, as `fuzzy=lightning blast&set=m11` (0.526) is a 404.
+        """
+        assert dispatch(by_name_paths, "/cards/named", "fuzzy=qrnqrnyy").status == falcon.HTTP_404
+        assert payload(dispatch(by_name_paths, "/cards/named", "fuzzy=yvtugavat+oybj"))["name"] == "Yvtugavat Obyg"
+        in_set = f"fuzzy=yvtugavat+oybj&set={ORDER_SET_CODE}"
+        assert payload(dispatch(by_name_paths, "/cards/named", in_set))["name"] == "Yvtugavat Obyg"
+        blast = f"fuzzy=yvtugavat+oynfg&set={ORDER_SET_CODE}"
+        assert dispatch(by_name_paths, "/cards/named", blast).status == falcon.HTTP_404
 
     def test_neither_parameter_is_a_400(self, compat_corpus: APIResource):
         resp = dispatch(compat_corpus, "/cards/named")
