@@ -63,7 +63,7 @@ from api.scryfall_compat.objects import (
     sql_row_to_engine_row,
     to_scryfall_card,
 )
-from api.scryfall_compat.query_terms import scryfall_term_policy
+from api.scryfall_compat.query_terms import _UUID_V4_RE, scryfall_term_policy
 from api.settings import settings
 from api.utils import db_utils
 from api.utils.routing import route
@@ -347,6 +347,14 @@ _EXTRAS_DERIVED_TRIGGERS = frozenset(
 # The set-code attribute every spelling of the set operator (`e:`, `s:`, `set:`) rewrites to.
 _SET_CODE_ATTRIBUTE = "card_set_code"
 
+# The attribute `oracleid:` and `oracle_id:` bind to. The keyword arrives with #926 -- the parser
+# on this branch does not know it yet, exactly as `query_terms._KNOWN_KEYWORDS` already allows for --
+# so until that lands the arm below is reached only by a tree built with the leaf in it.
+_ORACLE_ID_ATTRIBUTE = "oracle_id"
+
+# The operators under which `oracleid:` is a trigger. `!=` is not one: it echoes false.
+_ORACLE_ID_TRIGGER_OPERATORS = frozenset({":", "="})
+
 
 def _fold_directives_for_echo(
     parsed: Query,
@@ -403,13 +411,14 @@ def _extras_triggers(node: object) -> _ExtrasTriggers:
     true and `-e:war t:land` is false. And it is a FORCE, not a default: an explicit
     `include_extras=false` is overridden, in the echo and in the rows.
 
-    Unconditional triggers: `a:`, `wm:`, `layout:`, `name:/regex/`, `t:token` and `is:extra`
-    (`b:` belongs here too -- this parser has no block operator, so the term cannot reach us).
-    Each fires on the TERM and not on what it matches: `a:"Wesley Burt"` triggers although
-    `a:"Wesley Burt" is:extra` is 0, `name:/zzzqq/` matches nothing and still triggers,
-    `layout:normal` triggers. Deliberately NOT triggers, each probed: `t:` at any other value,
-    `o:`, `o:/…/`, `t:/…/`, `cn:`, `st:`, `year:`/`date:`, `border:`, `frame:`, `is:` at any other
-    value, `name:"literal"`, a bare `name:` word, and `!"Exact"`.
+    Unconditional triggers: `a:`, `wm:`, `layout:`, `name:/regex/`, `oracleid:<v4 uuid>`,
+    `t:token` and `is:extra` (`b:` belongs here too -- this parser has no block operator, so the
+    term cannot reach us). Each fires on the TERM and not on what it matches: `a:"Wesley Burt"`
+    triggers although `a:"Wesley Burt" is:extra` is 0, `name:/zzzqq/` matches nothing and still
+    triggers, `layout:normal` triggers, and so does an `oracleid:` naming a well-formed id no card
+    has. Deliberately NOT triggers, each probed: `t:` at any other value, `o:`, `o:/…/`, `t:/…/`,
+    `cn:`, `game:`, `st:`, `year:`/`date:`, `border:`, `frame:`, `is:` at any other value,
+    `name:"literal"`, a bare `name:` word, and `!"Exact"`.
 
     Conditional trigger: a set term, IFF that set holds at least one `is:extra` printing --
     `QueryEngine.sets_with_extras` is that table. Over 18 measured sets the split is perfect
@@ -495,6 +504,8 @@ def _extras_triggers_of_term(node: BinaryOperatorNode) -> _ExtrasTriggers:
         return _ExtrasTriggers(forced=True, sets=())
     if attribute == "card_legalities" and _legality_term_triggers(node, value):
         return _ExtrasTriggers(forced=True, sets=())
+    if attribute == _ORACLE_ID_ATTRIBUTE and _oracle_id_term_triggers(node, node.rhs):
+        return _ExtrasTriggers(forced=True, sets=())
     if attribute == _SET_CODE_ATTRIBUTE:
         return _ExtrasTriggers(forced=False, sets=(value,))
     return _NO_EXTRAS_TRIGGERS
@@ -514,6 +525,36 @@ def _legality_term_triggers(node: BinaryOperatorNode, value: str) -> bool:
     lhs = node.lhs
     original = getattr(lhs, "original_attribute", None) if isinstance(lhs, AttributeNode) else None
     return original == "banned" or value == "premodern"
+
+
+def _oracle_id_term_triggers(node: BinaryOperatorNode, rhs: StringValueNode) -> bool:
+    """`oracleid:` under `:` or `=` whose value is a v4 UUID and was not written as a regex.
+
+    "Every printing of this card", and on api.scryfall.com that means EVERY one: the term forces
+    `include_extras`, so the answer carries a card's tokens, 30th Anniversary, Collectors' Edition,
+    World Championship and art-series printings. Measured 2026-09-25 with the probe the rest of this
+    table was built with, `<term> or cmc=3` sent with `include_extras=false` and the verdict read
+    out of the `next_page` echo (bare 8,089 echoing false; extras-on 8,297):
+
+      FIRES (echo true): `oracleid:` and `oracleid=` at Mechtitan (whose printings are ALL extras
+        -- tneo/14 and the sld/1969 reversible card, and a 404 without this), Doubling Cube and
+        Fury Sliver (NONE of whose printings are); the same id upper-cased, quoted, or spelled
+        `oracle_id:`; `-oracleid:<id> cmc=3`, so negation does not cancel it; and
+        `oracleid:11111111-1111-4111-8111-111111111111`, a well-formed id no card has -- the TERM,
+        not the rows, like every other trigger here. `unique=prints` and `unique=cards` alike.
+      DOES NOT FIRE (8,089, echo false): every value that is not a v4 UUID -- `abc`, a prefix, the
+        nil UUID, a version-1 shape, a bad variant nibble, no hyphens -- each "ignored" with
+        `You must provide a valid v4 UUID.`; the regex spelling, ignored as an unknown regular
+        expression keyword; and `oracleid!=<id>`. Nor does anything else that names one card:
+        `!"Mechtitan"` is 404, `cn:14 or cmc=3` and `game:arena or cmc=3` echo false.
+
+    The v4 check is `query_terms`' own, the one that decides whether the term survives into the
+    tree at all. On `/cards/*` that policy has already dropped every non-v4 value and the regex
+    spelling, and replaced `!=` with a term that matches nothing, before this walk runs -- so the
+    checks here agree with it rather than add to it, and are what keeps the walk right when handed
+    a tree the policy did not see.
+    """
+    return node.operator in _ORACLE_ID_TRIGGER_OPERATORS and not rhs.regex_derived and _UUID_V4_RE.match(str(rhs.value)) is not None
 
 
 def _mentions_is_tag(node: object, tag: str) -> bool:

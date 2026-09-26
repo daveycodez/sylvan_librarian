@@ -21,7 +21,7 @@ import pytest
 from cachebox import LRUCache
 
 from api.enums import CardOrdering, SortDirection, UniqueOn, resolve_direction
-from api.parsing import parse_scryfall_query
+from api.parsing import AttributeNode, BinaryOperatorNode, NotNode, OrNode, StringValueNode, parse_scryfall_query
 from api.scryfall_compat import routes as routes_module
 from api.scryfall_compat.objects import MAX_COLLECTION_IDENTIFIERS, PAGE_SIZE
 from api.scryfall_compat.routes import _csv_cell, _csv_mana_cost, _csv_price
@@ -40,6 +40,12 @@ BEAR_ID = "22222222-2222-4222-8222-222222222222"
 DELVER_ID = "33333333-3333-4333-8333-333333333333"
 BOLT_ORACLE_ID = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
 EXTRA_ID = "55555555-5555-4555-8555-555555555555"
+# The extra's oracle id, pinned so `oracleid:` can name it. Its ONLY printing is the extra, which is
+# Mechtitan's shape on api.scryfall.com: tneo/14 and sld/1969, both `is:extra`.
+EXTRA_ORACLE_ID = "5a5a5a5a-5555-4555-8555-5a5a5a5a5a5a"
+# A well-formed v4 id no card carries as its oracle id: `oracleid:` fires on the TERM, so this
+# triggers too.
+UNKNOWN_V4_ID = "fefefefe-0000-4000-8000-fefefefefefe"
 # A SET OF ITS OWN, on purpose. `e:`/`s:` is the CONDITIONAL `include_extras` trigger -- a set term
 # turns extras on iff that set holds one -- so putting the extra in SET_CODE would auto-enable
 # every `s:sfc` query in this module and quietly change what the paging tests page over.
@@ -412,6 +418,7 @@ def _extra() -> dict:
     card = make_raw_card(card_id=EXTRA_ID, name="Compat Substitute")
     card |= {
         "object": "card",
+        "oracle_id": EXTRA_ORACLE_ID,
         "set": EXTRAS_SET_CODE,
         "set_name": "Scryfall Compat Extras",
         "collector_number": "1",
@@ -632,6 +639,21 @@ def payload(resp) -> dict:
     if resp.media is not None:
         return resp.media
     return orjson.loads(resp.render_body())
+
+
+def _parser_reads_oracleid() -> bool:
+    """Whether this tree's parser knows the `oracleid:` keyword, which arrives with #926."""
+    try:
+        parse_scryfall_query(f"oracleid:{BOLT_ORACLE_ID}")
+    except ValueError:
+        return False
+    return True
+
+
+# The route-level `oracleid:` cases need the keyword in the PARSER, and that is #926's, not this
+# branch's. Skipped until it lands rather than left red; `TestExtrasTriggers` pins the gate itself
+# on a hand-built leaf meanwhile, so the rule is under test either way.
+needs_oracleid = pytest.mark.skipif(not _parser_reads_oracleid(), reason="the `oracleid:` keyword arrives with #926")
 
 
 class TestRouteRegistration:
@@ -939,6 +961,85 @@ class TestSearch:
         monkeypatch.setattr("api.scryfall_compat.routes.PAGE_SIZE", 1)
         body = payload(dispatch(compat_corpus, "/cards/search", "q=t%3Acreature&include_extras=false"))
         assert "include_extras=false" in body["next_page"]
+
+    @needs_oracleid
+    @pytest.mark.parametrize("unique", ["cards", "prints"])
+    def test_an_oracleid_whose_every_printing_is_an_extra_answers_it(self, by_name_paths: APIResource, unique):
+        """`oracleid:` is an unconditional trigger, so a card that is ALL extras is not a 404.
+
+        Mechtitan's shape: on api.scryfall.com `oracleid:<Mechtitan>` sent with
+        `include_extras=false` answers tneo/14 and sld/1969, both `is:extra`, under `unique=prints`
+        and tneo/14 under `unique=cards`. Without the trigger the gate closes and it is a 404. Both paths, since `_search` answers from
+        the engine or from SQL depending on the worker.
+        """
+        query = urlencode({"q": f"oracleid:{EXTRA_ORACLE_ID}", "include_extras": "false", "unique": unique})
+        body = payload(dispatch(by_name_paths, "/cards/search", query))
+        assert [card["id"] for card in body["data"]] == [EXTRA_ID]
+
+    @needs_oracleid
+    def test_an_oracleid_on_an_ordinary_card_still_answers_it(self, by_name_paths: APIResource):
+        """The gate opening adds nothing to a card with no extras -- Doubling Cube's shape."""
+        query = urlencode({"q": f"oracleid:{BOLT_ORACLE_ID}", "include_extras": "false"})
+        body = payload(dispatch(by_name_paths, "/cards/search", query))
+        assert [card["id"] for card in body["data"]] == [BOLT_ID]
+
+    @needs_oracleid
+    @pytest.mark.parametrize(
+        "query",
+        [
+            f"oracleid:{EXTRA_ORACLE_ID}",
+            f"oracleid={EXTRA_ORACLE_ID}",
+            f"oracleid:{EXTRA_ORACLE_ID.upper()}",
+            f'oracleid:"{EXTRA_ORACLE_ID}"',
+            f"oracle_id:{EXTRA_ORACLE_ID}",
+            f"-oracleid:{EXTRA_ORACLE_ID} cmc=3",
+            f"oracleid:{BOLT_ORACLE_ID}",
+            f"oracleid:{UNKNOWN_V4_ID}",
+        ],
+        ids=["colon", "equals", "upper-case", "quoted", "underscore", "negated", "no-extras", "no-card"],
+    )
+    @pytest.mark.parametrize("unique", ["cards", "prints"])
+    def test_every_oracleid_spelling_forces_the_flag(self, by_name_paths: APIResource, monkeypatch, query, unique):
+        """Each spelling api.scryfall.com fires on, measured 2026-09-25 -- see `_oracle_id_term_triggers`.
+
+        `<term> or t:creature`, the probe's own shape over this corpus: the flag is what is under
+        test, and the echo carries it.
+        """
+        seen = {}
+        original = by_name_paths._search
+        monkeypatch.setattr(by_name_paths, "_search", lambda **kw: (seen.update(kw), original(**kw))[1])
+        monkeypatch.setattr("api.scryfall_compat.routes.PAGE_SIZE", 1)
+        params = urlencode({"q": f"{query} or t:creature", "include_extras": "false", "unique": unique})
+        body = payload(dispatch(by_name_paths, "/cards/search", params))
+        assert seen["include_extras"] is True
+        assert "include_extras=true" in body["next_page"]
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "oracleid:abc",
+            "oracleid:5a5a5a5a",
+            "oracleid:00000000-0000-0000-0000-000000000000",
+            "oracleid:5a5a5a5a-5555-1555-8555-5a5a5a5a5a5a",
+            "oracleid:5a5a5a5a-5555-4555-c555-5a5a5a5a5a5a",
+            f"oracleid:{EXTRA_ORACLE_ID.replace('-', '')}",
+            f"oracleid:/{EXTRA_ORACLE_ID}/",
+            f"oracleid!={EXTRA_ORACLE_ID}",
+        ],
+        ids=["word", "prefix", "nil", "version-1", "bad-variant", "no-hyphens", "regex", "not-equal"],
+    )
+    def test_an_oracleid_scryfall_ignores_leaves_the_flag_alone(self, by_name_paths: APIResource, monkeypatch, query):
+        """Every non-v4 value, the regex spelling and `!=` echo false on api.scryfall.com.
+
+        Measured 2026-09-25 with `<term> or cmc=3`: 8,089 rows echoing `include_extras=false`, the
+        bare count. The first seven are "ignored" there -- `You must provide a valid v4 UUID.` --
+        and `!=` is kept but is not a trigger.
+        """
+        seen = {}
+        original = by_name_paths._search
+        monkeypatch.setattr(by_name_paths, "_search", lambda **kw: (seen.update(kw), original(**kw))[1])
+        dispatch(by_name_paths, "/cards/search", urlencode({"q": f"{query} or t:creature", "include_extras": "false"}))
+        assert seen["include_extras"] is False
 
     # ── in-query directives ──────────────────────────────────────────────────
 
@@ -1292,6 +1393,68 @@ class TestExtrasTriggers:
         # And a set term inside an expansion is not a set the caller named: nothing widens by
         # accident through the conditional arm either.
         assert routes_module._extras_triggers(parse_scryfall_query("is:split")).sets == ()
+
+    @staticmethod
+    def _oracle_id_leaf(value: str, operator: str = ":", *, regex_derived: bool = False) -> BinaryOperatorNode:
+        """An `oracleid:` leaf as #926's parser builds it: `oracle_id`, the operator, the value.
+
+        Built by hand because the keyword is #926's and this branch's parser does not know it yet;
+        the shape is the one that parser emits, `regex_derived` included for the lowered regex.
+        """
+        return BinaryOperatorNode(AttributeNode("oracle_id"), operator, StringValueNode(value, regex_derived=regex_derived))
+
+    def test_an_oracleid_naming_a_v4_uuid_forces_extras(self):
+        """`oracleid:` at a v4 UUID fires on the TERM -- see `_oracle_id_term_triggers`.
+
+        Measured on api.scryfall.com 2026-09-25 with `<term> or cmc=3`: `:` and `=`, any case,
+        negated, and for a well-formed id no card has. `oracle_id:` binds to the same attribute and
+        quoting reaches the same leaf, so this covers those spellings too.
+        """
+        cmc = parse_scryfall_query("cmc=3").root
+        for leaf in (
+            self._oracle_id_leaf(EXTRA_ORACLE_ID),
+            self._oracle_id_leaf(EXTRA_ORACLE_ID, "="),
+            self._oracle_id_leaf(EXTRA_ORACLE_ID.upper()),
+            self._oracle_id_leaf(UNKNOWN_V4_ID),
+        ):
+            assert routes_module._extras_triggers(leaf).forced is True, (leaf.operator, leaf.rhs.value)
+            assert routes_module._extras_triggers(OrNode([leaf, cmc])).forced is True
+            assert routes_module._extras_triggers(NotNode(leaf)).forced is True
+
+    def test_an_oracleid_scryfall_ignores_does_not_force_extras(self):
+        """A value that is not a v4 UUID, the regex spelling and `!=` all echo false.
+
+        Measured 2026-09-25: the non-v4 values are "ignored" with `You must provide a valid v4
+        UUID.` and the regex with an unknown-regex-keyword warning, so none of them reaches
+        Scryfall's tree; `!=` does, and still is not a trigger. The route's term policy drops all
+        of these but `!=` first, so the walk's own checks are what these pin.
+        """
+        for value in (
+            "abc",
+            "5a5a5a5a",
+            "00000000-0000-0000-0000-000000000000",
+            "5a5a5a5a-5555-1555-8555-5a5a5a5a5a5a",
+            "5a5a5a5a-5555-4555-c555-5a5a5a5a5a5a",
+            EXTRA_ORACLE_ID.replace("-", ""),
+        ):
+            assert routes_module._extras_triggers(self._oracle_id_leaf(value)).forced is False, value
+        assert routes_module._extras_triggers(self._oracle_id_leaf(EXTRA_ORACLE_ID, regex_derived=True)).forced is False
+        assert routes_module._extras_triggers(self._oracle_id_leaf(EXTRA_ORACLE_ID, "!=")).forced is False
+
+    @needs_oracleid
+    def test_the_parsed_oracleid_spellings_agree_with_the_hand_built_leaf(self):
+        """The same verdicts through the parser, once it knows the keyword."""
+        for query in (
+            f"oracleid:{EXTRA_ORACLE_ID}",
+            f"oracleid={EXTRA_ORACLE_ID}",
+            f"oracle_id:{EXTRA_ORACLE_ID.upper()}",
+            f'oracleid:"{EXTRA_ORACLE_ID}"',
+            f"-oracleid:{EXTRA_ORACLE_ID} cmc=3",
+            f"oracleid:{UNKNOWN_V4_ID} or cmc=3",
+        ):
+            assert routes_module._extras_triggers(parse_scryfall_query(query)).forced is True, query
+        for query in (f"oracleid!={EXTRA_ORACLE_ID}", "oracleid:abc", f"oracleid:/{EXTRA_ORACLE_ID}/"):
+            assert routes_module._extras_triggers(parse_scryfall_query(query)).forced is False, query
 
     def test_banned_triggers_wholesale_and_f_only_at_premodern(self):
         """Every legality alias binds to `card_legalities`, so the alias separates them.
@@ -1837,6 +2000,12 @@ class TestRandom:
         """
         body = payload(dispatch(compat_corpus, "/cards/random", "q=is%3Aextra&include_extras=false"))
         assert body["id"] in {EXTRA_ID, POOL_EMBLEM_ID, POOL_TOKEN_ID, POOL_ART_SERIES_ID, FLAVOR_TOKEN_ID}
+
+    @needs_oracleid
+    def test_an_oracleid_draws_a_card_whose_every_printing_is_an_extra(self, by_name_paths: APIResource):
+        """The draw shares the gate, so `oracleid:` opens it here too -- Mechtitan is not a 404."""
+        query = urlencode({"q": f"oracleid:{EXTRA_ORACLE_ID}", "include_extras": "false"})
+        assert payload(dispatch(by_name_paths, "/cards/random", query))["id"] == EXTRA_ID
 
     def test_a_set_term_on_an_extras_set_is_the_conditional_trigger(self, compat_corpus: APIResource, monkeypatch):
         """The one trigger that asks the store: a set term enables extras iff that set holds one.
