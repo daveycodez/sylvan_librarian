@@ -20,6 +20,7 @@ from api.scryfall_compat.objects import (
     error_object,
     image_uri,
     ruling_object,
+    rulings_oracle_id,
     sql_row_to_engine_row,
     to_scryfall_card,
 )
@@ -382,6 +383,46 @@ class TestEnvelopes:
             "comment": "It does.",
         }
         assert ruling_object(row)["published_at"] == "2004-10-04"
+
+
+_FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
+
+
+class TestRulingsOracleId:
+    """The oracle id `/cards/:id/rulings` looks rulings up by: the card's own, else its faces'."""
+
+    def test_a_reversible_printing_is_read_through_its_faces(self):
+        """Ugin, Eye of the Storms tdm/382, as api.scryfall.com serves it.
+
+        Scryfall's own object has no top-level `oracle_id`; both faces carry the card's. It answers
+        `/cards/tdm/382/rulings` with the same 3 rulings as tdm/1 (2026-09-25), so the faces' id is
+        the one the rulings hang off.
+        """
+        ugin = json.loads((_FIXTURES / "ugin_eye_of_the_storms_tdm_382.json").read_text(encoding="utf-8"))
+        assert ugin["layout"] == "reversible_card"
+        assert "oracle_id" not in ugin
+        assert rulings_oracle_id(ugin) == "5c58353a-fd60-4528-bf0d-669626cda0b2"
+
+    def test_the_object_built_for_a_reversible_row_resolves_to_the_rows_oracle_id(self):
+        """What `to_scryfall_card` builds drops the top-level id, and the rulings still find it."""
+        card = to_scryfall_card(
+            row(
+                name="Propaganda // Propaganda",
+                layout="reversible_card",
+                card_faces=[
+                    {"name": "Propaganda", "oracle_text": "Front.", "mana_cost": "{2}{U}"},
+                    {"name": "Propaganda", "oracle_text": "Back.", "mana_cost": "{2}{U}"},
+                ],
+            )
+        )
+        assert "oracle_id" not in card
+        assert rulings_oracle_id(card) == "11111111-2222-3333-4444-555555555555"
+
+    def test_a_card_with_its_own_oracle_id_uses_it(self):
+        assert rulings_oracle_id(to_scryfall_card(row())) == "11111111-2222-3333-4444-555555555555"
+
+    def test_no_oracle_id_anywhere_is_empty(self):
+        assert rulings_oracle_id({"object": "card", "card_faces": [{"name": "A"}, {"name": "B"}]}) == ""
 
 
 class TestPageUrl:

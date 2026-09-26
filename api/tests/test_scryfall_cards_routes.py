@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import json
+import pathlib
 import uuid
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
@@ -1178,6 +1179,53 @@ class TestCollectionScope:
         assert [card["id"] for card in body["data"]] == [SCOPE_A_ID]
 
 
+# A REVERSIBLE printing, from api.scryfall.com as served (2026-09-25): Bloomvine Regent tdm/381, and
+# its 11 rulings. Its card object has no top-level `oracle_id`; both faces carry the card's. It is the
+# reversible shape this corpus can import -- Ugin, Eye of the Storms tdm/382 is `X // X`, which
+# preprocess_card filters out -- and its rulings are the same 11 Scryfall serves for tdm/136.
+_FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
+BLOOMVINE_ID = "081f2de5-251a-41c9-a62f-11487f54d355"
+BLOOMVINE_ORACLE_ID = "da1e019c-2ffb-412d-90d7-f2e5e5c44c4b"
+
+
+def _bloomvine_rulings() -> list[dict]:
+    """Scryfall's own `/cards/tdm/381/rulings` data, as served 2026-09-25."""
+    return json.loads((_FIXTURES / "bloomvine_regent_tdm_381_rulings.json").read_text(encoding="utf-8"))["data"]
+
+
+@pytest.fixture(name="reversible_corpus", scope="module")
+def reversible_corpus_fixture(compat_corpus: APIResource) -> APIResource:
+    """The corpus plus Bloomvine Regent tdm/381 and its rulings, exactly as Scryfall serves them."""
+    card = json.loads((_FIXTURES / "bloomvine_regent_tdm_381.json").read_text(encoding="utf-8"))
+    compat_corpus.admin._upsert_cards([card])
+    with compat_corpus.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
+        # preprocess_card stores a multi-face row under its FACES' layout, which for this printing is
+        # `adventure`. The printing's own layout is `reversible_card` -- what Scryfall serves, and
+        # what the card object's reversible branch keys on -- so the row carries that here.
+        cursor.execute(
+            "UPDATE magic.cards SET card_layout = %(layout)s WHERE scryfall_id = %(id)s",
+            {"layout": card["layout"], "id": BLOOMVINE_ID},
+        )
+        cursor.execute("DELETE FROM magic.rulings WHERE oracle_id = %(oracle_id)s", {"oracle_id": BLOOMVINE_ORACLE_ID})
+        cursor.executemany(
+            "INSERT INTO magic.rulings (oracle_id, source, published_at, comment) VALUES (%s, %s, %s, %s)",
+            [(r["oracle_id"], r["source"], r["published_at"], r["comment"]) for r in _bloomvine_rulings()],
+        )
+        conn.commit()
+    compat_corpus.app_context.reload_engine(force=True)
+    compat_corpus.admin._clear_caches()
+    return compat_corpus
+
+
+@pytest.fixture(name="reversible_paths", params=["engine", "sql"])
+def reversible_paths_fixture(request, reversible_corpus: APIResource):
+    """The reversible corpus answered by the engine, and again by the SQL fallback."""
+    saved = settings.enable_engine
+    settings.enable_engine = request.param == "engine"
+    yield reversible_corpus
+    settings.enable_engine = saved
+
+
 class TestRulings:
     """The five rulings routes."""
 
@@ -1226,6 +1274,24 @@ class TestRulings:
     def test_rulings_by_external_id(self, compat_corpus: APIResource, namespace, external_id):
         body = payload(dispatch(compat_corpus, f"/cards/{namespace}/{external_id}/rulings"))
         assert len(body["data"]) == 4  # three rulings, one of them served twice
+
+    @pytest.mark.parametrize("path", [f"/cards/{BLOOMVINE_ID}/rulings", "/cards/tdm/381/rulings"])
+    def test_a_reversible_printing_answers_its_cards_rulings(self, reversible_paths: APIResource, path: str):
+        """A reversible printing's rulings hang off its faces' oracle id, as on api.scryfall.com.
+
+        Its card object carries no top-level `oracle_id`, and reading only that answered `data: []`
+        for every reversible printing. Scryfall answers `/cards/tdm/381/rulings` with Bloomvine
+        Regent's 11.
+        """
+        card = payload(dispatch(reversible_paths, f"/cards/{BLOOMVINE_ID}"))
+        assert card["layout"] == "reversible_card"
+        assert "oracle_id" not in card
+        assert {face["oracle_id"] for face in card["card_faces"]} == {BLOOMVINE_ORACLE_ID}
+
+        body = payload(dispatch(reversible_paths, path))
+        assert len(body["data"]) == 11
+        # One date for all 11, so the order within it is the `comment` stand-in (see _rulings_for).
+        assert sorted(body["data"], key=lambda r: r["comment"]) == sorted(_bloomvine_rulings(), key=lambda r: r["comment"])
 
     def test_a_card_with_no_rulings_returns_an_empty_list(self, compat_corpus: APIResource):
         body = payload(dispatch(compat_corpus, f"/cards/{BEAR_ID}/rulings"))

@@ -682,6 +682,31 @@ def catalog_object(values: list[str]) -> dict[str, Any]:
     return {"object": "catalog", "total_values": len(values), "data": values}
 
 
+def rulings_oracle_id(card: dict[str, Any]) -> str:
+    """The oracle id a card object's rulings hang off: its own, or its faces' when it has none.
+
+    A `reversible_card` printing is the one card object with no top-level `oracle_id` (see
+    `_REVERSIBLE_LAYOUT`): the id is on every face instead, 0 of 81 disagreeing. Reading only the top
+    level answered `/cards/:id/rulings` with an empty list for every reversible printing, where
+    api.scryfall.com answers the card's rulings -- tdm/382 "Ugin, Eye of the Storms" has the same 3
+    as tdm/1, and tdm/381 "Bloomvine Regent" the same 11 as tdm/136 (2026-09-25).
+
+    Args:
+        card: A card object, as `to_scryfall_card` builds it or api.scryfall.com serves it.
+
+    Returns:
+        The oracle id, or "" when neither the card nor any face carries one.
+    """
+    oracle_id = card.get("oracle_id")
+    if oracle_id:
+        return str(oracle_id)
+    for face in card.get("card_faces") or ():
+        face_oracle_id = face.get("oracle_id")
+        if face_oracle_id:
+            return str(face_oracle_id)
+    return ""
+
+
 def ruling_object(row: dict[str, Any]) -> dict[str, Any]:
     """Build one Scryfall Ruling object from a `magic.rulings` row.
 

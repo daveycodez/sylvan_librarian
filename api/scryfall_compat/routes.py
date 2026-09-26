@@ -55,6 +55,7 @@ from api.scryfall_compat.objects import (
     error_object,
     not_found_error,
     ruling_object,
+    rulings_oracle_id,
     sql_row_to_engine_row,
     to_scryfall_card,
 )
@@ -2146,13 +2147,16 @@ class ScryfallCardsRoutes:
         rulings, against the 2026-08-11 dump -- so the remaining 5,923 (one ruling, or one per date)
         are the ones this now matches exactly. See docs/issues/local-scryfall-cards-api.md.
 
+        A reversible printing's card object carries no top-level oracle id, so the id is read
+        through `rulings_oracle_id`, which falls back to the faces'.
+
         Args:
             card: The card whose oracle id the rulings hang off.
 
         Returns:
             A List object of Ruling objects, empty when the card has none.
         """
-        oracle_id = card.get("oracle_id")
+        oracle_id = rulings_oracle_id(card)
         if not oracle_id:
             return card_list([])
         rows = self._run_query(
