@@ -196,14 +196,24 @@ _COMPAT_BLOB_EXCLUDED = frozenset(
         "watermark", "reserved", "game_changer", "frame",
         # pure functions of id / set / collector_number / oracle_id, re-emitted on read
         "object", "uri", "scryfall_uri", "image_uris", "rulings_uri", "prints_search_uri",
-        "set_uri", "set_search_uri", "scryfall_set_uri", "card_back_id", "related_uris",
-        "purchase_uris", "resource_id",
+        "set_uri", "set_search_uri", "scryfall_set_uri", "related_uris", "purchase_uris",
+        # NOT `card_back_id` or `resource_id`, which sat here as "re-emitted on read" and are not
+        # pure functions of anything: the back differs from Scryfall's shared one on ~2,600 of the
+        # ~98k default printings (Collectors' Edition, the oversized and memorabilia sets), and
+        # `resource_id` is an opaque hash on the newest ~6,000 (msc/806, soc/190). Both ride the
+        # residue now; `_compat_blob` drops a back that is the shared one.
         # its own column
         "card_faces",
         # added by this module before the snapshot is taken
         "card_name", "face_name", "face_idx", "scryfall_id",
     },
 )  # fmt: skip
+
+
+# Scryfall's shared card back, which nearly every one-image printing names. Kept out of the residue:
+# both card-object writers emit it when the row names no other back, so storing it would cost ~55
+# bytes a row for no information. The same id as objects.CARD_BACK_ID.
+_SHARED_CARD_BACK_ID = "0aeebaf5-8c7d-4636-9e82-8c27447861f7"
 
 
 def _compat_blob(card: dict[str, Any]) -> dict[str, Any]:
@@ -213,9 +223,14 @@ def _compat_blob(card: dict[str, Any]) -> dict[str, Any]:
         card: The card object as Scryfall sent it, before this module's own keys matter.
 
     Returns:
-        The residue, ready to store as card_compat_blob.
+        The residue, ready to store as card_compat_blob -- with a `card_back_id` only when it is not
+        Scryfall's shared back.
     """
-    return {key: value for key, value in card.items() if key not in _COMPAT_BLOB_EXCLUDED}
+    return {
+        key: value
+        for key, value in card.items()
+        if key not in _COMPAT_BLOB_EXCLUDED and not (key == "card_back_id" and value == _SHARED_CARD_BACK_ID)
+    }
 
 
 def _merge_processed_faces(faces: list[dict[str, Any]]) -> dict[str, Any]:

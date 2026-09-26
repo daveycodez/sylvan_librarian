@@ -368,19 +368,20 @@ class TestScryfallKeyOrderAndKeys:
     """api.scryfall.com's key order at every level, and the keys it sends that this used to drop.
 
     The sequences are read off Scryfall's own objects (2026-09-26), never off either writer; the
-    parity fixture holds eight of those objects whole. `card_object.rs` asserts the same cases.
+    parity fixture holds thirteen of those objects whole. `card_object.rs` asserts the same cases.
     """
 
-    # Lightning Bolt msc/806's top level as api.scryfall.com served it, minus the three keys this
-    # branch's store does not hold yet (`resource_id`, `artist_ids`, `preview`).
+    # Lightning Bolt msc/806's top level as api.scryfall.com served it, `resource_id` and
+    # `artist_ids` included.
     MSC_806_KEYS = (
-        "object", "id", "oracle_id", "multiverse_ids", "mtgo_id", "arena_id", "tcgplayer_id", "cardmarket_id",
+        "object", "id", "oracle_id", "multiverse_ids", "resource_id", "mtgo_id", "arena_id", "tcgplayer_id",
+        "cardmarket_id",
         "name", "lang", "released_at", "uri", "scryfall_uri", "layout", "highres_image", "image_status",
         "image_updated_at", "image_uris", "mana_cost", "cmc", "type_line", "oracle_text", "colors",
         "color_identity", "keywords", "all_parts", "legalities", "games", "reserved", "game_changer", "foil",
         "nonfoil", "finishes", "oversized", "promo", "reprint", "variation", "set_id", "set", "set_name",
         "set_type", "set_uri", "set_search_uri", "scryfall_set_uri", "rulings_uri", "prints_search_uri",
-        "collector_number", "digital", "rarity", "flavor_text", "card_back_id", "artist", "illustration_id",
+        "collector_number", "digital", "rarity", "flavor_text", "card_back_id", "artist", "artist_ids", "illustration_id",
         "border_color", "frame", "full_art", "textless", "booster", "story_spotlight", "promo_types", "edhrec_rank",
         "prices", "related_uris", "purchase_uris",
     )  # fmt: skip
@@ -407,6 +408,14 @@ class TestScryfallKeyOrderAndKeys:
                     frame="2015",
                     promo_types=["universesbeyond"],
                     edhrec_rank=157,
+                    resource_id="A59396A4D646C69A1DD41F9906BE9A9CDECE83F18DC5C53501DD7BAE50511DBB",
+                    artist_ids=["1eced451-4da5-42bc-b49d-70c41246581f"],
+                    # The engine answers None for a residue key the printing does not carry.
+                    variation_of=None,
+                    attraction_lights=None,
+                    card_back_id=None,
+                    preview=None,
+                    content_warning=None,
                 ).items()
             )
         )
@@ -460,9 +469,10 @@ class TestScryfallKeyOrderAndKeys:
         assert keys.index(after) == keys.index(before) + 1, keys
 
     def test_faces_carry_scryfalls_key_order(self):
-        """Delver of Secrets inr/60's front face on api.scryfall.com, minus the `artist_id` not stored."""
+        """Delver of Secrets inr/60's front face on api.scryfall.com, its `artist_id` included."""
         face = {
             "artist": "Nils Hamm",
+            "artist_id": "c540d1fc-1500-457f-93cf-d6069ee66546",
             "colors": ["U"],
             "color_indicator": [],
             "illustration_id": "1c2fee9b-89ea-4ab1-a751-451c3cd65a88",
@@ -484,9 +494,88 @@ class TestScryfallKeyOrderAndKeys:
             "power",
             "toughness",
             "artist",
+            "artist_id",
             "illustration_id",
             "image_uris",
         ]
+
+    @pytest.mark.parametrize(
+        ("before", "after"),
+        [
+            ("multiverse_ids", "resource_id"),
+            ("resource_id", "mtgo_id"),
+            ("variation", "variation_of"),
+            ("variation_of", "set_id"),
+            ("flavor_text", "attraction_lights"),
+            ("attraction_lights", "card_back_id"),
+            ("artist", "artist_ids"),
+            ("artist_ids", "illustration_id"),
+            ("edhrec_rank", "preview"),
+            ("preview", "content_warning"),
+            ("content_warning", "prices"),
+        ],
+    )
+    def test_the_residue_keys_take_scryfalls_positions(self, before: str, after: str):
+        """Each residue key in the one position api.scryfall.com gives it.
+
+        Balloon Stand unf/200a's lights just ahead of its own back, `artist_ids` after the credit,
+        `preview` and `content_warning` last before `prices`, `variation_of` straight after the flag.
+        """
+        keys = list(
+            to_scryfall_card(
+                row(
+                    multiverse_ids=[1],
+                    resource_id="AB12",
+                    variation=True,
+                    variation_of="3d170015-b125-49a6-a15e-8fd116bbcb14",
+                    flavor_text="x",
+                    attraction_lights=[2, 6],
+                    card_back_id="7840c131-f96b-4700-9347-2215c43156e6",
+                    artist="Someone",
+                    artist_ids=["ffffffff-0000-0000-0000-000000000001"],
+                    edhrec_rank=5,
+                    preview={"previewed_at": "2022-10-04", "source": "Wizards of the Coast", "source_uri": ""},
+                    content_warning=False,
+                )
+            )
+        )
+        assert keys.index(after) == keys.index(before) + 1, keys
+
+    def test_the_residue_keys_are_verbatim_and_absent_when_not_carried(self):
+        """Values pass through as stored, and a row carrying none writes none.
+
+        `preview` comes out in Scryfall's key order whatever the row's (the SQL lane's jsonb is
+        shortest-key-first), and a row naming no back of its own gets the shared one.
+        """
+        card = to_scryfall_card(
+            row(
+                attraction_lights=[2, 6],
+                card_back_id="7840c131-f96b-4700-9347-2215c43156e6",
+                preview={"source_uri": "", "source": "Wizards of the Coast", "previewed_at": "2022-10-04"},
+                content_warning=False,
+                artist_ids=[],
+            )
+        )
+        assert card["attraction_lights"] == [2, 6]
+        assert card["card_back_id"] == "7840c131-f96b-4700-9347-2215c43156e6"
+        assert list(card["preview"]) == ["source", "source_uri", "previewed_at"]
+        assert card["content_warning"] is False, "a false warning is still Scryfall's key"
+        assert card["artist_ids"] == [], "an empty list is a value, not an absence"
+
+        bare = to_scryfall_card(
+            row(resource_id=None, variation_of=None, attraction_lights=None, card_back_id=None, preview=None,
+                content_warning=None, artist_ids=None)
+        )  # fmt: skip
+        for absent in ("resource_id", "variation_of", "attraction_lights", "preview", "content_warning", "artist_ids"):
+            assert absent not in bare, absent
+        assert bare["card_back_id"] == "0aeebaf5-8c7d-4636-9e82-8c27447861f7"
+
+    def test_a_two_image_card_writes_no_back_even_when_the_row_names_one(self):
+        """The back belongs to a face on a two-image layout; a row value must not resurrect the key."""
+        card = to_scryfall_card(
+            row(layout="transform", card_back_id="7840c131-f96b-4700-9347-2215c43156e6", card_faces=[{"name": "a"}, {"name": "b"}])
+        )
+        assert "card_back_id" not in card
 
     def test_a_reversible_face_carries_cmc_after_its_mana_cost(self):
         """Zndrsplt sld/379's faces: the card's oracle_id after `object`, its cmc after `mana_cost`."""
@@ -779,7 +868,7 @@ class TestCardObjectParityWithTheRustBuilder:
     never meet. A shared fixture is what makes each job fail on its own drift.
 
     Key ORDER included, at every level: `json` keeps the fixture's order, and the compact bytes
-    must match. Eight of the cases are api.scryfall.com's own objects (see the fixture's
+    must match. Thirteen of the cases are api.scryfall.com's own objects (see the fixture's
     `_comment`), so the order both writers are held to is Scryfall's rather than either writer's.
     """
 
@@ -789,7 +878,7 @@ class TestCardObjectParityWithTheRustBuilder:
     def test_the_fixture_carries_scryfalls_own_objects(self):
         doc = json.loads(_PARITY_FIXTURE.read_text(encoding="utf-8"))
         sourced = [c for c in doc["cases"] if "scryfall" in c]
-        assert len(sourced) >= 8
+        assert len(sourced) >= 13
         for case in sourced:
             assert case["expected"]["uri"] == case["scryfall"]["uri"], case["case"]
 

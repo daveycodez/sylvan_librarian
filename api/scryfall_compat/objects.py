@@ -65,9 +65,16 @@ CARD_OBJECT_FIELDS = (
     "promo_types", "frame_effects", "games", "finishes", "booster", "digital", "foil", "nonfoil",
     "full_art", "highres_image", "oversized", "promo", "reprint", "story_spotlight", "textless",
     "variation", "card_faces", "all_parts",
+    # The residue beyond the compat columns: the artists' uuids and the rare keys, each None where
+    # the printing does not carry it (card_back_id is None for Scryfall's shared back).
+    "artist_ids", "resource_id", "variation_of", "attraction_lights", "card_back_id", "preview",
+    "content_warning",
 )  # fmt: skip
 
-# Scryfall's card back, one image for every normal card.
+# Scryfall's shared card back -- the `card_back_id` of every one-image printing but the few thousand
+# that print another (Collectors' Edition, the oversized and memorabilia sets, planes, schemes,
+# vanguards, attractions). The row names those in its own `card_back_id`; this is the default, and
+# the importer keeps it out of card_compat_blob because it says nothing.
 CARD_BACK_ID = "0aeebaf5-8c7d-4636-9e82-8c27447861f7"
 
 # The file extension each `image_uris` size is served as, in Scryfall's own key order.
@@ -298,6 +305,10 @@ _FACE_KEY_ORDER = (
     "oracle_text", "printed_text", "colors", "color_indicator", "power", "toughness", "loyalty",
     "defense", "flavor_text", "watermark", "artist", "artist_id", "illustration_id",
 )  # fmt: skip
+
+# `preview`'s keys in Scryfall's order, the same on every previewed printing. The SQL lane's jsonb
+# stores keys shortest-first and the engine's map is alphabetical, and neither is this.
+_PREVIEW_KEY_ORDER = ("source", "source_uri", "previewed_at")
 
 # A related card's keys in Scryfall's order. `uri` closes it and is derived -- the card's own
 # `/cards/:id` on this host, exactly as the top-level `uri` is -- so the stored one is never read.
@@ -539,14 +550,14 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
 
     Three sources, and every one of Scryfall's keys comes from exactly one: 29 stored columns, 12
     derived (every *_uri and image_uris, pure functions of the id/set/collector number/oracle id),
-    and the 33-key residue carried in card_compat_blob.
+    and the residue carried in card_compat_blob.
 
     THE ORDER IS SCRYFALL'S (2026-09-26), the same sequence card_object.rs writes: this used to be
     its own dict literal, and every object it built differed from api.scryfall.com's in key order
     at the top level, on every face, on every related card and in `legalities` -- 63 of 63
-    printings in a differential against the live API. The keys the store does not hold yet
-    (`resource_id`, `artist_ids`, `preview`, `variation_of`, `attraction_lights`,
-    `content_warning`, a non-shared `card_back_id`) are absent from it.
+    printings in a differential against the live API. The residue keys (`resource_id`,
+    `artist_ids`, `variation_of`, `attraction_lights`, a non-shared `card_back_id`, `preview`,
+    `content_warning`) take their own positions in it, each verbatim where the row carries it.
 
     Args:
         row: An engine row carrying CARD_OBJECT_FIELDS, or a SQL row through sql_row_to_engine_row.
@@ -574,8 +585,8 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
     # front face (see _JOINED_SEARCH_LAYOUTS). `related_uris.edhrec` and every `purchase_uris`
     # fallback take THIS string; the two `tcgplayer_infinite_*` links take the joined `name`.
     search_name = name.split(" // ", 1)[0] if faces and layout not in _JOINED_SEARCH_LAYOUTS else name
-    # Scryfall's `content_warning`, when the row carries it (the SQL lane's residue does; the store
-    # does not hold it yet). True withdraws every marketplace link -- see `_related_uris`.
+    # Scryfall's `content_warning`, verbatim from the residue. True withdraws every marketplace link
+    # -- see `_related_uris`.
     content_warning = row.get("content_warning") is True
     is_tags = row.get("card_is_tags") or []
     image_updated_at = row.get("image_updated_at")
@@ -586,6 +597,10 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
     if not reversible:
         card["oracle_id"] = oracle_id
     card["multiverse_ids"] = row.get("multiverse_ids") or []
+    # Between the multiverse ids and the client ids, on the printings that carry one -- an opaque
+    # hash, verbatim.
+    if row.get("resource_id") is not None:
+        card["resource_id"] = row["resource_id"]
     # The marketplace and client ids, where Scryfall puts them: straight after the multiverse ids.
     for key in ("mtgo_id", "mtgo_foil_id", "arena_id", "tcgplayer_id", "tcgplayer_etched_id", "cardmarket_id"):
         if row.get(key) is not None:
@@ -649,6 +664,11 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
         "promo": bool(row.get("promo")),
         "reprint": bool(row.get("reprint")),
         "variation": bool(row.get("variation")),
+    }
+    # The printing this one is a variation OF, right after the flag.
+    if row.get("variation_of") is not None:
+        card["variation_of"] = row["variation_of"]
+    card |= {
         "set_id": row.get("set_id"),
         "set": set_code,
         "set_name": row.get("set_name"),
@@ -666,12 +686,20 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
         card["watermark"] = row["watermark"]
     if row.get("flavor_text") and not two_image:
         card["flavor_text"] = row["flavor_text"]
+    # An attraction's lights, just ahead of the card back.
+    if row.get("attraction_lights") is not None:
+        card["attraction_lights"] = row["attraction_lights"]
     # A two-image layout keeps `card_back_id` and `illustration_id` on its FACES alone -- there is
     # no shared back and no card-level illustration when the card is two pictures -- and Scryfall
-    # omits the top-level keys entirely rather than nulling them.
+    # omits the top-level keys entirely rather than nulling them. Elsewhere the back is the row's
+    # when it names one, and Scryfall's shared back otherwise.
     if not two_image:
-        card["card_back_id"] = CARD_BACK_ID
+        card["card_back_id"] = row.get("card_back_id") or CARD_BACK_ID
     card["artist"] = row.get("artist")
+    # The artists' uuids, between the credit and the illustration: present whenever the row carries
+    # a list, an empty one included.
+    if isinstance(row.get("artist_ids"), list):
+        card["artist_ids"] = row["artist_ids"]
     if not two_image:
         card["illustration_id"] = str(row["illustration_id"]) if row.get("illustration_id") else None
     card["border_color"] = row.get("border_color")
@@ -692,6 +720,12 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
     for key in ("edhrec_rank", "penny_rank"):
         if row.get(key) is not None:
             card[key] = row[key]
+    # The preview, in its own key order, then the content warning -- the last two before `prices`.
+    preview = row.get("preview")
+    if preview is not None:
+        card["preview"] = _ordered(preview, _PREVIEW_KEY_ORDER) if isinstance(preview, dict) else preview
+    if row.get("content_warning") is not None:
+        card["content_warning"] = row["content_warning"]
     card["prices"] = _prices(row)
     card["related_uris"] = _related_uris(name, search_name, row.get("multiverse_ids") or [], lang, content_warning=content_warning)
     # A printing NO MARKETPLACE SELLS omits the key rather than carrying three dead links. The

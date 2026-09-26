@@ -13140,8 +13140,8 @@ fn two_faces() -> (Vec<OracleFace>, Vec<PrintingFace>) {
         },
     ];
     let printing = vec![
-        PrintingFace { illustration_id: 0xAAAA, card_artist_vid: 1, flavor_text_id: 7, flavor_name_id: NONE_STR },
-        PrintingFace { illustration_id: 0xBBBB, card_artist_vid: 2, flavor_text_id: NONE_STR, flavor_name_id: NONE_STR },
+        PrintingFace { illustration_id: 0xAAAA, card_artist_vid: 1, flavor_text_id: 7, flavor_name_id: NONE_STR, artist_uuid_id: NONE_STR },
+        PrintingFace { illustration_id: 0xBBBB, card_artist_vid: 2, flavor_text_id: NONE_STR, flavor_name_id: NONE_STR, artist_uuid_id: NONE_STR },
     ];
     (oracle, printing)
 }
@@ -13324,8 +13324,94 @@ fn the_niche_actually_niches() {
     // its own -- without `#[rkyv(with = NicheInto<Zero>)]` each of the eleven is 8 bytes and this
     // struct is 128, which is what it measured at before the attribute was added. Multiplied by
     // ~98,000 printings, the difference is 4.2 MB.
-    assert_eq!(std::mem::size_of::<Archived<CompatFields>>(), 84);
+    //
+    // 84 -> 92 with the card object's residue ids (`artist_ids_id`, `extras_id`), which the ROW
+    // does not pay for: see `the_card_object_residue_rides_the_rows_padding`.
+    assert_eq!(std::mem::size_of::<Archived<CompatFields>>(), 92);
     assert_eq!(std::mem::size_of::<Archived<Option<NonZeroU32>>>(), 8, "the bare Option is NOT niched");
+}
+
+/// The card object's residue costs the rows NOTHING, and this is where that is held.
+///
+///   * `CompatFields` is the LAST member of `Printing`, and `Printing`'s 16-byte alignment (from
+///     `scryfall_id`) rounded 264 bytes of fields up to 272 -- eight spare bytes at the tail, which
+///     `artist_ids_id` and `extras_id` now fill. `CompatFields` grows 84 -> 92; `Printing` stays 272.
+///   * `PrintingFace` was 28 bytes of fields rounded to 32 by `illustration_id`; `artist_uuid_id`
+///     takes the last four.
+///
+/// A field added in FRONT of `compat` would push it past the round-up and grow every printing by 16
+/// bytes (~1.6 MB over the ~98k default printings), which the size pin alone would catch but not
+/// explain; the offsets say where the room was.
+#[test]
+fn the_card_object_residue_rides_the_rows_padding() {
+    use std::mem::offset_of;
+    type P = Archived<Printing>;
+    type C = Archived<CompatFields>;
+    type F = Archived<PrintingFace>;
+    assert_eq!(offset_of!(P, compat), 180);
+    assert_eq!(offset_of!(C, artist_ids_id), 60);
+    assert_eq!(offset_of!(C, extras_id), 64);
+    assert_eq!(std::mem::size_of::<C>(), 92);
+    assert_eq!(std::mem::size_of::<P>(), 272, "180 + 92 is exactly the old round-up");
+    assert_eq!(offset_of!(F, flavor_name_id), 24);
+    assert_eq!(offset_of!(F, artist_uuid_id), 28);
+    assert_eq!(std::mem::size_of::<F>(), 32);
+}
+
+/// The residue ids through an archive and back: `extras_id` names one interned JSON object and
+/// `printing_extra` reads each key out of it verbatim -- strings, lists and objects alike -- with
+/// None for a key the printing does not carry, and for a printing that carries none at all.
+#[test]
+fn the_card_object_residue_reads_back_verbatim_from_the_archive() {
+    let extras = serde_json::json!({
+        "resource_id": "A59396A4D646C69A1DD41F9906BE9A9CDECE83F18DC5C53501DD7BAE50511DBB",
+        "attraction_lights": [2, 6],
+        "card_back_id": "7840c131-f96b-4700-9347-2215c43156e6",
+        "preview": {"source": "Wizards of the Coast", "source_uri": "", "previewed_at": "2025-01-07"},
+        "content_warning": true,
+    });
+    let strings: Vec<String> = vec![
+        String::new(),
+        extras.to_string(),
+        "996ad764-4ae0-4952-8bb5-5a75c9d68275,3a243c17-3baa-4b53-9599-645311cd7d3d".to_owned(),
+    ];
+    let mut carried = stub_printing(1, 1, Some(1.0));
+    carried.compat.extras_id = 1;
+    carried.compat.artist_ids_id = 2;
+    let bare = stub_printing(2, 2, Some(1.0));
+    assert_eq!(bare.compat.extras_id, NONE_STR, "the default is the absent sentinel, not string 0");
+    assert_eq!(bare.compat.artist_ids_id, NONE_STR);
+
+    let strings_bytes = rkyv::to_bytes::<Error>(&strings).expect("serialize");
+    let s = rkyv::access::<Archived<Vec<String>>, Error>(&strings_bytes).expect("access");
+    let printings_bytes = rkyv::to_bytes::<Error>(&vec![carried, bare]).expect("serialize");
+    let p = rkyv::access::<Archived<Vec<Printing>>, Error>(&printings_bytes).expect("access");
+
+    for key in ["resource_id", "attraction_lights", "card_back_id", "preview", "content_warning"] {
+        assert_eq!(super::printing_extra(&p[0], s, key).as_ref(), Some(&extras[key]), "{key} reads back verbatim");
+    }
+    assert_eq!(super::printing_extra(&p[0], s, "variation_of"), None, "a key the residue does not carry is absent");
+    assert_eq!(super::str_at(s, u32::from(p[0].compat.artist_ids_id)), Some(strings[2].as_str()));
+    for key in super::PRINTING_EXTRA_KEYS {
+        assert_eq!(super::printing_extra(&p[1], s, key), None, "{key}: no residue, nothing to read");
+    }
+    assert_eq!(super::str_at(s, u32::from(p[1].compat.artist_ids_id)), None);
+}
+
+/// `promo_types` and `frame_effects` come back in STORED order -- Scryfall's -- where the set-like
+/// tag collections come back sorted. mkm/378 sends `frame_effects: ["showcase", "legendary"]`;
+/// `sorted_strs` answered `["legendary", "showcase"]`.
+#[test]
+fn promo_types_and_frame_effects_keep_scryfalls_order() {
+    let vocab: Vec<String> = vec!["legendary".to_owned(), "showcase".to_owned()];
+    let mut printing = stub_printing(1, 1, Some(1.0));
+    printing.compat.frame_effects = vec![1, 0];
+    let vocab_bytes = rkyv::to_bytes::<Error>(&vocab).expect("serialize");
+    let v = rkyv::access::<Archived<Vec<String>>, Error>(&vocab_bytes).expect("access");
+    let printings_bytes = rkyv::to_bytes::<Error>(&vec![printing]).expect("serialize");
+    let p = rkyv::access::<Archived<Vec<Printing>>, Error>(&printings_bytes).expect("access");
+    assert_eq!(super::ordered_strs(v, &p[0].compat.frame_effects), vec!["showcase", "legendary"]);
+    assert_eq!(super::sorted_strs(v, &p[0].compat.frame_effects), vec!["legendary", "showcase"], "what the field used to emit");
 }
 
 #[test]
@@ -14568,6 +14654,7 @@ fn prefer_borderless_ignores_flavor_named_printings_and_ranks_frames() {
         card_artist_vid: ARTIST_NONE,
         flavor_text_id: NONE_STR,
         flavor_name_id: spider_gwen,
+        artist_uuid_id: NONE_STR,
     }];
     assert_eq!(representative(&data, "borderless", "name", "asc"), 1, "a face-level flavor name excludes too");
     data.printings[2].faces = Vec::new();

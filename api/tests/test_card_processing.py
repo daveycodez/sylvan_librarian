@@ -845,6 +845,30 @@ class TestEngineCardObjects:
         row = preprocess_card(self._two_faced())[0]
         assert len(json.dumps(row["card_compat_blob"])) < len(json.dumps(row["raw_card_blob"])) / 2
 
+    def test_compat_blob_keeps_the_residue_the_card_object_writes(self) -> None:
+        """`resource_id` and a card back of the printing's own are not derivable, so they ride the blob.
+
+        Both sat in the exclusion list as "re-emitted on read", and neither is a function of anything
+        stored: Siren's Call ced/78 prints its own back, and msc/806's `resource_id` is an opaque hash.
+        """
+        card = create_test_card(name="Residue Test")
+        card |= {
+            "resource_id": "A59396A4D646C69A1DD41F9906BE9A9CDECE83F18DC5C53501DD7BAE50511DBB",
+            "card_back_id": "98784b63-d263-4abc-aabb-a092e6ecc788",
+            "artist_ids": ["1eced451-4da5-42bc-b49d-70c41246581f"],
+            "preview": {"source": "Wizards of the Coast", "source_uri": "", "previewed_at": "2025-01-07"},
+        }
+        blob = preprocess_card(card)[0]["card_compat_blob"]
+        assert blob["resource_id"] == card["resource_id"]
+        assert blob["card_back_id"] == "98784b63-d263-4abc-aabb-a092e6ecc788"
+        assert blob["artist_ids"] == ["1eced451-4da5-42bc-b49d-70c41246581f"]
+        assert blob["preview"] == card["preview"]
+
+    def test_compat_blob_drops_the_shared_card_back(self) -> None:
+        """Nearly every printing names Scryfall's shared back, which both writers emit by default."""
+        card = create_test_card(name="Shared Back Test") | {"card_back_id": "0aeebaf5-8c7d-4636-9e82-8c27447861f7"}
+        assert "card_back_id" not in preprocess_card(card)[0]["card_compat_blob"]
+
     def test_single_faced_cards_still_get_a_compat_blob(self) -> None:
         """The residue is card-level, so it is not a multi-face concern."""
         assert "card_compat_blob" in preprocess_card(create_test_card(name="Solo Test"))[0]

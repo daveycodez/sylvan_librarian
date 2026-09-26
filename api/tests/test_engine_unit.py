@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from api.parsing import parse_scryfall_query
+from api.scryfall_compat.objects import CARD_OBJECT_FIELDS, to_scryfall_card
 from card_engine import ENGINE_COLUMNS, QueryEngine, UnknownFieldError
 
 if TYPE_CHECKING:
@@ -1339,6 +1340,124 @@ class TestFieldSelection:
             "Jace, the Mind Sculptor": "3",
             "Nicol Bolas, Planeswalker": "5",
         }, "a field the SELECT list does not fetch is silently absent from every card object"
+
+    def test_the_card_object_residue_rides_the_store_verbatim(self, fresh_engine: Callable[[], QueryEngine]) -> None:
+        """The residue a card object needs beyond the compat columns, through ENGINE_COLUMNS and back.
+
+        `artist_ids`, the face `artist_id` and the rare keys (`resource_id`, `variation_of`,
+        `attraction_lights`, a non-shared `card_back_id`, `preview`, `content_warning`) arrive in
+        `card_compat_blob` / `card_faces`, both already in ENGINE_COLUMNS, and the store used to drop
+        every one of them at archive time -- so every engine-served card object lacked them while the
+        SQL lane, reading the same blob, had them. Each must come back verbatim, and absent (None)
+        where the printing does not carry it; Scryfall's shared card back is never stored at all.
+
+        """
+        rows = json.loads(_FIXTURE.read_text())[:3]
+        assert {r["card_name"] for r in rows} == {"Black Lotus"}
+        fire_ice = ["996ad764-4ae0-4952-8bb5-5a75c9d68275", "3a243c17-3baa-4b53-9599-645311cd7d3d"]
+        preview = {"source": "Wizards of the Coast", "source_uri": "", "previewed_at": "2025-01-07"}
+        rows[0]["card_compat_blob"] = {
+            "artist_ids": fire_ice,
+            "resource_id": "A59396A4D646C69A1DD41F9906BE9A9CDECE83F18DC5C53501DD7BAE50511DBB",
+            "preview": preview,
+            "card_back_id": "0aeebaf5-8c7d-4636-9e82-8c27447861f7",
+        }
+        rows[1]["card_compat_blob"] = {
+            "artist_ids": [],
+            "card_back_id": "7840c131-f96b-4700-9347-2215c43156e6",
+            "variation_of": "3d170015-b125-49a6-a15e-8fd116bbcb14",
+            "attraction_lights": [2, 6],
+            "content_warning": True,
+        }
+        rows[2]["card_compat_blob"] = {}
+        # A faced card of its own, so its faces are the card's faces. No `artist` credit on the faces:
+        # this branch resolves the credit's artist-vocab id against the collection vocab (fixed by
+        # multilingual-store's `card_artist_name_id`), which is not what is under test here.
+        faced = dict(rows[2]) | {
+            "scryfall_id": "18303862-4726-4136-814f-157aa7006579",
+            "oracle_id": "b3c7b9c5-6d46-4d26-a7ff-c1a6bd3a6d4a",
+            "card_name": "Fire // Ice",
+            "card_name_folded": "fire // ice",
+            "card_faces": [
+                {"name": "Fire", "type_line": "Instant", "artist_id": fire_ice[0]},
+                {"name": "Ice", "type_line": "Instant", "artist_id": fire_ice[1]},
+            ],
+            "card_compat_blob": {"artist_ids": fire_ice},
+        }
+        projected = [{col: card.get(col) for col in ENGINE_COLUMNS} for card in [*rows, faced]]
+        e = fresh_engine()
+        e.reload(projected)
+
+        residue = ["artist_ids", "resource_id", "variation_of", "attraction_lights", "card_back_id", "preview", "content_warning"]
+        _, cards = _run(e, "", fields=["scryfall_id", *residue, "card_faces"])
+        by_id = {str(c["scryfall_id"]): c for c in cards}
+        full, rare, bare = (by_id[r["scryfall_id"]] for r in rows)
+
+        assert full["artist_ids"] == fire_ice, "a list, in Scryfall's order"
+        assert full["resource_id"] == "A59396A4D646C69A1DD41F9906BE9A9CDECE83F18DC5C53501DD7BAE50511DBB"
+        assert full["preview"] == preview
+        assert full["card_back_id"] is None, "Scryfall's shared back is the writers' default, never stored"
+        for key in ("variation_of", "attraction_lights", "content_warning"):
+            assert full[key] is None, key
+
+        assert rare["artist_ids"] == [], "an empty list stays a list"
+        assert rare["card_back_id"] == "7840c131-f96b-4700-9347-2215c43156e6"
+        assert rare["variation_of"] == "3d170015-b125-49a6-a15e-8fd116bbcb14"
+        assert rare["attraction_lights"] == [2, 6]
+        assert rare["content_warning"] is True
+
+        for key in residue:
+            assert bare[key] is None, f"{key}: a printing carrying none of the residue answers None"
+
+        faces = by_id[faced["scryfall_id"]]["card_faces"]
+        assert [f.get("artist_id") for f in faces] == fire_ice, "each face its own artist's uuid"
+        assert by_id[rows[0]["scryfall_id"]]["card_faces"] == [], "a single-faced card has no faces to carry one"
+
+    def test_frame_effects_and_promo_types_keep_scryfalls_order(self, fresh_engine: Callable[[], QueryEngine]) -> None:
+        """Both lists come back in the order Scryfall sent them, not sorted.
+
+        api.scryfall.com's lists are not alphabetical -- mkm/378 sends `frame_effects:
+        ["showcase", "legendary"]` and `promo_types: ["dossier", "boosterfun", "invisibleink"]` -- and
+        the engine emitted both through the same lexicographic sort as the set-like tag collections,
+        which reordered ~5,000 frame_effects and ~9,200 promo_types lists of the ~98k default printings.
+        """
+        rows = json.loads(_FIXTURE.read_text())[:1]
+        rows[0]["card_compat_blob"] = {
+            "frame_effects": ["showcase", "legendary", "inverted"],
+            "promo_types": ["dossier", "boosterfun", "invisibleink"],
+        }
+        e = fresh_engine()
+        e.reload([{col: card.get(col) for col in ENGINE_COLUMNS} for card in rows])
+        _, cards = _run(e, "", fields=["frame_effects", "promo_types"])
+        assert cards[0]["frame_effects"] == ["showcase", "legendary", "inverted"]
+        assert cards[0]["promo_types"] == ["dossier", "boosterfun", "invisibleink"]
+
+    def test_the_card_object_fields_all_resolve_and_build(self, fresh_engine: Callable[[], QueryEngine]) -> None:
+        """Every CARD_OBJECT_FIELDS name is a FIELD_TABLE entry, and the residue reaches the object.
+
+        A name the engine does not know raises UnknownFieldError on every /cards/* lookup, so adding a
+        residue key to the object's field list without its engine field would fail the whole surface.
+        """
+        rows = json.loads(_FIXTURE.read_text())[:1]
+        # See the test above for why the credit is left out.
+        rows[0]["card_artist"] = None
+        rows[0]["card_compat_blob"] = {
+            "artist_ids": ["1eced451-4da5-42bc-b49d-70c41246581f"],
+            "preview": {"source": "Wizards of the Coast", "source_uri": "", "previewed_at": "2025-01-07"},
+            "card_back_id": "7840c131-f96b-4700-9347-2215c43156e6",
+        }
+        e = fresh_engine()
+        e.reload([{col: card.get(col) for col in ENGINE_COLUMNS} for card in rows])
+        _, cards = _run(e, "", fields=list(CARD_OBJECT_FIELDS))
+        card = to_scryfall_card(cards[0])
+        assert card["artist_ids"] == ["1eced451-4da5-42bc-b49d-70c41246581f"]
+        assert card["card_back_id"] == "7840c131-f96b-4700-9347-2215c43156e6"
+        assert list(card["preview"]) == ["source", "source_uri", "previewed_at"]
+        keys = list(card)
+        assert keys.index("artist_ids") == keys.index("artist") + 1
+        assert keys.index("preview") == keys.index("prices") - 1
+        for absent in ("resource_id", "variation_of", "attraction_lights", "content_warning"):
+            assert absent not in card, absent
 
     def test_requested_fields_returned_exactly(self, engine: QueryEngine) -> None:
         _, cards = _run(

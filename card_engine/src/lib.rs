@@ -3,7 +3,7 @@ use pyo3::create_exception;
 use pyo3::intern;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDate, PyDateAccess, PyDict, PyList, PyString, PyTuple};
+use pyo3::types::{PyBool, PyDate, PyDateAccess, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use rkyv::{Archive, Archived, Deserialize, Serialize};
 use rkyv::niche::niching::Zero;
 use rkyv::with::NicheInto;
@@ -294,6 +294,17 @@ struct PrintingFace {
     // (a card-level flavor name) answers prm/80925. Only the card-level one reaches the name
     // routes; this one is emission-only, like `flavor_text` beside it.
     flavor_name_id: u32,
+    // Scryfall's FACE-level `artist_id`: the uuid of THIS face's artist, interned as its hyphenated
+    // string (NONE_STR = absent). Every face of every faced printing carries one -- Delver of
+    // Secrets' two faces the same uuid, Fire // Ice's two different ones -- and the card object
+    // emits it between `artist` and `illustration_id`. Emission-only.
+    //
+    // FREE: the face measured 28 bytes of fields rounded to 32 by `illustration_id`'s 16-byte
+    // alignment, and this u32 sits in those four trailing bytes (pinned in
+    // `the_card_object_residue_rides_the_rows_padding`). A string id rather than the raw u128
+    // because the u128 would take the face to 48 bytes, and ~500 artists stand behind every face
+    // in the default corpus.
+    artist_uuid_id: u32,
 }
 
 // Bit positions in `CompatFields.flags`. Twelve booleans Scryfall sends on every card object; a
@@ -379,6 +390,21 @@ struct CompatFields {
     games: u8,
     finishes: u8,
     flags: u16,
+    // Scryfall's top-level `artist_ids`: the printing's artist uuids in Scryfall's order, joined
+    // with `,` and interned into the string table (NONE_STR = the key was absent; an interned ""
+    // is the list `[]`, so absence and emptiness stay two states -- a uuid never contains a comma,
+    // so the join is lossless). A LIST, not one id: Fire // Ice dmr/215, credited "David Martin &
+    // Franz Vohwinkel", carries both artists' uuids, one per face. ~2,250 distinct lists over the
+    // ~98k printings of the default corpus, so one id a row rather than 16 bytes per artist.
+    artist_ids_id: u32,
+    // The RARE residue a card object carries, as one interned string (NONE_STR = the printing
+    // carries none of it): a compact JSON object holding whichever of PRINTING_EXTRA_KEYS --
+    // `resource_id`, `variation_of`, `attraction_lights`, `card_back_id` (only when it is NOT
+    // Scryfall's shared back), `preview`, `content_warning` -- Scryfall sent, verbatim. One string
+    // rather than six fields because none of them is common: `preview` is the most frequent, on
+    // ~16% of printings, and the rest together are under 9%. Interning dedupes the shapes that
+    // repeat (a set previewed together shares one `preview`).
+    extras_id: u32,
     multiverse_ids: Vec<u32>,
     promo_types: Vec<u16>,
     frame_effects: Vec<u16>,
@@ -409,6 +435,8 @@ impl Default for CompatFields {
             games: 0,
             finishes: 0,
             flags: 0,
+            artist_ids_id: NONE_STR,
+            extras_id: NONE_STR,
             multiverse_ids: Vec::new(),
             promo_types: Vec::new(),
             frame_effects: Vec::new(),
@@ -701,6 +729,8 @@ struct FaceRow {
     card_artist_vid: u16,
     flavor_text_id: u32,
     flavor_name_id: u32,
+    // The face's Scryfall `artist_id` (see PrintingFace.artist_uuid_id).
+    artist_uuid_id: u32,
 }
 
 // Type aliases for the archived (mmap-backed) store types
@@ -1217,7 +1247,7 @@ fn opt_nonzero_u32(d: &Bound<PyDict>, key: &str) -> Option<NonZeroU32> {
     opt_u32(d, key).and_then(NonZeroU32::new)
 }
 
-fn compat_from_pydict(d: &Bound<PyDict>, vocab: &mut VocabInterner) -> PyResult<CompatFields> {
+fn compat_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInterner) -> PyResult<CompatFields> {
     let Some(blob) = d.get_item("card_compat_blob").ok().flatten().and_then(|v| v.cast_into::<PyDict>().ok()) else {
         return Ok(CompatFields::default());
     };
@@ -1268,6 +1298,8 @@ fn compat_from_pydict(d: &Bound<PyDict>, vocab: &mut VocabInterner) -> PyResult<
         image_status_id: intern_opt(vocab, opt_str(&blob, "image_status"))?,
         set_type_id: intern_opt(vocab, opt_str(&blob, "set_type"))?,
         security_stamp_id: intern_opt(vocab, opt_str(&blob, "security_stamp"))?,
+        artist_ids_id: artist_ids_from_blob(&blob, it),
+        extras_id: printing_extras_from_blob(&blob, it)?,
         games: str_set_bits(&blob, "games", &[("paper", GAME_PAPER), ("mtgo", GAME_MTGO), ("arena", GAME_ARENA)]),
         finishes: str_set_bits(
             &blob,
@@ -1289,6 +1321,111 @@ fn compat_from_pydict(d: &Bound<PyDict>, vocab: &mut VocabInterner) -> PyResult<
         promo_types: str_list_to_ids(&blob, "promo_types", vocab)?,
         frame_effects: str_list_to_ids(&blob, "frame_effects", vocab)?,
     })
+}
+
+/// The residue keys `CompatFields.extras_id` holds, in the order the card object emits them. Each
+/// is kept VERBATIM when the blob carries it -- a string, a list or an object alike -- and is absent
+/// otherwise, so the writers can emit exactly what Scryfall sent.
+pub(crate) const PRINTING_EXTRA_KEYS: [&str; 6] =
+    ["resource_id", "variation_of", "attraction_lights", "card_back_id", "preview", "content_warning"];
+
+/// `CompatFields.artist_ids_id`: the blob's `artist_ids`, joined with `,` and interned; NONE_STR
+/// when Scryfall sent no list at all. An EMPTY list interns "", so `[]` round-trips as `[]`.
+fn artist_ids_from_blob(blob: &Bound<PyDict>, it: &mut Interner) -> u32 {
+    let Some(ids) = blob.get_item("artist_ids").ok().flatten().and_then(|v| v.extract::<Vec<String>>().ok()) else {
+        return NONE_STR;
+    };
+    it.intern(ids.join(","))
+}
+
+/// `CompatFields.extras_id`: the rare residue keys (PRINTING_EXTRA_KEYS) as one compact JSON
+/// object, interned; NONE_STR when the printing carries none of them. A `card_back_id` naming
+/// Scryfall's shared back is dropped here -- the writers emit that back by default, and storing it
+/// would give nearly every printing a residue string that says nothing. The importer drops it from
+/// `card_compat_blob` for the same reason, so this is the belt to that brace.
+fn printing_extras_from_blob(blob: &Bound<PyDict>, it: &mut Interner) -> PyResult<u32> {
+    let mut extras = serde_json::Map::new();
+    for key in PRINTING_EXTRA_KEYS {
+        let Some(value) = blob.get_item(key)? else { continue };
+        let value = py_to_json(&value)?;
+        match &value {
+            Value::Null => {}
+            Value::String(s) if key == "card_back_id" && s == card_object::CARD_BACK_ID => {}
+            _ => {
+                extras.insert(key.to_owned(), value);
+            }
+        }
+    }
+    Ok(if extras.is_empty() { NONE_STR } else { it.intern(Value::Object(extras).to_string()) })
+}
+
+/// A Python value from a jsonb column, as JSON. The residue is JSON on both sides of the driver
+/// (psycopg decodes jsonb to dict/list/str/int/float/bool/None), so this is the inverse of that
+/// decode and nothing more. `bool` is checked before `int` because Python's bool IS an int.
+fn py_to_json(value: &Bound<PyAny>) -> PyResult<Value> {
+    if value.is_none() {
+        return Ok(Value::Null);
+    }
+    if let Ok(b) = value.cast::<PyBool>() {
+        return Ok(Value::Bool(b.is_true()));
+    }
+    if let Ok(s) = value.cast::<PyString>() {
+        return Ok(Value::String(s.to_str()?.to_owned()));
+    }
+    if value.cast::<PyInt>().is_ok() {
+        if let Ok(n) = value.extract::<i64>() {
+            return Ok(Value::from(n));
+        }
+        return Ok(Value::from(value.extract::<u64>()?));
+    }
+    if let Ok(f) = value.cast::<PyFloat>() {
+        return Ok(serde_json::Number::from_f64(f.value()).map_or(Value::Null, Value::Number));
+    }
+    if let Ok(list) = value.cast::<PyList>() {
+        return list.iter().map(|item| py_to_json(&item)).collect::<PyResult<Vec<_>>>().map(Value::Array);
+    }
+    if let Ok(tuple) = value.cast::<PyTuple>() {
+        return tuple.iter().map(|item| py_to_json(&item)).collect::<PyResult<Vec<_>>>().map(Value::Array);
+    }
+    if let Ok(dict) = value.cast::<PyDict>() {
+        let mut map = serde_json::Map::new();
+        for (k, v) in dict.iter() {
+            map.insert(k.extract::<String>()?, py_to_json(&v)?);
+        }
+        return Ok(Value::Object(map));
+    }
+    Err(PyValueError::new_err(format!("card_compat_blob holds a value JSON cannot carry: {value:?}")))
+}
+
+/// A JSON value as the Python object psycopg would have decoded it to -- `py_to_json`'s inverse,
+/// for the residue fields the result rows carry.
+fn json_to_py<'py>(py: Python<'py>, value: &Value) -> PyResult<Bound<'py, PyAny>> {
+    Ok(match value {
+        Value::Null => py.None().into_bound(py),
+        Value::Bool(b) => b.into_pyobject(py)?.to_owned().into_any(),
+        Value::Number(n) => match (n.as_i64(), n.as_u64()) {
+            (Some(i), _) => i.into_pyobject(py)?.into_any(),
+            (None, Some(u)) => u.into_pyobject(py)?.into_any(),
+            _ => n.as_f64().unwrap_or(f64::NAN).into_pyobject(py)?.into_any(),
+        },
+        Value::String(s) => s.into_pyobject(py)?.into_any(),
+        Value::Array(items) => PyList::new(py, items.iter().map(|v| json_to_py(py, v)).collect::<PyResult<Vec<_>>>()?)?.into_any(),
+        Value::Object(map) => {
+            let d = PyDict::new(py);
+            for (k, v) in map {
+                d.set_item(k, json_to_py(py, v)?)?;
+            }
+            d.into_any()
+        }
+    })
+}
+
+/// One key of a printing's rare residue (see `CompatFields.extras_id`), or None when the printing
+/// does not carry it.
+fn printing_extra(p: &APrinting, strings: &AStrings, key: &str) -> Option<Value> {
+    str_at(strings, u32::from(p.compat.extras_id))
+        .and_then(|text| serde_json::from_str::<serde_json::Map<String, Value>>(text).ok())
+        .and_then(|mut extras| extras.remove(key))
 }
 
 /// Scryfall's `all_parts`, read out of the compat blob.
@@ -1366,6 +1503,7 @@ fn faces_from_pydict(d: &Bound<PyDict>, it: &mut Interner, artists: &mut VocabIn
             card_artist_vid,
             flavor_text_id: it.intern_opt(opt_str(face, "flavor_text")),
             flavor_name_id: it.intern_opt(opt_str(face, "flavor_name")),
+            artist_uuid_id: it.intern_opt(opt_str(face, "artist_id")),
         });
     }
     Ok(faces)
@@ -1449,7 +1587,7 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
         flavor_name_folded_id: it.intern_opt(opt_str(d, "flavor_name_folded")),
         card_faces: faces_from_pydict(d, it, artists)?,
         all_parts: all_parts_from_pydict(d, it, vocab)?,
-        compat: compat_from_pydict(d, vocab)?,
+        compat: compat_from_pydict(d, it, vocab)?,
     })
 }
 
@@ -15011,8 +15149,14 @@ const FIELD_TABLE: &[(&str, FieldKey, FieldExtractor)] = &[
         let ids: Vec<u32> = p.compat.multiverse_ids.iter().map(|v| u32::from(*v)).collect();
         Ok(ids.into_pyobject(py)?.into_any())
     }),
-    ("promo_types", |py| intern!(py, "promo_types"), |py, _c, p, _s, v| Ok(sorted_strs(v, &p.compat.promo_types).into_pyobject(py)?.into_any())),
-    ("frame_effects", |py| intern!(py, "frame_effects"), |py, _c, p, _s, v| Ok(sorted_strs(v, &p.compat.frame_effects).into_pyobject(py)?.into_any())),
+    // In SCRYFALL'S order, not sorted: `str_list_to_ids` keeps the list as sent and the renumber
+    // keeps it too (`remap_keep_order`), and api.scryfall.com's order is not alphabetical --
+    // mkm/378 sends `frame_effects: ["showcase", "legendary"]` and `promo_types: ["dossier",
+    // "boosterfun", "invisibleink"]`, sld/379 `["legendary", "inverted"]`. These went
+    // through `sorted_strs` like the set-like tag collections, which reordered them on ~5,000
+    // frame_effects lists and ~9,200 promo_types lists of the ~98k default printings.
+    ("promo_types", |py| intern!(py, "promo_types"), |py, _c, p, _s, v| Ok(ordered_strs(v, &p.compat.promo_types).into_pyobject(py)?.into_any())),
+    ("frame_effects", |py| intern!(py, "frame_effects"), |py, _c, p, _s, v| Ok(ordered_strs(v, &p.compat.frame_effects).into_pyobject(py)?.into_any())),
     ("games", |py| intern!(py, "games"), |py, _c, p, _s, _v| Ok(bits_to_names(p.compat.games, GAME_NAMES).into_pyobject(py)?.into_any())),
     ("finishes", |py| intern!(py, "finishes"), |py, _c, p, _s, _v| Ok(bits_to_names(p.compat.finishes, FINISH_NAMES).into_pyobject(py)?.into_any())),
     ("booster", |py| intern!(py, "booster"), |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_BOOSTER).into_pyobject(py)?.to_owned().into_any())),
@@ -15027,6 +15171,24 @@ const FIELD_TABLE: &[(&str, FieldKey, FieldExtractor)] = &[
     ("story_spotlight", |py| intern!(py, "story_spotlight"), |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_STORY_SPOTLIGHT).into_pyobject(py)?.to_owned().into_any())),
     ("textless", |py| intern!(py, "textless"), |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_TEXTLESS).into_pyobject(py)?.to_owned().into_any())),
     ("variation", |py| intern!(py, "variation"), |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_VARIATION).into_pyobject(py)?.to_owned().into_any())),
+    // Scryfall's `artist_ids` -- see `CompatFields.artist_ids_id`. None is "no list"; an interned
+    // "" is the list `[]`.
+    ("artist_ids", |py| intern!(py, "artist_ids"), |py, _c, p, s, _v| {
+        Ok(match str_at(s, u32::from(p.compat.artist_ids_id)) {
+            None => py.None().into_bound(py),
+            Some("") => PyList::empty(py).into_any(),
+            Some(ids) => ids.split(',').collect::<Vec<_>>().into_pyobject(py)?.into_any(),
+        })
+    }),
+    // The rare residue, verbatim -- see `CompatFields.extras_id` and PRINTING_EXTRA_KEYS. Each is
+    // None when the printing does not carry the key; `card_back_id` is None for Scryfall's shared
+    // back, which the card object writes by default.
+    ("resource_id", |py| intern!(py, "resource_id"), |py, _c, p, s, _v| extra_to_py(py, p, s, "resource_id")),
+    ("variation_of", |py| intern!(py, "variation_of"), |py, _c, p, s, _v| extra_to_py(py, p, s, "variation_of")),
+    ("attraction_lights", |py| intern!(py, "attraction_lights"), |py, _c, p, s, _v| extra_to_py(py, p, s, "attraction_lights")),
+    ("card_back_id", |py| intern!(py, "card_back_id"), |py, _c, p, s, _v| extra_to_py(py, p, s, "card_back_id")),
+    ("preview", |py| intern!(py, "preview"), |py, _c, p, s, _v| extra_to_py(py, p, s, "preview")),
+    ("content_warning", |py| intern!(py, "content_warning"), |py, _c, p, s, _v| extra_to_py(py, p, s, "content_warning")),
     // Each face as its own dict, front first, in Scryfall's key names. Empty list for a
     // single-faced card, which is how Scryfall omits card_faces entirely.
     ("card_faces", |py| intern!(py, "card_faces"), |py, c, p, s, v| Ok(faces_to_pylist(py, c, p, s, v)?.into_any())),
@@ -15198,6 +15360,10 @@ fn faces_to_pylist<'py>(
             if let Some(v) = str_at(strings, u32::from(art.flavor_name_id)) {
                 d.set_item("flavor_name", v)?;
             }
+            // Present only when Scryfall sent one, like `flavor_name` above.
+            if let Some(v) = str_at(strings, u32::from(art.artist_uuid_id)) {
+                d.set_item("artist_id", v)?;
+            }
         }
         out.push(d);
     }
@@ -15208,6 +15374,20 @@ fn faces_to_pylist<'py>(
 /// Every id is a real entry (there is no absent sentinel for collection elements).
 pub(crate) fn coll_str(vocab: &AStrings, id: u16) -> &str {
     vocab[id as usize].as_str()
+}
+
+/// Resolves interned collection ids to their strings in STORED order -- for the lists whose order
+/// is Scryfall's (`promo_types`, `frame_effects`), which `sorted_strs` would rewrite.
+fn ordered_strs<'a>(vocab: &'a AStrings, ids: &Archived<Vec<u16>>) -> Vec<&'a str> {
+    ids.iter().map(|id| coll_str(vocab, u16::from(*id))).collect()
+}
+
+/// One key of the printing's rare residue as a Python object, None when it does not carry it.
+fn extra_to_py<'py>(py: Python<'py>, p: &APrinting, strings: &AStrings, key: &str) -> PyResult<Bound<'py, PyAny>> {
+    match printing_extra(p, strings, key) {
+        Some(value) => json_to_py(py, &value),
+        None => Ok(py.None().into_bound(py)),
+    }
 }
 
 /// Resolves interned collection ids to a lexicographically sorted `Vec<&str>` for
@@ -15360,7 +15540,18 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 // in the renumbered id space — an archive from before the renumber would resolve each to the
 // wrong string, so it must not be read by this build. Value dated ahead of #913's for the same
 // never-reuse reason as every entry above.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026090804;
+//
+// 2026092601 — THE CARD OBJECT'S MISSING RESIDUE. `CompatFields` gains `artist_ids_id` (Scryfall's
+// top-level `artist_ids`) and `extras_id` (the rare keys — `resource_id`, `variation_of`,
+// `attraction_lights`, a non-shared `card_back_id`, `preview`, `content_warning` — as one interned
+// JSON string), and `PrintingFace` gains `artist_uuid_id` (the face's `artist_id`). All three land
+// in padding the rows already had — `CompatFields` is the LAST member of `Printing`, whose 16-byte
+// round-up held eight spare bytes, and the face's four trailing bytes take the other — so
+// `size_of::<APrinting>` stays 272 and the header cannot see the change: a reader pairing this code
+// with a 2026090804 store would read every `multiverse_ids`/`promo_types`/`frame_effects` vector
+// header eight bytes off. Dated ahead of every sibling branch's value (…810 on #929 is the highest)
+// for the same never-reuse reason as every entry above.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026092601;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -16090,6 +16281,7 @@ impl QueryEngine {
                         card_artist_vid: f.card_artist_vid,
                         flavor_text_id: f.flavor_text_id,
                         flavor_name_id: f.flavor_name_id,
+                        artist_uuid_id: f.artist_uuid_id,
                     })
                     .collect(),
             flavor_name_id: row.flavor_name_id,

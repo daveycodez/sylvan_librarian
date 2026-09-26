@@ -1548,3 +1548,65 @@ class TestSelfUrlScheme:
             url = self._next_page(compat_corpus, monkeypatch, {"X-Proxy-Host": lookalike})
             assert url.startswith("http://falconframework.org/cards?"), lookalike
             assert lookalike not in url
+
+
+# api.scryfall.com's own card objects, as served 2026-09-26, that carry the residue a card object
+# needs beyond the compat columns: Fire // Ice dmr/215 (two artists, one per face), Brazen Borrower
+# soc/190 (`resource_id`, each face's `artist_id`), Siren's Call ced/78 (Collectors' Edition's own
+# card back), Delney mkm/378 (`preview`, and `frame_effects`/`promo_types` that are not
+# alphabetical), Army of Allah arn/2† (`variation_of`) and Invoke Prejudice leg/62
+# (`content_warning`). Every one survives preprocess_card, so each goes through the real importer.
+_RESIDUE_KEYS = ("resource_id", "variation_of", "attraction_lights", "card_back_id", "artist_ids", "preview", "content_warning")
+
+
+def _residue_cards() -> list[dict]:
+    return json.loads((_FIXTURES / "scryfall_card_object_residue.json").read_text(encoding="utf-8"))
+
+
+@pytest.fixture(name="residue_corpus", scope="module")
+def residue_corpus_fixture(compat_corpus: APIResource) -> APIResource:
+    """The corpus plus Scryfall's own residue-carrying printings, imported as Scryfall serves them."""
+    compat_corpus.admin._upsert_cards(_residue_cards())
+    compat_corpus.app_context.reload_engine(force=True)
+    compat_corpus.admin._clear_caches()
+    return compat_corpus
+
+
+@pytest.fixture(name="residue_paths", params=["engine", "sql"])
+def residue_paths_fixture(request, residue_corpus: APIResource):
+    """The residue corpus answered by the engine, and again by the SQL fallback."""
+    saved = settings.enable_engine
+    settings.enable_engine = request.param == "engine"
+    yield residue_corpus
+    settings.enable_engine = saved
+
+
+class TestCardObjectResidue:
+    """The keys Scryfall sends that neither lane served: through the importer, the store and back.
+
+    `artist_ids`, each face's `artist_id`, `resource_id`, `variation_of`, `attraction_lights`,
+    `preview`, `content_warning` and a card back of the printing's own. The engine dropped every
+    one at archive time; the SQL lane read most of them in `card_compat_blob` and the writer never
+    emitted them; `resource_id` and the back never reached the blob at all. Asserted against
+    Scryfall's own objects on both lanes -- each value verbatim, and each key right after the key
+    Scryfall puts in front of it.
+    """
+
+    @pytest.mark.parametrize("card", _residue_cards(), ids=lambda c: f"{c['set']}/{c['collector_number']}")
+    def test_the_residue_matches_scryfall(self, residue_paths: APIResource, card: dict):
+        served = payload(dispatch(residue_paths, f"/cards/{card['id']}"))
+        keys, theirs = list(served), list(card)
+        for key in _RESIDUE_KEYS:
+            if key not in card:
+                assert key not in served, f"{key}: Scryfall sends none here"
+                continue
+            assert served[key] == card[key], key
+            if isinstance(card[key], dict):
+                assert list(served[key]) == list(card[key]), f"{key}: Scryfall's key order"
+            before = theirs[theirs.index(key) - 1]
+            assert keys[keys.index(key) - 1] == before, f"{key} must follow {before}: {keys}"
+        for key in ("frame_effects", "promo_types"):
+            assert served.get(key) == card.get(key), f"{key}: Scryfall's order, not sorted"
+        assert [face.get("artist_id") for face in served.get("card_faces", [])] == [
+            face.get("artist_id") for face in card.get("card_faces", [])
+        ]
