@@ -2150,7 +2150,7 @@ class TestRandom:
         it — a query that names the class can never answer nothing.
         """
         body = payload(dispatch(compat_corpus, "/cards/random", "q=is%3Aextra&include_extras=false"))
-        assert body["id"] in {EXTRA_ID, POOL_EMBLEM_ID, POOL_TOKEN_ID, POOL_ART_SERIES_ID, FLAVOR_TOKEN_ID}
+        assert body["id"] in {EXTRA_ID, POOL_EMBLEM_ID, POOL_TOKEN_ID, POOL_ART_SERIES_ID, FLAVOR_TOKEN_ID, FACE_CHAOS_ID}
 
     @needs_oracleid
     def test_an_oracleid_draws_a_card_whose_every_printing_is_an_extra(self, by_name_paths: APIResource):
