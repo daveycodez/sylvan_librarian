@@ -4194,48 +4194,73 @@ fn build_printed_name_index(
 }
 
 // ─── Fuzzy name matching ─────────────────────────────────────────────────────
-// SCRYFALL'S `?fuzzy=` METRIC, DERIVED FROM 86 PROBED NEEDLES (api.scryfall.com, 2026-08-16) —
-// NOT pg_trgm's similarity(), which is what this scan used to compute.
+// SCRYFALL'S `?fuzzy=` TYPO METRIC IS pg_trgm's similarity() OF THE COLLATED NAME — derived from
+// 212 cached api.scryfall.com answers (2026-08-16 to 2026-09-25), then confirmed by five probes
+// chosen to test it (2026-09-26):
 //
-// The old code reimplemented pg_trgm exactly so the engine and upstream's Postgres FALLBACK would
-// resolve a needle the same way. It does not: pg_trgm splits on non-alphanumerics and pads each
-// WORD with "  x ", which makes its trigram set a set of WORDS and therefore blind to word order.
-// The clean proof is one needle:
+//     collate = lowercased, accents folded (by the caller), EVERY non-alphanumeric removed —
+//               `collate_name`, the fold `card_name_collated` is built with ("Ugin, the Spirit
+//               Dragon" -> "uginthespiritdragon", "bolt lightning" -> "boltlightning")
+//     score   = |A ∩ B| / |A ∪ B| over the DISTINCT pg_trgm windows of "  " + collated + " "
+//               (pg_trgm's own padding, applied to the collated string as ONE word — which is
+//               exactly what the SQL fallback's `magic.similarity()` computes over its collated
+//               name expression, so the two lanes score alike)
+//     FLOOR 0.55 — a candidate under it is no candidate. NO LEAD — the best candidate answers,
+//     and a tie is never ambiguous: a served card first, then the card FIRST PRINTED most
+//     recently, then the name that sorts last (`FuzzyRace`).
+//
+// WORD-SPLIT pg_trgm IS NOT IT. Postgres' similarity() over the raw name splits on
+// non-alphanumerics and pads each WORD, which makes its trigram set a set of words and therefore
+// blind to word order. The clean proof is one needle:
 //
 //     /cards/named?fuzzy=bolt+lightning  ->  Blightning
 //
-// pg_trgm scores `bolt lightning` against `Lightning Bolt` at 1.0 — the two have identical word
-// sets — so no threshold and no tiebreak can ever let Blightning win. Scryfall answers Blightning,
-// so Scryfall is not scoring word sets.
+// Word-split pg_trgm scores `bolt lightning` against `Lightning Bolt` at 1.0 — the two have
+// identical word sets — so no threshold and no tiebreak could ever let Blightning win. Collated,
+// the name is one word, so its windows run across the word boundary and keep the order:
+// Blightning 9/16 = 0.5625, Lightning Bolt 9/19 = 0.474.
 //
-// WHAT IT IS SCORING, fitted over the whole 86-needle set (the fit lives in this repo's history
-// as scratchpad/fit3.ts; the probe corpus is the cached Scryfall responses it reads):
+// NOR IS `(J + L) / 2`, which this scan computed before: a byte-trigram Jaccard of the collated
+// strings, unpadded, averaged with a normalized Levenshtein, floor 0.625, lead 0.002 (fitted to
+// the first 86 probed needles). Scored over every cached answer, card for card, with the stage
+// order below, it misses six of the 212 and all five probes; the collated similarity misses none:
 //
-//     fold  = accents folded, lowercased, EVERY non-alphanumeric removed  ("Ego à Deriva" ->
-//             "egoaderiva", "bolt lightning" -> "boltlightning")
-//     J     = Jaccard over the distinct raw 3-byte windows of the WHOLE folded string
-//             (no word split, no padding — this is where word order survives)
-//     L     = 1 - levenshtein(a, b) / max(|a|, |b|)
-//     score = (J + L) / 2                    FLOOR 0.625   LEAD 0.01
+//   - `ugin spirit` is Ugin, the Spirit Dragon, the one card containing both words. `(J + L) / 2`
+//     scores Inspirit 0.775, a confident typo winner; here 0.538, under the floor.
+//   - `mindstat` is Mindstatic. Levenshtein ranks Mindstab (one substitution, 0.795) first; here
+//     Mindstatic 0.667, Mindstab 0.636.
+//   - `sculptor` is Storm Sculptor. Levenshtein ranks Soul Sculptor (4 edits against 5) first;
+//     here the two TIE at 8/14 and the card first printed later answers.
+//   - `assaultron` and `jace sculpt` are `ambiguous` (two cards contain the words). `(J + L) / 2`
+//     answers Assault Drone (0.667) and Resculpt (0.628); here 0.500 and 0.429.
+//   - `lightning blast&set=m11` is a 404. `(J + L) / 2` answers M11's Lightning Bolt (0.66); here
+//     0.526.
+//   - The five probes: `illusionary`, `parallax` and `thoughts` are TIES that Scryfall answers
+//     (Illusionary Wall, Parallax Wave, Thought Scour) where the lead called them ambiguous;
+//     `haunting` is Haunting Hymn, not Hunting; `deadeall` is a 404, not Deadfall.
 //
-// Neither half alone reproduces the set: J alone puts `Lightning Bolt` (0.692) above `Blightning`
-// (0.583) for `bolt lightning`; L alone puts `Ball Lightning` (0.846) above it. Their mean puts
-// Blightning first (0.676 vs 0.664), and does so for 85 of the 86 needles. The one it does not
-// reproduce is `fuzzy=austere` — see `cards_containing_all_words`, which is the stage that
-// actually answers it.
+// THE FLOOR is bracketed by those probes: `deadeall` scores 6/11 = 0.545 against Deadfall and is
+// a 404 on Scryfall, while `lightning blow&set=m11` and `lihgtning bolt` score 5/9 = 0.556
+// against Lightning Bolt and answer it. 0.55 sits between.
+//
+// THE TIE-BREAK is from the five ties among the answers, every one of which Scryfall answers —
+// so there is no lead. The card whose FIRST printing is newest wins four of them outright
+// (Illusionary Wall 1995 over Illusionary Mask 1993, Haunting Hymn 2006 over Haunting Wind 1994,
+// Storm Sculptor 2017 over Soul Sculptor 1998, Thought Scour 2012 over Thoughtseize 2007), and
+// Parallax Wave and Parallax Tide share their first day (Nemesis), where the name that sorts last
+// answers. Name order alone, EDHREC popularity and oracle id each contradict one of the five.
 //
 // THE STAGE ORDER CHANGED WITH THE METRIC, and had to: `/cards/named?fuzzy=` is exact ->
 // TYPO -> containment, not exact -> containment -> typo. `fuzzy=primeval titanoth` is the proof
 // in one needle — containment answers `Titanoth Rex` (its flavor name carries "primeval", its
-// oracle name carries "titanoth") and Scryfall answers `Primeval Titan`, which only the typo
-// stage can produce. Reordering without the metric change is not an option either: it turns
-// `bolt` and `jac bel`, which Scryfall calls ambiguous, into hits.
+// oracle name carries "titanoth") and Scryfall answers `Primeval Titan` (0.722 here), which only
+// the typo stage can produce.
 //
-// TYPO FIRST IS NOT UNCONDITIONAL. A winner that scores WEAKLY loses to the containment stage:
-// under `FUZZY_WEAK_BELOW` to a card that alone carries every query word, under
-// `FUZZY_FAINT_BELOW` to several of them, which is `ambiguous`. `fuzzy_card_by_name` reports the
-// winner's strength and the route asks containment only for a weak one. The measurements are
-// on the two constants.
+// TYPO FIRST IS UNCONDITIONAL ON THIS METRIC. On `(J + L) / 2` a weakly scoring winner had to
+// yield to the containment stage (`FUZZY_WEAK_BELOW`, `FUZZY_FAINT_BELOW`); on the collated
+// similarity every such winner is under the floor, so there is no winner to yield and both lines
+// are retired to 0. The mechanism stays: `fuzzy_card_by_name` still reports a winner's strength
+// against a line a caller passes. The measurements are on the two constants.
 //
 // THE TYPO STAGE IS ENGLISH-ONLY. Scryfall gives foreign printed names no typo tolerance at all:
 // `fuzzy=blitzschlag` resolves the German printing of Lightning Bolt, `fuzzy=blitzschlagg`
@@ -4244,144 +4269,84 @@ fn build_printed_name_index(
 // CONTAINMENT stages only, and this scan reads oracle names — which also takes ~247k records off
 // the hot path it used to walk.
 //
-// UPSTREAM CONSEQUENCE, deliberate and owner-approved (PR #927): upstream's SQL fallback still
-// scores with pg_trgm, so the two paths now disagree on needles like `bolt lightning`. The engine
-// is what this port serves and Scryfall is what it has to match, so the engine matches Scryfall.
+// THE SQL FALLBACK SCORES THE SAME METRIC: `_fuzzy_similarity_candidate` in
+// `api/scryfall_compat/routes.py` takes `magic.similarity()` of the collated name at the same
+// floor, no lead, and the same tiebreaks, so the two lanes no longer disagree on needles like
+// `bolt lightning` (word-split pg_trgm, which the fallback scored before, answered Lightning Bolt).
 //
-// Nothing is stored for this. The name vocabulary is ~31,700 oracle names, so scoring the whole
-// corpus per request is a few milliseconds -- cheaper than carrying a trigram index for a route
-// that is a small fraction of traffic. It runs in the Durable Object (30 s), never the isolate.
+// Nothing is stored for this beyond the collated name the archive already carries. The name
+// vocabulary is ~31,700 oracle names, so scoring the whole corpus per request is a few
+// milliseconds -- cheaper than carrying a trigram index for a route that is a small fraction of
+// traffic.
 
 /// The score at or above which a candidate is eligible at all, and the margin the winner must
-/// hold over the best DIFFERENT answer. Fitted, not chosen: 0.625 sits in the middle of the
-/// 0.60–0.65 plateau over which the 86-needle set scores identically.
-///
-/// THE LEAD WAS REFITTED WHEN THE CORPUS GREW. It was 0.01 while the extras classes were refused
-/// at import; importing them put `Lightning Bolt // Lightning Bolt` (astx/76, an art-series
-/// printing Scryfall also has) into the name space at 0.6731 against Blightning's 0.6763 for
-/// `fuzzy=bolt lightning` — a 0.0032 gap, so a 0.01 lead called the headline needle ambiguous.
-/// Scryfall answers Blightning with that card in its own corpus, so the metric's separation is
-/// real and the threshold was simply too coarse for it. 0.002 sits inside the 0.0005–0.003
-/// plateau the refit found, and still leaves an EXACT tie (difference 0) ambiguous, which is the
-/// only thing the lead has to catch. (Art-series cards have since left the typo pool altogether --
-/// see `ART_SERIES_LAYOUT` -- so that particular runner-up is gone; the lead stays where the refit
-/// put it.)
-pub(crate) const FUZZY_SCORE_FLOOR: f32 = 0.625;
-pub(crate) const FUZZY_SCORE_LEAD: f32 = 0.002;
+/// hold over the best DIFFERENT answer — 0.0, so there is none: Scryfall's typo stage answers its
+/// best candidate even on an exact tie. Both measured; see the section comment.
+pub(crate) const FUZZY_SCORE_FLOOR: f32 = 0.55;
+pub(crate) const FUZZY_SCORE_LEAD: f32 = 0.0;
 
 /// The score below which a typo winner no longer outranks the containment stage: the one card
-/// whose names carry every query word answers instead. Scryfall runs the typo stage first, but a
-/// WEAK winner loses to a card that alone contains the words. Measured on api.scryfall.com
-/// 2026-09-25 over 33 needles where exactly one card contains every word and the typo race picks
-/// another: the typo winner answered 20 of the 22 scoring 0.714 or more on this metric
-/// (`inquisitor serr` is the lowest, `soulcatchers` 0.908 the highest) and the contained card all
-/// 11 scoring 0.703 or less (`hyd disintegrat` the highest, `prophesi` 0.625 the lowest). 0.71
-/// sits between.
-///
-/// The other two sit on the wrong side and are left there: `ugin spirit` (Inspirit, 0.775) and
-/// `mindstat` (Mindstab, 0.795) answer the contained card on Scryfall. No line on this metric
-/// takes them without giving up the needles around them it gets right -- `stranglero` (0.775),
-/// `snorti` (0.792) and eleven more answer the typo winner there.
-pub(crate) const FUZZY_WEAK_BELOW: f32 = 0.71;
+/// whose names carry every query word answers instead. RETIRED (0.0): the line was fitted on the
+/// metric before, `(J + L) / 2`, at 0.71 over 33 needles where exactly one card contains every word
+/// and the typo race picks another (api.scryfall.com, 2026-09-25). On the collated similarity every
+/// winner that line moved to containment scores UNDER THE FLOOR (`hyd disintegrat`'s Disintegrate
+/// 0.474, `tuk returned`'s Returned 0.500, `prophesi`'s Prophecy 0.500, `ugin spirit`'s Inspirit
+/// 0.538), so there is no typo winner and containment answers with no line at all, while the ones
+/// Scryfall answers from the typo stage clear it (`primeval titanoth` 0.722, `inquisitor serr`
+/// 0.611). The two needles the line could never reach, `ugin spirit` and `mindstat`, answer as on
+/// Scryfall too. The mechanism stays (`FuzzyOutcome::status`) for a caller that passes a line.
+pub(crate) const FUZZY_WEAK_BELOW: f32 = 0.0;
 
 /// The score below which a typo winner yields to an AMBIGUOUS containment too, so the lookup is
-/// `ambiguous`. Where more than one card carries every word, Scryfall still answers the typo winner
-/// for `bolt lightning` (Blightning, 0.676: Lightning Bolt and "Emeritus of Conflict // Lightning
-/// Bolt" both contain the words), `lightning bolt // lightning bolt` (0.673) and `insolent` (0.701),
-/// and answers `ambiguous` for `assaultron` (Assault Drone, 0.667) and `jace sculpt` (Resculpt,
-/// 0.628) -- measured 2026-09-25. 0.67 is the line between 0.667 and 0.673. Two needles below it
-/// answer the typo winner on Scryfall and stay ambiguous here, `ancestral` (Ancestral Mask, 0.664)
-/// and `paralyzing` (Paralyzing Grasp, 0.641); a line under them would put `assaultron` and
-/// `jace sculpt` on the wrong side instead, as many needles either way, and those two answer
-/// correctly with the containment stage first.
-pub(crate) const FUZZY_FAINT_BELOW: f32 = 0.67;
+/// `ambiguous`. RETIRED (0.0) with `FUZZY_WEAK_BELOW`, for the same reason: fitted at 0.67 on
+/// `(J + L) / 2` between `assaultron` (Assault Drone, 0.667, ambiguous on Scryfall) and `lightning
+/// bolt // lightning bolt` (0.673, answered). On the collated similarity Assault Drone scores
+/// 0.500 and `jace sculpt`'s Resculpt 0.429 — under the floor, so containment's `ambiguous` answers
+/// them — while `bolt lightning` (Blightning 0.5625) and `lightning bolt // lightning bolt`
+/// (Lightning Bolt 0.875) clear it and answer. `ancestral` and `paralyzing`, which the old line
+/// left ambiguous where Scryfall answers the typo winner, answer too.
+pub(crate) const FUZZY_FAINT_BELOW: f32 = 0.0;
 
-/// `s` with every non-alphanumeric ASCII byte removed, written into a caller-owned buffer.
+/// The distinct pg_trgm windows of an already-COLLATED string, as a sorted, deduped run so a merge
+/// can stand in for a set intersection. Empty for an empty string.
 ///
-/// Multi-byte UTF-8 is kept whole (a continuation byte is never ASCII), so a CJK printed name
-/// survives this unchanged while `"ego à deriva"` — already accent-folded by the caller — becomes
-/// `"egoaderiva"`. This is the same separator fold `core_api::strip_separators` applies to the
-/// containment stage's words, spelled for bytes because the windows below are byte windows.
-fn fold_separators_into(s: &str, out: &mut Vec<u8>) {
+/// pg_trgm's windows — `"  " + collated + " "`, every 3-character window — collected sorted
+/// rather than by first appearance, because the fuzzy scan intersects every name in the corpus
+/// with the needle and a merge of two sorted runs is what keeps that cheap.
+fn collated_windows_into(collated: &str, out: &mut Vec<[char; 3]>) {
     out.clear();
-    out.extend(s.bytes().filter(|b| !b.is_ascii() || b.is_ascii_alphanumeric()));
-}
-
-/// The distinct 3-byte windows of an already-separator-folded string, as a sorted, deduped run so
-/// a merge can stand in for a set intersection.
-///
-/// A string under three bytes has no windows, so it is right-padded with NUL — a byte no folded
-/// name contains — which gives it exactly one gram that only an identical short string shares.
-fn name_trigrams_into(folded: &[u8], out: &mut Vec<[u8; 3]>) {
-    out.clear();
-    if folded.is_empty() {
+    if collated.is_empty() {
         return;
     }
-    if folded.len() < 3 {
-        out.push([folded[0], *folded.get(1).unwrap_or(&0), 0]);
-        return;
-    }
-    for w in folded.windows(3) {
-        out.push([w[0], w[1], w[2]]);
+    let mut window = [' ', ' ', ' '];
+    for c in collated.chars().chain(std::iter::once(' ')) {
+        window = [window[1], window[2], c];
+        out.push(window);
     }
     out.sort_unstable();
     out.dedup();
 }
 
-/// Levenshtein distance over bytes, two rolling rows in a caller-owned buffer so the scan
-/// allocates once rather than once per name. Bytes rather than chars for the same reason the
-/// trigram windows are byte windows: the strings this compares are accent-folded oracle names,
-/// which are ASCII but for a handful of names whose non-ASCII bytes then simply compare as bytes.
-fn levenshtein_bytes(a: &[u8], b: &[u8], buf: &mut Vec<u32>) -> u32 {
-    if a.is_empty() {
-        return b.len() as u32;
-    }
-    if b.is_empty() {
-        return a.len() as u32;
-    }
-    let m = b.len();
-    buf.clear();
-    buf.extend(0..=m as u32);
-    for (i, &ca) in a.iter().enumerate() {
-        let mut diag = buf[0];
-        buf[0] = i as u32 + 1;
-        for j in 1..=m {
-            let up = buf[j];
-            let cost = u32::from(ca != b[j - 1]);
-            buf[j] = (buf[j] + 1).min(buf[j - 1] + 1).min(diag + cost);
-            diag = up;
-        }
-    }
-    buf[m]
-}
-
-/// TEST-ONLY: the REFERENCE statement of the metric above, written the obvious way (sets and a
-/// full DP) so the scan's faster route to it — sorted-run merge, rolling rows, the Jaccard
-/// prefilter — has something to be pinned against. See `fuzzy_score_matches_the_reference`.
+/// TEST-ONLY: the REFERENCE statement of the metric above, written the obvious way — collate
+/// both sides, pad each as pg_trgm pads a word, take every 3-character window as a set, Jaccard —
+/// so the scan's faster route to it (sorted runs, a merge, the size-ratio skip) has something to
+/// be pinned against. See `fuzzy_score_matches_the_reference`.
 #[cfg(test)]
 pub(crate) fn fuzzy_similarity(a: &str, b: &str) -> f32 {
-    let fold = |s: &str| -> Vec<u8> {
-        let mut v = Vec::new();
-        fold_separators_into(s, &mut v);
-        v
+    let grams = |s: &str| -> std::collections::BTreeSet<[char; 3]> {
+        let collated = collate_name(&s.to_lowercase());
+        if collated.is_empty() {
+            return std::collections::BTreeSet::new();
+        }
+        let padded: Vec<char> = format!("  {collated} ").chars().collect();
+        padded.windows(3).map(|w| [w[0], w[1], w[2]]).collect()
     };
-    let (fa, fb) = (fold(a), fold(b));
-    if fa.is_empty() || fb.is_empty() {
+    let (ga, gb) = (grams(a), grams(b));
+    if ga.is_empty() || gb.is_empty() {
         return 0.0;
     }
-    let grams = |v: &[u8]| -> std::collections::BTreeSet<[u8; 3]> {
-        let mut g = Vec::new();
-        name_trigrams_into(v, &mut g);
-        g.into_iter().collect()
-    };
-    let (ga, gb) = (grams(&fa), grams(&fb));
     let shared = ga.intersection(&gb).count();
-    let union = ga.len() + gb.len() - shared;
-    let jaccard = if union == 0 { 0.0 } else { shared as f32 / union as f32 };
-    let mut buf = Vec::new();
-    let dist = levenshtein_bytes(&fa, &fb, &mut buf) as f32;
-    let lev = 1.0 - dist / fa.len().max(fb.len()) as f32;
-    (jaccard + lev) / 2.0
+    shared as f32 / (ga.len() + gb.len() - shared) as f32
 }
 
 /// What a `?fuzzy=` lookup resolved to.
@@ -4392,9 +4357,11 @@ pub(crate) enum FuzzyOutcome {
     /// printing object rather than the English card. `score` is the winner's own, which decides
     /// whether a containment answer outranks it (`FUZZY_WEAK_BELOW`).
     Hit { cid: u32, vpid: u32, score: f32 },
-    /// Two distinct names on two distinct CARDS scored too close to choose between; Scryfall
-    /// answers `ambiguous`. A card's own English and foreign names never read ambiguous, and
-    /// neither do two cards sharing one name (they are one answer, the pre-multilingual rule).
+    /// Two distinct names on two distinct CARDS scored within `lead` of each other; Scryfall
+    /// answers `ambiguous`. Never at the default lead of 0, which is Scryfall's — it answers every
+    /// tie — so this is reached only by a caller that passes a positive lead. A card's own English
+    /// and foreign names never read ambiguous, and neither do two cards sharing one name (they
+    /// are one answer, the pre-multilingual rule).
     Ambiguous,
     /// Nothing cleared the floor.
     Miss,
@@ -4417,25 +4384,64 @@ impl FuzzyOutcome {
 
 /// The running best and runner-up of the fuzzy scan, under the competition rule above: a
 /// candidate threatens the leader only when BOTH its name and its oracle card differ.
+///
+/// THE LEADER IS RANKED ON (score, served, first printed, name), and everything after the score is
+/// a tiebreak, never a competitor:
+///
+///   - `served`: two cards sharing one name score identically, and when one of them has no
+///     printing a default search shows (a token named like a card) the served card is the one a
+///     client means.
+///   - `first`, then the name, DESCENDING: two different names that score the same are not
+///     ambiguous on Scryfall — the card first printed most recently answers, and on the same first
+///     day the name that sorts last (`sculptor` is Storm Sculptor, `parallax` Parallax Wave; the
+///     five measured ties are in the section comment).
+///
+/// The runner-up rule reads scores alone; at the default lead of 0 it never makes anything
+/// ambiguous, and it stays for a caller that passes a positive lead.
 struct FuzzyRace<'a> {
-    best: Option<(f32, u32, u32, &'a str)>, // (score, cid, vpid, name)
+    best: Option<RaceEntry<'a>>,
     runner_up: Option<f32>,
 }
 
+/// One candidate as the race ranks it.
+#[derive(Clone, Copy)]
+struct RaceEntry<'a> {
+    score: f32,
+    /// `any_printing_is_served`.
+    served: bool,
+    /// `card_first_released`: yyyymmdd, 0 when unknown.
+    first: u32,
+    name: &'a str,
+    cid: u32,
+    vpid: u32,
+}
+
+impl RaceEntry<'_> {
+    /// The race's order: score, then served, then first printed, then name — all descending, so
+    /// `Greater` leads.
+    fn rank(&self, other: &RaceEntry<'_>) -> std::cmp::Ordering {
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| self.served.cmp(&other.served))
+            .then_with(|| self.first.cmp(&other.first))
+            .then_with(|| self.name.cmp(other.name))
+    }
+}
+
 impl<'a> FuzzyRace<'a> {
-    fn offer(&mut self, score: f32, cid: u32, vpid: u32, name: &'a str) {
+    fn offer(&mut self, entry: RaceEntry<'a>) {
         match self.best {
-            Some((best_score, best_cid, _, best_name)) if score <= best_score => {
-                if name != best_name && cid != best_cid && self.runner_up.is_none_or(|r| score > r) {
-                    self.runner_up = Some(score);
+            Some(best) if entry.rank(&best) != std::cmp::Ordering::Greater => {
+                if entry.name != best.name && entry.cid != best.cid && self.runner_up.is_none_or(|r| entry.score > r) {
+                    self.runner_up = Some(entry.score);
                 }
             }
             _ => {
-                if let Some((prev_score, prev_cid, _, prev_name)) = self.best
-                    && prev_name != name && prev_cid != cid && self.runner_up.is_none_or(|r| prev_score > r) {
-                        self.runner_up = Some(prev_score);
+                if let Some(prev) = self.best
+                    && prev.name != entry.name && prev.cid != entry.cid && self.runner_up.is_none_or(|r| prev.score > r) {
+                        self.runner_up = Some(prev.score);
                     }
-                self.best = Some((score, cid, vpid, name));
+                self.best = Some(entry);
             }
         }
     }
@@ -4443,8 +4449,8 @@ impl<'a> FuzzyRace<'a> {
     fn outcome(self, lead: f32) -> FuzzyOutcome {
         match (self.best, self.runner_up) {
             (None, _) => FuzzyOutcome::Miss,
-            (Some((score, _, _, _)), Some(second)) if score - second < lead => FuzzyOutcome::Ambiguous,
-            (Some((score, cid, vpid, _)), _) => FuzzyOutcome::Hit { cid, vpid, score },
+            (Some(best), Some(second)) if best.score - second < lead => FuzzyOutcome::Ambiguous,
+            (Some(best), _) => FuzzyOutcome::Hit { cid: best.cid, vpid: best.vpid, score: best.score },
         }
     }
 }
@@ -5088,30 +5094,43 @@ pub(crate) fn printed_names_containing_all_words(
     by_name.into_iter().take(limit).map(|(_, _, _, cid, vpid)| (cid, vpid)).collect()
 }
 
-/// `(J + L) / 2` for one candidate, or None when it cannot clear `floor`.
+/// The day a card was FIRST printed — the earliest `released_at` among its canonical printings —
+/// as yyyymmdd, or 0 when none carries a date. The fuzzy race's tiebreak after `served`; see
+/// `FuzzyRace`.
+pub(crate) fn card_first_released(data: &Archived<CardData>, cid: usize) -> u32 {
+    let (start, end) = (u32::from(data.offsets[cid]) as usize, u32::from(data.offsets[cid + 1]) as usize);
+    data.printings[start..end]
+        .iter()
+        .filter_map(|p| p.released_at_int.as_ref().map(|v| u32::from(*v)))
+        .min()
+        .unwrap_or(0)
+}
+
+/// Whether any CANONICAL printing of this card is one a default search would show — the fuzzy
+/// race's first tiebreak (see `FuzzyRace`).
 ///
-/// Two exact skips, in the order that makes the cheap one pay for the dear one:
+/// The card-level reading of `-is:extra`, which is the gate `/cards/search` ANDs in: a card is
+/// served if ANY of its printings is, not only if all of them are. A token, an emblem or a
+/// memorabilia front card has no served printing at all.
 ///
-///   1. THE JACCARD PREFILTER. `L` is at most 1, so a candidate cannot reach `floor` unless
-///      `J >= 2 * floor - 1` — 0.25 at the fitted floor. The Jaccard is a merge of two sorted
-///      runs; the Levenshtein is a `|a| x |b|` DP, so paying the merge to skip the DP is the
-///      whole reason the scan stays in the low milliseconds over ~31,700 names.
-///   2. THE SIZE-RATIO CEILING inside it (`shared <= min(|a|,|b|)`, `union >= max`), which drops
-///      wildly mismatched lengths without touching either run.
+/// `None` for `extra_vid` means this store's collection vocabulary never interned the tag — a
+/// fixture, or a corpus with no extras — and then every card is servable, which is the same
+/// answer the scan would give.
+fn any_printing_is_served(data: &Archived<CardData>, cid: usize, extra_vid: Option<u16>) -> bool {
+    let Some(vid) = extra_vid else { return true };
+    let (start, end) = (u32::from(data.offsets[cid]) as usize, u32::from(data.offsets[cid + 1]) as usize);
+    (start..end).any(|pid| !data.printings[pid].card_is_tags.iter().any(|t| u16::from(*t) == vid))
+}
+
+/// The collated similarity for one candidate, or None when it cannot clear `floor`.
 ///
-/// Both are ceilings on the true score, never approximations of it: nothing that could clear the
-/// floor is skipped.
-fn fuzzy_score_cleared(
-    name_tg: &[[u8; 3]],
-    needle_tg: &[[u8; 3]],
-    name: &[u8],
-    needle: &[u8],
-    floor: f32,
-    dp: &mut Vec<u32>,
-) -> Option<f32> {
+/// One exact skip before the merge: THE SIZE-RATIO CEILING (`shared <= min(|a|,|b|)`,
+/// `union >= max`), which drops wildly mismatched lengths without touching either run. It is a
+/// ceiling on the true score, never an approximation of it: nothing that could clear the floor is
+/// skipped.
+fn fuzzy_score_cleared(name_tg: &[[char; 3]], needle_tg: &[[char; 3]], floor: f32) -> Option<f32> {
     let (la, lb) = (name_tg.len(), needle_tg.len());
-    let jaccard_floor = (2.0 * floor - 1.0).max(0.0);
-    if la == 0 || lb == 0 || (la.min(lb) as f32) < jaccard_floor * la.max(lb) as f32 {
+    if la == 0 || lb == 0 || (la.min(lb) as f32) < floor * la.max(lb) as f32 {
         return None;
     }
     // Two sorted runs merged: no set, no allocation, no hashing.
@@ -5127,17 +5146,7 @@ fn fuzzy_score_cleared(
             }
         }
     }
-    let union = la + lb - shared;
-    let jaccard = if union == 0 { 0.0 } else { shared as f32 / union as f32 };
-    if jaccard < jaccard_floor {
-        return None;
-    }
-    let longest = name.len().max(needle.len());
-    if longest == 0 {
-        return None;
-    }
-    let lev = 1.0 - levenshtein_bytes(name, needle, dp) as f32 / longest as f32;
-    let score = (jaccard + lev) / 2.0;
+    let score = shared as f32 / (la + lb - shared) as f32;
     (score >= floor).then_some(score)
 }
 
@@ -5160,26 +5169,23 @@ pub(crate) fn preferred_vpid(data: &Archived<CardData>, cid: usize) -> Option<u3
     (start < u32::from(data.offsets[cid + 1])).then_some(start)
 }
 
-/// The needle, in the form both scans below compare against: lowercased, separator-folded bytes
-/// plus their sorted trigram run. Empty when nothing alphanumeric survives.
-fn fuzzy_needle(needle: &str) -> Option<(Vec<u8>, Vec<[u8; 3]>)> {
-    let lowered = needle.to_lowercase();
-    let mut bytes = Vec::with_capacity(lowered.len());
-    fold_separators_into(&lowered, &mut bytes);
+/// The needle's windows, in the form the scan compares against: collated the way the names are,
+/// then `collated_windows_into`. None when nothing alphanumeric survives.
+fn fuzzy_needle(needle: &str) -> Option<Vec<[char; 3]>> {
     let mut tg = Vec::with_capacity(32);
-    name_trigrams_into(&bytes, &mut tg);
-    (!tg.is_empty()).then_some((bytes, tg))
+    collated_windows_into(&collate_name(&needle.to_lowercase()), &mut tg);
+    (!tg.is_empty()).then_some(tg)
 }
 
-/// The typo-tolerant name match, with Scryfall's thresholds, over every card's folded ENGLISH
+/// The typo-tolerant name match, with Scryfall's thresholds, over every card's collated ENGLISH
 /// name — and only those. Printed names get no typo tolerance on Scryfall (`fuzzy=blitzschlagg`
 /// and `fuzzy=ego a derva` both answer 404 while the exact foreign spellings resolve), so they
 /// reach `?fuzzy=` through the exact and containment stages instead; see the module comment.
 ///
-/// A candidate must clear `floor`, and the best must lead the runner-up by `lead`. The
-/// runner-up rule is FuzzyRace's: only a different name on a different CARD competes — several
-/// printings of one card are the same answer, a card's own foreign and English names are too,
-/// and two cards sharing a name stay one answer.
+/// A candidate must clear `floor`, and the best must lead the runner-up by `lead` (0 by default,
+/// so the best always answers). The runner-up rule is FuzzyRace's: only a different name on a
+/// different CARD competes — several printings of one card are the same answer, a card's own
+/// foreign and English names are too, and two cards sharing a name stay one answer.
 ///
 /// An art-series card is neither a winner nor a competitor (see `ART_SERIES_LAYOUT`); every other
 /// extras class races.
@@ -5189,29 +5195,33 @@ pub(crate) fn fuzzy_name_match(
     floor: f32,
     lead: f32,
 ) -> FuzzyOutcome {
-    // The needle's folded bytes and trigrams are LOOP-INVARIANT. Rebuilding them per card is what
-    // made one `?fuzzy=` lookup cost 25,350 us on the real corpus before this scan was written.
-    let Some((needle_bytes, needle_tg)) = fuzzy_needle(needle) else { return FuzzyOutcome::Miss };
+    // The needle's windows are LOOP-INVARIANT. Rebuilding them per card is what made one
+    // `?fuzzy=` lookup cost 25,350 us on the real corpus before this scan was written.
+    let Some(needle_tg) = fuzzy_needle(needle) else { return FuzzyOutcome::Miss };
     // Reused across every candidate, so the scan allocates once rather than per name.
-    let mut name_bytes: Vec<u8> = Vec::with_capacity(64);
-    let mut name_tg: Vec<[u8; 3]> = Vec::with_capacity(64);
-    let mut dp: Vec<u32> = Vec::with_capacity(64);
+    let mut name_tg: Vec<[char; 3]> = Vec::with_capacity(64);
     let mut race = FuzzyRace { best: None, runner_up: None };
+    let extra_vid = data.coll_vocab.iter().position(|s| s.as_str() == EXTRA_IS_TAG).map(|p| p as u16);
     for (cid, card) in data.cards.iter().enumerate() {
-        let name = folded_name(card, &data.strings);
-        fold_separators_into(name, &mut name_bytes);
-        name_trigrams_into(&name_bytes, &mut name_tg);
-        if let Some(score) =
-            fuzzy_score_cleared(&name_tg, &needle_tg, &name_bytes, &needle_bytes, floor, &mut dp)
-        {
+        collated_windows_into(collated_name(card, &data.strings), &mut name_tg);
+        if let Some(score) = fuzzy_score_cleared(&name_tg, &needle_tg, floor) {
             // Checked only on a name that cleared the floor, so the layout compare stays off the
             // scan's hot path.
             if is_art_series(data, cid) {
                 continue;
             }
             // An English-name hit materializes what it always has: the card's preferred printing.
+            // The tiebreaks are read only for a name that cleared the floor, so they stay off the
+            // scan's hot path.
             if let Some(vpid) = preferred_vpid(data, cid) {
-                race.offer(score, cid as u32, vpid, name);
+                race.offer(RaceEntry {
+                    score,
+                    served: any_printing_is_served(data, cid, extra_vid),
+                    first: card_first_released(data, cid),
+                    name: folded_name(card, &data.strings),
+                    cid: cid as u32,
+                    vpid,
+                });
             }
         }
     }
@@ -18695,9 +18705,12 @@ impl QueryEngine {
     /// exist. "weak" and "faint" carry the winner too, and say what it yields to: a weak winner
     /// loses to a card that alone contains every query word, a faint one to several
     /// (`FUZZY_WEAK_BELOW`, `FUZZY_FAINT_BELOW`). The caller asks the containment stage for those.
-    /// Every threshold DEFAULTS to its fitted value (see the `Fuzzy name matching` module comment):
-    /// they belong to the metric, not to the caller, and a Python-side copy of them drifts the
-    /// moment the metric is refitted. They stay arguments so a test can sweep them.
+    /// Every threshold DEFAULTS to its measured value (see the `Fuzzy name matching` module
+    /// comment): they belong to the metric, not to the caller, and a Python-side copy of them
+    /// drifts the moment the metric is refitted. They stay arguments so a test can sweep them. At
+    /// the defaults a tie answers (lead 0: the race's tiebreaks choose) and both lines are retired
+    /// (0), so the status is "hit" or "miss"; the other three come back only for a caller that
+    /// passes a positive lead or line.
     #[pyo3(signature = (
         name,
         floor=FUZZY_SCORE_FLOOR,

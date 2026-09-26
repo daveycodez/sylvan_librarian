@@ -730,12 +730,15 @@ _COLLECTION_NOT_AN_ARRAY_DETAILS = "The `identifiers` list must be a JSON array.
 # similarity_threshold, so the index-assisted `%` prefilter always admits a strict superset of what
 # the floor keeps.
 #
-# THESE ARE NO LONGER THE ENGINE'S. The engine scores a different metric — Scryfall's, derived from
-# 86 probed needles; see card_engine's `Fuzzy name matching` module comment — with its own fitted
-# floor and lead, which it now supplies as the defaults of `fuzzy_card_by_name`. The two paths
-# therefore resolve a handful of needles differently (`fuzzy=bolt lightning` is Blightning through
-# the engine and Lightning Bolt through pg_trgm, and Scryfall says Blightning). That is deliberate:
-# the engine is the path that serves, and matching Scryfall is what this surface is for.
+# THESE ARE NO LONGER THE ENGINE'S. The engine scores Scryfall's metric — pg_trgm's similarity of
+# the COLLATED name (every non-alphanumeric removed, so the name is one word and word order
+# survives), measured against 212 cached api.scryfall.com answers and five probes; see
+# card_engine's `Fuzzy name matching` module comment — with its own floor (0.55) and no lead,
+# which it supplies as the defaults of `fuzzy_card_by_name`. This query scores pg_trgm over the
+# raw name, which splits it into words, so the two paths resolve a handful of needles differently
+# (`fuzzy=bolt lightning` is Blightning through the engine and Lightning Bolt through the word
+# sets here, and Scryfall says Blightning). That is deliberate: the engine is the path that
+# serves, and matching Scryfall is what this surface is for.
 FUZZY_SIMILARITY_FLOOR = 0.4
 FUZZY_SIMILARITY_LEAD = 0.05
 
