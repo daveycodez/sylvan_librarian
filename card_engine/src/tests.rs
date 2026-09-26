@@ -14597,14 +14597,14 @@ fn printings_without_relations_carry_none() {
 
 // ─── Fuzzy name matching ──────────────────────────────────────────────────────
 
-/// `fuzzy_score_cleared` is a hand-rolled restatement of the metric that skips work two ways (the
-/// Jaccard prefilter, the size-ratio ceiling) and merges sorted runs instead of intersecting
-/// sets. It must agree EXACTLY with `fuzzy_similarity`, the reference statement — a single
-/// dropped window or an over-eager skip would shift every fuzzy score without failing anything
-/// else.
+/// `fuzzy_score_cleared` is a hand-rolled restatement of the metric that skips work (the
+/// size-ratio ceiling) and merges sorted runs instead of intersecting sets. It must agree EXACTLY
+/// with `fuzzy_similarity`, the reference statement — a single dropped window or an over-eager
+/// skip would shift every fuzzy score without failing anything else. The reference takes its
+/// windows from `collated_trigrams`, so this also pins the scan's windows to autocomplete's.
 ///
-/// Lengths 1 and 2 are the interesting axis: they are the cases with no full 3-window, where the
-/// NUL padding is the only thing keeping two short strings from colliding.
+/// Lengths 1 and 2 are the interesting axis: pg_trgm's padding gives them windows ("  a", " ab",
+/// "ab ") where an unpadded run would have none.
 #[test]
 fn fuzzy_score_matches_the_reference() {
     let cases = [
@@ -14628,20 +14628,18 @@ fn fuzzy_score_matches_the_reference() {
         "blightning",
         "counterspell",
         "counters",
+        "human—time lord",
+        "ratonhnhaké:ton",
     ];
-    let mut dp = Vec::new();
-    let (mut ab, mut bb) = (Vec::new(), Vec::new());
     let (mut at, mut bt) = (Vec::new(), Vec::new());
     for a in cases {
         for b in cases {
-            crate::fold_separators_into(a, &mut ab);
-            crate::fold_separators_into(b, &mut bb);
-            crate::name_trigrams_into(&ab, &mut at);
-            crate::name_trigrams_into(&bb, &mut bt);
+            crate::collated_windows_into(&crate::collate_name(&a.to_lowercase()), &mut at);
+            crate::collated_windows_into(&crate::collate_name(&b.to_lowercase()), &mut bt);
             let want = crate::fuzzy_similarity(a, b);
-            // Floor 0.0 asks for the score whenever one exists, so the skips are exercised
-            // against the reference rather than hidden behind them.
-            let got = crate::fuzzy_score_cleared(&at, &bt, &ab, &bb, 0.0, &mut dp);
+            // Floor 0.0 asks for the score whenever one exists, so the skip is exercised against
+            // the reference rather than hidden behind it.
+            let got = crate::fuzzy_score_cleared(&at, &bt, 0.0);
             match got {
                 Some(score) => assert!((score - want).abs() < 1e-6, "{a:?} vs {b:?}: {score} != {want}"),
                 None => assert_eq!(want, 0.0, "{a:?} vs {b:?}: skipped a nonzero score {want}"),
@@ -14650,32 +14648,51 @@ fn fuzzy_score_matches_the_reference() {
     }
 }
 
-/// The metric itself, on the needles that fixed it. Hand-computed from the definition in lib.rs's
-/// module comment: J over the whole folded string's 3-byte windows, averaged with normalized
-/// Levenshtein.
+/// The metric itself, on the needles that fixed it: pg_trgm's similarity of the COLLATED strings,
+/// hand-computed from the definition in lib.rs's module comment, and every expectation measured
+/// on api.scryfall.com.
 #[test]
 fn fuzzy_similarity_is_the_derived_metric() {
     // Identical strings score 1.0, and separators are not characters.
     assert!((fuzzy_similarity("abc", "abc") - 1.0).abs() < 1e-6);
     assert!((fuzzy_similarity("urza's bauble", "urza s bauble") - 1.0).abs() < 1e-6);
+    assert!((fuzzy_similarity("Lightning Bolt", "lightningbolt") - 1.0).abs() < 1e-6, "case folds");
 
-    // THE NEEDLE THAT DISPROVED pg_trgm. Word-set similarity scores `bolt lightning` against
-    // `Lightning Bolt` at 1.0, so Blightning could never win; Scryfall answers Blightning, and so
-    // does this metric. Measured on api.scryfall.com 2026-08-16.
+    // THE NEEDLE THAT DISPROVED WORD-SPLIT pg_trgm, which scores `bolt lightning` against
+    // `Lightning Bolt` at 1.0. Collated, the windows cross the word boundary and keep the order:
+    // Blightning 9/16, Lightning Bolt 9/19. Scryfall answers Blightning (2026-08-16).
     let blightning = fuzzy_similarity("bolt lightning", "blightning");
     let bolt = fuzzy_similarity("bolt lightning", "lightning bolt");
-    assert!(blightning > bolt, "bolt lightning: Blightning {blightning} must beat Lightning Bolt {bolt}");
+    assert_eq!((blightning, bolt), (9.0 / 16.0, 9.0 / 19.0));
+
+    // The needles `(J + L) / 2` answered differently from Scryfall (2026-09-25/26).
+    assert!(fuzzy_similarity("ugin spirit", "inspirit") < crate::FUZZY_SCORE_FLOOR, "0.538: containment answers Ugin");
+    assert!(
+        fuzzy_similarity("mindstat", "mindstatic") > fuzzy_similarity("mindstat", "mindstab"),
+        "Mindstatic 0.667 over Mindstab 0.636"
+    );
+    assert_eq!(fuzzy_similarity("sculptor", "storm sculptor"), fuzzy_similarity("sculptor", "soul sculptor"), "a tie");
+    assert!(fuzzy_similarity("assaultron", "assault drone") < crate::FUZZY_SCORE_FLOOR, "0.500: containment's ambiguous");
+    assert!(fuzzy_similarity("jace sculpt", "resculpt") < crate::FUZZY_SCORE_FLOOR, "0.429: containment's ambiguous");
+    assert!(fuzzy_similarity("lightning blast", "lightning bolt") < crate::FUZZY_SCORE_FLOOR, "0.526: a 404 in m11");
+    assert!(fuzzy_similarity("primeval titanoth", "primeval titan") >= crate::FUZZY_SCORE_FLOOR, "0.722");
+
+    // The floor, bracketed by probes: 6/11 is a 404 (`deadeall`), 5/9 an answer.
+    assert_eq!(fuzzy_similarity("deadeall", "deadfall"), 6.0 / 11.0);
+    assert!(fuzzy_similarity("deadeall", "deadfall") < crate::FUZZY_SCORE_FLOOR);
+    assert_eq!(fuzzy_similarity("lightning blow", "lightning bolt"), 5.0 / 9.0);
+    assert!(fuzzy_similarity("lightning blow", "lightning bolt") >= crate::FUZZY_SCORE_FLOOR);
 
     // Nothing in common scores 0, and an empty side scores 0 rather than dividing by zero.
     assert_eq!(fuzzy_similarity("abc", "xyz"), 0.0);
     assert_eq!(fuzzy_similarity("", "abc"), 0.0);
     assert_eq!(fuzzy_similarity("", ""), 0.0);
 
-    // Symmetric, as both halves are.
+    // Symmetric.
     assert_eq!(fuzzy_similarity("lightning", "lightnin"), fuzzy_similarity("lightnin", "lightning"));
 
-    // The fitted floor admits the needles Scryfall resolves and rejects the ones it calls
-    // ambiguous or not_found — the plateau's two edges, on real names.
+    // The floor admits the needles Scryfall resolves and rejects the ones it calls ambiguous or
+    // not_found.
     assert!(fuzzy_similarity("counterspellxxxxxxxxxx", "counterspell") >= crate::FUZZY_SCORE_FLOOR);
     assert!(fuzzy_similarity("lihgtning bolt", "lightning bolt") >= crate::FUZZY_SCORE_FLOOR);
     assert!(fuzzy_similarity("sol rin", "sol ring") >= crate::FUZZY_SCORE_FLOOR);
@@ -14717,19 +14734,78 @@ fn a_typo_resolves_to_the_intended_card() {
 }
 
 #[test]
-fn two_close_names_are_ambiguous_not_a_guess() {
-    // Scryfall reports `ambiguous` rather than picking, and collapsing that to "not found" would
-    // tell the client the card does not exist.
+fn two_names_that_tie_are_not_ambiguous() {
+    // Scryfall's typo stage answers a tie (`illusionary`, `parallax`, `thoughts`, `sculptor`,
+    // probed 2026-09-26) — the card first printed most recently, then the name that sorts last.
+    // The fixture's cards carry no dates, so the name decides.
     //
     // The pair is SYMMETRIC around the needle — "fire dragen" is one substitution from each, and
-    // each differs from it in the same three trigrams — so the two score identically and neither
-    // can lead. An asymmetric near-miss like "fire dragoon" (two edits, one more trigram) is NOT
-    // ambiguous under the derived metric and must not be used here: it loses by 0.068, which is
-    // the metric working rather than a tie.
-    let data = named_cards_store(&["fire dragon", "fire dragan"]);
+    // each differs from it in the same windows — so the two score identically.
+    let data = named_cards_store(&["fire dragan", "fire dragon"]);
     let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
     let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
-    assert!(matches!(fuzzy_name_match(a, "fire dragen", crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD), FuzzyOutcome::Ambiguous));
+    assert!(
+        matches!(
+            fuzzy_name_match(a, "fire dragen", crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD),
+            FuzzyOutcome::Hit { cid: 1, .. }
+        ),
+        "the tie goes to the name that sorts last"
+    );
+    // The lead mechanism stays for a caller that passes one: a positive lead calls the tie.
+    assert!(matches!(fuzzy_name_match(a, "fire dragen", crate::FUZZY_SCORE_FLOOR, 0.002), FuzzyOutcome::Ambiguous));
+}
+
+/// THE TIE-BREAK, on the measured ties' own names and first-printed days (api.scryfall.com,
+/// 2026-09-26). The card FIRST printed most recently answers even where its name sorts first —
+/// `haunting` is Haunting Hymn (2006) over Haunting Wind (1994), `thoughts` Thought Scour (2012)
+/// over Thoughtseize (2007), `sculptor` Storm Sculptor (2017) over Soul Sculptor (1998) — and on
+/// the same first day the name that sorts last does: `parallax` is Parallax Wave, which shares
+/// Nemesis with Parallax Tide.
+#[test]
+fn a_tie_goes_to_the_card_first_printed_last() {
+    let cards: [(&str, u32); 8] = [
+        ("haunting hymn", 20060203),
+        ("haunting wind", 19940601),
+        ("thought scour", 20120601),
+        ("thoughtseize", 20071012),
+        ("storm sculptor", 20170922),
+        ("soul sculptor", 19980201),
+        ("parallax tide", 20000214),
+        ("parallax wave", 20000214),
+    ];
+    let mut data = named_cards_store(&cards.map(|(name, _)| name));
+    for (i, (_, released)) in cards.iter().enumerate() {
+        data.printings[i].released_at_int = Some(*released);
+    }
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let answer = |needle: &str| match fuzzy_name_match(a, needle, crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD) {
+        FuzzyOutcome::Hit { cid, .. } => cards[cid as usize].0,
+        _ => panic!("{needle}: expected a hit"),
+    };
+    // Each pair really is a tie on the metric, so it is the tiebreak that answers.
+    assert_eq!(fuzzy_similarity("haunting", "haunting hymn"), fuzzy_similarity("haunting", "haunting wind"));
+    assert_eq!(fuzzy_similarity("thoughts", "thought scour"), fuzzy_similarity("thoughts", "thoughtseize"));
+    assert_eq!(answer("haunting"), "haunting hymn");
+    assert_eq!(answer("thoughts"), "thought scour");
+    assert_eq!(answer("sculptor"), "storm sculptor");
+    assert_eq!(answer("parallax"), "parallax wave");
+}
+
+/// A SERVED card outranks an extras-only card on a tie, before the first-printed key: a token
+/// sharing a card's name scores identically, is usually printed later, and is not the card a
+/// client means.
+#[test]
+fn a_tie_goes_to_the_served_card_before_the_newer_one() {
+    let mut data = autocomplete_store(&[("Fire Dragon", false), ("Fire Dragon", true)]);
+    data.printings[0].released_at_int = Some(19980101);
+    data.printings[1].released_at_int = Some(20240101);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    assert!(matches!(
+        fuzzy_name_match(a, "fire dragen", crate::FUZZY_SCORE_FLOOR, crate::FUZZY_SCORE_LEAD),
+        FuzzyOutcome::Hit { cid: 0, .. }
+    ));
 }
 
 #[test]
@@ -14912,8 +14988,10 @@ fn bilingual_store() -> (CardData, u16, u16) {
 
     let mut foreign = stub_printing(2, 2, None);
     foreign.compat.lang_id = fr;
-    data.strings = vec!["eclair de foudre".to_string()];
-    foreign.printed_name_folded_id = 0;
+    // PUSHED, not assigned: `store_of` has already interned the card's collated name into this
+    // table, and the fuzzy scan reads it from there.
+    data.strings.push("eclair de foudre".to_string());
+    foreign.printed_name_folded_id = (data.strings.len() - 1) as u32;
     data.foreign = vec![foreign];
     data.foreign_offsets = vec![0, 1];
     data.indexes.langs = build_lang_index(&data.printings, &data.coll_vocab);
