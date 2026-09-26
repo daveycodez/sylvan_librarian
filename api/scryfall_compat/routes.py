@@ -1771,11 +1771,18 @@ class ScryfallCardsRoutes:
                 bad_request_error("The page parameter must be a positive integer."),
                 pretty=pretty,
             )
-        total = self._run_query(query="SELECT count(1) AS total FROM magic.cards", explain=False)["result"][0]["total"]
+        # Canonical printings only, the default every other lane serves: magic.cards holds every
+        # language since all_cards became the feed, and the by-id lookup that renders the page
+        # below reads canonical printings only. `scryfall_id` last makes the order total, so an
+        # OFFSET page never repeats or skips a card that ties on the rest.
+        total = self._run_query(
+            query="SELECT count(1) AS total FROM magic.cards WHERE is_canonical",
+            explain=False,
+        )["result"][0]["total"]
         rows = self._run_query(
             query=(
-                f"SELECT {_CARD_COLUMNS} FROM magic.cards AS card "
-                "ORDER BY card_name, card_set_code, collector_number_int, collector_number "
+                "SELECT scryfall_id FROM magic.cards WHERE is_canonical "
+                "ORDER BY card_name, card_set_code, collector_number_int, collector_number, scryfall_id "
                 "LIMIT %(limit)s OFFSET %(offset)s"
             ),
             params={"limit": PAGE_SIZE, "offset": (page_number - 1) * PAGE_SIZE},
@@ -1784,8 +1791,10 @@ class ScryfallCardsRoutes:
         if not rows:
             return self._scryfall_respond(falcon_response, not_found_error(_NO_MATCH_DETAILS), pretty=pretty)
 
-        cards = [to_scryfall_card(row) for row in rows]
-        has_more = (page_number - 1) * PAGE_SIZE + len(cards) < total
+        # SQL picks and orders the page; `_cards_by_ids` renders it, as it does /cards/search's, so a
+        # listed card is the object `/cards/:id` answers: the engine's, with SQL as the fallback.
+        cards = self._cards_by_ids([str(row["scryfall_id"]) for row in rows])
+        has_more = (page_number - 1) * PAGE_SIZE + len(rows) < total
         next_page = None
         if has_more:
             next_page = objects.build_page_url(_self_base_url(request, request_host, "/cards"), {}, page_number + 1)
