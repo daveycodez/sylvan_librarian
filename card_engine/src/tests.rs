@@ -15155,6 +15155,31 @@ fn printings_without_relations_carry_none() {
     assert!(a.all_parts.is_empty(), "~95% of printings have no relations");
 }
 
+#[test]
+fn renumbering_the_vocab_remaps_each_related_cards_component() {
+    // Interned in the order the renumber reverses, so an id it forgets to remap names the other
+    // component rather than happening to survive; the sentinel must stay the sentinel.
+    let mut vocab = VocabInterner::new();
+    let token = vocab.intern("token".to_string()).expect("intern token");
+    let combo_piece = vocab.intern("combo_piece".to_string()).expect("intern combo_piece");
+    let mut printing = stub_printing(1, 1, None);
+    printing.all_parts = vec![
+        RelatedCard { id: 0xAAAA, name_id: 10, type_line_id: 11, component_id: combo_piece },
+        RelatedCard { id: 0xBBBB, name_id: 20, type_line_id: 21, component_id: token },
+        RelatedCard { id: 0xCCCC, name_id: 30, type_line_id: 31, component_id: VOCAB_NONE },
+    ];
+    let mut printings = vec![printing];
+
+    let sorted = renumber_coll_vocab(&mut [], &mut printings, &mut [], vocab.strings);
+
+    let components: Vec<Option<&str>> = printings[0]
+        .all_parts
+        .iter()
+        .map(|part| if part.component_id == VOCAB_NONE { None } else { Some(sorted[part.component_id as usize].as_str()) })
+        .collect();
+    assert_eq!(components, [Some("combo_piece"), Some("token"), None]);
+}
+
 // ─── Fuzzy name matching ──────────────────────────────────────────────────────
 
 /// `fuzzy_score_cleared` is a hand-rolled restatement of the metric that skips work two ways (the

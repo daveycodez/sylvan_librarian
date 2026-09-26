@@ -1635,6 +1635,12 @@ fn renumber_coll_vocab(
         remap_scalar(&mut printing.compat.security_stamp_id);
         remap_in_place(&mut printing.compat.promo_types);
         remap_in_place(&mut printing.compat.frame_effects);
+        // A related card's `component` is interned into this vocab at load and resolved through it
+        // at emit, like the scalars above. Left out, every all_parts entry named whatever string its
+        // OLD id sorted to: a meld's combo_piece came back "etched", a token "expansion".
+        for part in printing.all_parts.iter_mut() {
+            remap_scalar(&mut part.component_id);
+        }
     }
     sorted_vocab
 }
