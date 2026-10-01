@@ -252,6 +252,7 @@ fn stub_printing(scryfall_id: u128, illustration_id: u128, prefer_score: Option<
         flavor_text_id: NONE_STR,
         flavor_text_lower_id: NONE_STR,
         card_artist_vid: ARTIST_NONE,
+        card_artist_name_id: NONE_STR,
         card_set_code: InlineStr::from_str(""),
         set_rank: 0,
         artist_rank: 0,
@@ -13140,8 +13141,8 @@ fn two_faces() -> (Vec<OracleFace>, Vec<PrintingFace>) {
         },
     ];
     let printing = vec![
-        PrintingFace { illustration_id: 0xAAAA, card_artist_vid: 1, flavor_text_id: 7, flavor_name_id: NONE_STR },
-        PrintingFace { illustration_id: 0xBBBB, card_artist_vid: 2, flavor_text_id: NONE_STR, flavor_name_id: NONE_STR },
+        PrintingFace { illustration_id: 0xAAAA, card_artist_vid: 1, card_artist_name_id: NONE_STR, flavor_text_id: 7, flavor_name_id: NONE_STR },
+        PrintingFace { illustration_id: 0xBBBB, card_artist_vid: 2, card_artist_name_id: NONE_STR, flavor_text_id: NONE_STR, flavor_name_id: NONE_STR },
     ];
     (oracle, printing)
 }
@@ -13353,6 +13354,16 @@ fn the_overflow_id_is_free_in_the_row() {
     // The inline width is unchanged by this field: 61 bytes plus the length byte, and the u32 that
     // follows starts at 64 either way. Narrowing it would only push more names onto the spill path.
     assert_eq!(std::mem::size_of::<InlineStr<NAME_INLINE>>(), 62);
+}
+
+/// `card_artist_name_id` costs neither archived row a byte: on `Printing` it takes the two bytes
+/// of padding after `card_artist_vid` plus slack the 16-byte round-up already held, and on
+/// `PrintingFace` the u16 beside the u128 left the same hole. Pinned because it is why the format
+/// constant, not the header's sizes, is what tells an older archive apart.
+#[test]
+fn the_printed_artist_is_free_in_both_rows() {
+    assert_eq!(std::mem::size_of::<Archived<Printing>>(), 272);
+    assert_eq!(std::mem::size_of::<Archived<PrintingFace>>(), 32);
 }
 
 #[test]
@@ -14604,6 +14615,7 @@ fn prefer_borderless_ignores_flavor_named_printings_and_ranks_frames() {
     data.printings[2].faces = vec![PrintingFace {
         illustration_id: 0,
         card_artist_vid: ARTIST_NONE,
+        card_artist_name_id: NONE_STR,
         flavor_text_id: NONE_STR,
         flavor_name_id: spider_gwen,
     }];

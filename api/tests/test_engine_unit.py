@@ -1340,6 +1340,40 @@ class TestFieldSelection:
         _, cards = _run(e, fields=["games"])
         assert cards[0]["games"] == listed
 
+    def test_artist_is_the_printed_string_on_a_store_of_any_size(self, fresh_engine: Callable[[], QueryEngine]) -> None:
+        """`artist` is the credit as printed, and asking for it never indexes past a small vocab.
+
+        The emitter resolved the printing's ARTIST-vocab id against the COLLECTION vocab. On a
+        one-card store with no collection words that read index 0 of an empty table and panicked
+        ("index out of bounds: the len is 0 but the index is 0"); on this 90-card fixture it read
+        index 35 of 30; on a full corpus it answered some unrelated collection word. And the artist
+        vocab itself holds only the lowercased search form, so no vocab lookup could have been right.
+        """
+        card = json.loads(_FIXTURE.read_text())[0] | {
+            "card_artist": "Milivoj Ćeran",
+            # No collection words at all: the smallest vocab the cross-read could meet.
+            "card_keywords": {},
+            "card_is_tags": {},
+            "card_frame_data": {},
+            "card_subtypes": [],
+            "card_faces": [{"name": "Front", "artist": "Nils Hamm"}, {"name": "Back"}],
+        }
+        e = fresh_engine()
+        e.reload([{column: card.get(column) for column in ENGINE_COLUMNS}])
+        _, cards = _run(e, fields=["artist", "card_faces"])
+        assert cards[0]["artist"] == "Milivoj Ćeran"
+        assert [face["artist"] for face in cards[0]["card_faces"]] == ["Nils Hamm", None]
+        # Search still narrows through the lowercased vocab.
+        assert _run(e, 'artist:"ćeran"')[0] == 1
+
+        # The shared fixture, where the same read used to run off the end of a 30-word vocab.
+        e.reload(json.loads(_FIXTURE.read_text()))
+        _, lotus = _run(e, 'name="Black Lotus" set:lea', fields=["artist"])
+        assert lotus[0]["artist"] == "Christopher Rush"
+        artistless = fresh_engine()
+        artistless.reload([{column: card.get(column) for column in ENGINE_COLUMNS} | {"card_artist": None, "card_faces": None}])
+        assert _run(artistless, fields=["artist"])[1][0]["artist"] is None
+
     def test_engine_columns_feed_every_key_the_loader_reads(self, fresh_engine: Callable[[], QueryEngine]) -> None:
         """A reload from rows projected to exactly ENGINE_COLUMNS still answers `loyalty`.
 

@@ -283,6 +283,8 @@ struct RelatedCard {
 struct PrintingFace {
     illustration_id: u128,
     card_artist_vid: u16,
+    // The face's artist AS PRINTED (see `Printing.card_artist_name_id`); NONE_STR = absent.
+    card_artist_name_id: u32,
     flavor_text_id: u32,
     // Scryfall's FACE-level `flavor_name`, interned (NONE_STR = absent). The card-level twin is
     // `Printing.flavor_name_id`, and a printing carries one or the other, never both: 28 face
@@ -556,6 +558,14 @@ struct Printing {
     // against the vocab once per query (FilterExpr::ArtistMatch), so no artist
     // strings live on the printing.
     card_artist_vid: u16,
+    // The artist AS PRINTED, interned into `CardData.strings` (NONE_STR = absent) -- what the card
+    // object's `artist` emits. `card_artist_vid` cannot stand in for it: it indexes
+    // `artist_vocab`, which holds only the LOWERCASED search form ("milivoj ćeran"), and the
+    // emitters used to resolve it against `coll_vocab`, a different table altogether -- so
+    // `artist` came back as whatever collection word sat at that index ("fumes" for Franz
+    // Vohwinkel on a full corpus) and indexed past the end on a store whose collection vocab is
+    // smaller than its artist vocab (a test fixture, a single-set import).
+    card_artist_name_id: u32,
     card_set_code: InlineStr<8>,
     // Dense ranks of card_set_code and the artist name in byte order, assigned post-load by
     // assign_set_ranks / assign_artist_ranks; the sort keys for SortCol::Set and SortCol::Artist.
@@ -647,6 +657,7 @@ struct CardRow {
     flavor_text_id: u32,
     flavor_text_lower_id: u32,
     card_artist_vid: u16,
+    card_artist_name_id: u32,
     card_set_code: InlineStr<8>,
     card_layout_id: u32,
     card_border_id: u32,
@@ -711,6 +722,7 @@ struct FaceRow {
     color_indicator: u8,
     illustration_id: u128,
     card_artist_vid: u16,
+    card_artist_name_id: u32,
     flavor_text_id: u32,
     flavor_name_id: u32,
 }
@@ -1361,7 +1373,8 @@ fn faces_from_pydict(d: &Bound<PyDict>, it: &mut Interner, artists: &mut VocabIn
         let Ok(face) = item.cast::<PyDict>() else {
             continue;
         };
-        let card_artist_vid = match opt_str(face, "artist") {
+        let artist = opt_str(face, "artist");
+        let card_artist_vid = match &artist {
             Some(a) => artists.intern(a.to_lowercase())?,
             None => ARTIST_NONE,
         };
@@ -1378,6 +1391,7 @@ fn faces_from_pydict(d: &Bound<PyDict>, it: &mut Interner, artists: &mut VocabIn
             color_indicator: str_list_color_mask(face, "color_indicator"),
             illustration_id: opt_str(face, "illustration_id").map_or(0, |s| parse_uuid_or_hash(&s)),
             card_artist_vid,
+            card_artist_name_id: it.intern_opt(artist),
             flavor_text_id: it.intern_opt(opt_str(face, "flavor_text")),
             flavor_name_id: it.intern_opt(opt_str(face, "flavor_name")),
         });
@@ -1397,7 +1411,8 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
     let oracle_text_lower_id = it.intern(oracle_text.to_lowercase());
     let flavor_text = opt_str(d, "flavor_text").unwrap_or_default();
     let flavor_text_lower_id = it.intern(flavor_text.to_lowercase());
-    let card_artist_vid = match opt_str(d, "card_artist") {
+    let card_artist = opt_str(d, "card_artist");
+    let card_artist_vid = match &card_artist {
         Some(a) => artists.intern(a.to_lowercase())?,
         None => ARTIST_NONE,
     };
@@ -1416,6 +1431,7 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
         flavor_text_lower_id,
         flavor_text_id: it.intern(flavor_text),
         card_artist_vid,
+        card_artist_name_id: it.intern_opt(card_artist),
         card_set_code: InlineStr::<8>::from_str(&opt_str(d, "card_set_code").unwrap_or_default()),
         card_layout_id: it.intern(opt_str(d, "card_layout").unwrap_or_default()),
         card_border_id: it.intern(opt_str(d, "card_border").unwrap_or_default()),
@@ -15044,7 +15060,7 @@ const FIELD_TABLE: &[(&str, FieldKey, FieldExtractor)] = &[
     ("variation", |py| intern!(py, "variation"), |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_VARIATION).into_pyobject(py)?.to_owned().into_any())),
     // Each face as its own dict, front first, in Scryfall's key names. Empty list for a
     // single-faced card, which is how Scryfall omits card_faces entirely.
-    ("card_faces", |py| intern!(py, "card_faces"), |py, c, p, s, v| Ok(faces_to_pylist(py, c, p, s, v)?.into_any())),
+    ("card_faces", |py| intern!(py, "card_faces"), |py, c, p, s, _v| Ok(faces_to_pylist(py, c, p, s)?.into_any())),
     // Scryfall's related-card list. Each entry carries its own id/name/type_line because most
     // point outside the corpus -- a `token` component references a card the import filters out.
     ("all_parts", |py| intern!(py, "all_parts"), |py, c, _p, s, v| {
@@ -15072,7 +15088,7 @@ const FIELD_TABLE: &[(&str, FieldKey, FieldExtractor)] = &[
     // ── The remaining fields a card object needs ─────────────────────────────────────────────
     ("oracle_id", |py| intern!(py, "oracle_id"), |py, c, _p, _s, _v| Ok(uuid_from_u128(u128::from(c.oracle_id)).into_pyobject(py)?.into_any())),
     ("flavor_text", |py| intern!(py, "flavor_text"), |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.flavor_text_id)).into_pyobject(py)?.into_any())),
-    ("artist", |py| intern!(py, "artist"), |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.card_artist_vid)).into_pyobject(py)?.into_any())),
+    ("artist", |py| intern!(py, "artist"), |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.card_artist_name_id)).into_pyobject(py)?.into_any())),
     ("watermark", |py| intern!(py, "watermark"), |py, _c, p, s, _v| Ok(str_at(s, u32::from(p.card_watermark_id)).into_pyobject(py)?.into_any())),
     ("edhrec_rank", |py| intern!(py, "edhrec_rank"), |py, c, _p, _s, _v| Ok(c.edhrec_rank.as_ref().copied().map(u32::from).into_pyobject(py)?.into_any())),
     // ISO date, the shape Scryfall sends and JSON can carry. The store holds it as an int.
@@ -15235,7 +15251,6 @@ fn faces_to_pylist<'py>(
     card: &AOracleCard,
     printing: &APrinting,
     strings: &AStrings,
-    vocab: &AStrings,
 ) -> PyResult<Bound<'py, PyList>> {
     let mut out: Vec<Bound<PyDict>> = Vec::with_capacity(card.faces.len());
     for (i, face) in card.faces.iter().enumerate() {
@@ -15253,7 +15268,7 @@ fn faces_to_pylist<'py>(
         // Art is per printing, and a printing may carry fewer face-art records than the card has
         // faces; those faces simply have no art rather than borrowing the wrong face's.
         if let Some(art) = printing.faces.get(i) {
-            d.set_item("artist", coll_str_opt(vocab, u16::from(art.card_artist_vid)))?;
+            d.set_item("artist", str_at(strings, u32::from(art.card_artist_name_id)))?;
             d.set_item("illustration_id", uuid_from_u128(u128::from(art.illustration_id)))?;
             d.set_item("flavor_text", str_at(strings, u32::from(art.flavor_text_id)))?;
             if let Some(v) = str_at(strings, u32::from(art.flavor_name_id)) {
@@ -15421,7 +15436,13 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 // in the renumbered id space — an archive from before the renumber would resolve each to the
 // wrong string, so it must not be read by this build. Value dated ahead of #913's for the same
 // never-reuse reason as every entry above.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026090804;
+//
+// 2026100101 — `Printing` and `PrintingFace` each GAIN `card_artist_name_id`, the artist as
+// printed. The card object's `artist` was read from `card_artist_vid` against the wrong vocab (see
+// the field). Neither archived row grows -- both ids ride padding the rows already had (272 and
+// 32 bytes before and after, pinned by `the_printed_artist_is_free_in_both_rows`) -- so the
+// header's sizes cannot see the fields that moved, and this constant is the only guard.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026100101;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -16120,6 +16141,7 @@ impl QueryEngine {
                 flavor_text_id: row.flavor_text_id,
                 flavor_text_lower_id: row.flavor_text_lower_id,
                 card_artist_vid: row.card_artist_vid,
+                card_artist_name_id: row.card_artist_name_id,
                 card_set_code: row.card_set_code,
                 // Both assigned once the whole printing list exists, by assign_set_ranks /
                 // assign_artist_ranks -- a dense rank cannot be known one row at a time.
@@ -16149,6 +16171,7 @@ impl QueryEngine {
                     .map(|f| PrintingFace {
                         illustration_id: f.illustration_id,
                         card_artist_vid: f.card_artist_vid,
+                        card_artist_name_id: f.card_artist_name_id,
                         flavor_text_id: f.flavor_text_id,
                         flavor_name_id: f.flavor_name_id,
                     })
