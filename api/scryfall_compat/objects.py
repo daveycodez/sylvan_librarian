@@ -469,7 +469,7 @@ def _faces(row: dict[str, Any], *, two_image: bool, face_images: bool, reversibl
         if face_images:
             built["image_uris"] = _image_uris(
                 row.get("scryfall_id", ""),
-                row.get("image_updated_at"),
+                _image_epoch(row.get("image_updated_at")),
                 "front" if index == 0 else "back",
             )
         out.append(built)
@@ -509,6 +509,23 @@ def _image_updated_at(value: object) -> str | None:
         return value or None
     if isinstance(value, int) and not isinstance(value, bool) and value:
         return datetime.datetime.fromtimestamp(value, tz=datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return None
+
+
+def _image_epoch(value: object) -> int | None:
+    """The epoch seconds an image URL carries as its cache-buster (`...jpg?1783903008`).
+
+    The engine hands them over as the int; the SQL lane reads the residue verbatim and holds
+    Scryfall's ISO string, which went into the URL as it stood (`...jpg?2026-07-13T00:36:48Z`).
+    """
+    if isinstance(value, str):
+        try:
+            parsed = datetime.datetime.strptime(value.removesuffix("Z") + "+0000", "%Y-%m-%dT%H:%M:%S%z")
+        except ValueError:
+            return None
+        return int(parsed.timestamp())
+    if isinstance(value, int) and not isinstance(value, bool) and value:
+        return value
     return None
 
 
@@ -626,7 +643,7 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
     # one, skipping the ones that do not -- flipped Erayo, whose back face carries an empty cost,
     # is `{1}{U}` and not `{1}{U} // `. Checked against all 3,654 such printings with zero misses.
     if not faces or not two_image:
-        card["image_uris"] = _image_uris(scryfall_id, image_updated_at)
+        card["image_uris"] = _image_uris(scryfall_id, _image_epoch(image_updated_at))
     if not faces:
         card["mana_cost"] = row.get("mana_cost")
     elif not two_image:

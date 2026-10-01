@@ -23,7 +23,7 @@ use super::{
     build_external_id_index, find_printing_by_external_id, EXT_MULTIVERSE, EXT_MTGO, EXT_ARENA, EXT_TCGPLAYER,
     trigram_similarity, fuzzy_name_match, autocomplete_names, FuzzyOutcome,
     exact_name_match, collection_name_match, names_containing_all_words, name_best, NameScope, CollectionScope,
-    VOCAB_NONE, COMPAT_FULL_ART, COMPAT_PROMO, COMPAT_REPRINT, COMPAT_TEXTLESS, GAME_PAPER, GAME_MTGO, GAME_ARENA, GAME_MEMBER_MASK, games_pack, games_to_names, FINISH_FOIL, FINISH_NONFOIL,
+    iso8601_utc_to_epoch_secs, VOCAB_NONE, COMPAT_FULL_ART, COMPAT_PROMO, COMPAT_REPRINT, COMPAT_TEXTLESS, GAME_PAPER, GAME_MTGO, GAME_ARENA, GAME_MEMBER_MASK, games_pack, games_to_names, FINISH_FOIL, FINISH_NONFOIL,
     TextField, TextSearchField, Tri, SortedTrigramIndex, VocabInterner, ARTIST_NONE, NONE_STR, TYPE_ARTIFACT, TYPE_CREATURE,
     TYPE_ENCHANTMENT, TYPE_INSTANT, TYPE_LAND, TYPE_LEGENDARY, TYPE_PLANESWALKER, TYPE_SNOW, TYPE_SORCERY,
 };
@@ -13364,6 +13364,23 @@ fn the_overflow_id_is_free_in_the_row() {
 fn the_printed_artist_is_free_in_both_rows() {
     assert_eq!(std::mem::size_of::<Archived<Printing>>(), 272);
     assert_eq!(std::mem::size_of::<Archived<PrintingFace>>(), 32);
+}
+
+/// Scryfall's `image_updated_at` string to the epoch its image URLs carry: Lightning Bolt
+/// msc/806 is "2026-07-13T00:36:48Z" and `...jpg?1783903008` on api.scryfall.com.
+#[test]
+fn image_updated_at_parses_scryfalls_iso_string() {
+    assert_eq!(iso8601_utc_to_epoch_secs("2026-07-13T00:36:48Z"), Some(1_783_903_008));
+    assert_eq!(iso8601_utc_to_epoch_secs("2026-07-13T00:36:48"), Some(1_783_903_008));
+    // Leap days, either side and on a century that keeps one.
+    assert_eq!(iso8601_utc_to_epoch_secs("2024-02-29T00:00:00Z"), Some(1_709_164_800));
+    assert_eq!(iso8601_utc_to_epoch_secs("2024-03-01T00:00:00Z"), Some(1_709_251_200));
+    assert_eq!(iso8601_utc_to_epoch_secs("2000-02-29T00:00:00Z"), Some(951_782_400));
+    assert_eq!(iso8601_utc_to_epoch_secs("1970-01-01T00:00:00Z"), Some(0));
+    // Anything else is absent, never a guess.
+    for junk in ["", "2026-07-13", "2026-13-01T00:00:00Z", "2026-07-13T25:00:00Z", "yesterday"] {
+        assert_eq!(iso8601_utc_to_epoch_secs(junk), None, "{junk}");
+    }
 }
 
 #[test]

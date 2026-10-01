@@ -1374,6 +1374,18 @@ class TestFieldSelection:
         artistless.reload([{column: card.get(column) for column in ENGINE_COLUMNS} | {"card_artist": None, "card_faces": None}])
         assert _run(artistless, fields=["artist"])[1][0]["artist"] is None
 
+    def test_image_updated_at_is_read_from_scryfalls_iso_string(self, fresh_engine: Callable[[], QueryEngine]) -> None:
+        """`card_compat_blob` keeps Scryfall's string; the loader read it as a number and stored nothing.
+
+        So on the engine lane no card object had `image_updated_at` and every image URL lost its
+        cache-buster. Lightning Bolt msc/806's value, as api.scryfall.com sends it.
+        """
+        card = json.loads(_FIXTURE.read_text())[0] | {"card_compat_blob": {"image_updated_at": "2026-07-13T00:36:48Z"}}
+        e = fresh_engine()
+        e.reload([{column: card.get(column) for column in ENGINE_COLUMNS}])
+        _, cards = _run(e, fields=["image_updated_at"])
+        assert cards[0]["image_updated_at"] == 1783903008
+
     def test_engine_columns_feed_every_key_the_loader_reads(self, fresh_engine: Callable[[], QueryEngine]) -> None:
         """A reload from rows projected to exactly ENGINE_COLUMNS still answers `loyalty`.
 

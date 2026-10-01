@@ -603,6 +603,14 @@ class TestScryfallKeyOrderAndKeys:
     def test_image_updated_at_renders_iso8601_utc(self, stored: object, expected: str):
         assert to_scryfall_card(row(image_updated_at=stored))["image_updated_at"] == expected
 
+    @pytest.mark.parametrize("stored", [1783903008, "2026-07-13T00:36:48Z"])
+    def test_the_image_cache_buster_is_epoch_seconds_on_both_lanes(self, stored: object):
+        """Lightning Bolt msc/806: `...jpg?1783903008`, whether the row holds the int or Scryfall's string."""
+        card = to_scryfall_card(row(image_updated_at=stored))
+        assert card["image_uris"]["large"].endswith(".jpg?1783903008")
+        faced = to_scryfall_card(row(layout="transform", image_updated_at=stored, card_faces=[{"name": "a"}, {"name": "b"}]))
+        assert faced["card_faces"][1]["image_uris"]["png"].endswith(".png?1783903008")
+
     def test_no_stored_image_updated_at_omits_the_key(self):
         assert "image_updated_at" not in to_scryfall_card(row(image_updated_at=None))
 
