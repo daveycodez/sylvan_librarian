@@ -312,9 +312,21 @@ const COMPAT_TEXTLESS: u16 = 1 << 10;
 const COMPAT_VARIATION: u16 = 1 << 11;
 
 // `games` and `finishes` bitsets. Closed vocabularies, so a byte each beats a Vec of interned ids.
+//
+// `games` spends only its low three bits on membership; the next three carry the ORDER, because
+// Scryfall's array is ordered and a bitset alone cannot say so. api.scryfall.com serves
+// ["arena","paper","mtgo"] on khm/1, ["paper","mtgo","arena"] on mom/1 and sos/1 (2026-10-01), and
+// the 2026-08-16 all_cards bulk holds nine distinct orderings of the three -- a fixed emission
+// order disagreed with 42% of the printings that list more than one game. The ordering is a
+// permutation of at most three values, so it fits in three bits with two to spare and the archive
+// does not grow by a byte. See GAME_ORDERS.
 const GAME_PAPER: u8 = 1 << 0;
 const GAME_MTGO: u8 = 1 << 1;
 const GAME_ARENA: u8 = 1 << 2;
+/// The membership half of a packed `games` byte.
+const GAME_MEMBER_MASK: u8 = GAME_PAPER | GAME_MTGO | GAME_ARENA;
+/// Where the GAME_ORDERS index sits in a packed `games` byte.
+const GAME_ORDER_SHIFT: u32 = 3;
 const FINISH_NONFOIL: u8 = 1 << 0;
 const FINISH_FOIL: u8 = 1 << 1;
 const FINISH_ETCHED: u8 = 1 << 2;
@@ -1268,7 +1280,9 @@ fn compat_from_pydict(d: &Bound<PyDict>, vocab: &mut VocabInterner) -> PyResult<
         image_status_id: intern_opt(vocab, opt_str(&blob, "image_status"))?,
         set_type_id: intern_opt(vocab, opt_str(&blob, "set_type"))?,
         security_stamp_id: intern_opt(vocab, opt_str(&blob, "security_stamp"))?,
-        games: str_set_bits(&blob, "games", &[("paper", GAME_PAPER), ("mtgo", GAME_MTGO), ("arena", GAME_ARENA)]),
+        // Ordered, not folded: Scryfall's games array carries an order the bitset alone would lose
+        // (see GAME_ORDERS). `finishes` below stays a plain set -- Scryfall lists those in one order.
+        games: games_pack(str_list(&blob, "games").iter().map(String::as_str)),
         finishes: str_set_bits(
             &blob,
             "finishes",
@@ -15013,7 +15027,8 @@ const FIELD_TABLE: &[(&str, FieldKey, FieldExtractor)] = &[
     }),
     ("promo_types", |py| intern!(py, "promo_types"), |py, _c, p, _s, v| Ok(sorted_strs(v, &p.compat.promo_types).into_pyobject(py)?.into_any())),
     ("frame_effects", |py| intern!(py, "frame_effects"), |py, _c, p, _s, v| Ok(sorted_strs(v, &p.compat.frame_effects).into_pyobject(py)?.into_any())),
-    ("games", |py| intern!(py, "games"), |py, _c, p, _s, _v| Ok(bits_to_names(p.compat.games, GAME_NAMES).into_pyobject(py)?.into_any())),
+    // Scryfall's own order, not a fixed one -- the byte carries the permutation (see GAME_ORDERS).
+    ("games", |py| intern!(py, "games"), |py, _c, p, _s, _v| Ok(games_to_names(p.compat.games).into_pyobject(py)?.into_any())),
     ("finishes", |py| intern!(py, "finishes"), |py, _c, p, _s, _v| Ok(bits_to_names(p.compat.finishes, FINISH_NAMES).into_pyobject(py)?.into_any())),
     ("booster", |py| intern!(py, "booster"), |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_BOOSTER).into_pyobject(py)?.to_owned().into_any())),
     ("digital", |py| intern!(py, "digital"), |py, _c, p, _s, _v| Ok(compat_flag(p, COMPAT_DIGITAL).into_pyobject(py)?.to_owned().into_any())),
@@ -15145,10 +15160,56 @@ pub(crate) fn frame_of(p: &APrinting, vocab: &AStrings) -> Option<&'static str> 
     })
 }
 
-/// Bitset member names, in the order Scryfall lists them.
+/// Bitset member names. `finishes` is emitted in this order, which is the one order Scryfall
+/// lists them in; `games` is not (see GAME_ORDERS).
 const GAME_NAMES: &[(&str, u8)] = &[("paper", GAME_PAPER), ("mtgo", GAME_MTGO), ("arena", GAME_ARENA)];
 const FINISH_NAMES: &[(&str, u8)] =
     &[("nonfoil", FINISH_NONFOIL), ("foil", FINISH_FOIL), ("etched", FINISH_ETCHED), ("glossy", FINISH_GLOSSY)];
+
+/// The six orderings of the `games` vocabulary, indexed by the packed byte's order field.
+///
+/// A row listing fewer than three games matches whichever permutation restricts to its order, and
+/// `games_pack` picks the lowest such index so the encoding is a function of the input alone.
+/// Index 0 is the paper/mtgo/arena listing every pre-order archive byte meant.
+const GAME_ORDERS: [[u8; 3]; 6] = [
+    [GAME_PAPER, GAME_MTGO, GAME_ARENA],
+    [GAME_PAPER, GAME_ARENA, GAME_MTGO],
+    [GAME_MTGO, GAME_PAPER, GAME_ARENA],
+    [GAME_MTGO, GAME_ARENA, GAME_PAPER],
+    [GAME_ARENA, GAME_PAPER, GAME_MTGO],
+    [GAME_ARENA, GAME_MTGO, GAME_PAPER],
+];
+
+/// Pack Scryfall's ordered `games` array into the membership+order byte.
+///
+/// Unknown members (`astral`, `sega`) and repeats are dropped. Every ordering of distinct known
+/// members is a restriction of one of the six permutations, so the lookup always finds one.
+fn games_pack<'a>(names: impl IntoIterator<Item = &'a str>) -> u8 {
+    let mut ordered: Vec<u8> = Vec::with_capacity(3);
+    for name in names {
+        let Some((_, bit)) = GAME_NAMES.iter().find(|(n, _)| *n == name) else { continue };
+        if !ordered.contains(bit) {
+            ordered.push(*bit);
+        }
+    }
+    let members = ordered.iter().fold(0u8, |acc, bit| acc | bit);
+    let index = GAME_ORDERS
+        .iter()
+        .position(|perm| perm.iter().copied().filter(|bit| members & bit != 0).eq(ordered.iter().copied()))
+        .unwrap_or(0);
+    members | ((index as u8) << GAME_ORDER_SHIFT)
+}
+
+/// Unpack a `games` byte into Scryfall's own ordering.
+fn games_to_names(packed: u8) -> Vec<&'static str> {
+    let members = packed & GAME_MEMBER_MASK;
+    let index = ((packed >> GAME_ORDER_SHIFT) as usize).min(GAME_ORDERS.len() - 1);
+    GAME_ORDERS[index]
+        .iter()
+        .filter(|bit| members & *bit != 0)
+        .filter_map(|bit| GAME_NAMES.iter().find(|(_, b)| b == bit).map(|(name, _)| *name))
+        .collect()
+}
 
 fn bits_to_names(bits: u8, table: &[(&'static str, u8)]) -> Vec<&'static str> {
     table.iter().filter(|(_, bit)| bits & bit != 0).map(|(name, _)| *name).collect()

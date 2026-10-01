@@ -1316,6 +1316,30 @@ class TestFieldSelection:
         _, bolt = _run(engine, 'name="Lightning Bolt"', unique="card", limit=1, fields=["name", "loyalty"])
         assert bolt[0]["loyalty"] is None
 
+    @pytest.mark.parametrize(
+        "listed",
+        [
+            ["arena", "paper", "mtgo"],  # khm/1 on api.scryfall.com, 2026-10-01
+            ["paper", "arena", "mtgo"],  # one/1
+            ["paper", "mtgo", "arena"],  # mom/1
+            ["mtgo", "paper"],
+            ["paper"],
+            [],
+        ],
+    )
+    def test_games_keep_the_order_scryfall_listed_them_in(self, fresh_engine: Callable[[], QueryEngine], listed: list[str]) -> None:
+        """`games` is an ordered array on Scryfall and the order is not fixed per card.
+
+        The store held it as a bare bitset and emitted paper/mtgo/arena whatever the payload said.
+        `card_compat_blob` is the column that carries it, and ENGINE_COLUMNS already selects it.
+        """
+        assert "card_compat_blob" in ENGINE_COLUMNS
+        card = json.loads(_FIXTURE.read_text())[0] | {"card_compat_blob": {"lang": "en", "games": listed}}
+        e = fresh_engine()
+        e.reload([{column: card.get(column) for column in ENGINE_COLUMNS}])
+        _, cards = _run(e, fields=["games"])
+        assert cards[0]["games"] == listed
+
     def test_engine_columns_feed_every_key_the_loader_reads(self, fresh_engine: Callable[[], QueryEngine]) -> None:
         """A reload from rows projected to exactly ENGINE_COLUMNS still answers `loyalty`.
 

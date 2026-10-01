@@ -23,7 +23,7 @@ use super::{
     build_external_id_index, find_printing_by_external_id, EXT_MULTIVERSE, EXT_MTGO, EXT_ARENA, EXT_TCGPLAYER,
     trigram_similarity, fuzzy_name_match, autocomplete_names, FuzzyOutcome,
     exact_name_match, collection_name_match, names_containing_all_words, name_best, NameScope, CollectionScope,
-    VOCAB_NONE, COMPAT_FULL_ART, COMPAT_PROMO, COMPAT_REPRINT, COMPAT_TEXTLESS, GAME_PAPER, GAME_ARENA, FINISH_FOIL, FINISH_NONFOIL,
+    VOCAB_NONE, COMPAT_FULL_ART, COMPAT_PROMO, COMPAT_REPRINT, COMPAT_TEXTLESS, GAME_PAPER, GAME_MTGO, GAME_ARENA, GAME_MEMBER_MASK, games_pack, games_to_names, FINISH_FOIL, FINISH_NONFOIL,
     TextField, TextSearchField, Tri, SortedTrigramIndex, VocabInterner, ARTIST_NONE, NONE_STR, TYPE_ARTIFACT, TYPE_CREATURE,
     TYPE_ENCHANTMENT, TYPE_INSTANT, TYPE_LAND, TYPE_LEGENDARY, TYPE_PLANESWALKER, TYPE_SNOW, TYPE_SORCERY,
 };
@@ -13293,6 +13293,44 @@ fn compat_fields_survive_the_archive_round_trip() {
     assert_ne!(u16::from(a.flags) & COMPAT_PROMO, 0);
     assert_ne!(u16::from(a.flags) & COMPAT_REPRINT, 0);
     assert_eq!(u16::from(a.flags) & COMPAT_TEXTLESS, 0, "textless was not set");
+}
+
+/// `games` survives the byte in SCRYFALL's order, not a fixed one.
+///
+/// The low three bits are membership and the next three a GAME_ORDERS index, so this is two
+/// assertions in one: the unpacked list is the payload's own order, and the membership bits
+/// underneath are still exactly the members. The three-game orders are api.scryfall.com's for
+/// khm/1, mom/1 and one/1 as fetched 2026-10-01.
+#[test]
+fn games_keep_the_order_the_payload_listed_them_in() {
+    for listed in [
+        vec!["arena", "paper", "mtgo"],
+        vec!["paper", "mtgo", "arena"],
+        vec!["paper", "arena", "mtgo"],
+        vec!["mtgo", "arena", "paper"],
+        vec!["mtgo", "paper", "arena"],
+        vec!["arena", "mtgo", "paper"],
+        vec!["mtgo", "paper"],
+        vec!["arena", "paper"],
+        vec!["arena", "mtgo"],
+        vec!["paper", "mtgo"],
+        vec!["paper"],
+        vec!["arena"],
+        vec![],
+    ] {
+        let packed = games_pack(listed.iter().copied());
+        assert_eq!(games_to_names(packed), listed, "the emitted order is the payload's");
+        assert_eq!((packed & GAME_MEMBER_MASK).count_ones() as usize, listed.len(), "one membership bit per game");
+    }
+    // An unknown game is dropped rather than mispacked, and a repeat does not double-count.
+    assert_eq!(games_to_names(games_pack(["astral", "mtgo", "paper", "mtgo"])), ["mtgo", "paper"]);
+    // A byte written before the order field existed reads as the fixed order it always meant.
+    assert_eq!(games_to_names(GAME_PAPER | GAME_MTGO | GAME_ARENA), ["paper", "mtgo", "arena"]);
+    // The packed byte survives the archive whole, order bits included.
+    let compat = CompatFields { games: games_pack(["arena", "paper", "mtgo"]), ..CompatFields::default() };
+    let bytes = rkyv::to_bytes::<Error>(&compat).expect("serialize");
+    let a = rkyv::access::<Archived<CompatFields>, Error>(&bytes).expect("access");
+    assert_eq!(games_to_names(a.games), ["arena", "paper", "mtgo"]);
 }
 
 /// `card_name_lower_id` costs the archived row NOTHING, and that is why it is a u32 sitting beside
