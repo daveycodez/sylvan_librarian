@@ -309,6 +309,27 @@ fn is_face_owned_key(key: &str) -> bool {
     )
 }
 
+/// Top-level keys a ONE-IMAGE faced card (split, flip, adventure, prepare) takes from its FRONT
+/// face, not from the row — the Python twin is `_FRONT_FACE_KEYS` in objects.py.
+///
+/// The row is the SEARCH row: the importer overlays every face on the card and folds the faces
+/// together (`_merge_processed_faces`), so `flavor_text` is every face's text joined with
+/// "\n//\n" and the stats are the first face that has any. Neither is Scryfall's top-level value,
+/// which is face 0's and only face 0's — 900 of 900 one-image faced printings of the 2026-05-31
+/// default_cards bulk for each of these keys. What the merge gets wrong, each re-read on
+/// api.scryfall.com 2026-10-01:
+///
+///   flavor_text  adventure  the card-level text is on the overlay of BOTH faces, so the join
+///                           doubles it: Bonecrusher Giant clb/781 came out as "Not every tale
+///                           ends in glory.\n//\nNot every tale ends in glory."
+///   flavor_text  split      Cut // Ribbons sld/367: only the Ribbons half has flavor, and
+///                           Scryfall sends no top-level copy of it
+///   power/tough. flip       Curse of the Fire Penguin unh/73: only the flipped face is a
+///                           creature, and Scryfall sends no top-level stats
+///
+/// `loyalty` rides along on the same rule, though no one-image printing carries one today.
+const FRONT_FACE_KEYS: [&str; 4] = ["power", "toughness", "loyalty", "flavor_text"];
+
 /// The languages Scryfall writes into the scryfall_uri path — its ten print localizations,
 /// exactly. The glyph and novelty languages (ph, qya, he, la, grc, ar, sa, dw) get NO path
 /// segment: a ph Elesh Norn lives at `/card/one/414/elesh-norn-mother-of-machines`, English form.
@@ -678,6 +699,8 @@ fn write_faces(
     scryfall_id: &str,
     updated_at: Option<u64>,
     two_image: bool,
+    // Whether each face gets its own `image_uris`: a two-image layout that Scryfall has a scan of.
+    face_images: bool,
     // The card's `oracle_id` and `cmc`, to be written on EVERY face -- `Some` only for a
     // reversible printing, which is the one layout whose faces carry them (and whose top-level
     // object omits them). Both faces of all 81 send the card's own values, never a second one.
@@ -750,7 +773,7 @@ fn write_faces(
                 write_value(out, &mut first, key, value);
             }
         }
-        if two_image {
+        if face_images {
             write_key(out, &mut first, "image_uris");
             write_image_uris(out, scryfall_id, updated_at, if index == 0 { "front" } else { "back" });
         }
@@ -812,6 +835,13 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     // A value that belongs to a face on a two-image layout (see `is_face_owned_key`) has no
     // top-level copy there.
     let top_level = |key: &str| !(two_image && is_face_owned_key(key));
+    // The value a top-level key carries: the front face's for FRONT_FACE_KEYS on a one-image faced
+    // card, the row's otherwise.
+    let front = faces.filter(|_| !two_image).and_then(|f| f.first()).and_then(Value::as_object);
+    let card_value = |key: &str| match front {
+        Some(face) if FRONT_FACE_KEYS.contains(&key) => str_of(face, key),
+        _ => str_of(row, key),
+    };
 
     out.push(b'{');
     let mut first = true;
@@ -899,7 +929,7 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     // u8 and loses both -- and a face's on a two-image layout.
     for key in ["power", "toughness", "loyalty"] {
         if top_level(key) {
-            write_opt_str(out, &mut first, key, str_of(row, key));
+            write_opt_str(out, &mut first, key, card_value(key));
         }
     }
     // `colors` is one of the values a two-image layout keeps on its faces alone (see
@@ -911,7 +941,21 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     write_list(out, &mut first, "keywords", list_of(row, "card_keywords"));
     if let Some(faces) = faces {
         write_key(out, &mut first, "card_faces");
-        write_faces(out, faces, scryfall_id, image_updated_at, two_image, reversible.then_some((oracle_id, num_of(row, "cmc"))));
+        // A two-image printing Scryfall has no scan of carries NO face images: all 162
+        // `image_status: "missing"` two-image printings of the 2026-05-31 default_cards bulk (every
+        // one an art-series card; astx/66s re-read live 2026-10-01) omit `image_uris` on every
+        // face, and no other two-image printing omits them anywhere. The one-image and
+        // single-faced "missing" printings (22 there) still send a top-level set.
+        let face_images = two_image && str_of(row, "image_status") != Some("missing");
+        write_faces(
+            out,
+            faces,
+            scryfall_id,
+            image_updated_at,
+            two_image,
+            face_images,
+            reversible.then_some((oracle_id, num_of(row, "cmc"))),
+        );
     }
     if let Some(parts) = list_of(row, "all_parts").filter(|a| !a.is_empty()) {
         write_key(out, &mut first, "all_parts");
@@ -964,7 +1008,7 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     write_str_or_null(out, &mut first, "rarity", str_of(row, "rarity"));
     write_opt_str(out, &mut first, "watermark", str_of(row, "watermark"));
     if top_level("flavor_text") {
-        write_opt_str(out, &mut first, "flavor_text", str_of(row, "flavor_text"));
+        write_opt_str(out, &mut first, "flavor_text", card_value("flavor_text"));
     }
     // No shared card back on a two-image layout, and no card-level illustration: both belong to a
     // face there, and Scryfall omits the top-level keys entirely.
@@ -973,8 +1017,11 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
         write_json_str(out, CARD_BACK_ID);
     }
     write_str_or_null(out, &mut first, "artist", present_str_of(row, "artist"));
+    // OMITTED, never null, when the printing has none: 731 printings of the 2026-05-31
+    // default_cards bulk carry no `illustration_id` key at all (unscanned playtest and token
+    // cards -- unk/CAa, re-read live 2026-10-01) and not one sends it as null.
     if !two_image {
-        write_str_or_null(out, &mut first, "illustration_id", str_of(row, "illustration_id"));
+        write_opt_str(out, &mut first, "illustration_id", str_of(row, "illustration_id"));
     }
     write_str_or_null(out, &mut first, "border_color", str_of(row, "border_color"));
     write_opt_str(out, &mut first, "frame", str_of(row, "frame"));
@@ -1081,7 +1128,7 @@ mod tests {
     fn optional_keys_are_omitted_rather_than_nulled() {
         let card = build(json!({"name": "Llanowar Elves", "scryfall_id": "ab000000-0000-0000-0000-000000000001"}));
         for absent in
-            ["power", "toughness", "loyalty", "flavor_text", "watermark", "frame", "security_stamp", "legalities"]
+            ["power", "toughness", "loyalty", "flavor_text", "watermark", "frame", "security_stamp", "legalities", "illustration_id"]
         {
             assert!(card.get(absent).is_none(), "{absent} should be omitted when the row has none");
         }
@@ -1214,6 +1261,85 @@ mod tests {
         }));
         assert_eq!(card["mana_cost"], "{1}{U}");
         assert_eq!(card["card_faces"][1]["mana_cost"], "", "the face still reports its empty cost");
+    }
+
+    /// A one-image faced card's top-level stats and flavor are its FRONT face's, never the merged
+    /// search row's — see `FRONT_FACE_KEYS`. The rows below are what the importer stores for
+    /// Bonecrusher Giant clb/781 (flavor joined with itself), Cut // Ribbons sld/367 (the back
+    /// half's flavor) and Curse of the Fire Penguin unh/73 (the flipped face's stats).
+    #[test]
+    fn a_one_image_faced_card_takes_its_top_level_values_from_the_front_face() {
+        let adventure = build(json!({
+            "name": "Bonecrusher Giant // Stomp",
+            "scryfall_id": "cd000000-0000-0000-0000-0000000000b1",
+            "layout": "adventure",
+            "power": "4",
+            "toughness": "3",
+            "flavor_text": "Not every tale ends in glory.\n//\nNot every tale ends in glory.",
+            "card_faces": [
+                {"name": "Bonecrusher Giant", "power": "4", "toughness": "3", "flavor_text": "Not every tale ends in glory."},
+                {"name": "Stomp"},
+            ],
+        }));
+        assert_eq!(adventure["flavor_text"], "Not every tale ends in glory.");
+        assert_eq!((&adventure["power"], &adventure["toughness"]), (&json!("4"), &json!("3")));
+
+        let split = build(json!({
+            "name": "Cut // Ribbons",
+            "scryfall_id": "cd000000-0000-0000-0000-0000000000b2",
+            "layout": "split",
+            "flavor_text": "Better To Reign In Hell Than Serve In Heaven",
+            "card_faces": [{"name": "Cut"}, {"name": "Ribbons", "flavor_text": "Better To Reign In Hell Than Serve In Heaven"}],
+        }));
+        assert!(split.get("flavor_text").is_none(), "no top-level copy of a back half's flavor");
+        assert_eq!(split["card_faces"][1]["flavor_text"], "Better To Reign In Hell Than Serve In Heaven");
+
+        let flip = build(json!({
+            "name": "Curse of the Fire Penguin // Curse of the Fire Penguin Creature",
+            "scryfall_id": "cd000000-0000-0000-0000-0000000000b3",
+            "layout": "flip",
+            "power": "6",
+            "toughness": "5",
+            "card_faces": [{"name": "Curse of the Fire Penguin"}, {"name": "Curse of the Fire Penguin Creature", "power": "6", "toughness": "5"}],
+        }));
+        assert!(flip.get("power").is_none() && flip.get("toughness").is_none(), "the flipped face's stats stay on it");
+        assert_eq!(flip["card_faces"][1]["power"], "6");
+
+        // A two-image layout never had a top-level copy, and still has none.
+        let transform = build(json!({
+            "name": "Delver of Secrets // Insectile Aberration",
+            "scryfall_id": "cd000000-0000-0000-0000-0000000000b4",
+            "layout": "transform",
+            "power": "1",
+            "flavor_text": "a\n//\nb",
+            "card_faces": [{"name": "Delver of Secrets", "power": "1", "flavor_text": "a"}, {"name": "Insectile Aberration", "flavor_text": "b"}],
+        }));
+        assert!(transform.get("power").is_none() && transform.get("flavor_text").is_none());
+        // ...and an unfaced card keeps the row's own.
+        let plain = build(json!({"name": "Grizzly Bears", "scryfall_id": "cd000000-0000-0000-0000-0000000000b5", "power": "2", "flavor_text": "Growl."}));
+        assert_eq!((&plain["power"], &plain["flavor_text"]), (&json!("2"), &json!("Growl.")));
+    }
+
+    /// An art-series card Scryfall has no scan of (astx/66s) sends no face `image_uris` at all;
+    /// a scanned one sends a set per face.
+    #[test]
+    fn an_unscanned_two_image_card_sends_no_face_images() {
+        let art = |status: &str| {
+            build(json!({
+                "name": "Memory Lapse // Memory Lapse",
+                "scryfall_id": "0131ba2a-9cea-4c4b-b15e-5f527be565e3",
+                "layout": "art_series",
+                "image_status": status,
+                "card_faces": [{"name": "Memory Lapse", "colors": []}, {"name": "Memory Lapse", "colors": []}],
+            }))
+        };
+        let missing = art("missing");
+        assert!(missing.get("image_uris").is_none());
+        for face in missing["card_faces"].as_array().expect("faces") {
+            assert!(face.get("image_uris").is_none(), "{face}");
+        }
+        let scanned = art("highres_scan");
+        assert!(scanned["card_faces"][1]["image_uris"]["small"].as_str().is_some_and(|u| u.contains("/back/")));
     }
 
     /// EDHREC files most multi-face cards under the FRONT face and split-likes under both halves.
@@ -1825,7 +1951,7 @@ mod tests {
     /// that never meet. A shared fixture is what makes each job fail on its own drift.
     ///
     /// Key ORDER included, at every level: the written bytes must equal the fixture's `expected`
-    /// minified in the fixture's own order, which the Python side asserts too. Eight of the cases
+    /// minified in the fixture's own order, which the Python side asserts too. Thirteen of the cases
     /// are api.scryfall.com's own objects (see the fixture's `_comment`), so the order both
     /// writers are held to is Scryfall's rather than either writer's.
     #[test]

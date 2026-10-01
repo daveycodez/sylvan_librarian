@@ -282,6 +282,14 @@ _FACE_OWNED_KEYS = frozenset(
     {"colors", "card_back_id", "illustration_id", "power", "toughness", "loyalty", "flavor_text", "color_indicator"},
 )
 
+# Top-level keys a ONE-IMAGE faced card (split, flip, adventure, prepare) takes from its FRONT face,
+# not from the row -- the twin of FRONT_FACE_KEYS in card_object.rs, which carries the evidence.
+# The row is the SEARCH row: `_merge_processed_faces` joins every face's `flavor_text` with
+# "\n//\n" (and an adventure's card-level flavor reaches both faces, so the join doubles it:
+# Bonecrusher Giant clb/781) and takes the stats of the first face that has any (the flipped face
+# of Curse of the Fire Penguin unh/73). Scryfall's top-level value is face 0's and only face 0's.
+_FRONT_FACE_KEYS = frozenset({"power", "toughness", "loyalty", "flavor_text"})
+
 # The glyph languages whose printings link Gatherer's UNTRANSLATED page. Measured on
 # api.scryfall.com 2026-09-26: every `lang:ph` and `lang:qya` printing that links to Gatherer at all
 # says `printed=false` (19 and 3 of them), as every English one does.
@@ -429,7 +437,7 @@ def _face_emits(key: str, value: object, *, two_image: bool) -> bool:
     return True
 
 
-def _faces(row: dict[str, Any], *, two_image: bool, reversible: bool) -> list[dict[str, Any]]:
+def _faces(row: dict[str, Any], *, two_image: bool, face_images: bool, reversible: bool) -> list[dict[str, Any]]:
     """The card's faces, with the keys the engine deliberately does not store re-added.
 
     `object` is the constant "card_face", and a face's `image_uris` is the card's CDN function with
@@ -437,7 +445,8 @@ def _faces(row: dict[str, Any], *, two_image: bool, reversible: bool) -> list[di
 
     `image_uris` is gated on the LAYOUT rather than on the face count: only a two-image layout has
     a second picture, and giving one to a split or adventure face invents a URL with nothing behind
-    it. Keys in Scryfall's order (_FACE_KEY_ORDER), never the row's: the engine's face dict and the
+    it. `face_images` is that gate, already narrowed by the caller to the printings Scryfall has a
+    scan of. Keys in Scryfall's order (_FACE_KEY_ORDER), never the row's: the engine's face dict and the
     SQL lane's jsonb (which stores keys shortest-first) are both in some other order.
     """
     faces = row.get("card_faces") or []
@@ -457,7 +466,7 @@ def _faces(row: dict[str, Any], *, two_image: bool, reversible: bool) -> list[di
         for key, value in face.items():
             if key not in _FACE_KEY_ORDER and key not in derived and _face_emits(key, value, two_image=two_image):
                 built[key] = value
-        if two_image:
+        if face_images:
             built["image_uris"] = _image_uris(
                 row.get("scryfall_id", ""),
                 row.get("image_updated_at"),
@@ -569,7 +578,16 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
     # Only ever true for a card that HAS faces: the two-image layouts are all multi-face.
     two_image = has_faces and layout in _TWO_IMAGE_LAYOUTS
     reversible = layout == _REVERSIBLE_LAYOUT
-    faces = _faces(row, two_image=two_image, reversible=reversible)
+    # A two-image printing Scryfall has no scan of carries NO face images: all 162
+    # `image_status: "missing"` two-image printings of the 2026-05-31 default_cards bulk (every one
+    # an art-series card; astx/66s re-read live 2026-10-01) omit `image_uris` on every face, and no
+    # other two-image printing omits them anywhere. The one-image and single-faced "missing"
+    # printings (22 there) still send a top-level set.
+    face_images = two_image and row.get("image_status") != "missing"
+    faces = _faces(row, two_image=two_image, face_images=face_images, reversible=reversible)
+    # Where a top-level key in _FRONT_FACE_KEYS is read from: the front face on a one-image faced
+    # card, the row otherwise.
+    front = row["card_faces"][0] if has_faces and not two_image else row
     # The name a SEARCH LINK spells: the joined one, except on the layouts whose searches take the
     # front face (see _JOINED_SEARCH_LAYOUTS). `related_uris.edhrec` and every `purchase_uris`
     # fallback take THIS string; the two `tcgplayer_infinite_*` links take the joined `name`.
@@ -622,8 +640,8 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
     # Where Scryfall puts `loyalty`: beside the creature stats it is the planeswalker analogue of,
     # as the PRINTED string (`planeswalker_loyalty` is a u8 in the engine and cannot hold "X").
     for key in ("power", "toughness", "loyalty"):
-        if row.get(key) and not (two_image and key in _FACE_OWNED_KEYS):
-            card[key] = row[key]
+        if front.get(key) and not (two_image and key in _FACE_OWNED_KEYS):
+            card[key] = front[key]
     # `colors` is one of the values a two-image layout keeps on its faces alone.
     if not two_image:
         card["colors"] = row.get("colors") or []
@@ -664,16 +682,18 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
     }
     if row.get("watermark"):
         card["watermark"] = row["watermark"]
-    if row.get("flavor_text") and not two_image:
-        card["flavor_text"] = row["flavor_text"]
+    if front.get("flavor_text") and not two_image:
+        card["flavor_text"] = front["flavor_text"]
     # A two-image layout keeps `card_back_id` and `illustration_id` on its FACES alone -- there is
     # no shared back and no card-level illustration when the card is two pictures -- and Scryfall
     # omits the top-level keys entirely rather than nulling them.
     if not two_image:
         card["card_back_id"] = CARD_BACK_ID
     card["artist"] = row.get("artist")
-    if not two_image:
-        card["illustration_id"] = str(row["illustration_id"]) if row.get("illustration_id") else None
+    # OMITTED, never null, when the printing has none: 731 printings of the 2026-05-31 default_cards
+    # bulk carry no `illustration_id` key at all (unk/CAa, re-read live 2026-10-01) and none sends null.
+    if not two_image and row.get("illustration_id"):
+        card["illustration_id"] = str(row["illustration_id"])
     card["border_color"] = row.get("border_color")
     if row.get("frame"):
         card["frame"] = row["frame"]

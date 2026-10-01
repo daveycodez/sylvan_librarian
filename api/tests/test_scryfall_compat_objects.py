@@ -368,7 +368,7 @@ class TestScryfallKeyOrderAndKeys:
     """api.scryfall.com's key order at every level, and the keys it sends that this used to drop.
 
     The sequences are read off Scryfall's own objects (2026-09-26), never off either writer; the
-    parity fixture holds eight of those objects whole. `card_object.rs` asserts the same cases.
+    parity fixture holds thirteen of those objects whole. `card_object.rs` asserts the same cases.
     """
 
     # Lightning Bolt msc/806's top level as api.scryfall.com served it, minus the three keys this
@@ -513,6 +513,59 @@ class TestScryfallKeyOrderAndKeys:
         )
         for key in ("power", "toughness", "flavor_text"):
             assert key not in card
+
+    def test_a_one_image_faced_card_takes_its_top_level_values_from_the_front_face(self):
+        """The row is the merged SEARCH row; Scryfall's top-level flavor and stats are face 0's alone.
+
+        The rows are what the importer stores for Bonecrusher Giant clb/781 (the card-level flavor
+        reaches both faces, so the join doubles it), Cut // Ribbons sld/367 (only the back half has
+        flavor) and Curse of the Fire Penguin unh/73 (only the flipped face has stats).
+        """
+        tale = "Not every tale ends in glory."
+        adventure = to_scryfall_card(
+            row(
+                layout="adventure",
+                power="4",
+                toughness="3",
+                flavor_text=f"{tale}\n//\n{tale}",
+                card_faces=[{"name": "Bonecrusher Giant", "power": "4", "toughness": "3", "flavor_text": tale}, {"name": "Stomp"}],
+            )
+        )
+        assert (adventure["flavor_text"], adventure["power"], adventure["toughness"]) == (tale, "4", "3")
+
+        reign = "Better To Reign In Hell Than Serve In Heaven"
+        split = to_scryfall_card(
+            row(layout="split", flavor_text=reign, card_faces=[{"name": "Cut"}, {"name": "Ribbons", "flavor_text": reign}])
+        )
+        assert "flavor_text" not in split
+        assert split["card_faces"][1]["flavor_text"] == reign
+
+        flip = to_scryfall_card(
+            row(layout="flip", power="6", toughness="5", card_faces=[{"name": "a"}, {"name": "b", "power": "6", "toughness": "5"}])
+        )
+        assert "power" not in flip
+        assert "toughness" not in flip
+        assert flip["card_faces"][1]["power"] == "6"
+
+        # An unfaced card keeps the row's own.
+        plain = to_scryfall_card(row(power="2", flavor_text="Growl."))
+        assert (plain["power"], plain["flavor_text"]) == ("2", "Growl.")
+
+    def test_an_unscanned_two_image_card_sends_no_face_images(self):
+        """Memory Lapse astx/66s: `image_status: missing` on an art series card means no `image_uris` anywhere."""
+        faces = [{"name": "Memory Lapse", "colors": []}, {"name": "Memory Lapse", "colors": []}]
+        missing = to_scryfall_card(row(layout="art_series", image_status="missing", card_faces=faces))
+        assert "image_uris" not in missing
+        assert all("image_uris" not in face for face in missing["card_faces"])
+        scanned = to_scryfall_card(row(layout="art_series", image_status="highres_scan", card_faces=faces))
+        assert "/back/" in scanned["card_faces"][1]["image_uris"]["small"]
+
+    def test_a_printing_with_no_illustration_omits_the_key(self):
+        """Potatoes unk/CAa: Scryfall sends no `illustration_id` at all, never a null."""
+        assert "illustration_id" not in to_scryfall_card(row())
+        assert to_scryfall_card(row(illustration_id="22222222-0000-0000-0000-000000000002"))["illustration_id"] == (
+            "22222222-0000-0000-0000-000000000002"
+        )
 
     def test_an_unknown_format_follows_scryfalls_known_ones(self):
         card = to_scryfall_card(row(legalities={"aaa_new": "legal", "vintage": "legal", "standard": "legal"}))
@@ -779,7 +832,7 @@ class TestCardObjectParityWithTheRustBuilder:
     never meet. A shared fixture is what makes each job fail on its own drift.
 
     Key ORDER included, at every level: `json` keeps the fixture's order, and the compact bytes
-    must match. Eight of the cases are api.scryfall.com's own objects (see the fixture's
+    must match. Thirteen of the cases are api.scryfall.com's own objects (see the fixture's
     `_comment`), so the order both writers are held to is Scryfall's rather than either writer's.
     """
 
