@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing
+import re
 import uuid
 from unittest.mock import patch
 
@@ -91,6 +92,29 @@ class TestBuildBooleanIsTagsSql:
         real_calls = _build_boolean_is_tags_sql(BOOLEAN_IS_TAGS).split("jsonb_build_object(")[1:]
         assert len(real_calls) > 1
         assert all(call.count("CASE WHEN") <= 50 for call in real_calls)
+
+    def test_sql_reads_the_blob_once_per_row(self) -> None:
+        """The tag expressions read a subquery that has already produced the blob, not the table.
+
+        `raw_card_blob` is TOASTed, and each `cards.raw_card_blob->...` against the table detoasts
+        it again: with 122 tags a first sync of the 2026-08-16 bulk took 35 s per chunk, past the
+        import's 30 s statement_timeout, and 10 s once the blob is produced once. `OFFSET 0` is
+        what stops the planner flattening the subquery back onto the table.
+        """
+        sql = _build_boolean_is_tags_sql({"reserved": "cards.raw_card_blob->'reserved' = 'true'::jsonb"})
+        subquery = sql[sql.index("FROM (") : sql.index(") cards")]
+        assert "cards.raw_card_blob || '{}'::jsonb AS raw_card_blob" in subquery
+        assert "FROM magic.cards cards" in subquery
+        assert subquery.rstrip().endswith("OFFSET 0")
+        assert sql.index("CASE WHEN") < sql.index("FROM (")
+
+    def test_every_tag_expression_reads_only_columns_the_subquery_provides(self) -> None:
+        """An expression naming a column the subquery does not select would fail every import."""
+        sql = _build_boolean_is_tags_sql(BOOLEAN_IS_TAGS)
+        subquery = sql[sql.index("FROM (") : sql.index(") cards")]
+        provided = set(re.findall(r"cards\.(\w+)", subquery)) | {"raw_card_blob"}
+        read = {column for expr in BOOLEAN_IS_TAGS.values() for column in re.findall(r"cards\.(\w+)", expr)}
+        assert read <= provided
 
 
 def _is_tags_for(api_resource: APIResource, scryfall_id: str) -> dict:
