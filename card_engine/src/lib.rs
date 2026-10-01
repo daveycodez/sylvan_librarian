@@ -1299,7 +1299,16 @@ fn compat_from_pydict(d: &Bound<PyDict>, vocab: &mut VocabInterner) -> PyResult<
         return Ok(CompatFields::default());
     };
     let prices = blob.get_item("prices").ok().flatten().and_then(|v| v.cast_into::<PyDict>().ok());
-    let price = |key: &str| prices.as_ref().and_then(|p| opt_price_cents(p, key));
+    // Scryfall's `prices` values are decimal STRINGS ("0.73"), and the residue keeps the object as
+    // sent. `opt_price_cents` alone reads only numbers -- right for the three price COLUMNS, which
+    // the importer converts -- so the three residue prices came back None on every printing.
+    let price = |key: &str| {
+        let prices = prices.as_ref()?;
+        opt_price_cents(prices, key).or_else(|| {
+            let dollars = opt_str(prices, key)?.parse::<f64>().ok()?;
+            (dollars.is_finite() && dollars >= 0.0).then(|| (dollars * 100.0).round() as u32)
+        })
+    };
 
     let mut flags = 0u16;
     for (key, bit) in [

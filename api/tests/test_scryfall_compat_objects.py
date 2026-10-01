@@ -611,6 +611,14 @@ class TestScryfallKeyOrderAndKeys:
         faced = to_scryfall_card(row(layout="transform", image_updated_at=stored, card_faces=[{"name": "a"}, {"name": "b"}]))
         assert faced["card_faces"][1]["image_uris"]["png"].endswith(".png?1783903008")
 
+    def test_the_residue_prices_are_read_from_scryfalls_prices_object_on_the_sql_lane(self):
+        """Vadrok iko/214: `usd_foil` and `eur_foil` have no column, only the residue's `prices` strings."""
+        residue = {"usd": "0.62", "usd_foil": "0.73", "usd_etched": None, "eur": "0.61", "eur_foil": "0.87", "tix": "0.02"}
+        prices = to_scryfall_card(row(price_usd=0.62, price_eur=0.61, price_tix=0.02, prices=residue))["prices"]
+        assert prices == residue
+        # The engine's own fields win where a row carries both.
+        assert to_scryfall_card(row(price_usd_foil=1.5, prices=residue))["prices"]["usd_foil"] == "1.50"
+
     def test_no_stored_image_updated_at_omits_the_key(self):
         assert "image_updated_at" not in to_scryfall_card(row(image_updated_at=None))
 

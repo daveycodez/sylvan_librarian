@@ -416,7 +416,13 @@ fn write_prices(out: &mut Vec<u8>, row: &Map<String, Value>) {
         ("tix", "price_tix"),
     ] {
         write_key(out, &mut first, key);
-        match num_of(row, column).and_then(Value::as_f64) {
+        // The row's own field, else the residue's `prices` object as Scryfall sent it -- decimal
+        // STRINGS -- which is where the SQL lane keeps the three variants no column stores.
+        let residue = || match row.get("prices")?.get(key)? {
+            Value::String(text) => text.parse::<f64>().ok(),
+            other => other.as_f64(),
+        };
+        match num_of(row, column).and_then(Value::as_f64).or_else(residue) {
             // Two decimals, matching Python's `f"{float(v):.2f}"` and the port's `toFixed(2)`.
             Some(v) => write_json_str(out, &format!("{v:.2}")),
             None => out.extend_from_slice(b"null"),
@@ -1428,6 +1434,13 @@ mod tests {
         assert_eq!(card["prices"]["eur"], "0.01");
         assert_eq!(card["prices"]["tix"], "0.00");
         assert_eq!(card["prices"]["usd_foil"], serde_json::Value::Null);
+
+        // The SQL lane's residue: Scryfall's own `prices` strings fill the variants no column holds.
+        let card = build(json!({"name": "x", "scryfall_id": "ef000000-0000-0000-0000-000000000003",
+            "price_usd": 0.62, "prices": {"usd": "0.62", "usd_foil": "0.73", "usd_etched": null, "eur_foil": "0.87"}}));
+        assert_eq!(card["prices"]["usd_foil"], "0.73");
+        assert_eq!(card["prices"]["eur_foil"], "0.87");
+        assert_eq!(card["prices"]["usd_etched"], serde_json::Value::Null);
     }
 
     /// The slug and quote_plus paths, which are where a reimplementation drifts. Every slug

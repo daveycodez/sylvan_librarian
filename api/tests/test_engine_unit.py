@@ -1386,6 +1386,19 @@ class TestFieldSelection:
         _, cards = _run(e, fields=["image_updated_at"])
         assert cards[0]["image_updated_at"] == 1783903008
 
+    def test_the_residue_prices_are_read_from_scryfalls_strings(self, fresh_engine: Callable[[], QueryEngine]) -> None:
+        """`card_compat_blob.prices` is Scryfall's object as sent, and Scryfall sends prices as strings.
+
+        The loader read them as numbers, so `usd_foil`, `usd_etched` and `eur_foil` -- the three
+        with no column -- were null on every card object. Vadrok iko/214's values.
+        """
+        prices = {"usd": "0.62", "usd_foil": "0.73", "usd_etched": None, "eur": "0.61", "eur_foil": "0.87", "tix": "0.02"}
+        card = json.loads(_FIXTURE.read_text())[0] | {"card_compat_blob": {"prices": prices}}
+        e = fresh_engine()
+        e.reload([{column: card.get(column) for column in ENGINE_COLUMNS}])
+        _, cards = _run(e, fields=["price_usd_foil", "price_usd_etched", "price_eur_foil"])
+        assert cards[0] == {"price_usd_foil": 0.73, "price_usd_etched": None, "price_eur_foil": 0.87}
+
     def test_engine_columns_feed_every_key_the_loader_reads(self, fresh_engine: Callable[[], QueryEngine]) -> None:
         """A reload from rows projected to exactly ENGINE_COLUMNS still answers `loyalty`.
 

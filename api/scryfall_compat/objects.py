@@ -403,15 +403,23 @@ def _purchase_uris(row: dict[str, Any], search_name: str) -> dict[str, str]:
 def _prices(row: dict[str, Any]) -> dict[str, Any]:
     """Scryfall's `prices` object: the three price columns plus the three residue variants."""
 
-    def fmt(value: float | None) -> str | None:
+    def fmt(value: float | str | None) -> str | None:
         return None if value is None else f"{float(value):.2f}"
+
+    # The SQL lane's residue holds Scryfall's `prices` object whole, strings and all, and that is
+    # the only place it has the three variants no column stores; the engine emits them as fields.
+    residue = row.get("prices") if isinstance(row.get("prices"), dict) else {}
+
+    def variant(key: str) -> str | None:
+        stored = row.get(f"price_{key}")
+        return fmt(stored if stored is not None else residue.get(key))
 
     return {
         "usd": fmt(row.get("price_usd")),
-        "usd_foil": fmt(row.get("price_usd_foil")),
-        "usd_etched": fmt(row.get("price_usd_etched")),
+        "usd_foil": variant("usd_foil"),
+        "usd_etched": variant("usd_etched"),
         "eur": fmt(row.get("price_eur")),
-        "eur_foil": fmt(row.get("price_eur_foil")),
+        "eur_foil": variant("eur_foil"),
         "tix": fmt(row.get("price_tix")),
     }
 
