@@ -314,6 +314,17 @@ def _build_boolean_is_tags_sql(tags: dict[str, str]) -> str:
     ``promo_types`` vocabulary took it past 100 rows. As one call the statement failed every
     import with "cannot pass more than 100 arguments to a function", so the cap is enforced here
     rather than remembered.
+
+    The expressions read an inner ``cards`` subquery, not the table: ``raw_card_blob`` is a
+    TOASTed value, and every ``cards.raw_card_blob->...`` in the statement detoasts and
+    decompresses the whole blob again -- once per tag, per row. ``raw_card_blob || '{}'`` in the
+    subquery produces the blob once as a plain in-memory value, and ``OFFSET 0`` keeps the planner
+    from flattening the subquery and putting the per-expression reads back on the table. Measured
+    on the 2026-08-16 bulk (97,812 rows, the 122 tags here, Postgres 14, four chunks): a first
+    sync, where every row is written, 35 s per chunk down to 10 s -- against the import's 30 s
+    statement_timeout -- and a sync that changes nothing 14 s down to 2 s, with the same tags on every row. The subquery lists the
+    columns the expressions may read; one that reads another column fails as an unknown column
+    on the first sync rather than quietly, and the column goes here.
     """
     managed = ", ".join(f"'{tag}'" for tag in tags)
     pairs = [f"'{tag}', CASE WHEN ({expr}) THEN true END" for tag, expr in tags.items()]
@@ -329,8 +340,17 @@ WITH proposed AS (
             || jsonb_strip_nulls(
                 {built_objects}
             ) AS proposed_is_tags
-    FROM magic.cards cards
-    WHERE (abs(hashtext(cards.scryfall_id::text)) %% %(num_chunks)s) = %(chunk_index)s
+    FROM (
+        SELECT
+            cards.scryfall_id,
+            cards.card_is_tags,
+            cards.mana_cost_text,
+            cards.oracle_text,
+            cards.raw_card_blob || '{{}}'::jsonb AS raw_card_blob
+        FROM magic.cards cards
+        WHERE (abs(hashtext(cards.scryfall_id::text)) %% %(num_chunks)s) = %(chunk_index)s
+        OFFSET 0
+    ) cards
 )
 UPDATE magic.cards
 SET card_is_tags = proposed.proposed_is_tags
