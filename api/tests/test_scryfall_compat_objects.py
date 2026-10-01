@@ -567,6 +567,18 @@ class TestScryfallKeyOrderAndKeys:
             "22222222-0000-0000-0000-000000000002"
         )
 
+    def test_colour_arrays_are_alphabetical_not_wubrg(self):
+        """The engine hands colours over WUBRG (a tuple, for `color_identity`); Scryfall sends the alphabet."""
+        card = to_scryfall_card(row(colors=["W", "U", "R"], color_identity=("W", "U", "B", "R", "G")))
+        assert card["colors"] == ["R", "U", "W"]
+        assert card["color_identity"] == ["B", "G", "R", "U", "W"]
+        faced = to_scryfall_card(
+            row(layout="transform", card_faces=[{"name": "a", "colors": ["U", "R"], "color_indicator": ["W", "G"]}, {"name": "b", "colors": []}])
+        )
+        assert faced["card_faces"][0]["colors"] == ["R", "U"]
+        assert faced["card_faces"][0]["color_indicator"] == ["G", "W"]
+        assert faced["card_faces"][1]["colors"] == []
+
     def test_an_unknown_format_follows_scryfalls_known_ones(self):
         card = to_scryfall_card(row(legalities={"aaa_new": "legal", "vintage": "legal", "standard": "legal"}))
         assert list(card["legalities"]) == ["standard", "vintage", "aaa_new"]

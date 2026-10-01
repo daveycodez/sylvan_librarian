@@ -172,6 +172,17 @@ fn write_list(out: &mut Vec<u8>, first: &mut bool, key: &str, value: Option<&Vec
     }
 }
 
+/// A colour-letter array in SCRYFALL's order, which is the alphabet -- `["R","U","W"]` on Vadrok
+/// iko/214, `["R","U"]` on Fire // Ice -- and not WUBRG, the order the engine decodes its colour
+/// bitmask in (`identity_letters`) and `/search` keeps. Every multi-colour `colors`,
+/// `color_identity` and `color_indicator` array of the 2026-08-16 all_cards bulk is ascending;
+/// only the ones that happen to be WUBRG-ordered too used to come out right.
+fn write_colors(out: &mut Vec<u8>, value: Option<&Vec<Value>>) {
+    let mut letters: Vec<&Value> = value.map(|a| a.iter().collect()).unwrap_or_default();
+    letters.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
+    serde_json::to_writer(&mut *out, &letters).expect("writing an array to a Vec cannot fail");
+}
+
 // ─── derived values ──────────────────────────────────────────────────────────
 
 /// Scryfall's URL slug for a card name.
@@ -749,7 +760,12 @@ fn write_faces(
             if let Some(value) = map.get(key)
                 && emits(key, value)
             {
-                write_value(out, &mut first, key, value);
+                if matches!(key, "colors" | "color_indicator") {
+                    write_key(out, &mut first, key);
+                    write_colors(out, value.as_array());
+                } else {
+                    write_value(out, &mut first, key, value);
+                }
             }
             if key == "mana_cost"
                 && let Some((_, cmc)) = card_ids
@@ -935,9 +951,11 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     // `colors` is one of the values a two-image layout keeps on its faces alone (see
     // TWO_IMAGE_LAYOUTS); `color_identity` is the card's and stays at top level on every layout.
     if !two_image {
-        write_list(out, &mut first, "colors", list_of(row, "colors"));
+        write_key(out, &mut first, "colors");
+        write_colors(out, list_of(row, "colors"));
     }
-    write_list(out, &mut first, "color_identity", list_of(row, "color_identity"));
+    write_key(out, &mut first, "color_identity");
+    write_colors(out, list_of(row, "color_identity"));
     write_list(out, &mut first, "keywords", list_of(row, "card_keywords"));
     if let Some(faces) = faces {
         write_key(out, &mut first, "card_faces");
@@ -1340,6 +1358,30 @@ mod tests {
         }
         let scanned = art("highres_scan");
         assert!(scanned["card_faces"][1]["image_uris"]["small"].as_str().is_some_and(|u| u.contains("/back/")));
+    }
+
+    /// Colour arrays leave in the alphabet's order whatever order the row holds them in: the
+    /// engine decodes its bitmask WUBRG, and Scryfall sends Vadrok iko/214 as `["R","U","W"]`.
+    #[test]
+    fn colour_arrays_are_alphabetical_not_wubrg() {
+        let card = build(json!({
+            "name": "Vadrok, Apex of Thunder",
+            "scryfall_id": "cd000000-0000-0000-0000-0000000000c1",
+            "colors": ["W", "U", "R"],
+            "color_identity": ["W", "U", "B", "R", "G"],
+        }));
+        assert_eq!(card["colors"], json!(["R", "U", "W"]));
+        assert_eq!(card["color_identity"], json!(["B", "G", "R", "U", "W"]));
+
+        let faced = build(json!({
+            "name": "a // b",
+            "scryfall_id": "cd000000-0000-0000-0000-0000000000c2",
+            "layout": "transform",
+            "card_faces": [{"name": "a", "colors": ["U", "R"], "color_indicator": ["W", "G"]}, {"name": "b", "colors": []}],
+        }));
+        assert_eq!(faced["card_faces"][0]["colors"], json!(["R", "U"]));
+        assert_eq!(faced["card_faces"][0]["color_indicator"], json!(["G", "W"]));
+        assert_eq!(faced["card_faces"][1]["colors"], json!([]));
     }
 
     /// EDHREC files most multi-face cards under the FRONT face and split-likes under both halves.

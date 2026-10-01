@@ -459,7 +459,7 @@ def _faces(row: dict[str, Any], *, two_image: bool, face_images: bool, reversibl
             built["oracle_id"] = str(row.get("oracle_id") or "")
         for key in _FACE_KEY_ORDER:
             if key in face and _face_emits(key, face[key], two_image=two_image):
-                built[key] = face[key]
+                built[key] = sorted(face[key]) if key in ("colors", "color_indicator") else face[key]
             if key == "mana_cost" and reversible:
                 built["cmc"] = _decimal(row.get("cmc"))
         derived = {"object", "image_uris"} | ({"oracle_id", "cmc"} if reversible else set())
@@ -644,8 +644,10 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
             card[key] = front[key]
     # `colors` is one of the values a two-image layout keeps on its faces alone.
     if not two_image:
-        card["colors"] = row.get("colors") or []
-    card["color_identity"] = row.get("color_identity") or []
+        card["colors"] = sorted(row.get("colors") or [])
+    # Colour arrays are ALPHABETICAL on Scryfall (`["R","U","W"]` on Vadrok iko/214), where the
+    # engine decodes its bitmask WUBRG and `/search` keeps that order. The SQL lane sorted already.
+    card["color_identity"] = sorted(row.get("color_identity") or [])
     card["keywords"] = row.get("card_keywords") or []
     if faces:
         card["card_faces"] = faces
