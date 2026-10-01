@@ -30,7 +30,12 @@ EQUIVALENCES = [
     ("is:new", "frame:2003 or frame:2015 or frame:future"),
     # type / subtype based
     ("is:historic", "t:legendary or t:artifact or t:saga"),
-    ("is:permanent", "t:creature or t:artifact or t:enchantment or t:land or t:planeswalker or t:battle"),
+    # `t:summon` / `t:eaturecray`: the pre-Sixth-Edition and pig-Latin creature spellings, which
+    # api.scryfall.com counts as permanents (Old Fogey, Atinlay Igpay; 2026-10-01).
+    (
+        "is:permanent",
+        "t:creature or t:artifact or t:enchantment or t:land or t:planeswalker or t:battle or t:summon or t:eaturecray",
+    ),
     ("is:party", "t:creature (t:cleric or t:rogue or t:warrior or t:wizard or kw:changeling)"),
     ("is:outlaw", "t:assassin or t:mercenary or t:pirate or t:rogue or t:warlock or kw:changeling"),
     ("is:bear", "t:creature pow=2 tou=2 cmc=2"),

@@ -52,7 +52,20 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     # the all-creature-type cards Scryfall counts. Note party IS creature-restricted while outlaw is
     # NOT (it also matches Kindred non-creature cards carrying an outlaw subtype).
     ("is", "historic"): "t:legendary or t:artifact or t:saga",  # exact
-    ("is", "permanent"): "t:creature or t:artifact or t:enchantment or t:land or t:planeswalker or t:battle",  # +2 / 25954
+    # `Summon` is the creature spelling before Sixth Edition (Old Fogey's "Summon -- Dinosaur") and
+    # `Eaturecray` is Unhinged's pig-Latin one (Atinlay Igpay). api.scryfall.com counts both as
+    # permanents while its `t:creature` finds neither: `is:permanent -t:creature -t:artifact
+    # -t:enchantment -t:land -t:planeswalker -t:battle` is exactly those two cards, `t:summon` the
+    # one and `t:eaturecray` the other (2026-10-01). So they are named as the type words they
+    # print rather than folded into `t:creature`.
+    #
+    # UNOBSERVABLE HERE TODAY, like `is:funny` below: all 18 printings carrying either word in the
+    # 2026-08-16 bulk are in a funny set or have no legal format, and the importer keeps neither.
+    # The two terms keep the definition Scryfall's; they cannot add a card this corpus holds.
+    (
+        "is",
+        "permanent",
+    ): "t:creature or t:artifact or t:enchantment or t:land or t:planeswalker or t:battle or t:summon or t:eaturecray",
     ("is", "party"): "t:creature (t:cleric or t:rogue or t:warrior or t:wizard or kw:changeling)",  # exact
     ("is", "outlaw"): "t:assassin or t:mercenary or t:pirate or t:rogue or t:warlock or kw:changeling",  # exact
     # NO `is:vanilla` HERE -- it is an ENGINE predicate now, see ENGINE_IS_VALUES below. Two
