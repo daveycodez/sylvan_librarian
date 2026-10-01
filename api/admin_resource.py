@@ -99,6 +99,25 @@ _BOOLEAN_IS_TAGS_SYNC_CHUNK_COUNT = 4
 # 100 arguments, and every pair is two. See _build_boolean_is_tags_sql.
 _JSONB_BUILD_OBJECT_MAX_PAIRS = 50
 
+# A meld card's role, for the `meldpart` / `meldresult` rows of BOOLEAN_IS_TAGS: the `component`
+# of the card's own `all_parts` entry. "Own" is the entry carrying the card's id -- and, when NO
+# entry does, the entry carrying its name. A reprint's `all_parts` can list a SIBLING printing's
+# ids instead of its own: in the 2026-08-16 bulk, Ragnarok, Divine Deliverance (fin/99b, fin/381b,
+# fin/446b), Brisela (sld/1336b) and the eight Fang / Vanille / Bruna / Gisela printings beside
+# them name no entry by their own id, so matching on id alone left 12 printings with no role --
+# `is:meldresult` 20 printings against api.scryfall.com's 24, `is:meldpart` 40 against 48
+# (`unique=prints`, 2026-09-26). The name fallback only runs when the id finds nothing, so a card
+# whose own entry is a `combo_piece` is not handed the role of a meld card that shares its name;
+# and only the meld components count, so a token of the same name decides nothing.
+_MELD_ROLE_SQL = (
+    "EXISTS (SELECT 1 FROM jsonb_array_elements(cards.raw_card_blob->'all_parts') part"
+    " WHERE part->>'component' = '{component}'"
+    " AND (part->>'id' = cards.raw_card_blob->>'id'"
+    " OR (part->>'name' = cards.raw_card_blob->>'name'"
+    " AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements(cards.raw_card_blob->'all_parts') own"
+    " WHERE own->>'id' = cards.raw_card_blob->>'id'))))"
+)
+
 # is: values derivable from a single boolean SQL expression against a card's own row,
 # synced in chunked set-based statements after each import (see _sync_boolean_is_tags) -- no
 # per-tag API sweep, unlike CUSTOM_IS_TAGS below, and no accumulation in the import loop.
@@ -218,9 +237,9 @@ BOOLEAN_IS_TAGS: dict[str, str] = {
     # meld card carries all three entries (two parts, one result), so `layout:meld` says the card
     # melds and nothing about which side it is, and reading any entry but the card's own would tag
     # all three the same. 14 parts and 7 results on api.scryfall.com (2026-09-03), two parts per
-    # result; both answered 0 here before this.
-    "meldpart": "EXISTS (SELECT 1 FROM jsonb_array_elements(cards.raw_card_blob->'all_parts') part WHERE part->>'id' = cards.raw_card_blob->>'id' AND part->>'component' = 'meld_part')",
-    "meldresult": "EXISTS (SELECT 1 FROM jsonb_array_elements(cards.raw_card_blob->'all_parts') part WHERE part->>'id' = cards.raw_card_blob->>'id' AND part->>'component' = 'meld_result')",
+    # result; both answered 0 here before this. See _MELD_ROLE_SQL for how "own" is decided.
+    "meldpart": _MELD_ROLE_SQL.format(component="meld_part"),
+    "meldresult": _MELD_ROLE_SQL.format(component="meld_result"),
     "neonink": "cards.raw_card_blob->'promo_types' @> '\"neonink\"'",
     "nonfoil": "cards.raw_card_blob->'nonfoil' = 'true'::jsonb",
     "oilslick": "cards.raw_card_blob->'promo_types' @> '\"oilslick\"'",

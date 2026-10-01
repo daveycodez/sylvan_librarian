@@ -267,6 +267,55 @@ class TestBooleanIsTags:
         assert tags.get("meldresult") is True
         assert "meldpart" not in tags
 
+    def test_meld_role_falls_back_to_the_cards_name_when_all_parts_names_a_sibling_printing(
+        self, api_resource: APIResource
+    ) -> None:
+        """A reprint whose `all_parts` carries another printing's ids still gets its role.
+
+        Ragnarok, Divine Deliverance fin/99b and Vanille, Cheerful l'Cie fin/211 are this shape in
+        the 2026-08-16 bulk: all three entries are there, none under the printing's own id.
+        """
+        result = make_raw_card(name="Sibling Ids Melded")
+        part = make_raw_card(name="Sibling Ids Half")
+        for card in (result, part):
+            card["layout"] = "meld"
+            card["all_parts"] = [
+                {"object": "related_card", "id": str(uuid.uuid4()), "component": "meld_part", "name": "Sibling Ids Half"},
+                {"object": "related_card", "id": str(uuid.uuid4()), "component": "meld_part", "name": "Sibling Ids Other Half"},
+                {"object": "related_card", "id": str(uuid.uuid4()), "component": "meld_result", "name": "Sibling Ids Melded"},
+            ]
+        api_resource.admin._upsert_cards([result, part])
+        result_tags = _is_tags_for(api_resource, result["id"])
+        assert result_tags.get("meldresult") is True
+        assert "meldpart" not in result_tags
+        part_tags = _is_tags_for(api_resource, part["id"])
+        assert part_tags.get("meldpart") is True
+        assert "meldresult" not in part_tags
+
+    def test_meld_name_fallback_does_not_override_the_cards_own_entry(self, api_resource: APIResource) -> None:
+        """An entry under the card's own id is the answer, even beside a meld entry of its name."""
+        card = make_raw_card(name="Shared Name Import Test")
+        card["all_parts"] = [
+            {"object": "related_card", "id": card["id"], "component": "combo_piece", "name": "Shared Name Import Test"},
+            {"object": "related_card", "id": str(uuid.uuid4()), "component": "meld_result", "name": "Shared Name Import Test"},
+        ]
+        api_resource.admin._upsert_cards([card])
+        tags = _is_tags_for(api_resource, card["id"])
+        assert "meldpart" not in tags
+        assert "meldresult" not in tags
+
+    def test_a_token_sharing_the_cards_name_gives_it_no_meld_role(self, api_resource: APIResource) -> None:
+        """The name fallback reads meld components only: a same-named token entry decides nothing."""
+        card = make_raw_card(name="Token Namesake Import Test")
+        card["all_parts"] = [
+            {"object": "related_card", "id": str(uuid.uuid4()), "component": "token", "name": "Token Namesake Import Test"},
+            {"object": "related_card", "id": str(uuid.uuid4()), "component": "meld_part", "name": "Someone Else"},
+        ]
+        api_resource.admin._upsert_cards([card])
+        tags = _is_tags_for(api_resource, card["id"])
+        assert "meldpart" not in tags
+        assert "meldresult" not in tags
+
     def test_other_cards_meld_roles_do_not_tag_this_card(self, api_resource: APIResource) -> None:
         """`all_parts` naming OTHER cards' roles (a token maker, a combo piece) is not a meld role."""
         card = make_raw_card(name="Meld Bystander Import Test")

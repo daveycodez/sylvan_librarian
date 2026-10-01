@@ -119,6 +119,10 @@ Via `BOOLEAN_IS_TAGS` in `api/admin_resource.py` (synced from raw_card_blob on e
 `is:meldpart` / `is:meldresult` read the `component` of the card's OWN entry in its `all_parts`
 array -- every meld card carries all three entries, so `layout:meld` cannot say which side a
 card is. 14 parts and 7 results on api.scryfall.com (2026-09-03), two parts per result.
+"Own" is the entry under the card's id, or under its NAME when no entry carries its id: twelve
+reprints in the 2026-08-16 bulk (Ragnarok fin/99b, Brisela sld/1336b, Vanille fin/211, ...) list a
+sibling printing's ids, which left `is:meldresult` at 20 printings against Scryfall's 24 and
+`is:meldpart` at 40 against 48 (`unique=prints`, 2026-09-26).
 
 ### Beyond the syntax page
 
