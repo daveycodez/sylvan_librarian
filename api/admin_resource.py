@@ -44,7 +44,7 @@ import psycopg
 import requests
 from cachebox import TTLCache
 
-from api.card_processing import preprocess_card
+from api.card_processing import ROLE_CLASSES_KEY, preprocess_card
 from api.db.bulk_upsert import bulk_upsert as _bulk_upsert
 from api.scryfall_bulk_data_fetcher import BulkDataKey, ScryfallBulkDataFetcher
 from api.settings import settings
@@ -118,6 +118,10 @@ _MELD_ROLE_SQL = (
     " WHERE own->>'id' = cards.raw_card_blob->>'id'))))"
 )
 
+# Membership of one role class in the `role_classes` array card_processing.role_classes() writes
+# onto raw_card_blob at import. See that function for the rules.
+_ROLE_CLASS_SQL = f"cards.raw_card_blob->'{ROLE_CLASSES_KEY}' @> '\"{{role}}\"'"
+
 # is: values derivable from a single boolean SQL expression against a card's own row,
 # synced in chunked set-based statements after each import (see _sync_boolean_is_tags) -- no
 # per-tag API sweep, unlike CUSTOM_IS_TAGS below, and no accumulation in the import loop.
@@ -160,10 +164,16 @@ BOOLEAN_IS_TAGS: dict[str, str] = {
     "boosterfun": "cards.raw_card_blob->'promo_types' @> '\"boosterfun\"'",
     "boxtopper": "cards.raw_card_blob->'promo_types' @> '\"boxtopper\"'",
     "brawldeck": "cards.raw_card_blob->'promo_types' @> '\"brawldeck\"'",
+    # The role classes -- brawler, commander, duelcommander, oathbreaker, spell -- are questions
+    # about the face you CAST and the printing's own legalities. card_processing.role_classes()
+    # decides them at import, the only place that still holds a card's faces, and writes the
+    # answer onto raw_card_blob; the five rows are array membership, as the promo types are.
+    "brawler": _ROLE_CLASS_SQL.format(role="brawler"),
     "bringafriend": "cards.raw_card_blob->'promo_types' @> '\"bringafriend\"'",
     "bundle": "cards.raw_card_blob->'promo_types' @> '\"bundle\"'",
     "buyabox": "cards.raw_card_blob->'promo_types' @> '\"buyabox\"'",
     "chocobotrackfoil": "cards.raw_card_blob->'promo_types' @> '\"chocobotrackfoil\"'",
+    "commander": _ROLE_CLASS_SQL.format(role="commander"),
     "commanderparty": "cards.raw_card_blob->'promo_types' @> '\"commanderparty\"'",
     "commanderpromo": "cards.raw_card_blob->'promo_types' @> '\"commanderpromo\"'",
     "concept": "cards.raw_card_blob->'promo_types' @> '\"concept\"'",
@@ -178,6 +188,7 @@ BOOLEAN_IS_TAGS: dict[str, str] = {
     "draculaseries": "cards.raw_card_blob->'promo_types' @> '\"draculaseries\"'",
     "draftweekend": "cards.raw_card_blob->'promo_types' @> '\"draftweekend\"'",
     "dragonscalefoil": "cards.raw_card_blob->'promo_types' @> '\"dragonscalefoil\"'",
+    "duelcommander": _ROLE_CLASS_SQL.format(role="duelcommander"),
     "duels": "cards.raw_card_blob->'promo_types' @> '\"duels\"'",
     "embossed": "cards.raw_card_blob->'promo_types' @> '\"embossed\"'",
     "etched": "cards.raw_card_blob->'finishes' @> '\"etched\"'",
@@ -242,6 +253,7 @@ BOOLEAN_IS_TAGS: dict[str, str] = {
     "meldresult": _MELD_ROLE_SQL.format(component="meld_result"),
     "neonink": "cards.raw_card_blob->'promo_types' @> '\"neonink\"'",
     "nonfoil": "cards.raw_card_blob->'nonfoil' = 'true'::jsonb",
+    "oathbreaker": _ROLE_CLASS_SQL.format(role="oathbreaker"),
     "oilslick": "cards.raw_card_blob->'promo_types' @> '\"oilslick\"'",
     "openhouse": "cards.raw_card_blob->'promo_types' @> '\"openhouse\"'",
     # "Partner with <name>" cards carry a plain "Partner" keyword alongside it (verified
@@ -274,6 +286,7 @@ BOOLEAN_IS_TAGS: dict[str, str] = {
     "silverscroll": "cards.raw_card_blob->'promo_types' @> '\"silverscroll\"'",
     "sldbonus": "cards.raw_card_blob->'promo_types' @> '\"sldbonus\"'",
     "sourcematerial": "cards.raw_card_blob->'promo_types' @> '\"sourcematerial\"'",
+    "spell": _ROLE_CLASS_SQL.format(role="spell"),
     "spotlight": "cards.raw_card_blob->'story_spotlight' = 'true'::jsonb",
     "stamped": "cards.raw_card_blob->'promo_types' @> '\"stamped\"'",
     "standardshowdown": "cards.raw_card_blob->'promo_types' @> '\"standardshowdown\"'",

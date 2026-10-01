@@ -330,6 +330,83 @@ class TestBooleanIsTags:
         assert "meldresult" not in tags
         assert "buyabox" not in tags
 
+    @staticmethod
+    def _faced_card(name: str, layout: str, faces: list[dict]) -> dict:
+        """A two-faced raw card, legal where a commander needs it to be."""
+        card = make_raw_card(name=name)
+        card["layout"] = layout
+        card["type_line"] = " // ".join(face["type_line"] for face in faces)
+        card["legalities"] = {"commander": "legal", "brawl": "legal", "duel": "legal", "oathbreaker": "legal"}
+        card["card_faces"] = [{"name": f"{name} face {i}", "colors": [], **face} for i, face in enumerate(faces, start=1)]
+        return card
+
+    def test_role_classes_are_read_from_the_front_face(self, api_resource: APIResource) -> None:
+        """A legendary creature with a planeswalker back leads a deck; the stored row is one face of it.
+
+        Kytheon, Hero of Akros // Gideon, Battle-Forged: the row a predicate sees may be the
+        planeswalker, which has no toughness and is not the face anyone casts.
+        """
+        card = self._faced_card(
+            "Front Legend Import Test",
+            "transform",
+            [
+                {"type_line": "Legendary Creature — Human Soldier", "power": "2", "toughness": "1"},
+                {"type_line": "Legendary Planeswalker — Gideon", "loyalty": "3"},
+            ],
+        )
+        api_resource.admin._upsert_cards([card])
+        tags = _is_tags_for(api_resource, card["id"])
+        assert {tag for tag in ("commander", "brawler", "duelcommander", "oathbreaker", "spell") if tags.get(tag)} == {
+            "commander",
+            "brawler",
+            "duelcommander",
+            "spell",
+        }
+
+    def test_a_legendary_back_face_is_no_commander(self, api_resource: APIResource) -> None:
+        """Westvale Abbey // Ormendahl, Profane Prince: a land you play, a legend you turn it into."""
+        card = self._faced_card(
+            "Back Legend Import Test",
+            "transform",
+            [{"type_line": "Land"}, {"type_line": "Legendary Creature — Demon", "power": "9", "toughness": "7"}],
+        )
+        api_resource.admin._upsert_cards([card])
+        tags = _is_tags_for(api_resource, card["id"])
+        assert not {"commander", "brawler", "duelcommander", "oathbreaker", "spell"} & set(tags)
+
+    def test_a_meld_result_is_a_spell_and_no_commander(self, api_resource: APIResource) -> None:
+        """Ragnarok, Divine Deliverance fin/99b, whose `all_parts` names a sibling printing's ids.
+
+        The SQL `meldresult` row and `role_classes` each decide "is this the result" for
+        themselves; this is the card on which the two must agree.
+        """
+        card = make_raw_card(name="Melded Legend Import Test")
+        card |= {"layout": "meld", "type_line": "Legendary Creature — Beast Avatar", "power": "7", "toughness": "6"}
+        card["legalities"] = {"commander": "legal", "brawl": "legal", "duel": "legal"}
+        card["all_parts"] = [
+            {"object": "related_card", "id": str(uuid.uuid4()), "component": "meld_part", "name": "Melded Legend Half"},
+            {"object": "related_card", "id": str(uuid.uuid4()), "component": "meld_result", "name": "Melded Legend Import Test"},
+        ]
+        api_resource.admin._upsert_cards([card])
+        tags = _is_tags_for(api_resource, card["id"])
+        assert tags.get("meldresult") is True
+        assert tags.get("spell") is True
+        assert not {"commander", "brawler", "duelcommander"} & set(tags)
+
+    def test_a_card_that_loses_its_role_loses_the_tag(self, api_resource: APIResource) -> None:
+        """A commander ban arrives as a legality change; the next import takes the tag back off."""
+        card = make_raw_card(name="Banned Later Import Test")
+        card |= {"type_line": "Legendary Creature — Demon", "power": "7", "toughness": "7"}
+        card["legalities"] = {"commander": "legal", "vintage": "legal"}
+        api_resource.admin._upsert_cards([card])
+        assert _is_tags_for(api_resource, card["id"]).get("commander") is True
+
+        banned = make_raw_card(card_id=card["id"], name="Banned Later Import Test")
+        banned |= {"type_line": "Legendary Creature — Demon", "power": "7", "toughness": "7", "oracle_id": card["oracle_id"]}
+        banned["legalities"] = {"commander": "banned", "vintage": "legal"}
+        api_resource.admin._upsert_cards([banned])
+        assert "commander" not in _is_tags_for(api_resource, card["id"])
+
     def test_partner_keyword_lands_as_is_tag(self, api_resource: APIResource) -> None:
         card = make_raw_card(name="Partner Import Test")
         card["keywords"] = ["Partner"]
@@ -601,4 +678,6 @@ class TestUpsertBehavior:
             cursor.execute("SELECT prefer_score, card_is_tags FROM magic.cards WHERE scryfall_id = %s", (card_id,))
             row = cursor.fetchone()
         assert row["prefer_score"] == 42.0
-        assert row["card_is_tags"] == {"is:instant": True}
+        # `spell` is a key the import manages (make_raw_card is an Instant) and is synced on every
+        # upsert; the backfilled key beside it is the one that must survive.
+        assert row["card_is_tags"] == {"is:instant": True, "spell": True}

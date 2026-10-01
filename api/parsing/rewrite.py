@@ -123,21 +123,13 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     ("is", "triland"): "otag:cycle-ala-shardland or otag:cycle-ktk-wedgeland",  # 10, name-verified
     ("is", "triome"): "otag:cycle-iko-triome or otag:cycle-snc-triland",  # 10, name-verified
     # ── Non-land derivables ──────────────────────────────────────────────
-    # Commander eligibility, refined per review: legendary permanents with a
-    # printed toughness (creatures, Vehicles, Spacecraft -- toughness>=0, the
-    # parser-friendly spelling of toughness>-1; no legendary prints negative
-    # toughness and * compares as 0 on both engines) plus Backgrounds, plus
-    # rules text granting eligibility outright, MINUS the commander banlist:
-    # diffing the eligibility shape against Scryfall's is:commander showed it
-    # excludes banned cards (Griselbrand, Golos, Emrakul, Erayo were the
-    # over-catch) while keeping 329 casual not-legal legends. Residual is the
-    # face-evaluation cluster from docs/issues/00713: back-face legendaries
-    # over-match on combined type lines, and face-granted eligibility text
-    # under-matches until faces are searchable.
-    (
-        "is",
-        "commander",
-    ): '((t:legendary (toughness>=0 or t:background)) or o:"can be your commander") -banned:commander',
+    # NO `is:commander` HERE -- it is a STORED tag now, with `is:brawler`, `is:duelcommander`,
+    # `is:oathbreaker` and `is:spell` (BOOLEAN_IS_TAGS, decided by card_processing.role_classes
+    # at import). Its rewrite composed `t:legendary`, `toughness>=0` and `o:` over a ROW, and a
+    # faced card's row is one of its faces: who can lead a deck is a question about the face you
+    # cast, so the row answered for a transform card's legendary back (Westvale Abbey //
+    # Ormendahl), a flip card's flipped legend (Budoka Pupil // Ichiga) and a meld result
+    # (Brisela), and missed a legendary front whose back is not a creature (Kytheon // Gideon).
     ("is", "companion"): "kw:companion",  # 10, name-verified
     ("is", "class"): "t:class",  # 34, equals Scryfall's paper count exactly
     # is:adventure is LAYOUT semantics by Scryfall's own definition -- it
