@@ -363,12 +363,36 @@ class TestToScryfallCard:
     def test_card_back_id_is_the_shared_constant(self):
         assert to_scryfall_card(row())["card_back_id"] == "0aeebaf5-8c7d-4636-9e82-8c27447861f7"
 
+    def test_a_meld_part_keeps_its_own_card_back(self):
+        """Bruna, the Fading Light inr/14: the back is half of Brisela, and the row says which."""
+        bruna = to_scryfall_card(row(layout="meld", card_back_id="5353eb15-86a9-42fb-87e6-10d0b2fda365"))
+        assert bruna["card_back_id"] == "5353eb15-86a9-42fb-87e6-10d0b2fda365"
+
+    def test_the_card_level_indicator_and_produced_mana_take_scryfalls_positions(self):
+        """Dryad Arbor dsc/273 carries both: `color_indicator` after `colors`, `produced_mana` after `keywords`."""
+        arbor = to_scryfall_card(row(colors=["G"], color_indicator=["G"], color_identity=["G"], produced_mana=["W", "B", "G", "C"]))
+        keys = list(arbor)
+        assert keys[keys.index("colors") : keys.index("colors") + 5] == [
+            "colors", "color_indicator", "color_identity", "keywords", "produced_mana",
+        ]  # fmt: skip
+        assert arbor["produced_mana"] == ["B", "C", "G", "W"]
+        plain = to_scryfall_card(row(color_indicator=[], produced_mana=[]))
+        assert "color_indicator" not in plain
+        assert "produced_mana" not in plain
+        # A two-image layout keeps indicators on its faces and still reports what it produces; the
+        # SQL lane's column is the `{letter: true}` set.
+        mdfc = to_scryfall_card(
+            row(layout="modal_dfc", color_indicator=["R"], produced_mana={"R": True}, card_faces=[{"name": "a"}, {"name": "b"}])
+        )
+        assert "color_indicator" not in mdfc
+        assert mdfc["produced_mana"] == ["R"]
+
 
 class TestScryfallKeyOrderAndKeys:
     """api.scryfall.com's key order at every level, and the keys it sends that this used to drop.
 
     The sequences are read off Scryfall's own objects (2026-09-26), never off either writer; the
-    parity fixture holds fourteen of those objects whole. `card_object.rs` asserts the same cases.
+    parity fixture holds nineteen of those objects whole. `card_object.rs` asserts the same cases.
     """
 
     # Lightning Bolt msc/806's top level as api.scryfall.com served it, minus the three keys this
@@ -878,7 +902,7 @@ class TestCardObjectParityWithTheRustBuilder:
     never meet. A shared fixture is what makes each job fail on its own drift.
 
     Key ORDER included, at every level: `json` keeps the fixture's order, and the compact bytes
-    must match. Fourteen of the cases are api.scryfall.com's own objects (see the fixture's
+    must match. Nineteen of the cases are api.scryfall.com's own objects (see the fixture's
     `_comment`), so the order both writers are held to is Scryfall's rather than either writer's.
     """
 

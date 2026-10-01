@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from api.card_processing import preprocess_card
 from api.parsing import parse_scryfall_query
 from card_engine import ENGINE_COLUMNS, QueryEngine, UnknownFieldError
 
@@ -1426,6 +1427,55 @@ class TestFieldSelection:
         older = fresh_engine()
         older.reload([{column: (card | {"card_compat_blob": {}}).get(column) for column in ENGINE_COLUMNS}])
         assert _run(older, fields=["keywords"])[1][0]["keywords"] == ["first strike", "flying", "mutate"]
+
+    def test_a_split_cards_joined_credit_answers_for_either_artist(self, fresh_engine: Callable[[], QueryEngine]) -> None:
+        """Fire // Ice dmr/215, importer to engine: `artist` is the card's joined credit and `artist:` finds both names.
+
+        The merged row used to carry the front face's artist alone, so `artist:vohwinkel` missed the
+        card and its object said "David Martin".
+        """
+        live = json.loads((_FIXTURE.parent / "fire_ice_dmr_215.json").read_text(encoding="utf-8"))
+        e = fresh_engine()
+        e.reload([{column: row.get(column) for column in ENGINE_COLUMNS} for row in preprocess_card(live)])
+        for query in ("artist:vohwinkel", 'artist:"david martin"', 'artist:"Franz Vohwinkel"'):
+            total, cards = _run(e, query, fields=["artist", "card_faces"])
+            assert total == 1, query
+            assert cards[0]["artist"] == "David Martin & Franz Vohwinkel"
+            assert [face["artist"] for face in cards[0]["card_faces"]] == ["David Martin", "Franz Vohwinkel"]
+        assert _run(e, "artist:rush")[0] == 0
+
+    def test_the_remaining_card_object_keys_come_out_of_the_store(self, fresh_engine: Callable[[], QueryEngine]) -> None:
+        """Four things a card object carries that the engine lane dropped or reordered.
+
+        `produced_mana` was stored and never emitted; a card-level `color_indicator` and a meld
+        part's own `card_back_id` were not stored; `promo_types` and `frame_effects` were stored in
+        Scryfall's order and sorted on the way out (Burst Lightning pw26/20, Fable neo/141).
+        """
+        promo = ["playpromo", "wizardsplaynetwork", "standardshowdown", "universesbeyond"]
+        card = json.loads(_FIXTURE.read_text())[0] | {
+            "produced_mana": {"G": True},
+            "card_compat_blob": {
+                "color_indicator": ["G"],
+                "card_back_id": "5353eb15-86a9-42fb-87e6-10d0b2fda365",
+                "promo_types": promo,
+                "frame_effects": ["fandfc", "enchantment"],
+            },
+        }
+        e = fresh_engine()
+        e.reload([{column: card.get(column) for column in ENGINE_COLUMNS}])
+        _, cards = _run(e, fields=["produced_mana", "color_indicator", "card_back_id", "promo_types", "frame_effects"])
+        assert cards[0] == {
+            "produced_mana": ["G"],
+            "color_indicator": ["G"],
+            "card_back_id": "5353eb15-86a9-42fb-87e6-10d0b2fda365",
+            "promo_types": promo,
+            "frame_effects": ["fandfc", "enchantment"],
+        }
+        # Absent stays absent: no indicator, no production, and the shared back is not stored.
+        plain = fresh_engine()
+        plain.reload([{column: (card | {"produced_mana": {}, "card_compat_blob": {}}).get(column) for column in ENGINE_COLUMNS}])
+        _, cards = _run(plain, fields=["produced_mana", "color_indicator", "card_back_id"])
+        assert cards[0] == {"produced_mana": [], "color_indicator": [], "card_back_id": None}
 
     def test_engine_columns_feed_every_key_the_loader_reads(self, fresh_engine: Callable[[], QueryEngine]) -> None:
         """A reload from rows projected to exactly ENGINE_COLUMNS still answers `loyalty`.

@@ -390,6 +390,9 @@ struct CompatFields {
     image_status_id: u16,
     set_type_id: u16,
     security_stamp_id: u16,
+    // A card back that is NOT the shared one -- a meld part's -- interned; VOCAB_NONE for the
+    // shared back, which is every other printing and is derived on read.
+    card_back_vid: u16,
     games: u8,
     finishes: u8,
     flags: u16,
@@ -420,6 +423,7 @@ impl Default for CompatFields {
             image_status_id: VOCAB_NONE,
             set_type_id: VOCAB_NONE,
             security_stamp_id: VOCAB_NONE,
+            card_back_vid: VOCAB_NONE,
             games: 0,
             finishes: 0,
             flags: 0,
@@ -478,6 +482,9 @@ struct OracleCard {
     card_colors: u8,
     card_color_identity: u8,
     produced_mana: u8,
+    // Scryfall's CARD-level `color_indicator` (Dryad Arbor's `["G"]`, Ancestral Vision's `["U"]`),
+    // read from `card_compat_blob`; 0 = none. A face's own indicator is `OracleFace.color_indicator`.
+    color_indicator: u8,
     card_types: u16,
     // True for the ~556 oracle ids whose printings carry different legality
     // words (non-tournament printings: 30A, Collectors' Edition, gold border).
@@ -656,6 +663,7 @@ struct CardRow {
     card_colors: u8,
     card_color_identity: u8,
     produced_mana: u8,
+    color_indicator: u8,
     card_types: u16,
 
     scryfall_id: u128,
@@ -1160,6 +1168,7 @@ fn renumber_coll_vocab(cards: &mut [OracleCard], printings: &mut [Printing], col
         remap_opt(&mut compat.image_status_id);
         remap_opt(&mut compat.set_type_id);
         remap_opt(&mut compat.security_stamp_id);
+        remap_opt(&mut compat.card_back_vid);
         remap_keep_order(&mut compat.promo_types);
         remap_keep_order(&mut compat.frame_effects);
     }
@@ -1366,6 +1375,7 @@ fn compat_from_pydict(d: &Bound<PyDict>, vocab: &mut VocabInterner) -> PyResult<
         image_status_id: intern_opt(vocab, opt_str(&blob, "image_status"))?,
         set_type_id: intern_opt(vocab, opt_str(&blob, "set_type"))?,
         security_stamp_id: intern_opt(vocab, opt_str(&blob, "security_stamp"))?,
+        card_back_vid: intern_opt(vocab, opt_str(&blob, "card_back_id"))?,
         // Ordered, not folded: Scryfall's games array carries an order the bitset alone would lose
         // (see GAME_ORDERS). `finishes` below stays a plain set -- Scryfall lists those in one order.
         games: games_pack(str_list(&blob, "games").iter().map(String::as_str)),
@@ -1527,6 +1537,12 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
         card_colors: jsonb_color_to_bits(d, "card_colors"),
         card_color_identity: jsonb_color_to_bits(d, "card_color_identity"),
         produced_mana: jsonb_color_to_bits(d, "produced_mana"),
+        color_indicator: d
+            .get_item("card_compat_blob")
+            .ok()
+            .flatten()
+            .and_then(|v| v.cast_into::<PyDict>().ok())
+            .map_or(0, |blob| str_list_color_mask(&blob, "color_indicator")),
 
         cmc: opt_u8(d, "cmc"), // Un-set cards have fractional cmc, but we don't load those into the dataset
         creature_power: opt_i8(d, "creature_power"),
@@ -15117,6 +15133,8 @@ const FIELD_TABLE: &[(&str, FieldKey, FieldExtractor)] = &[
     ("lang", |py| intern!(py, "lang"), |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.lang_id)).into_pyobject(py)?.into_any())),
     ("image_status", |py| intern!(py, "image_status"), |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.image_status_id)).into_pyobject(py)?.into_any())),
     ("set_type", |py| intern!(py, "set_type"), |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.set_type_id)).into_pyobject(py)?.into_any())),
+    // None for the shared back, which the card-object builders supply themselves.
+    ("card_back_id", |py| intern!(py, "card_back_id"), |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.card_back_vid)).into_pyobject(py)?.into_any())),
     ("security_stamp", |py| intern!(py, "security_stamp"), |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.security_stamp_id)).into_pyobject(py)?.into_any())),
     ("set_id", |py| intern!(py, "set_id"), |py, _c, p, _s, v| Ok(coll_str_opt(v, u16::from(p.compat.set_vid)).into_pyobject(py)?.into_any())),
     ("arena_id", |py| intern!(py, "arena_id"), |py, _c, p, _s, _v| Ok(p.compat.arena_id.as_ref().map(|v| v.get()).into_pyobject(py)?.into_any())),
@@ -15135,8 +15153,8 @@ const FIELD_TABLE: &[(&str, FieldKey, FieldExtractor)] = &[
         let ids: Vec<u32> = p.compat.multiverse_ids.iter().map(|v| u32::from(*v)).collect();
         Ok(ids.into_pyobject(py)?.into_any())
     }),
-    ("promo_types", |py| intern!(py, "promo_types"), |py, _c, p, _s, v| Ok(sorted_strs(v, &p.compat.promo_types).into_pyobject(py)?.into_any())),
-    ("frame_effects", |py| intern!(py, "frame_effects"), |py, _c, p, _s, v| Ok(sorted_strs(v, &p.compat.frame_effects).into_pyobject(py)?.into_any())),
+    ("promo_types", |py| intern!(py, "promo_types"), |py, _c, p, _s, v| Ok(compat_strs(v, &p.compat.promo_types).into_pyobject(py)?.into_any())),
+    ("frame_effects", |py| intern!(py, "frame_effects"), |py, _c, p, _s, v| Ok(compat_strs(v, &p.compat.frame_effects).into_pyobject(py)?.into_any())),
     // Scryfall's own order, not a fixed one -- the byte carries the permutation (see GAME_ORDERS).
     ("games", |py| intern!(py, "games"), |py, _c, p, _s, _v| Ok(games_to_names(p.compat.games).into_pyobject(py)?.into_any())),
     ("finishes", |py| intern!(py, "finishes"), |py, _c, p, _s, _v| Ok(bits_to_names(p.compat.finishes, FINISH_NAMES).into_pyobject(py)?.into_any())),
@@ -15173,6 +15191,10 @@ const FIELD_TABLE: &[(&str, FieldKey, FieldExtractor)] = &[
     // `colors` is this PR's addition; #877 already supplies layout, cmc, rarity,
     // color_identity and legalities, so those are not repeated here.
     ("colors", |py| intern!(py, "colors"), |py, c, _p, _s, _v| Ok(identity_letters(c.card_colors).into_pyobject(py)?.into_any())),
+    // Two more colour sets a card object carries and nothing emitted: the card-level indicator and
+    // the mana a card can make (`mana:` already filters on the latter; it had no result field).
+    ("color_indicator", |py| intern!(py, "color_indicator"), |py, c, _p, _s, _v| Ok(identity_letters(c.color_indicator).into_pyobject(py)?.into_any())),
+    ("produced_mana", |py| intern!(py, "produced_mana"), |py, c, _p, _s, _v| Ok(identity_letters(c.produced_mana).into_pyobject(py)?.into_any())),
     // `to_scryfall_card` reads both of these, and neither had an entry here or a place in
     // CARD_OBJECT_FIELDS -- so on the ENGINE path every card object carried `border_color: null`
     // and no `frame` at all, where Scryfall always sends both. Only the accessors were missing;
@@ -15380,6 +15402,15 @@ pub(crate) fn coll_str(vocab: &AStrings, id: u16) -> &str {
     vocab[id as usize].as_str()
 }
 
+/// `promo_types` / `frame_effects` in the order Scryfall listed them, which is not sorted:
+/// `["fandfc","enchantment"]` on Fable of the Mirror-Breaker neo/141, `["playpromo",
+/// "wizardsplaynetwork","standardshowdown","universesbeyond"]` on Burst Lightning pw26/20. The
+/// store keeps that order (`renumber_coll_vocab` remaps these two without re-sorting); only the
+/// emitter sorted it away.
+fn compat_strs<'a>(vocab: &'a AStrings, ids: &Archived<Vec<u16>>) -> Vec<&'a str> {
+    ids.iter().map(|id| coll_str(vocab, u16::from(*id))).collect()
+}
+
 /// Resolves interned collection ids to a lexicographically sorted `Vec<&str>` for
 /// deterministic field output.
 fn sorted_strs<'a>(vocab: &'a AStrings, ids: &Archived<Vec<u16>>) -> Vec<&'a str> {
@@ -15541,7 +15572,11 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 // and order. The row does not grow -- 256 bytes before and after, the pin in
 // `the_overflow_id_is_free_in_the_row` -- but the fields after it move, so the header's sizes
 // cannot see it and this constant is the only guard.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026100102;
+//
+// 2026100103 — `OracleCard` GAINS `color_indicator`, the card-level indicator, in the byte of
+// padding after `produced_mana`: the row stays 256 and the header cannot see it. `CompatFields`
+// gains `card_back_vid`, a meld part's own card back, the same way (84 bytes before and after).
+const ARCHIVE_FORMAT_VERSION: u32 = 2026100103;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -16185,6 +16220,7 @@ impl QueryEngine {
                     card_colors: row.card_colors,
                     card_color_identity: row.card_color_identity,
                     produced_mana: row.produced_mana,
+                    color_indicator: row.color_indicator,
                     card_types: row.card_types,
                     legality_divergent: false,
                     oracle_id: row.oracle_id,

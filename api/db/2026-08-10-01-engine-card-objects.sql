@@ -40,7 +40,13 @@ SET card_compat_blob = raw_card_blob - ARRAY[
         'purchase_uris', 'resource_id',
         'card_faces',
         'card_name', 'face_name', 'face_idx', 'scryfall_id'
-    ],
+    ]
+    -- ...except a card back that is NOT the shared one (a meld part's), which nothing derives.
+    || CASE
+        WHEN raw_card_blob ->> 'card_back_id' <> '0aeebaf5-8c7d-4636-9e82-8c27447861f7'
+            THEN jsonb_build_object('card_back_id', raw_card_blob -> 'card_back_id')
+        ELSE '{}'::jsonb
+    END,
     card_faces = CASE
         WHEN raw_card_blob ? 'card_faces' THEN (
             SELECT jsonb_agg(
@@ -52,6 +58,16 @@ SET card_compat_blob = raw_card_blob - ARRAY[
         ELSE NULL
     END
 WHERE card_compat_blob IS NULL;
+
+-- A multi-face row's card_artist is the CARD's credit, not its front face's (preprocess_card):
+-- Fire // Ice is "David Martin & Franz Vohwinkel", where the merged row used to keep "David Martin".
+-- Only rows whose blob is already the card-level object (it has card_faces) can be corrected here;
+-- the rest are rewritten by the next import.
+UPDATE magic.cards
+SET card_artist = raw_card_blob ->> 'artist'
+WHERE raw_card_blob ? 'card_faces'
+  AND raw_card_blob ->> 'artist' IS NOT NULL
+  AND card_artist IS DISTINCT FROM raw_card_blob ->> 'artist';
 
 -- The engine reload reads every ENGINE_COLUMNS value for every row, so a NULL here would mean a
 -- per-row branch in the hot path for a case that cannot legitimately occur.

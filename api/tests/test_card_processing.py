@@ -349,6 +349,24 @@ class TestCardProcessing:
         assert result["card_compat_blob"]["keywords"] == printed
         assert list(result["card_keywords"]) == ["flying", "mutate", "first strike"]
 
+    def test_a_multi_face_row_carries_the_cards_artist_credit_not_the_front_faces(self) -> None:
+        """Fire // Ice dmr/215 as api.scryfall.com sent it (2026-10-01): two faces, two artists, one joined credit."""
+        fixture = pathlib.Path(__file__).parent / "fixtures" / "fire_ice_dmr_215.json"
+        card = json.loads(fixture.read_text(encoding="utf-8"))
+
+        result = preprocess_card(card)[0]
+
+        assert result["card_artist"] == "David Martin & Franz Vohwinkel"
+        assert [face["artist"] for face in result["card_faces"]] == ["David Martin", "Franz Vohwinkel"]
+
+    def test_the_compat_blob_keeps_a_card_back_only_when_it_is_not_the_shared_one(self) -> None:
+        """A meld part's back is half of the melded card; every other printing's is derived on read."""
+        shared = "0aeebaf5-8c7d-4636-9e82-8c27447861f7"
+        own = "5353eb15-86a9-42fb-87e6-10d0b2fda365"
+
+        assert "card_back_id" not in preprocess_card(create_test_card() | {"card_back_id": shared})[0]["card_compat_blob"]
+        assert preprocess_card(create_test_card() | {"card_back_id": own})[0]["card_compat_blob"]["card_back_id"] == own
+
     def test_preprocess_card_handles_missing_fields(self) -> None:
         """Test preprocess_card handles missing optional fields."""
         minimal_card = create_test_card(

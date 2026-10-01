@@ -62,7 +62,7 @@ CARD_OBJECT_FIELDS = (
     "lang", "image_status", "set_type", "security_stamp", "set_id", "arena_id", "mtgo_id",
     "mtgo_foil_id", "tcgplayer_id", "tcgplayer_etched_id", "cardmarket_id", "penny_rank",
     "image_updated_at", "price_usd_foil", "price_usd_etched", "price_eur_foil", "multiverse_ids",
-    "promo_types", "frame_effects", "games", "finishes", "booster", "digital", "foil", "nonfoil",
+    "promo_types", "frame_effects", "color_indicator", "produced_mana", "card_back_id", "games", "finishes", "booster", "digital", "foil", "nonfoil",
     "full_art", "highres_image", "oversized", "promo", "reprint", "story_spotlight", "textless",
     "variation", "card_faces", "all_parts",
 )  # fmt: skip
@@ -670,6 +670,10 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
     # `colors` is one of the values a two-image layout keeps on its faces alone.
     if not two_image:
         card["colors"] = sorted(row.get("colors") or [])
+        # The CARD's indicator, only when it has one (Dryad Arbor's `["G"]`); a two-image layout's
+        # indicators are its faces'.
+        if row.get("color_indicator"):
+            card["color_indicator"] = sorted(row["color_indicator"])
     # Colour arrays are ALPHABETICAL on Scryfall (`["R","U","W"]` on Vadrok iko/214), where the
     # engine decodes its bitmask WUBRG and `/search` keeps that order. The SQL lane sorted already.
     card["color_identity"] = sorted(row.get("color_identity") or [])
@@ -678,6 +682,10 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
     # (a row imported before the residue kept the list).
     keywords = row.get("keywords")
     card["keywords"] = list(keywords) if keywords is not None else row.get("card_keywords") or []
+    # The mana the card can make, on every layout and only when it makes any. The engine emits the
+    # letters; the SQL lane's column is the `{letter: true}` set it is searched by.
+    if row.get("produced_mana"):
+        card["produced_mana"] = sorted(row["produced_mana"])
     if faces:
         card["card_faces"] = faces
     if row.get("all_parts"):
@@ -719,7 +727,9 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
     # no shared back and no card-level illustration when the card is two pictures -- and Scryfall
     # omits the top-level keys entirely rather than nulling them.
     if not two_image:
-        card["card_back_id"] = CARD_BACK_ID
+        # The shared back unless the row names another: a meld part's back is half of the melded
+        # card (Bruna, the Fading Light inr/14).
+        card["card_back_id"] = row.get("card_back_id") or CARD_BACK_ID
     card["artist"] = row.get("artist")
     # OMITTED, never null, when the printing has none: 731 printings of the 2026-05-31 default_cards
     # bulk carry no `illustration_id` key at all (unk/CAa, re-read live 2026-10-01) and none sends null.

@@ -5224,6 +5224,1619 @@
           "cardhoarder": "https://www.cardhoarder.com/cards/80437"
         }
       }
+    },
+    {
+      "case": "Dryad Arbor dsc/273: a card-level color_indicator after colors, produced_mana after keywords",
+      "scryfall": {
+        "uri": "https://api.scryfall.com/cards/e3ddbebf-72cd-4d1b-ba0d-d94934654ab7",
+        "fetched": "2026-10-01",
+        "removed": [
+          "artist_ids"
+        ]
+      },
+      "base_url": "https://api.scryfall.com",
+      "row": {
+        "all_parts": [],
+        "arena_id": null,
+        "artist": "Eric Fortune",
+        "booster": false,
+        "border_color": "black",
+        "card_back_id": null,
+        "card_faces": [],
+        "card_is_tags": [],
+        "card_keywords": [],
+        "cardmarket_id": 789011,
+        "cmc": 0.0,
+        "collector_number": "273",
+        "color_identity": [
+          "G"
+        ],
+        "color_indicator": [
+          "G"
+        ],
+        "colors": [
+          "G"
+        ],
+        "digital": false,
+        "edhrec_rank": 769,
+        "finishes": [
+          "nonfoil"
+        ],
+        "flavor_text": "\"Touch no tree, break no branch, and speak only the question you wish answered.\"\n—Von Yomm, elder druid, to her initiates",
+        "foil": false,
+        "frame": "2015",
+        "frame_effects": [],
+        "full_art": false,
+        "games": [
+          "paper",
+          "mtgo"
+        ],
+        "highres_image": true,
+        "illustration_id": "80a2053e-3199-4ff4-968c-a3d30b419afa",
+        "image_status": "highres_scan",
+        "image_updated_at": 1783909577,
+        "keywords": [],
+        "lang": "en",
+        "layout": "normal",
+        "legalities": {
+          "alchemy": "not_legal",
+          "brawl": "not_legal",
+          "commander": "legal",
+          "competitivebrawl": "not_legal",
+          "duel": "legal",
+          "future": "not_legal",
+          "gladiator": "not_legal",
+          "historic": "not_legal",
+          "legacy": "legal",
+          "modern": "legal",
+          "oathbreaker": "legal",
+          "oldschool": "not_legal",
+          "pauper": "not_legal",
+          "paupercommander": "not_legal",
+          "penny": "not_legal",
+          "pioneer": "not_legal",
+          "predh": "legal",
+          "premodern": "not_legal",
+          "standard": "not_legal",
+          "standardbrawl": "not_legal",
+          "timeless": "not_legal",
+          "tlr": "legal",
+          "vintage": "legal"
+        },
+        "loyalty": null,
+        "mana_cost": "",
+        "mtgo_foil_id": null,
+        "mtgo_id": 131171,
+        "multiverse_ids": [
+          676146
+        ],
+        "name": "Dryad Arbor",
+        "nonfoil": true,
+        "oracle_id": "e996cd67-739c-40f4-b276-0042acf26c71",
+        "oracle_text": "(This land isn't a spell, it's affected by summoning sickness, and it has \"{T}: Add {G}.\")",
+        "oversized": false,
+        "penny_rank": null,
+        "power": "1",
+        "price_eur": 3.21,
+        "price_eur_foil": null,
+        "price_tix": 6.49,
+        "price_usd": 3.73,
+        "price_usd_etched": null,
+        "price_usd_foil": null,
+        "produced_mana": [
+          "G"
+        ],
+        "promo": false,
+        "promo_types": [],
+        "rarity": "rare",
+        "released_at": "2024-09-27",
+        "reprint": true,
+        "scryfall_id": "e3ddbebf-72cd-4d1b-ba0d-d94934654ab7",
+        "security_stamp": "oval",
+        "set_code": "dsc",
+        "set_id": "4c822528-83c3-42c7-8708-dd1d37166819",
+        "set_name": "Duskmourn: House of Horror Commander",
+        "set_type": "commander",
+        "story_spotlight": false,
+        "tcgplayer_etched_id": null,
+        "tcgplayer_id": 579308,
+        "textless": false,
+        "toughness": "1",
+        "type_line": "Land Creature — Forest Dryad",
+        "variation": false,
+        "watermark": null
+      },
+      "expected": {
+        "object": "card",
+        "id": "e3ddbebf-72cd-4d1b-ba0d-d94934654ab7",
+        "oracle_id": "e996cd67-739c-40f4-b276-0042acf26c71",
+        "multiverse_ids": [
+          676146
+        ],
+        "mtgo_id": 131171,
+        "tcgplayer_id": 579308,
+        "cardmarket_id": 789011,
+        "name": "Dryad Arbor",
+        "lang": "en",
+        "released_at": "2024-09-27",
+        "uri": "https://api.scryfall.com/cards/e3ddbebf-72cd-4d1b-ba0d-d94934654ab7",
+        "scryfall_uri": "https://scryfall.com/card/dsc/273/dryad-arbor?utm_source=api",
+        "layout": "normal",
+        "highres_image": true,
+        "image_status": "highres_scan",
+        "image_updated_at": "2026-07-13T02:26:17Z",
+        "image_uris": {
+          "small": "https://cards.scryfall.io/small/front/e/3/e3ddbebf-72cd-4d1b-ba0d-d94934654ab7.jpg?1783909577",
+          "normal": "https://cards.scryfall.io/normal/front/e/3/e3ddbebf-72cd-4d1b-ba0d-d94934654ab7.jpg?1783909577",
+          "large": "https://cards.scryfall.io/large/front/e/3/e3ddbebf-72cd-4d1b-ba0d-d94934654ab7.jpg?1783909577",
+          "png": "https://cards.scryfall.io/png/front/e/3/e3ddbebf-72cd-4d1b-ba0d-d94934654ab7.png?1783909577",
+          "art_crop": "https://cards.scryfall.io/art_crop/front/e/3/e3ddbebf-72cd-4d1b-ba0d-d94934654ab7.jpg?1783909577",
+          "border_crop": "https://cards.scryfall.io/border_crop/front/e/3/e3ddbebf-72cd-4d1b-ba0d-d94934654ab7.jpg?1783909577",
+          "thumb": "https://cards.scryfall.io/thumb/front/e/3/e3ddbebf-72cd-4d1b-ba0d-d94934654ab7.webp?1783909577",
+          "grid": "https://cards.scryfall.io/grid/front/e/3/e3ddbebf-72cd-4d1b-ba0d-d94934654ab7.webp?1783909577",
+          "display": "https://cards.scryfall.io/display/front/e/3/e3ddbebf-72cd-4d1b-ba0d-d94934654ab7.webp?1783909577",
+          "art": "https://cards.scryfall.io/art/front/e/3/e3ddbebf-72cd-4d1b-ba0d-d94934654ab7.webp?1783909577",
+          "crop": "https://cards.scryfall.io/crop/front/e/3/e3ddbebf-72cd-4d1b-ba0d-d94934654ab7.webp?1783909577"
+        },
+        "mana_cost": "",
+        "cmc": 0.0,
+        "type_line": "Land Creature — Forest Dryad",
+        "oracle_text": "(This land isn't a spell, it's affected by summoning sickness, and it has \"{T}: Add {G}.\")",
+        "power": "1",
+        "toughness": "1",
+        "colors": [
+          "G"
+        ],
+        "color_indicator": [
+          "G"
+        ],
+        "color_identity": [
+          "G"
+        ],
+        "keywords": [],
+        "produced_mana": [
+          "G"
+        ],
+        "legalities": {
+          "standard": "not_legal",
+          "future": "not_legal",
+          "historic": "not_legal",
+          "timeless": "not_legal",
+          "gladiator": "not_legal",
+          "pioneer": "not_legal",
+          "modern": "legal",
+          "legacy": "legal",
+          "pauper": "not_legal",
+          "vintage": "legal",
+          "penny": "not_legal",
+          "commander": "legal",
+          "oathbreaker": "legal",
+          "standardbrawl": "not_legal",
+          "brawl": "not_legal",
+          "competitivebrawl": "not_legal",
+          "alchemy": "not_legal",
+          "paupercommander": "not_legal",
+          "duel": "legal",
+          "oldschool": "not_legal",
+          "premodern": "not_legal",
+          "predh": "legal",
+          "tlr": "legal"
+        },
+        "games": [
+          "paper",
+          "mtgo"
+        ],
+        "reserved": false,
+        "game_changer": false,
+        "foil": false,
+        "nonfoil": true,
+        "finishes": [
+          "nonfoil"
+        ],
+        "oversized": false,
+        "promo": false,
+        "reprint": true,
+        "variation": false,
+        "set_id": "4c822528-83c3-42c7-8708-dd1d37166819",
+        "set": "dsc",
+        "set_name": "Duskmourn: House of Horror Commander",
+        "set_type": "commander",
+        "set_uri": "https://api.scryfall.com/sets/4c822528-83c3-42c7-8708-dd1d37166819",
+        "set_search_uri": "https://api.scryfall.com/cards/search?order=set&q=e%3Adsc&unique=prints",
+        "scryfall_set_uri": "https://scryfall.com/sets/dsc?utm_source=api",
+        "rulings_uri": "https://api.scryfall.com/cards/e3ddbebf-72cd-4d1b-ba0d-d94934654ab7/rulings",
+        "prints_search_uri": "https://api.scryfall.com/cards/search?order=released&q=oracleid%3Ae996cd67-739c-40f4-b276-0042acf26c71&unique=prints",
+        "collector_number": "273",
+        "digital": false,
+        "rarity": "rare",
+        "flavor_text": "\"Touch no tree, break no branch, and speak only the question you wish answered.\"\n—Von Yomm, elder druid, to her initiates",
+        "card_back_id": "0aeebaf5-8c7d-4636-9e82-8c27447861f7",
+        "artist": "Eric Fortune",
+        "illustration_id": "80a2053e-3199-4ff4-968c-a3d30b419afa",
+        "border_color": "black",
+        "frame": "2015",
+        "security_stamp": "oval",
+        "full_art": false,
+        "textless": false,
+        "booster": false,
+        "story_spotlight": false,
+        "edhrec_rank": 769,
+        "prices": {
+          "usd": "3.73",
+          "usd_foil": null,
+          "usd_etched": null,
+          "eur": "3.21",
+          "eur_foil": null,
+          "tix": "6.49"
+        },
+        "related_uris": {
+          "gatherer": "https://gatherer.wizards.com/Pages/Card/Details.aspx?multiverseid=676146&printed=false",
+          "tcgplayer_infinite_articles": "https://www.tcgplayer.com/search/articles?productLineName=magic&q=Dryad+Arbor",
+          "tcgplayer_infinite_decks": "https://www.tcgplayer.com/search/decks?productLineName=magic&q=Dryad+Arbor",
+          "edhrec": "https://edhrec.com/route/?cc=Dryad+Arbor"
+        },
+        "purchase_uris": {
+          "tcgplayer": "https://www.tcgplayer.com/product/579308?page=1",
+          "cardmarket": "https://www.cardmarket.com/en/Magic/Products?idProduct=789011",
+          "cardhoarder": "https://www.cardhoarder.com/cards/131171"
+        }
+      }
+    },
+    {
+      "case": "Esika, God of the Tree khm/168: a modal_dfc reports the mana it produces, in the alphabet's order",
+      "scryfall": {
+        "uri": "https://api.scryfall.com/cards/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6",
+        "fetched": "2026-10-01",
+        "removed": [
+          "artist_ids",
+          "preview",
+          "card_faces[].artist_id"
+        ]
+      },
+      "base_url": "https://api.scryfall.com",
+      "row": {
+        "all_parts": [],
+        "arena_id": 75212,
+        "artist": "Johannes Voss",
+        "booster": true,
+        "border_color": "black",
+        "card_back_id": null,
+        "card_faces": [
+          {
+            "artist": "Johannes Voss",
+            "color_indicator": [],
+            "colors": [
+              "G"
+            ],
+            "defense": null,
+            "flavor_text": "\"I know this world, from canopy to roots.\"",
+            "illustration_id": "b02e8c7b-b733-4d3b-9d71-7a48c4d2e713",
+            "loyalty": null,
+            "mana_cost": "{1}{G}{G}",
+            "name": "Esika, God of the Tree",
+            "oracle_text": "Vigilance\n{T}: Add one mana of any color.\nOther legendary creatures you control have vigilance and \"{T}: Add one mana of any color.\"",
+            "power": "1",
+            "toughness": "4",
+            "type_line": "Legendary Creature — God"
+          },
+          {
+            "artist": "Johannes Voss",
+            "color_indicator": [],
+            "colors": [
+              "B",
+              "G",
+              "R",
+              "U",
+              "W"
+            ],
+            "defense": null,
+            "flavor_text": "Starnheim awaits.",
+            "illustration_id": "959283a3-5d90-4e9b-95ce-abc0ab93f75c",
+            "loyalty": null,
+            "mana_cost": "{W}{U}{B}{R}{G}",
+            "name": "The Prismatic Bridge",
+            "oracle_text": "At the beginning of your upkeep, reveal cards from the top of your library until you reveal a creature or planeswalker card. Put that card onto the battlefield and the rest on the bottom of your library in a random order.",
+            "power": null,
+            "toughness": null,
+            "type_line": "Legendary Enchantment"
+          }
+        ],
+        "card_is_tags": [],
+        "card_keywords": [
+          "vigilance"
+        ],
+        "cardmarket_id": 530332,
+        "cmc": 3.0,
+        "collector_number": "168",
+        "color_identity": [
+          "W",
+          "U",
+          "B",
+          "R",
+          "G"
+        ],
+        "color_indicator": [],
+        "colors": [],
+        "digital": false,
+        "edhrec_rank": 2523,
+        "finishes": [
+          "nonfoil",
+          "foil"
+        ],
+        "flavor_text": "\"I know this world, from canopy to roots.\"\n//\nStarnheim awaits.",
+        "foil": true,
+        "frame": "2015",
+        "frame_effects": [
+          "legendary"
+        ],
+        "full_art": false,
+        "games": [
+          "arena",
+          "paper",
+          "mtgo"
+        ],
+        "highres_image": true,
+        "illustration_id": null,
+        "image_status": "highres_scan",
+        "image_updated_at": 1783928221,
+        "keywords": [
+          "Vigilance"
+        ],
+        "lang": "en",
+        "layout": "modal_dfc",
+        "legalities": {
+          "alchemy": "not_legal",
+          "brawl": "legal",
+          "commander": "legal",
+          "competitivebrawl": "legal",
+          "duel": "legal",
+          "future": "not_legal",
+          "gladiator": "legal",
+          "historic": "legal",
+          "legacy": "legal",
+          "modern": "legal",
+          "oathbreaker": "legal",
+          "oldschool": "not_legal",
+          "pauper": "not_legal",
+          "paupercommander": "not_legal",
+          "penny": "legal",
+          "pioneer": "legal",
+          "predh": "not_legal",
+          "premodern": "not_legal",
+          "standard": "not_legal",
+          "standardbrawl": "not_legal",
+          "timeless": "legal",
+          "tlr": "not_legal",
+          "vintage": "legal"
+        },
+        "loyalty": null,
+        "mana_cost": null,
+        "mtgo_foil_id": null,
+        "mtgo_id": 87673,
+        "multiverse_ids": [
+          503781,
+          503782
+        ],
+        "name": "Esika, God of the Tree // The Prismatic Bridge",
+        "nonfoil": true,
+        "oracle_id": "92023a5d-a143-4950-a71b-d736e6b8e959",
+        "oracle_text": "Vigilance\n{T}: Add one mana of any color.\nOther legendary creatures you control have vigilance and \"{T}: Add one mana of any color.\"",
+        "oversized": false,
+        "penny_rank": 7383,
+        "power": "1",
+        "price_eur": 15.69,
+        "price_eur_foil": 17.93,
+        "price_tix": 0.02,
+        "price_usd": 22.02,
+        "price_usd_etched": null,
+        "price_usd_foil": 23.4,
+        "produced_mana": [
+          "W",
+          "U",
+          "B",
+          "R",
+          "G"
+        ],
+        "promo": false,
+        "promo_types": [],
+        "rarity": "mythic",
+        "released_at": "2021-02-05",
+        "reprint": false,
+        "scryfall_id": "f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6",
+        "security_stamp": "oval",
+        "set_code": "khm",
+        "set_id": "43057fad-b1c1-437f-bc48-0045bce6d8c9",
+        "set_name": "Kaldheim",
+        "set_type": "expansion",
+        "story_spotlight": false,
+        "tcgplayer_etched_id": null,
+        "tcgplayer_id": 230163,
+        "textless": false,
+        "toughness": "4",
+        "type_line": "Legendary Creature — God // Legendary Enchantment",
+        "variation": false,
+        "watermark": null
+      },
+      "expected": {
+        "object": "card",
+        "id": "f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6",
+        "oracle_id": "92023a5d-a143-4950-a71b-d736e6b8e959",
+        "multiverse_ids": [
+          503781,
+          503782
+        ],
+        "mtgo_id": 87673,
+        "arena_id": 75212,
+        "tcgplayer_id": 230163,
+        "cardmarket_id": 530332,
+        "name": "Esika, God of the Tree // The Prismatic Bridge",
+        "lang": "en",
+        "released_at": "2021-02-05",
+        "uri": "https://api.scryfall.com/cards/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6",
+        "scryfall_uri": "https://scryfall.com/card/khm/168/esika-god-of-the-tree-the-prismatic-bridge?utm_source=api",
+        "layout": "modal_dfc",
+        "highres_image": true,
+        "image_status": "highres_scan",
+        "image_updated_at": "2026-07-13T07:37:01Z",
+        "cmc": 3.0,
+        "type_line": "Legendary Creature — God // Legendary Enchantment",
+        "color_identity": [
+          "B",
+          "G",
+          "R",
+          "U",
+          "W"
+        ],
+        "keywords": [
+          "Vigilance"
+        ],
+        "produced_mana": [
+          "B",
+          "G",
+          "R",
+          "U",
+          "W"
+        ],
+        "card_faces": [
+          {
+            "object": "card_face",
+            "name": "Esika, God of the Tree",
+            "mana_cost": "{1}{G}{G}",
+            "type_line": "Legendary Creature — God",
+            "oracle_text": "Vigilance\n{T}: Add one mana of any color.\nOther legendary creatures you control have vigilance and \"{T}: Add one mana of any color.\"",
+            "colors": [
+              "G"
+            ],
+            "power": "1",
+            "toughness": "4",
+            "flavor_text": "\"I know this world, from canopy to roots.\"",
+            "artist": "Johannes Voss",
+            "illustration_id": "b02e8c7b-b733-4d3b-9d71-7a48c4d2e713",
+            "image_uris": {
+              "small": "https://cards.scryfall.io/small/front/f/6/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6.jpg?1783928221",
+              "normal": "https://cards.scryfall.io/normal/front/f/6/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6.jpg?1783928221",
+              "large": "https://cards.scryfall.io/large/front/f/6/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6.jpg?1783928221",
+              "png": "https://cards.scryfall.io/png/front/f/6/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6.png?1783928221",
+              "art_crop": "https://cards.scryfall.io/art_crop/front/f/6/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6.jpg?1783928221",
+              "border_crop": "https://cards.scryfall.io/border_crop/front/f/6/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6.jpg?1783928221",
+              "thumb": "https://cards.scryfall.io/thumb/front/f/6/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6.webp?1783928221",
+              "grid": "https://cards.scryfall.io/grid/front/f/6/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6.webp?1783928221",
+              "display": "https://cards.scryfall.io/display/front/f/6/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6.webp?1783928221",
+              "art": "https://cards.scryfall.io/art/front/f/6/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6.webp?1783928221",
+              "crop": "https://cards.scryfall.io/crop/front/f/6/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6.webp?1783928221"
+            }
+          },
+          {
+            "object": "card_face",
+            "name": "The Prismatic Bridge",
+            "mana_cost": "{W}{U}{B}{R}{G}",
+            "type_line": "Legendary Enchantment",
+            "oracle_text": "At the beginning of your upkeep, reveal cards from the top of your library until you reveal a creature or planeswalker card. Put that card onto the battlefield and the rest on the bottom of your library in a random order.",
+            "colors": [
+              "B",
+              "G",
+              "R",
+              "U",
+              "W"
+            ],
+            "flavor_text": "Starnheim awaits.",
+            "artist": "Johannes Voss",
+            "illustration_id": "959283a3-5d90-4e9b-95ce-abc0ab93f75c",
+            "image_uris": {
+              "small": "https://cards.scryfall.io/small/back/f/6/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6.jpg?1783928221",
+              "normal": "https://cards.scryfall.io/normal/back/f/6/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6.jpg?1783928221",
+              "large": "https://cards.scryfall.io/large/back/f/6/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6.jpg?1783928221",
+              "png": "https://cards.scryfall.io/png/back/f/6/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6.png?1783928221",
+              "art_crop": "https://cards.scryfall.io/art_crop/back/f/6/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6.jpg?1783928221",
+              "border_crop": "https://cards.scryfall.io/border_crop/back/f/6/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6.jpg?1783928221",
+              "thumb": "https://cards.scryfall.io/thumb/back/f/6/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6.webp?1783928221",
+              "grid": "https://cards.scryfall.io/grid/back/f/6/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6.webp?1783928221",
+              "display": "https://cards.scryfall.io/display/back/f/6/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6.webp?1783928221",
+              "art": "https://cards.scryfall.io/art/back/f/6/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6.webp?1783928221",
+              "crop": "https://cards.scryfall.io/crop/back/f/6/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6.webp?1783928221"
+            }
+          }
+        ],
+        "legalities": {
+          "standard": "not_legal",
+          "future": "not_legal",
+          "historic": "legal",
+          "timeless": "legal",
+          "gladiator": "legal",
+          "pioneer": "legal",
+          "modern": "legal",
+          "legacy": "legal",
+          "pauper": "not_legal",
+          "vintage": "legal",
+          "penny": "legal",
+          "commander": "legal",
+          "oathbreaker": "legal",
+          "standardbrawl": "not_legal",
+          "brawl": "legal",
+          "competitivebrawl": "legal",
+          "alchemy": "not_legal",
+          "paupercommander": "not_legal",
+          "duel": "legal",
+          "oldschool": "not_legal",
+          "premodern": "not_legal",
+          "predh": "not_legal",
+          "tlr": "not_legal"
+        },
+        "games": [
+          "arena",
+          "paper",
+          "mtgo"
+        ],
+        "reserved": false,
+        "game_changer": false,
+        "foil": true,
+        "nonfoil": true,
+        "finishes": [
+          "nonfoil",
+          "foil"
+        ],
+        "oversized": false,
+        "promo": false,
+        "reprint": false,
+        "variation": false,
+        "set_id": "43057fad-b1c1-437f-bc48-0045bce6d8c9",
+        "set": "khm",
+        "set_name": "Kaldheim",
+        "set_type": "expansion",
+        "set_uri": "https://api.scryfall.com/sets/43057fad-b1c1-437f-bc48-0045bce6d8c9",
+        "set_search_uri": "https://api.scryfall.com/cards/search?order=set&q=e%3Akhm&unique=prints",
+        "scryfall_set_uri": "https://scryfall.com/sets/khm?utm_source=api",
+        "rulings_uri": "https://api.scryfall.com/cards/f6cd7465-9dd0-473c-ac5e-dd9e2f22f5f6/rulings",
+        "prints_search_uri": "https://api.scryfall.com/cards/search?order=released&q=oracleid%3A92023a5d-a143-4950-a71b-d736e6b8e959&unique=prints",
+        "collector_number": "168",
+        "digital": false,
+        "rarity": "mythic",
+        "artist": "Johannes Voss",
+        "border_color": "black",
+        "frame": "2015",
+        "frame_effects": [
+          "legendary"
+        ],
+        "security_stamp": "oval",
+        "full_art": false,
+        "textless": false,
+        "booster": true,
+        "story_spotlight": false,
+        "edhrec_rank": 2523,
+        "penny_rank": 7383,
+        "prices": {
+          "usd": "22.02",
+          "usd_foil": "23.40",
+          "usd_etched": null,
+          "eur": "15.69",
+          "eur_foil": "17.93",
+          "tix": "0.02"
+        },
+        "related_uris": {
+          "gatherer": "https://gatherer.wizards.com/Pages/Card/Details.aspx?multiverseid=503781&printed=false",
+          "tcgplayer_infinite_articles": "https://www.tcgplayer.com/search/articles?productLineName=magic&q=Esika%2C+God+of+the+Tree+%2F%2F+The+Prismatic+Bridge",
+          "tcgplayer_infinite_decks": "https://www.tcgplayer.com/search/decks?productLineName=magic&q=Esika%2C+God+of+the+Tree+%2F%2F+The+Prismatic+Bridge",
+          "edhrec": "https://edhrec.com/route/?cc=Esika%2C+God+of+the+Tree"
+        },
+        "purchase_uris": {
+          "tcgplayer": "https://www.tcgplayer.com/product/230163?page=1",
+          "cardmarket": "https://www.cardmarket.com/en/Magic/Products?idProduct=530332",
+          "cardhoarder": "https://www.cardhoarder.com/cards/87673"
+        }
+      }
+    },
+    {
+      "case": "Fable of the Mirror-Breaker neo/141: frame_effects in Scryfall's order, not sorted",
+      "scryfall": {
+        "uri": "https://api.scryfall.com/cards/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc",
+        "fetched": "2026-10-01",
+        "removed": [
+          "artist_ids",
+          "preview",
+          "card_faces[].artist_id"
+        ]
+      },
+      "base_url": "https://api.scryfall.com",
+      "row": {
+        "all_parts": [
+          {
+            "component": "token",
+            "id": "6911181d-573b-41eb-96a4-799c96e008fc",
+            "name": "Treasure",
+            "object": "related_card",
+            "type_line": "Token Artifact — Treasure"
+          },
+          {
+            "component": "token",
+            "id": "0d9461c3-f545-4efb-926e-759961db0495",
+            "name": "Goblin Shaman",
+            "object": "related_card",
+            "type_line": "Token Creature — Goblin Shaman"
+          },
+          {
+            "component": "token",
+            "id": "f4e87a11-b3b1-47b2-bd73-f4c78d6fbe6c",
+            "name": "Copy",
+            "object": "related_card",
+            "type_line": "Token"
+          },
+          {
+            "component": "combo_piece",
+            "id": "6dee0388-a78d-4b3c-a0c5-25655e14115e",
+            "name": "Fable of the Mirror-Breaker // Reflection of Kiki-Jiki",
+            "object": "related_card",
+            "type_line": "Enchantment — Saga // Enchantment Creature — Goblin Shaman"
+          }
+        ],
+        "arena_id": 79570,
+        "artist": "Joseph Meehan",
+        "booster": true,
+        "border_color": "black",
+        "card_back_id": null,
+        "card_faces": [
+          {
+            "artist": "Joseph Meehan",
+            "color_indicator": [],
+            "colors": [
+              "R"
+            ],
+            "defense": null,
+            "flavor_text": null,
+            "illustration_id": "85479010-4db6-4128-b357-e39064d50b84",
+            "loyalty": null,
+            "mana_cost": "{2}{R}",
+            "name": "Fable of the Mirror-Breaker",
+            "oracle_text": "(As this Saga enters and after your draw step, add a lore counter.)\nI — Create a 2/2 red Goblin Shaman creature token with \"Whenever this token attacks, create a Treasure token.\"\nII — You may discard up to two cards. If you do, draw that many cards.\nIII — Exile this Saga, then return it to the battlefield transformed under your control.",
+            "power": null,
+            "toughness": null,
+            "type_line": "Enchantment — Saga"
+          },
+          {
+            "artist": "Joseph Meehan",
+            "color_indicator": [
+              "R"
+            ],
+            "colors": [
+              "R"
+            ],
+            "defense": null,
+            "flavor_text": "Blessed by Keiga, the Tide Star, Kiki-Jiki would one day master the art of duplication.",
+            "illustration_id": "15488154-8383-41af-9d38-1f3b8087b5b9",
+            "loyalty": null,
+            "mana_cost": "",
+            "name": "Reflection of Kiki-Jiki",
+            "oracle_text": "{1}, {T}: Create a token that's a copy of another target nonlegendary creature you control, except it has haste. Sacrifice it at the beginning of the next end step.",
+            "power": "2",
+            "toughness": "2",
+            "type_line": "Enchantment Creature — Goblin Shaman"
+          }
+        ],
+        "card_is_tags": [],
+        "card_keywords": [
+          "transform",
+          "treasure"
+        ],
+        "cardmarket_id": 607389,
+        "cmc": 3.0,
+        "collector_number": "141",
+        "color_identity": [
+          "R"
+        ],
+        "color_indicator": [],
+        "colors": [],
+        "digital": false,
+        "edhrec_rank": 1753,
+        "finishes": [
+          "nonfoil",
+          "foil"
+        ],
+        "flavor_text": "Blessed by Keiga, the Tide Star, Kiki-Jiki would one day master the art of duplication.",
+        "foil": true,
+        "frame": "2015",
+        "frame_effects": [
+          "fandfc",
+          "enchantment"
+        ],
+        "full_art": false,
+        "games": [
+          "paper",
+          "mtgo",
+          "arena"
+        ],
+        "highres_image": true,
+        "illustration_id": null,
+        "image_status": "highres_scan",
+        "image_updated_at": 1783923875,
+        "keywords": [
+          "Transform",
+          "Treasure"
+        ],
+        "lang": "en",
+        "layout": "transform",
+        "legalities": {
+          "alchemy": "not_legal",
+          "brawl": "legal",
+          "commander": "legal",
+          "competitivebrawl": "legal",
+          "duel": "legal",
+          "future": "not_legal",
+          "gladiator": "legal",
+          "historic": "legal",
+          "legacy": "legal",
+          "modern": "legal",
+          "oathbreaker": "legal",
+          "oldschool": "not_legal",
+          "pauper": "not_legal",
+          "paupercommander": "not_legal",
+          "penny": "not_legal",
+          "pioneer": "legal",
+          "predh": "not_legal",
+          "premodern": "not_legal",
+          "standard": "not_legal",
+          "standardbrawl": "not_legal",
+          "timeless": "legal",
+          "tlr": "legal",
+          "vintage": "legal"
+        },
+        "loyalty": null,
+        "mana_cost": null,
+        "mtgo_foil_id": null,
+        "mtgo_id": 97210,
+        "multiverse_ids": [
+          548443,
+          548444
+        ],
+        "name": "Fable of the Mirror-Breaker // Reflection of Kiki-Jiki",
+        "nonfoil": true,
+        "oracle_id": "c0957e5e-c71b-439c-931c-9f55d2f76ace",
+        "oracle_text": "(As this Saga enters and after your draw step, add a lore counter.)\nI — Create a 2/2 red Goblin Shaman creature token with \"Whenever this token attacks, create a Treasure token.\"\nII — You may discard up to two cards. If you do, draw that many cards.\nIII — Exile this Saga, then return it to the battlefield transformed under your control.",
+        "oversized": false,
+        "penny_rank": null,
+        "power": "2",
+        "price_eur": 8.51,
+        "price_eur_foil": 9.7,
+        "price_tix": 1.95,
+        "price_usd": 6.28,
+        "price_usd_etched": null,
+        "price_usd_foil": 6.72,
+        "produced_mana": [],
+        "promo": false,
+        "promo_types": [],
+        "rarity": "rare",
+        "released_at": "2022-02-18",
+        "reprint": false,
+        "scryfall_id": "24c0d87b-0049-4beb-b9cb-6f813b7aa7dc",
+        "security_stamp": "oval",
+        "set_code": "neo",
+        "set_id": "59a2059f-5482-433f-8761-eb2e17859b71",
+        "set_name": "Kamigawa: Neon Dynasty",
+        "set_type": "expansion",
+        "story_spotlight": false,
+        "tcgplayer_etched_id": null,
+        "tcgplayer_id": 262222,
+        "textless": false,
+        "toughness": "2",
+        "type_line": "Enchantment — Saga // Enchantment Creature — Goblin Shaman",
+        "variation": false,
+        "watermark": null
+      },
+      "expected": {
+        "object": "card",
+        "id": "24c0d87b-0049-4beb-b9cb-6f813b7aa7dc",
+        "oracle_id": "c0957e5e-c71b-439c-931c-9f55d2f76ace",
+        "multiverse_ids": [
+          548443,
+          548444
+        ],
+        "mtgo_id": 97210,
+        "arena_id": 79570,
+        "tcgplayer_id": 262222,
+        "cardmarket_id": 607389,
+        "name": "Fable of the Mirror-Breaker // Reflection of Kiki-Jiki",
+        "lang": "en",
+        "released_at": "2022-02-18",
+        "uri": "https://api.scryfall.com/cards/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc",
+        "scryfall_uri": "https://scryfall.com/card/neo/141/fable-of-the-mirror-breaker-reflection-of-kiki-jiki?utm_source=api",
+        "layout": "transform",
+        "highres_image": true,
+        "image_status": "highres_scan",
+        "image_updated_at": "2026-07-13T06:24:35Z",
+        "cmc": 3.0,
+        "type_line": "Enchantment — Saga // Enchantment Creature — Goblin Shaman",
+        "color_identity": [
+          "R"
+        ],
+        "keywords": [
+          "Transform",
+          "Treasure"
+        ],
+        "card_faces": [
+          {
+            "object": "card_face",
+            "name": "Fable of the Mirror-Breaker",
+            "mana_cost": "{2}{R}",
+            "type_line": "Enchantment — Saga",
+            "oracle_text": "(As this Saga enters and after your draw step, add a lore counter.)\nI — Create a 2/2 red Goblin Shaman creature token with \"Whenever this token attacks, create a Treasure token.\"\nII — You may discard up to two cards. If you do, draw that many cards.\nIII — Exile this Saga, then return it to the battlefield transformed under your control.",
+            "colors": [
+              "R"
+            ],
+            "artist": "Joseph Meehan",
+            "illustration_id": "85479010-4db6-4128-b357-e39064d50b84",
+            "image_uris": {
+              "small": "https://cards.scryfall.io/small/front/2/4/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc.jpg?1783923875",
+              "normal": "https://cards.scryfall.io/normal/front/2/4/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc.jpg?1783923875",
+              "large": "https://cards.scryfall.io/large/front/2/4/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc.jpg?1783923875",
+              "png": "https://cards.scryfall.io/png/front/2/4/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc.png?1783923875",
+              "art_crop": "https://cards.scryfall.io/art_crop/front/2/4/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc.jpg?1783923875",
+              "border_crop": "https://cards.scryfall.io/border_crop/front/2/4/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc.jpg?1783923875",
+              "thumb": "https://cards.scryfall.io/thumb/front/2/4/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc.webp?1783923875",
+              "grid": "https://cards.scryfall.io/grid/front/2/4/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc.webp?1783923875",
+              "display": "https://cards.scryfall.io/display/front/2/4/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc.webp?1783923875",
+              "art": "https://cards.scryfall.io/art/front/2/4/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc.webp?1783923875",
+              "crop": "https://cards.scryfall.io/crop/front/2/4/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc.webp?1783923875"
+            }
+          },
+          {
+            "object": "card_face",
+            "name": "Reflection of Kiki-Jiki",
+            "mana_cost": "",
+            "type_line": "Enchantment Creature — Goblin Shaman",
+            "oracle_text": "{1}, {T}: Create a token that's a copy of another target nonlegendary creature you control, except it has haste. Sacrifice it at the beginning of the next end step.",
+            "colors": [
+              "R"
+            ],
+            "color_indicator": [
+              "R"
+            ],
+            "power": "2",
+            "toughness": "2",
+            "flavor_text": "Blessed by Keiga, the Tide Star, Kiki-Jiki would one day master the art of duplication.",
+            "artist": "Joseph Meehan",
+            "illustration_id": "15488154-8383-41af-9d38-1f3b8087b5b9",
+            "image_uris": {
+              "small": "https://cards.scryfall.io/small/back/2/4/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc.jpg?1783923875",
+              "normal": "https://cards.scryfall.io/normal/back/2/4/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc.jpg?1783923875",
+              "large": "https://cards.scryfall.io/large/back/2/4/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc.jpg?1783923875",
+              "png": "https://cards.scryfall.io/png/back/2/4/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc.png?1783923875",
+              "art_crop": "https://cards.scryfall.io/art_crop/back/2/4/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc.jpg?1783923875",
+              "border_crop": "https://cards.scryfall.io/border_crop/back/2/4/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc.jpg?1783923875",
+              "thumb": "https://cards.scryfall.io/thumb/back/2/4/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc.webp?1783923875",
+              "grid": "https://cards.scryfall.io/grid/back/2/4/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc.webp?1783923875",
+              "display": "https://cards.scryfall.io/display/back/2/4/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc.webp?1783923875",
+              "art": "https://cards.scryfall.io/art/back/2/4/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc.webp?1783923875",
+              "crop": "https://cards.scryfall.io/crop/back/2/4/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc.webp?1783923875"
+            }
+          }
+        ],
+        "all_parts": [
+          {
+            "object": "related_card",
+            "id": "6911181d-573b-41eb-96a4-799c96e008fc",
+            "component": "token",
+            "name": "Treasure",
+            "type_line": "Token Artifact — Treasure",
+            "uri": "https://api.scryfall.com/cards/6911181d-573b-41eb-96a4-799c96e008fc"
+          },
+          {
+            "object": "related_card",
+            "id": "0d9461c3-f545-4efb-926e-759961db0495",
+            "component": "token",
+            "name": "Goblin Shaman",
+            "type_line": "Token Creature — Goblin Shaman",
+            "uri": "https://api.scryfall.com/cards/0d9461c3-f545-4efb-926e-759961db0495"
+          },
+          {
+            "object": "related_card",
+            "id": "f4e87a11-b3b1-47b2-bd73-f4c78d6fbe6c",
+            "component": "token",
+            "name": "Copy",
+            "type_line": "Token",
+            "uri": "https://api.scryfall.com/cards/f4e87a11-b3b1-47b2-bd73-f4c78d6fbe6c"
+          },
+          {
+            "object": "related_card",
+            "id": "6dee0388-a78d-4b3c-a0c5-25655e14115e",
+            "component": "combo_piece",
+            "name": "Fable of the Mirror-Breaker // Reflection of Kiki-Jiki",
+            "type_line": "Enchantment — Saga // Enchantment Creature — Goblin Shaman",
+            "uri": "https://api.scryfall.com/cards/6dee0388-a78d-4b3c-a0c5-25655e14115e"
+          }
+        ],
+        "legalities": {
+          "standard": "not_legal",
+          "future": "not_legal",
+          "historic": "legal",
+          "timeless": "legal",
+          "gladiator": "legal",
+          "pioneer": "legal",
+          "modern": "legal",
+          "legacy": "legal",
+          "pauper": "not_legal",
+          "vintage": "legal",
+          "penny": "not_legal",
+          "commander": "legal",
+          "oathbreaker": "legal",
+          "standardbrawl": "not_legal",
+          "brawl": "legal",
+          "competitivebrawl": "legal",
+          "alchemy": "not_legal",
+          "paupercommander": "not_legal",
+          "duel": "legal",
+          "oldschool": "not_legal",
+          "premodern": "not_legal",
+          "predh": "not_legal",
+          "tlr": "legal"
+        },
+        "games": [
+          "paper",
+          "mtgo",
+          "arena"
+        ],
+        "reserved": false,
+        "game_changer": false,
+        "foil": true,
+        "nonfoil": true,
+        "finishes": [
+          "nonfoil",
+          "foil"
+        ],
+        "oversized": false,
+        "promo": false,
+        "reprint": false,
+        "variation": false,
+        "set_id": "59a2059f-5482-433f-8761-eb2e17859b71",
+        "set": "neo",
+        "set_name": "Kamigawa: Neon Dynasty",
+        "set_type": "expansion",
+        "set_uri": "https://api.scryfall.com/sets/59a2059f-5482-433f-8761-eb2e17859b71",
+        "set_search_uri": "https://api.scryfall.com/cards/search?order=set&q=e%3Aneo&unique=prints",
+        "scryfall_set_uri": "https://scryfall.com/sets/neo?utm_source=api",
+        "rulings_uri": "https://api.scryfall.com/cards/24c0d87b-0049-4beb-b9cb-6f813b7aa7dc/rulings",
+        "prints_search_uri": "https://api.scryfall.com/cards/search?order=released&q=oracleid%3Ac0957e5e-c71b-439c-931c-9f55d2f76ace&unique=prints",
+        "collector_number": "141",
+        "digital": false,
+        "rarity": "rare",
+        "artist": "Joseph Meehan",
+        "border_color": "black",
+        "frame": "2015",
+        "frame_effects": [
+          "fandfc",
+          "enchantment"
+        ],
+        "security_stamp": "oval",
+        "full_art": false,
+        "textless": false,
+        "booster": true,
+        "story_spotlight": false,
+        "edhrec_rank": 1753,
+        "prices": {
+          "usd": "6.28",
+          "usd_foil": "6.72",
+          "usd_etched": null,
+          "eur": "8.51",
+          "eur_foil": "9.70",
+          "tix": "1.95"
+        },
+        "related_uris": {
+          "gatherer": "https://gatherer.wizards.com/Pages/Card/Details.aspx?multiverseid=548443&printed=false",
+          "tcgplayer_infinite_articles": "https://www.tcgplayer.com/search/articles?productLineName=magic&q=Fable+of+the+Mirror-Breaker+%2F%2F+Reflection+of+Kiki-Jiki",
+          "tcgplayer_infinite_decks": "https://www.tcgplayer.com/search/decks?productLineName=magic&q=Fable+of+the+Mirror-Breaker+%2F%2F+Reflection+of+Kiki-Jiki",
+          "edhrec": "https://edhrec.com/route/?cc=Fable+of+the+Mirror-Breaker"
+        },
+        "purchase_uris": {
+          "tcgplayer": "https://www.tcgplayer.com/product/262222?page=1",
+          "cardmarket": "https://www.cardmarket.com/en/Magic/Products?idProduct=607389",
+          "cardhoarder": "https://www.cardhoarder.com/cards/97210"
+        }
+      }
+    },
+    {
+      "case": "Bruna, the Fading Light inr/14: a meld part keeps its own card back",
+      "scryfall": {
+        "uri": "https://api.scryfall.com/cards/6fccdb60-5fce-4a6e-a709-b986f9a4b653",
+        "fetched": "2026-10-01",
+        "removed": [
+          "artist_ids",
+          "preview"
+        ]
+      },
+      "base_url": "https://api.scryfall.com",
+      "row": {
+        "all_parts": [
+          {
+            "component": "combo_piece",
+            "id": "cd8586f9-97e2-438d-b74f-1e53c811f314",
+            "name": "Eldritch Moon Checklist",
+            "object": "related_card",
+            "type_line": "Card"
+          },
+          {
+            "component": "meld_result",
+            "id": "7e926e19-553c-470a-afde-358541af5caa",
+            "name": "Brisela, Voice of Nightmares",
+            "object": "related_card",
+            "type_line": "Legendary Creature — Eldrazi Angel"
+          },
+          {
+            "component": "meld_part",
+            "id": "6fccdb60-5fce-4a6e-a709-b986f9a4b653",
+            "name": "Bruna, the Fading Light",
+            "object": "related_card",
+            "type_line": "Legendary Creature — Angel Horror"
+          },
+          {
+            "component": "meld_part",
+            "id": "04506bad-3856-4184-8dda-941ded60f41a",
+            "name": "Gisela, the Broken Blade",
+            "object": "related_card",
+            "type_line": "Legendary Creature — Angel Horror"
+          }
+        ],
+        "arena_id": null,
+        "artist": "Clint Cearley",
+        "booster": true,
+        "border_color": "black",
+        "card_back_id": "5353eb15-86a9-42fb-87e6-10d0b2fda365",
+        "card_faces": [],
+        "card_is_tags": [],
+        "card_keywords": [
+          "flying",
+          "vigilance"
+        ],
+        "cardmarket_id": 805025,
+        "cmc": 7.0,
+        "collector_number": "14",
+        "color_identity": [
+          "W"
+        ],
+        "color_indicator": [],
+        "colors": [
+          "W"
+        ],
+        "digital": false,
+        "edhrec_rank": 2432,
+        "finishes": [
+          "nonfoil",
+          "foil"
+        ],
+        "flavor_text": "She now sees only Emrakul's visions.",
+        "foil": true,
+        "frame": "2015",
+        "frame_effects": [
+          "legendary"
+        ],
+        "full_art": false,
+        "games": [
+          "paper",
+          "mtgo"
+        ],
+        "highres_image": true,
+        "illustration_id": "4c8cee4a-a9a4-42eb-9cbf-fcc6c6344d00",
+        "image_status": "highres_scan",
+        "image_updated_at": 1783908189,
+        "keywords": [
+          "Flying",
+          "Vigilance"
+        ],
+        "lang": "en",
+        "layout": "meld",
+        "legalities": {
+          "alchemy": "not_legal",
+          "brawl": "legal",
+          "commander": "legal",
+          "competitivebrawl": "legal",
+          "duel": "legal",
+          "future": "not_legal",
+          "gladiator": "legal",
+          "historic": "legal",
+          "legacy": "legal",
+          "modern": "legal",
+          "oathbreaker": "legal",
+          "oldschool": "not_legal",
+          "pauper": "not_legal",
+          "paupercommander": "not_legal",
+          "penny": "legal",
+          "pioneer": "legal",
+          "predh": "not_legal",
+          "premodern": "not_legal",
+          "standard": "not_legal",
+          "standardbrawl": "not_legal",
+          "timeless": "legal",
+          "tlr": "not_legal",
+          "vintage": "legal"
+        },
+        "loyalty": null,
+        "mana_cost": "{5}{W}{W}",
+        "mtgo_foil_id": null,
+        "mtgo_id": 135386,
+        "multiverse_ids": [
+          685830
+        ],
+        "name": "Bruna, the Fading Light",
+        "nonfoil": true,
+        "oracle_id": "bce7e45d-b2c5-43aa-91a6-3a3c24f30850",
+        "oracle_text": "When you cast this spell, you may return target Angel or Human creature card from your graveyard to the battlefield.\nFlying, vigilance\n(Melds with Gisela, the Broken Blade.)",
+        "oversized": false,
+        "penny_rank": 7441,
+        "power": "5",
+        "price_eur": 1.83,
+        "price_eur_foil": 2.79,
+        "price_tix": 0.03,
+        "price_usd": 3.92,
+        "price_usd_etched": null,
+        "price_usd_foil": 4.83,
+        "produced_mana": [],
+        "promo": false,
+        "promo_types": [],
+        "rarity": "rare",
+        "released_at": "2025-01-24",
+        "reprint": true,
+        "scryfall_id": "6fccdb60-5fce-4a6e-a709-b986f9a4b653",
+        "security_stamp": "oval",
+        "set_code": "inr",
+        "set_id": "b9618c8c-9f31-4b42-9798-2991893c27bf",
+        "set_name": "Innistrad Remastered",
+        "set_type": "masters",
+        "story_spotlight": false,
+        "tcgplayer_etched_id": null,
+        "tcgplayer_id": 609599,
+        "textless": false,
+        "toughness": "7",
+        "type_line": "Legendary Creature — Angel Horror",
+        "variation": false,
+        "watermark": null
+      },
+      "expected": {
+        "object": "card",
+        "id": "6fccdb60-5fce-4a6e-a709-b986f9a4b653",
+        "oracle_id": "bce7e45d-b2c5-43aa-91a6-3a3c24f30850",
+        "multiverse_ids": [
+          685830
+        ],
+        "mtgo_id": 135386,
+        "tcgplayer_id": 609599,
+        "cardmarket_id": 805025,
+        "name": "Bruna, the Fading Light",
+        "lang": "en",
+        "released_at": "2025-01-24",
+        "uri": "https://api.scryfall.com/cards/6fccdb60-5fce-4a6e-a709-b986f9a4b653",
+        "scryfall_uri": "https://scryfall.com/card/inr/14/bruna-the-fading-light?utm_source=api",
+        "layout": "meld",
+        "highres_image": true,
+        "image_status": "highres_scan",
+        "image_updated_at": "2026-07-13T02:03:09Z",
+        "image_uris": {
+          "small": "https://cards.scryfall.io/small/front/6/f/6fccdb60-5fce-4a6e-a709-b986f9a4b653.jpg?1783908189",
+          "normal": "https://cards.scryfall.io/normal/front/6/f/6fccdb60-5fce-4a6e-a709-b986f9a4b653.jpg?1783908189",
+          "large": "https://cards.scryfall.io/large/front/6/f/6fccdb60-5fce-4a6e-a709-b986f9a4b653.jpg?1783908189",
+          "png": "https://cards.scryfall.io/png/front/6/f/6fccdb60-5fce-4a6e-a709-b986f9a4b653.png?1783908189",
+          "art_crop": "https://cards.scryfall.io/art_crop/front/6/f/6fccdb60-5fce-4a6e-a709-b986f9a4b653.jpg?1783908189",
+          "border_crop": "https://cards.scryfall.io/border_crop/front/6/f/6fccdb60-5fce-4a6e-a709-b986f9a4b653.jpg?1783908189",
+          "thumb": "https://cards.scryfall.io/thumb/front/6/f/6fccdb60-5fce-4a6e-a709-b986f9a4b653.webp?1783908189",
+          "grid": "https://cards.scryfall.io/grid/front/6/f/6fccdb60-5fce-4a6e-a709-b986f9a4b653.webp?1783908189",
+          "display": "https://cards.scryfall.io/display/front/6/f/6fccdb60-5fce-4a6e-a709-b986f9a4b653.webp?1783908189",
+          "art": "https://cards.scryfall.io/art/front/6/f/6fccdb60-5fce-4a6e-a709-b986f9a4b653.webp?1783908189",
+          "crop": "https://cards.scryfall.io/crop/front/6/f/6fccdb60-5fce-4a6e-a709-b986f9a4b653.webp?1783908189"
+        },
+        "mana_cost": "{5}{W}{W}",
+        "cmc": 7.0,
+        "type_line": "Legendary Creature — Angel Horror",
+        "oracle_text": "When you cast this spell, you may return target Angel or Human creature card from your graveyard to the battlefield.\nFlying, vigilance\n(Melds with Gisela, the Broken Blade.)",
+        "power": "5",
+        "toughness": "7",
+        "colors": [
+          "W"
+        ],
+        "color_identity": [
+          "W"
+        ],
+        "keywords": [
+          "Flying",
+          "Vigilance"
+        ],
+        "all_parts": [
+          {
+            "object": "related_card",
+            "id": "cd8586f9-97e2-438d-b74f-1e53c811f314",
+            "component": "combo_piece",
+            "name": "Eldritch Moon Checklist",
+            "type_line": "Card",
+            "uri": "https://api.scryfall.com/cards/cd8586f9-97e2-438d-b74f-1e53c811f314"
+          },
+          {
+            "object": "related_card",
+            "id": "7e926e19-553c-470a-afde-358541af5caa",
+            "component": "meld_result",
+            "name": "Brisela, Voice of Nightmares",
+            "type_line": "Legendary Creature — Eldrazi Angel",
+            "uri": "https://api.scryfall.com/cards/7e926e19-553c-470a-afde-358541af5caa"
+          },
+          {
+            "object": "related_card",
+            "id": "6fccdb60-5fce-4a6e-a709-b986f9a4b653",
+            "component": "meld_part",
+            "name": "Bruna, the Fading Light",
+            "type_line": "Legendary Creature — Angel Horror",
+            "uri": "https://api.scryfall.com/cards/6fccdb60-5fce-4a6e-a709-b986f9a4b653"
+          },
+          {
+            "object": "related_card",
+            "id": "04506bad-3856-4184-8dda-941ded60f41a",
+            "component": "meld_part",
+            "name": "Gisela, the Broken Blade",
+            "type_line": "Legendary Creature — Angel Horror",
+            "uri": "https://api.scryfall.com/cards/04506bad-3856-4184-8dda-941ded60f41a"
+          }
+        ],
+        "legalities": {
+          "standard": "not_legal",
+          "future": "not_legal",
+          "historic": "legal",
+          "timeless": "legal",
+          "gladiator": "legal",
+          "pioneer": "legal",
+          "modern": "legal",
+          "legacy": "legal",
+          "pauper": "not_legal",
+          "vintage": "legal",
+          "penny": "legal",
+          "commander": "legal",
+          "oathbreaker": "legal",
+          "standardbrawl": "not_legal",
+          "brawl": "legal",
+          "competitivebrawl": "legal",
+          "alchemy": "not_legal",
+          "paupercommander": "not_legal",
+          "duel": "legal",
+          "oldschool": "not_legal",
+          "premodern": "not_legal",
+          "predh": "not_legal",
+          "tlr": "not_legal"
+        },
+        "games": [
+          "paper",
+          "mtgo"
+        ],
+        "reserved": false,
+        "game_changer": false,
+        "foil": true,
+        "nonfoil": true,
+        "finishes": [
+          "nonfoil",
+          "foil"
+        ],
+        "oversized": false,
+        "promo": false,
+        "reprint": true,
+        "variation": false,
+        "set_id": "b9618c8c-9f31-4b42-9798-2991893c27bf",
+        "set": "inr",
+        "set_name": "Innistrad Remastered",
+        "set_type": "masters",
+        "set_uri": "https://api.scryfall.com/sets/b9618c8c-9f31-4b42-9798-2991893c27bf",
+        "set_search_uri": "https://api.scryfall.com/cards/search?order=set&q=e%3Ainr&unique=prints",
+        "scryfall_set_uri": "https://scryfall.com/sets/inr?utm_source=api",
+        "rulings_uri": "https://api.scryfall.com/cards/6fccdb60-5fce-4a6e-a709-b986f9a4b653/rulings",
+        "prints_search_uri": "https://api.scryfall.com/cards/search?order=released&q=oracleid%3Abce7e45d-b2c5-43aa-91a6-3a3c24f30850&unique=prints",
+        "collector_number": "14",
+        "digital": false,
+        "rarity": "rare",
+        "flavor_text": "She now sees only Emrakul's visions.",
+        "card_back_id": "5353eb15-86a9-42fb-87e6-10d0b2fda365",
+        "artist": "Clint Cearley",
+        "illustration_id": "4c8cee4a-a9a4-42eb-9cbf-fcc6c6344d00",
+        "border_color": "black",
+        "frame": "2015",
+        "frame_effects": [
+          "legendary"
+        ],
+        "security_stamp": "oval",
+        "full_art": false,
+        "textless": false,
+        "booster": true,
+        "story_spotlight": false,
+        "edhrec_rank": 2432,
+        "penny_rank": 7441,
+        "prices": {
+          "usd": "3.92",
+          "usd_foil": "4.83",
+          "usd_etched": null,
+          "eur": "1.83",
+          "eur_foil": "2.79",
+          "tix": "0.03"
+        },
+        "related_uris": {
+          "gatherer": "https://gatherer.wizards.com/Pages/Card/Details.aspx?multiverseid=685830&printed=false",
+          "tcgplayer_infinite_articles": "https://www.tcgplayer.com/search/articles?productLineName=magic&q=Bruna%2C+the+Fading+Light",
+          "tcgplayer_infinite_decks": "https://www.tcgplayer.com/search/decks?productLineName=magic&q=Bruna%2C+the+Fading+Light",
+          "edhrec": "https://edhrec.com/route/?cc=Bruna%2C+the+Fading+Light"
+        },
+        "purchase_uris": {
+          "tcgplayer": "https://www.tcgplayer.com/product/609599?page=1",
+          "cardmarket": "https://www.cardmarket.com/en/Magic/Products?idProduct=805025",
+          "cardhoarder": "https://www.cardhoarder.com/cards/135386"
+        }
+      }
+    },
+    {
+      "case": "Burst Lightning pw26/20: promo_types in Scryfall's order, not sorted",
+      "scryfall": {
+        "uri": "https://api.scryfall.com/cards/4a2552ae-a1ef-4558-860f-7b1c0e749f9c",
+        "fetched": "2026-10-01",
+        "removed": [
+          "artist_ids"
+        ]
+      },
+      "base_url": "https://api.scryfall.com",
+      "row": {
+        "all_parts": [],
+        "arena_id": null,
+        "artist": "Néstor Ossandón Leal",
+        "booster": false,
+        "border_color": "black",
+        "card_back_id": null,
+        "card_faces": [],
+        "card_is_tags": [],
+        "card_keywords": [
+          "kicker"
+        ],
+        "cardmarket_id": null,
+        "cmc": 1.0,
+        "collector_number": "20",
+        "color_identity": [
+          "R"
+        ],
+        "color_indicator": [],
+        "colors": [
+          "R"
+        ],
+        "digital": false,
+        "edhrec_rank": 5312,
+        "finishes": [
+          "nonfoil",
+          "foil"
+        ],
+        "flavor_text": "Telepathy is a powerful gift, but it leaves Betazoids vulnerable to far more powerful psychic entities.",
+        "foil": true,
+        "frame": "2015",
+        "frame_effects": [
+          "extendedart"
+        ],
+        "full_art": false,
+        "games": [
+          "paper"
+        ],
+        "highres_image": true,
+        "illustration_id": "ec3a7445-7903-43ab-a62a-944f7a01e155",
+        "image_status": "highres_scan",
+        "image_updated_at": 1784652223,
+        "keywords": [
+          "Kicker"
+        ],
+        "lang": "en",
+        "layout": "normal",
+        "legalities": {
+          "alchemy": "legal",
+          "brawl": "legal",
+          "commander": "legal",
+          "competitivebrawl": "legal",
+          "duel": "legal",
+          "future": "legal",
+          "gladiator": "legal",
+          "historic": "legal",
+          "legacy": "legal",
+          "modern": "legal",
+          "oathbreaker": "legal",
+          "oldschool": "not_legal",
+          "pauper": "legal",
+          "paupercommander": "legal",
+          "penny": "legal",
+          "pioneer": "legal",
+          "predh": "legal",
+          "premodern": "not_legal",
+          "standard": "legal",
+          "standardbrawl": "legal",
+          "timeless": "legal",
+          "tlr": "legal",
+          "vintage": "legal"
+        },
+        "loyalty": null,
+        "mana_cost": "{R}",
+        "mtgo_foil_id": null,
+        "mtgo_id": null,
+        "multiverse_ids": [],
+        "name": "Burst Lightning",
+        "nonfoil": true,
+        "oracle_id": "ac2086fe-98ee-4280-9c7c-c5c2d6548a8b",
+        "oracle_text": "Kicker {4} (You may pay an additional {4} as you cast this spell.)\nBurst Lightning deals 2 damage to any target. If this spell was kicked, it deals 4 damage instead.",
+        "oversized": false,
+        "penny_rank": 31,
+        "power": null,
+        "price_eur": null,
+        "price_eur_foil": null,
+        "price_tix": null,
+        "price_usd": null,
+        "price_usd_etched": null,
+        "price_usd_foil": null,
+        "produced_mana": [],
+        "promo": true,
+        "promo_types": [
+          "playpromo",
+          "wizardsplaynetwork",
+          "standardshowdown",
+          "universesbeyond"
+        ],
+        "rarity": "rare",
+        "released_at": "2026-11-20",
+        "reprint": true,
+        "scryfall_id": "4a2552ae-a1ef-4558-860f-7b1c0e749f9c",
+        "security_stamp": "oval",
+        "set_code": "pw26",
+        "set_id": "6e547347-15c9-4756-b176-74ed3cd18fb2",
+        "set_name": "Wizards Play Network 2026",
+        "set_type": "promo",
+        "story_spotlight": false,
+        "tcgplayer_etched_id": null,
+        "tcgplayer_id": null,
+        "textless": false,
+        "toughness": null,
+        "type_line": "Instant",
+        "variation": false,
+        "watermark": null
+      },
+      "expected": {
+        "object": "card",
+        "id": "4a2552ae-a1ef-4558-860f-7b1c0e749f9c",
+        "oracle_id": "ac2086fe-98ee-4280-9c7c-c5c2d6548a8b",
+        "multiverse_ids": [],
+        "name": "Burst Lightning",
+        "lang": "en",
+        "released_at": "2026-11-20",
+        "uri": "https://api.scryfall.com/cards/4a2552ae-a1ef-4558-860f-7b1c0e749f9c",
+        "scryfall_uri": "https://scryfall.com/card/pw26/20/burst-lightning?utm_source=api",
+        "layout": "normal",
+        "highres_image": true,
+        "image_status": "highres_scan",
+        "image_updated_at": "2026-07-21T16:43:43Z",
+        "image_uris": {
+          "small": "https://cards.scryfall.io/small/front/4/a/4a2552ae-a1ef-4558-860f-7b1c0e749f9c.jpg?1784652223",
+          "normal": "https://cards.scryfall.io/normal/front/4/a/4a2552ae-a1ef-4558-860f-7b1c0e749f9c.jpg?1784652223",
+          "large": "https://cards.scryfall.io/large/front/4/a/4a2552ae-a1ef-4558-860f-7b1c0e749f9c.jpg?1784652223",
+          "png": "https://cards.scryfall.io/png/front/4/a/4a2552ae-a1ef-4558-860f-7b1c0e749f9c.png?1784652223",
+          "art_crop": "https://cards.scryfall.io/art_crop/front/4/a/4a2552ae-a1ef-4558-860f-7b1c0e749f9c.jpg?1784652223",
+          "border_crop": "https://cards.scryfall.io/border_crop/front/4/a/4a2552ae-a1ef-4558-860f-7b1c0e749f9c.jpg?1784652223",
+          "thumb": "https://cards.scryfall.io/thumb/front/4/a/4a2552ae-a1ef-4558-860f-7b1c0e749f9c.webp?1784652223",
+          "grid": "https://cards.scryfall.io/grid/front/4/a/4a2552ae-a1ef-4558-860f-7b1c0e749f9c.webp?1784652223",
+          "display": "https://cards.scryfall.io/display/front/4/a/4a2552ae-a1ef-4558-860f-7b1c0e749f9c.webp?1784652223",
+          "art": "https://cards.scryfall.io/art/front/4/a/4a2552ae-a1ef-4558-860f-7b1c0e749f9c.webp?1784652223",
+          "crop": "https://cards.scryfall.io/crop/front/4/a/4a2552ae-a1ef-4558-860f-7b1c0e749f9c.webp?1784652223"
+        },
+        "mana_cost": "{R}",
+        "cmc": 1.0,
+        "type_line": "Instant",
+        "oracle_text": "Kicker {4} (You may pay an additional {4} as you cast this spell.)\nBurst Lightning deals 2 damage to any target. If this spell was kicked, it deals 4 damage instead.",
+        "colors": [
+          "R"
+        ],
+        "color_identity": [
+          "R"
+        ],
+        "keywords": [
+          "Kicker"
+        ],
+        "legalities": {
+          "standard": "legal",
+          "future": "legal",
+          "historic": "legal",
+          "timeless": "legal",
+          "gladiator": "legal",
+          "pioneer": "legal",
+          "modern": "legal",
+          "legacy": "legal",
+          "pauper": "legal",
+          "vintage": "legal",
+          "penny": "legal",
+          "commander": "legal",
+          "oathbreaker": "legal",
+          "standardbrawl": "legal",
+          "brawl": "legal",
+          "competitivebrawl": "legal",
+          "alchemy": "legal",
+          "paupercommander": "legal",
+          "duel": "legal",
+          "oldschool": "not_legal",
+          "premodern": "not_legal",
+          "predh": "legal",
+          "tlr": "legal"
+        },
+        "games": [
+          "paper"
+        ],
+        "reserved": false,
+        "game_changer": false,
+        "foil": true,
+        "nonfoil": true,
+        "finishes": [
+          "nonfoil",
+          "foil"
+        ],
+        "oversized": false,
+        "promo": true,
+        "reprint": true,
+        "variation": false,
+        "set_id": "6e547347-15c9-4756-b176-74ed3cd18fb2",
+        "set": "pw26",
+        "set_name": "Wizards Play Network 2026",
+        "set_type": "promo",
+        "set_uri": "https://api.scryfall.com/sets/6e547347-15c9-4756-b176-74ed3cd18fb2",
+        "set_search_uri": "https://api.scryfall.com/cards/search?order=set&q=e%3Apw26&unique=prints",
+        "scryfall_set_uri": "https://scryfall.com/sets/pw26?utm_source=api",
+        "rulings_uri": "https://api.scryfall.com/cards/4a2552ae-a1ef-4558-860f-7b1c0e749f9c/rulings",
+        "prints_search_uri": "https://api.scryfall.com/cards/search?order=released&q=oracleid%3Aac2086fe-98ee-4280-9c7c-c5c2d6548a8b&unique=prints",
+        "collector_number": "20",
+        "digital": false,
+        "rarity": "rare",
+        "flavor_text": "Telepathy is a powerful gift, but it leaves Betazoids vulnerable to far more powerful psychic entities.",
+        "card_back_id": "0aeebaf5-8c7d-4636-9e82-8c27447861f7",
+        "artist": "Néstor Ossandón Leal",
+        "illustration_id": "ec3a7445-7903-43ab-a62a-944f7a01e155",
+        "border_color": "black",
+        "frame": "2015",
+        "frame_effects": [
+          "extendedart"
+        ],
+        "security_stamp": "oval",
+        "full_art": false,
+        "textless": false,
+        "booster": false,
+        "story_spotlight": false,
+        "promo_types": [
+          "playpromo",
+          "wizardsplaynetwork",
+          "standardshowdown",
+          "universesbeyond"
+        ],
+        "edhrec_rank": 5312,
+        "penny_rank": 31,
+        "prices": {
+          "usd": null,
+          "usd_foil": null,
+          "usd_etched": null,
+          "eur": null,
+          "eur_foil": null,
+          "tix": null
+        },
+        "related_uris": {
+          "tcgplayer_infinite_articles": "https://www.tcgplayer.com/search/articles?productLineName=magic&q=Burst+Lightning",
+          "tcgplayer_infinite_decks": "https://www.tcgplayer.com/search/decks?productLineName=magic&q=Burst+Lightning",
+          "edhrec": "https://edhrec.com/route/?cc=Burst+Lightning"
+        },
+        "purchase_uris": {
+          "tcgplayer": "https://www.tcgplayer.com/search/magic/product?productLineName=magic&q=Burst+Lightning&view=grid",
+          "cardmarket": "https://www.cardmarket.com/en/Magic/Products/Search?searchString=Burst+Lightning",
+          "cardhoarder": "https://www.cardhoarder.com/cards?data%5Bsearch%5D=Burst+Lightning"
+        }
+      }
     }
   ]
 }

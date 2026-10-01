@@ -82,7 +82,7 @@ _CARD_COLUMNS = (
     "card_color_identity, card_keywords, card_set_code, set_name, collector_number, "
     "card_rarity_int, flavor_text, card_artist AS artist, illustration_id, released_at, "
     "card_legalities, card_border, card_watermark, card_frame_data, card_is_tags, "
-    "card_compat_blob, card_faces"
+    "card_compat_blob, card_faces, produced_mana"
 )
 
 # ------------------------------------------------------------------ the by-name key rule

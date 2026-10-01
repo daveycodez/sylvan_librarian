@@ -213,6 +213,7 @@ fn stub_card(oracle_id: u128, card_types: u16, subtypes: &[&str], vocab: &mut Vo
         card_colors: 0,
         card_color_identity: 0,
         produced_mana: 0,
+        color_indicator: 0,
         card_types,
         legality_divergent: false,
         oracle_id,

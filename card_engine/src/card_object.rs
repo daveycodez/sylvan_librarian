@@ -959,6 +959,12 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     if !two_image {
         write_key(out, &mut first, "colors");
         write_colors(out, list_of(row, "colors"));
+        // The CARD's indicator, only when it has one (Dryad Arbor's `["G"]`); a two-image
+        // layout's indicators are its faces'.
+        if let Some(indicator) = list_of(row, "color_indicator").filter(|a| !a.is_empty()) {
+            write_key(out, &mut first, "color_indicator");
+            write_colors(out, Some(indicator));
+        }
     }
     write_key(out, &mut first, "color_identity");
     write_colors(out, list_of(row, "color_identity"));
@@ -966,6 +972,12 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     // list, the SQL lane's residue), the lowercased search set otherwise -- see
     // `OracleCard.card_keywords_printed`.
     write_list(out, &mut first, "keywords", list_of(row, "keywords").or_else(|| list_of(row, "card_keywords")));
+    // The mana the card can make, on every layout and only when it makes any: Command Tower's
+    // `["B","G","R","U","W"]`, and the land half of a modal_dfc (Akoum Warrior znr/134, `["R"]`).
+    if let Some(mana) = list_of(row, "produced_mana").filter(|a| !a.is_empty()) {
+        write_key(out, &mut first, "produced_mana");
+        write_colors(out, Some(mana));
+    }
     if let Some(faces) = faces {
         write_key(out, &mut first, "card_faces");
         // A two-image printing Scryfall has no scan of carries NO face images: all 162
@@ -1041,7 +1053,9 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     // face there, and Scryfall omits the top-level keys entirely.
     if !two_image {
         write_key(out, &mut first, "card_back_id");
-        write_json_str(out, CARD_BACK_ID);
+        // The shared back unless the row names another: a meld part's back is half of the melded
+        // card (Bruna, the Fading Light inr/14).
+        write_json_str(out, str_of(row, "card_back_id").unwrap_or(CARD_BACK_ID));
     }
     write_str_or_null(out, &mut first, "artist", present_str_of(row, "artist"));
     // OMITTED, never null, when the printing has none: 731 printings of the 2026-05-31
@@ -1413,6 +1427,37 @@ mod tests {
         // A card with no keywords says so with an empty list, from either key.
         let none = build(json!({"name": "Grizzly Bears", "scryfall_id": "cd000000-0000-0000-0000-0000000000d2", "keywords": []}));
         assert_eq!(none["keywords"], json!([]));
+    }
+
+    /// A meld part keeps its own card back; everything else gets the shared one.
+    #[test]
+    fn a_meld_part_keeps_its_own_card_back() {
+        let bruna = build(json!({"name": "Bruna, the Fading Light", "scryfall_id": "cd000000-0000-0000-0000-0000000000f1",
+            "layout": "meld", "card_back_id": "5353eb15-86a9-42fb-87e6-10d0b2fda365"}));
+        assert_eq!(bruna["card_back_id"], "5353eb15-86a9-42fb-87e6-10d0b2fda365");
+        let plain = build(json!({"name": "x", "scryfall_id": "cd000000-0000-0000-0000-0000000000f2", "card_back_id": null}));
+        assert_eq!(plain["card_back_id"], CARD_BACK_ID);
+    }
+
+    /// `color_indicator` after `colors` and `produced_mana` after `keywords`, both alphabetical
+    /// and both only when the card has one -- Dryad Arbor dsc/273 carries both.
+    #[test]
+    fn the_card_level_indicator_and_produced_mana_take_scryfalls_positions() {
+        let text = write(json!({
+            "name": "Dryad Arbor", "scryfall_id": "cd000000-0000-0000-0000-0000000000e1",
+            "colors": ["G"], "color_indicator": ["G"], "color_identity": ["G"],
+            "produced_mana": ["W", "B", "G", "C"],
+        }));
+        assert!(text.contains(r#""colors":["G"],"color_indicator":["G"],"color_identity":["G"],"keywords":[],"produced_mana":["B","C","G","W"],"#), "{text}");
+        let plain = build(json!({"name": "Grizzly Bears", "scryfall_id": "cd000000-0000-0000-0000-0000000000e2",
+            "color_indicator": [], "produced_mana": []}));
+        assert!(plain.get("color_indicator").is_none() && plain.get("produced_mana").is_none());
+        // A two-image layout keeps indicators on its faces and still reports what it produces.
+        let mdfc = build(json!({"name": "a // b", "scryfall_id": "cd000000-0000-0000-0000-0000000000e3",
+            "layout": "modal_dfc", "color_indicator": ["R"], "produced_mana": ["R"],
+            "card_faces": [{"name": "a"}, {"name": "b"}]}));
+        assert!(mdfc.get("color_indicator").is_none());
+        assert_eq!(mdfc["produced_mana"], json!(["R"]));
     }
 
     /// EDHREC files most multi-face cards under the FRONT face and split-likes under both halves.
@@ -2031,7 +2076,7 @@ mod tests {
     /// that never meet. A shared fixture is what makes each job fail on its own drift.
     ///
     /// Key ORDER included, at every level: the written bytes must equal the fixture's `expected`
-    /// minified in the fixture's own order, which the Python side asserts too. Fourteen of the cases
+    /// minified in the fixture's own order, which the Python side asserts too. Nineteen of the cases
     /// are api.scryfall.com's own objects (see the fixture's `_comment`), so the order both
     /// writers are held to is Scryfall's rather than either writer's.
     #[test]

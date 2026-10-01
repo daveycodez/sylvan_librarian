@@ -210,6 +210,12 @@ _COMPAT_BLOB_EXCLUDED = frozenset(
 )  # fmt: skip
 
 
+# The card back nearly every printing shares. `card_back_id` is derived on read for those (it is
+# in _COMPAT_BLOB_EXCLUDED), so only a DIFFERENT back is worth storing: a meld part's back is half
+# of the melded card (Bruna, the Fading Light inr/14: 5353eb15-...), and Scryfall says so.
+_SHARED_CARD_BACK_ID = "0aeebaf5-8c7d-4636-9e82-8c27447861f7"
+
+
 def _compat_blob(card: dict[str, Any]) -> dict[str, Any]:
     """The Scryfall keys that no column holds and no derivation recovers.
 
@@ -219,7 +225,10 @@ def _compat_blob(card: dict[str, Any]) -> dict[str, Any]:
     Returns:
         The residue, ready to store as card_compat_blob.
     """
-    return {key: value for key, value in card.items() if key not in _COMPAT_BLOB_EXCLUDED}
+    blob = {key: value for key, value in card.items() if key not in _COMPAT_BLOB_EXCLUDED}
+    if card.get("card_back_id") not in (None, _SHARED_CARD_BACK_ID):
+        blob["card_back_id"] = card["card_back_id"]
+    return blob
 
 
 def _merge_processed_faces(faces: list[dict[str, Any]]) -> dict[str, Any]:
@@ -357,6 +366,13 @@ def preprocess_card(card: dict[str, Any]) -> list[dict[str, Any]]:  # noqa: PLR0
         merged_row["card_compat_blob"] = _compat_blob(card)
         merged_row["flavor_name"] = card.get("flavor_name")
         merged_row["flavor_name_folded"] = _fold_name(merged_row["flavor_name"])
+        # The CARD's artist credit, not the front face's. Each face row is `card | face`, so the
+        # merged row carried face 0's `artist` -- "David Martin" for Fire // Ice dmr/215, whose
+        # card-level credit on Scryfall is "David Martin & Franz Vohwinkel". The card object's
+        # `artist` reads this column, and so does `artist:`, which is a substring match: the joined
+        # credit answers for either name where the front face's answered for one.
+        if card.get("artist"):
+            merged_row["card_artist"] = card["artist"]
         return [merged_row]
 
     # Single face case - set defaults
