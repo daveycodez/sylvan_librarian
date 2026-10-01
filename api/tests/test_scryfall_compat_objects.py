@@ -368,7 +368,7 @@ class TestScryfallKeyOrderAndKeys:
     """api.scryfall.com's key order at every level, and the keys it sends that this used to drop.
 
     The sequences are read off Scryfall's own objects (2026-09-26), never off either writer; the
-    parity fixture holds thirteen of those objects whole. `card_object.rs` asserts the same cases.
+    parity fixture holds fourteen of those objects whole. `card_object.rs` asserts the same cases.
     """
 
     # Lightning Bolt msc/806's top level as api.scryfall.com served it, minus the three keys this
@@ -566,6 +566,24 @@ class TestScryfallKeyOrderAndKeys:
         assert to_scryfall_card(row(illustration_id="22222222-0000-0000-0000-000000000002"))["illustration_id"] == (
             "22222222-0000-0000-0000-000000000002"
         )
+
+    def test_keywords_are_scryfalls_list_as_sent(self):
+        """Vadrok iko/214: printed casing and order from `keywords`, the lowercased search set only as a fallback."""
+        folded = ["first strike", "flying", "mutate"]
+        printed = ["Flying", "Mutate", "First strike"]
+        assert to_scryfall_card(row(card_keywords=folded, keywords=printed))["keywords"] == printed
+        assert to_scryfall_card(row(card_keywords=folded))["keywords"] == folded
+        assert to_scryfall_card(row(card_keywords=[], keywords=[]))["keywords"] == []
+
+    def test_the_sql_lane_reads_the_printed_keywords_from_the_residue(self):
+        """The residue flattens onto the row, so `keywords` arrives beside the lowercased column."""
+        sql_row = {
+            "scryfall_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "card_name": "Vadrok, Apex of Thunder",
+            "card_keywords": {"first strike": True, "flying": True, "mutate": True},
+            "card_compat_blob": {"keywords": ["Flying", "Mutate", "First strike"]},
+        }
+        assert to_scryfall_card(sql_row_to_engine_row(sql_row))["keywords"] == ["Flying", "Mutate", "First strike"]
 
     def test_colour_arrays_are_alphabetical_not_wubrg(self):
         """The engine hands colours over WUBRG (a tuple, for `color_identity`); Scryfall sends the alphabet."""
@@ -860,7 +878,7 @@ class TestCardObjectParityWithTheRustBuilder:
     never meet. A shared fixture is what makes each job fail on its own drift.
 
     Key ORDER included, at every level: `json` keeps the fixture's order, and the compact bytes
-    must match. Thirteen of the cases are api.scryfall.com's own objects (see the fixture's
+    must match. Fourteen of the cases are api.scryfall.com's own objects (see the fixture's
     `_comment`), so the order both writers are held to is Scryfall's rather than either writer's.
     """
 

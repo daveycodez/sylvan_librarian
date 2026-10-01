@@ -340,6 +340,15 @@ class TestCardProcessing:
             "flying": True,
         }
 
+    def test_the_compat_blob_keeps_the_keywords_as_scryfall_sent_them(self) -> None:
+        """The column is the lowercased search set; the card object needs the casing and the order."""
+        printed = ["Flying", "Mutate", "First strike"]
+
+        result = preprocess_card(create_test_card(keywords=list(printed)))[0]
+
+        assert result["card_compat_blob"]["keywords"] == printed
+        assert list(result["card_keywords"]) == ["flying", "mutate", "first strike"]
+
     def test_preprocess_card_handles_missing_fields(self) -> None:
         """Test preprocess_card handles missing optional fields."""
         minimal_card = create_test_card(

@@ -55,7 +55,7 @@ MAX_AUTOCOMPLETE_VALUES = 20
 # lookup, so the engine emits exactly this and nothing is fetched that is never read.
 CARD_OBJECT_FIELDS = (
     "name", "scryfall_id", "oracle_id", "layout", "mana_cost", "cmc", "type_line", "oracle_text",
-    "power", "toughness", "loyalty", "colors", "color_identity", "card_keywords", "set_code", "set_name",
+    "power", "toughness", "loyalty", "colors", "color_identity", "card_keywords", "keywords", "set_code", "set_name",
     "collector_number", "rarity", "flavor_text", "artist", "illustration_id", "released_at",
     "legalities", "edhrec_rank", "price_usd", "price_eur", "price_tix", "watermark",
     "card_frame_data", "card_is_tags", "border_color", "frame",
@@ -673,7 +673,11 @@ def to_scryfall_card(row: dict[str, Any], *, base_url: str = "https://api.scryfa
     # Colour arrays are ALPHABETICAL on Scryfall (`["R","U","W"]` on Vadrok iko/214), where the
     # engine decodes its bitmask WUBRG and `/search` keeps that order. The SQL lane sorted already.
     card["color_identity"] = sorted(row.get("color_identity") or [])
-    card["keywords"] = row.get("card_keywords") or []
+    # Scryfall's own casing and order when the row carries them -- `keywords` is the engine's
+    # printed list and, on the SQL lane, the residue's -- and the lowercased search set otherwise
+    # (a row imported before the residue kept the list).
+    keywords = row.get("keywords")
+    card["keywords"] = list(keywords) if keywords is not None else row.get("card_keywords") or []
     if faces:
         card["card_faces"] = faces
     if row.get("all_parts"):

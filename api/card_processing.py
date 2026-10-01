@@ -186,11 +186,15 @@ def _fold_name(value: str | None) -> str | None:
 # `prices` is deliberately absent from this set even though price_usd/eur/tix are columns --
 # usd_foil, usd_etched and eur_foil are not, and keeping the object whole costs a few bytes against
 # losing three fields.
+#
+# `keywords` is absent too, though `card_keywords` is a column: the column is the SEARCH set,
+# lowercased and (being a jsonb object) unordered, and Scryfall's casing and order come back from
+# neither -- "First strike", and ["Flying", "Mutate", "First strike"] on Vadrok iko/214.
 _COMPAT_BLOB_EXCLUDED = frozenset(
     {
         # stored in a column of their own
         "id", "oracle_id", "name", "released_at", "layout", "mana_cost", "cmc", "type_line",
-        "oracle_text", "power", "toughness", "loyalty", "colors", "color_identity", "keywords",
+        "oracle_text", "power", "toughness", "loyalty", "colors", "color_identity",
         "set", "set_name", "collector_number", "rarity", "flavor_text", "artist",
         "illustration_id", "border_color", "edhrec_rank", "legalities", "produced_mana",
         "watermark", "reserved", "game_changer", "frame",

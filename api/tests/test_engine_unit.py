@@ -1399,6 +1399,34 @@ class TestFieldSelection:
         _, cards = _run(e, fields=["price_usd_foil", "price_usd_etched", "price_eur_foil"])
         assert cards[0] == {"price_usd_foil": 0.73, "price_usd_etched": None, "price_eur_foil": 0.87}
 
+    def test_keywords_emit_as_printed_and_search_folded(self, fresh_engine: Callable[[], QueryEngine]) -> None:
+        """`keywords` is Scryfall's list as sent; `keyword:` keeps matching the lowercased set.
+
+        Vadrok iko/214 sends `["Flying", "Mutate", "First strike"]`. The importer lowercases
+        `card_keywords` so search reaches "first strike", and a jsonb object keeps no order, so
+        the card object answered `["first strike", "flying", "mutate"]`. The printed list rides in
+        `card_compat_blob`, which ENGINE_COLUMNS already selects.
+        """
+        printed = ["Flying", "Mutate", "First strike"]
+        base = json.loads(_FIXTURE.read_text())[0]
+        card = base | {
+            "card_keywords": {"first strike": True, "flying": True, "mutate": True},
+            "card_compat_blob": {"keywords": printed},
+        }
+        e = fresh_engine()
+        e.reload([{column: card.get(column) for column in ENGINE_COLUMNS}])
+        _, cards = _run(e, "keyword:flying", fields=["keywords", "card_keywords"])
+        assert cards[0]["keywords"] == printed
+        assert list(cards[0]["card_keywords"]) == ["first strike", "flying", "mutate"], "the search set is untouched"
+        for query in ('keyword:"first strike"', 'keyword:"First Strike"', "keyword:MUTATE"):
+            assert _run(e, query)[0] == 1, query
+        assert _run(e, "keyword:Flyin")[0] == _run(e, "keyword:flyin")[0]
+
+        # A row whose residue carries no list falls back to the search set rather than to nothing.
+        older = fresh_engine()
+        older.reload([{column: (card | {"card_compat_blob": {}}).get(column) for column in ENGINE_COLUMNS}])
+        assert _run(older, fields=["keywords"])[1][0]["keywords"] == ["first strike", "flying", "mutate"]
+
     def test_engine_columns_feed_every_key_the_loader_reads(self, fresh_engine: Callable[[], QueryEngine]) -> None:
         """A reload from rows projected to exactly ENGINE_COLUMNS still answers `loyalty`.
 

@@ -962,7 +962,10 @@ pub fn write_scryfall_card(out: &mut Vec<u8>, row: &Map<String, Value>, base_url
     }
     write_key(out, &mut first, "color_identity");
     write_colors(out, list_of(row, "color_identity"));
-    write_list(out, &mut first, "keywords", list_of(row, "card_keywords"));
+    // Scryfall's own casing and order when the row carries them (`keywords`: the engine's printed
+    // list, the SQL lane's residue), the lowercased search set otherwise -- see
+    // `OracleCard.card_keywords_printed`.
+    write_list(out, &mut first, "keywords", list_of(row, "keywords").or_else(|| list_of(row, "card_keywords")));
     if let Some(faces) = faces {
         write_key(out, &mut first, "card_faces");
         // A two-image printing Scryfall has no scan of carries NO face images: all 162
@@ -1388,6 +1391,28 @@ mod tests {
         assert_eq!(faced["card_faces"][0]["colors"], json!(["R", "U"]));
         assert_eq!(faced["card_faces"][0]["color_indicator"], json!(["G", "W"]));
         assert_eq!(faced["card_faces"][1]["colors"], json!([]));
+    }
+
+    /// `keywords` is Scryfall's list as sent -- Vadrok iko/214's `["Flying","Mutate","First strike"]`
+    /// -- not the lowercased, sorted search set beside it; a row without one falls back to the set.
+    #[test]
+    fn keywords_are_written_as_printed() {
+        let card = build(json!({
+            "name": "Vadrok, Apex of Thunder",
+            "scryfall_id": "cd000000-0000-0000-0000-0000000000d1",
+            "card_keywords": ["first strike", "flying", "mutate"],
+            "keywords": ["Flying", "Mutate", "First strike"],
+        }));
+        assert_eq!(card["keywords"], json!(["Flying", "Mutate", "First strike"]));
+        let fallback = build(json!({
+            "name": "Vadrok, Apex of Thunder",
+            "scryfall_id": "cd000000-0000-0000-0000-0000000000d1",
+            "card_keywords": ["first strike", "flying", "mutate"],
+        }));
+        assert_eq!(fallback["keywords"], json!(["first strike", "flying", "mutate"]));
+        // A card with no keywords says so with an empty list, from either key.
+        let none = build(json!({"name": "Grizzly Bears", "scryfall_id": "cd000000-0000-0000-0000-0000000000d2", "keywords": []}));
+        assert_eq!(none["keywords"], json!([]));
     }
 
     /// EDHREC files most multi-face cards under the FRONT face and split-likes under both halves.
@@ -2006,7 +2031,7 @@ mod tests {
     /// that never meet. A shared fixture is what makes each job fail on its own drift.
     ///
     /// Key ORDER included, at every level: the written bytes must equal the fixture's `expected`
-    /// minified in the fixture's own order, which the Python side asserts too. Thirteen of the cases
+    /// minified in the fixture's own order, which the Python side asserts too. Fourteen of the cases
     /// are api.scryfall.com's own objects (see the fixture's `_comment`), so the order both
     /// writers are held to is Scryfall's rather than either writer's.
     #[test]

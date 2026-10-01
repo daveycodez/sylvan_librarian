@@ -220,6 +220,7 @@ fn stub_card(oracle_id: u128, card_types: u16, subtypes: &[&str], vocab: &mut Vo
         oracle_text_id: NONE_STR,
         oracle_text_lower_id: NONE_STR,
         card_layout_id: NONE_STR,
+        card_keywords_printed: Vec::new(),
         mana_cost_text_id: NONE_STR,
         type_line_id: NONE_STR,
         cmc: None,

@@ -26,11 +26,12 @@ ALTER TABLE magic.cards ADD COLUMN IF NOT EXISTS card_faces jsonb;
 --
 -- `prices` is deliberately NOT removed even though price_usd/eur/tix are stored: usd_foil,
 -- usd_etched and eur_foil are not, and keeping the object whole costs a few bytes against losing
--- three fields.
+-- three fields. `keywords` stays for the same kind of reason: card_keywords is the lowercased,
+-- unordered search set, and Scryfall's casing and order ("First strike") come back from neither.
 UPDATE magic.cards
 SET card_compat_blob = raw_card_blob - ARRAY[
         'id', 'oracle_id', 'name', 'released_at', 'layout', 'mana_cost', 'cmc', 'type_line',
-        'oracle_text', 'power', 'toughness', 'loyalty', 'colors', 'color_identity', 'keywords',
+        'oracle_text', 'power', 'toughness', 'loyalty', 'colors', 'color_identity',
         'set', 'set_name', 'collector_number', 'rarity', 'flavor_text', 'artist',
         'illustration_id', 'border_color', 'edhrec_rank', 'legalities', 'produced_mana',
         'watermark', 'reserved', 'game_changer', 'frame',

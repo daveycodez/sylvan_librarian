@@ -28,6 +28,10 @@
     "with '\\n//\\n', the stats of the first face that has any), which is what makes them cases: the",
     "top-level value Scryfall sends is the front face's, not the row's.",
     "",
+    "Vadrok iko/214 is the case whose `row` is shaped as the ENGINE emits it rather than as Scryfall",
+    "sends it: colours in WUBRG order, the lowercased `card_keywords` search set beside the printed",
+    "`keywords` list. Both writers must turn that into Scryfall's bytes.",
+    "",
     "To add a case: add the row, run both suites, and paste the object they agree on. If they do",
     "not agree, that is the bug this file exists to find."
   ],
@@ -4940,6 +4944,284 @@
           "tcgplayer": "https://www.tcgplayer.com/product/632805?page=1",
           "cardmarket": "https://www.cardmarket.com/en/Magic/Products/Search?searchString=Potatoes",
           "cardhoarder": "https://www.cardhoarder.com/cards?data%5Bsearch%5D=Potatoes"
+        }
+      }
+    },
+    {
+      "case": "Vadrok iko/214: keywords in Scryfall's casing and order, and colours in the alphabet's, from a row holding the search set and WUBRG",
+      "scryfall": {
+        "uri": "https://api.scryfall.com/cards/ed7b0256-d342-4523-9516-6a007bf51825",
+        "fetched": "2026-10-01",
+        "removed": [
+          "artist_ids",
+          "preview"
+        ],
+        "note": [
+          "row carries what the engine emits: `colors` and `color_identity` WUBRG, `card_keywords` the lowercased search set, `keywords` the printed list, `image_updated_at` the epoch parsed from Scryfall's string"
+        ]
+      },
+      "base_url": "https://api.scryfall.com",
+      "row": {
+        "all_parts": [],
+        "arena_id": 71281,
+        "artist": "Zack Stella",
+        "booster": true,
+        "border_color": "black",
+        "card_faces": [],
+        "card_is_tags": [],
+        "card_keywords": [
+          "first strike",
+          "flying",
+          "mutate"
+        ],
+        "cardmarket_id": 451048,
+        "cmc": 3.0,
+        "collector_number": "214",
+        "color_identity": [
+          "W",
+          "U",
+          "R"
+        ],
+        "colors": [
+          "W",
+          "U",
+          "R"
+        ],
+        "digital": false,
+        "edhrec_rank": 13489,
+        "finishes": [
+          "nonfoil",
+          "foil"
+        ],
+        "flavor_text": null,
+        "foil": true,
+        "frame": "2015",
+        "frame_effects": [
+          "legendary"
+        ],
+        "full_art": false,
+        "games": [
+          "arena",
+          "paper",
+          "mtgo"
+        ],
+        "highres_image": true,
+        "illustration_id": "eeefd1aa-4caa-49af-ba8f-17261b2cf666",
+        "image_status": "highres_scan",
+        "image_updated_at": 1783931014,
+        "keywords": [
+          "Flying",
+          "Mutate",
+          "First strike"
+        ],
+        "lang": "en",
+        "layout": "mutate",
+        "legalities": {
+          "alchemy": "not_legal",
+          "brawl": "legal",
+          "commander": "legal",
+          "competitivebrawl": "legal",
+          "duel": "legal",
+          "future": "not_legal",
+          "gladiator": "legal",
+          "historic": "legal",
+          "legacy": "legal",
+          "modern": "legal",
+          "oathbreaker": "legal",
+          "oldschool": "not_legal",
+          "pauper": "not_legal",
+          "paupercommander": "not_legal",
+          "penny": "legal",
+          "pioneer": "legal",
+          "predh": "not_legal",
+          "premodern": "not_legal",
+          "standard": "not_legal",
+          "standardbrawl": "not_legal",
+          "timeless": "legal",
+          "tlr": "legal",
+          "vintage": "legal"
+        },
+        "loyalty": null,
+        "mana_cost": "{U}{R}{W}",
+        "mtgo_foil_id": null,
+        "mtgo_id": 80437,
+        "multiverse_ids": [
+          479734
+        ],
+        "name": "Vadrok, Apex of Thunder",
+        "nonfoil": true,
+        "oracle_id": "775c41fa-2316-43c9-af34-ac9c9b0db7e2",
+        "oracle_text": "Mutate {1}{W/U}{R}{R} (If you cast this spell for its mutate cost, put it over or under target non-Human creature you own. They mutate into the creature on top plus all abilities from under it.)\nFlying, first strike\nWhenever this creature mutates, you may cast target noncreature card with mana value 3 or less from your graveyard without paying its mana cost.",
+        "oversized": false,
+        "penny_rank": 9822,
+        "power": "3",
+        "price_eur": 0.61,
+        "price_eur_foil": 0.87,
+        "price_tix": 0.02,
+        "price_usd": 0.62,
+        "price_usd_etched": null,
+        "price_usd_foil": 0.73,
+        "promo": false,
+        "promo_types": [],
+        "rarity": "mythic",
+        "released_at": "2020-04-24",
+        "reprint": false,
+        "scryfall_id": "ed7b0256-d342-4523-9516-6a007bf51825",
+        "security_stamp": "oval",
+        "set_code": "iko",
+        "set_id": "19feda43-15ab-427e-a0e4-148a4bf2b03a",
+        "set_name": "Ikoria: Lair of Behemoths",
+        "set_type": "expansion",
+        "story_spotlight": false,
+        "tcgplayer_etched_id": null,
+        "tcgplayer_id": 212016,
+        "textless": false,
+        "toughness": "3",
+        "type_line": "Legendary Creature — Elemental Dinosaur Cat",
+        "variation": false,
+        "watermark": null
+      },
+      "expected": {
+        "object": "card",
+        "id": "ed7b0256-d342-4523-9516-6a007bf51825",
+        "oracle_id": "775c41fa-2316-43c9-af34-ac9c9b0db7e2",
+        "multiverse_ids": [
+          479734
+        ],
+        "mtgo_id": 80437,
+        "arena_id": 71281,
+        "tcgplayer_id": 212016,
+        "cardmarket_id": 451048,
+        "name": "Vadrok, Apex of Thunder",
+        "lang": "en",
+        "released_at": "2020-04-24",
+        "uri": "https://api.scryfall.com/cards/ed7b0256-d342-4523-9516-6a007bf51825",
+        "scryfall_uri": "https://scryfall.com/card/iko/214/vadrok-apex-of-thunder?utm_source=api",
+        "layout": "mutate",
+        "highres_image": true,
+        "image_status": "highres_scan",
+        "image_updated_at": "2026-07-13T08:23:34Z",
+        "image_uris": {
+          "small": "https://cards.scryfall.io/small/front/e/d/ed7b0256-d342-4523-9516-6a007bf51825.jpg?1783931014",
+          "normal": "https://cards.scryfall.io/normal/front/e/d/ed7b0256-d342-4523-9516-6a007bf51825.jpg?1783931014",
+          "large": "https://cards.scryfall.io/large/front/e/d/ed7b0256-d342-4523-9516-6a007bf51825.jpg?1783931014",
+          "png": "https://cards.scryfall.io/png/front/e/d/ed7b0256-d342-4523-9516-6a007bf51825.png?1783931014",
+          "art_crop": "https://cards.scryfall.io/art_crop/front/e/d/ed7b0256-d342-4523-9516-6a007bf51825.jpg?1783931014",
+          "border_crop": "https://cards.scryfall.io/border_crop/front/e/d/ed7b0256-d342-4523-9516-6a007bf51825.jpg?1783931014",
+          "thumb": "https://cards.scryfall.io/thumb/front/e/d/ed7b0256-d342-4523-9516-6a007bf51825.webp?1783931014",
+          "grid": "https://cards.scryfall.io/grid/front/e/d/ed7b0256-d342-4523-9516-6a007bf51825.webp?1783931014",
+          "display": "https://cards.scryfall.io/display/front/e/d/ed7b0256-d342-4523-9516-6a007bf51825.webp?1783931014",
+          "art": "https://cards.scryfall.io/art/front/e/d/ed7b0256-d342-4523-9516-6a007bf51825.webp?1783931014",
+          "crop": "https://cards.scryfall.io/crop/front/e/d/ed7b0256-d342-4523-9516-6a007bf51825.webp?1783931014"
+        },
+        "mana_cost": "{U}{R}{W}",
+        "cmc": 3.0,
+        "type_line": "Legendary Creature — Elemental Dinosaur Cat",
+        "oracle_text": "Mutate {1}{W/U}{R}{R} (If you cast this spell for its mutate cost, put it over or under target non-Human creature you own. They mutate into the creature on top plus all abilities from under it.)\nFlying, first strike\nWhenever this creature mutates, you may cast target noncreature card with mana value 3 or less from your graveyard without paying its mana cost.",
+        "power": "3",
+        "toughness": "3",
+        "colors": [
+          "R",
+          "U",
+          "W"
+        ],
+        "color_identity": [
+          "R",
+          "U",
+          "W"
+        ],
+        "keywords": [
+          "Flying",
+          "Mutate",
+          "First strike"
+        ],
+        "legalities": {
+          "standard": "not_legal",
+          "future": "not_legal",
+          "historic": "legal",
+          "timeless": "legal",
+          "gladiator": "legal",
+          "pioneer": "legal",
+          "modern": "legal",
+          "legacy": "legal",
+          "pauper": "not_legal",
+          "vintage": "legal",
+          "penny": "legal",
+          "commander": "legal",
+          "oathbreaker": "legal",
+          "standardbrawl": "not_legal",
+          "brawl": "legal",
+          "competitivebrawl": "legal",
+          "alchemy": "not_legal",
+          "paupercommander": "not_legal",
+          "duel": "legal",
+          "oldschool": "not_legal",
+          "premodern": "not_legal",
+          "predh": "not_legal",
+          "tlr": "legal"
+        },
+        "games": [
+          "arena",
+          "paper",
+          "mtgo"
+        ],
+        "reserved": false,
+        "game_changer": false,
+        "foil": true,
+        "nonfoil": true,
+        "finishes": [
+          "nonfoil",
+          "foil"
+        ],
+        "oversized": false,
+        "promo": false,
+        "reprint": false,
+        "variation": false,
+        "set_id": "19feda43-15ab-427e-a0e4-148a4bf2b03a",
+        "set": "iko",
+        "set_name": "Ikoria: Lair of Behemoths",
+        "set_type": "expansion",
+        "set_uri": "https://api.scryfall.com/sets/19feda43-15ab-427e-a0e4-148a4bf2b03a",
+        "set_search_uri": "https://api.scryfall.com/cards/search?order=set&q=e%3Aiko&unique=prints",
+        "scryfall_set_uri": "https://scryfall.com/sets/iko?utm_source=api",
+        "rulings_uri": "https://api.scryfall.com/cards/ed7b0256-d342-4523-9516-6a007bf51825/rulings",
+        "prints_search_uri": "https://api.scryfall.com/cards/search?order=released&q=oracleid%3A775c41fa-2316-43c9-af34-ac9c9b0db7e2&unique=prints",
+        "collector_number": "214",
+        "digital": false,
+        "rarity": "mythic",
+        "card_back_id": "0aeebaf5-8c7d-4636-9e82-8c27447861f7",
+        "artist": "Zack Stella",
+        "illustration_id": "eeefd1aa-4caa-49af-ba8f-17261b2cf666",
+        "border_color": "black",
+        "frame": "2015",
+        "frame_effects": [
+          "legendary"
+        ],
+        "security_stamp": "oval",
+        "full_art": false,
+        "textless": false,
+        "booster": true,
+        "story_spotlight": false,
+        "edhrec_rank": 13489,
+        "penny_rank": 9822,
+        "prices": {
+          "usd": "0.62",
+          "usd_foil": "0.73",
+          "usd_etched": null,
+          "eur": "0.61",
+          "eur_foil": "0.87",
+          "tix": "0.02"
+        },
+        "related_uris": {
+          "gatherer": "https://gatherer.wizards.com/Pages/Card/Details.aspx?multiverseid=479734&printed=false",
+          "tcgplayer_infinite_articles": "https://www.tcgplayer.com/search/articles?productLineName=magic&q=Vadrok%2C+Apex+of+Thunder",
+          "tcgplayer_infinite_decks": "https://www.tcgplayer.com/search/decks?productLineName=magic&q=Vadrok%2C+Apex+of+Thunder",
+          "edhrec": "https://edhrec.com/route/?cc=Vadrok%2C+Apex+of+Thunder"
+        },
+        "purchase_uris": {
+          "tcgplayer": "https://www.tcgplayer.com/product/212016?page=1",
+          "cardmarket": "https://www.cardmarket.com/en/Magic/Products?idProduct=451048",
+          "cardhoarder": "https://www.cardhoarder.com/cards/80437"
         }
       }
     }

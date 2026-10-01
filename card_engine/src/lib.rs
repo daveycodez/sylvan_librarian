@@ -521,6 +521,17 @@ struct OracleCard {
     // collections are sorted by id and deduped at load.
     card_subtypes: Vec<u16>,
     card_keywords: Vec<u16>,
+    // Scryfall's `keywords` AS SENT: its casing and its order, as ids into `CardData.strings`.
+    // `card_keywords` above is the SEARCH set -- lowercased at import so `keyword:` reaches the
+    // 131 keywords Scryfall does not Title Case, then sorted by id -- and neither half can be
+    // undone: "First strike" does not come back from capitalizing "first strike" word by word,
+    // and ["Flying", "Mutate", "First strike"] (Vadrok iko/214) is no sort of anything. Read from
+    // `card_compat_blob.keywords`; empty when the row's blob carries none.
+    //
+    // Into `strings`, not `coll_vocab`: a printed spelling is never a search key, and keeping it
+    // out of the collection vocab keeps it out of `renumber_coll_vocab`, whose set-like vectors
+    // are re-sorted by id -- which is exactly the order this field exists to keep.
+    card_keywords_printed: Vec<u32>,
     card_oracle_tags: Vec<u16>,
     // 2 bits per format, positions from the FORMAT_SHIFTS registry. The word
     // shared by this card's printings; exact unless legality_divergent.
@@ -683,6 +694,7 @@ struct CardRow {
 
     card_subtypes: Vec<u16>,
     card_keywords: Vec<u16>,
+    card_keywords_printed: Vec<u32>,
     card_legalities: u64,
     card_oracle_tags: Vec<u16>,
     card_art_tags: Vec<u16>,
@@ -1379,6 +1391,14 @@ fn compat_from_pydict(d: &Bound<PyDict>, vocab: &mut VocabInterner) -> PyResult<
     })
 }
 
+/// Scryfall's `keywords` as sent, read out of the compat blob (see `OracleCard.card_keywords_printed`).
+fn printed_keywords_from_pydict(d: &Bound<PyDict>, it: &mut Interner) -> Vec<u32> {
+    let Some(blob) = d.get_item("card_compat_blob").ok().flatten().and_then(|v| v.cast_into::<PyDict>().ok()) else {
+        return Vec::new();
+    };
+    str_list(&blob, "keywords").into_iter().map(|keyword| it.intern(keyword)).collect()
+}
+
 /// Scryfall's `all_parts`, read out of the compat blob.
 ///
 /// Kept in Scryfall's order: it is meaningful for melds (the two parts, then the result).
@@ -1524,6 +1544,7 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
         card_types,
         card_subtypes: str_list_to_ids(d, "card_subtypes", vocab)?,
         card_keywords: jsonb_obj_to_ids(d, "card_keywords", vocab)?,
+        card_keywords_printed: printed_keywords_from_pydict(d, it),
         card_legalities: jsonb_obj_to_legality_bits(d, "card_legalities"),
         card_oracle_tags: jsonb_obj_to_ids(d, "card_oracle_tags", vocab)?,
         card_art_tags: jsonb_obj_to_ids(d, "card_art_tags", vocab)?,
@@ -15055,6 +15076,17 @@ const FIELD_TABLE: &[(&str, FieldKey, FieldExtractor)] = &[
         Ok(items.into_pyobject(py)?.into_any())
     }),
     ("card_keywords", |py| intern!(py, "card_keywords"), |py, c, _p, _s, v| Ok(sorted_strs(v, &c.card_keywords).into_pyobject(py)?.into_any())),
+    // Scryfall's `keywords`: printed casing, printed order. `card_keywords` above stays the
+    // lowercased search set `/search` has always returned; a card whose blob carried no list
+    // falls back to it rather than reporting no keywords at all.
+    ("keywords", |py| intern!(py, "keywords"), |py, c, _p, s, v| {
+        let out: Vec<&str> = if c.card_keywords_printed.is_empty() {
+            sorted_strs(v, &c.card_keywords)
+        } else {
+            c.card_keywords_printed.iter().filter_map(|id| str_at(s, u32::from(*id))).collect()
+        };
+        Ok(out.into_pyobject(py)?.into_any())
+    }),
     ("card_oracle_tags", |py| intern!(py, "card_oracle_tags"), |py, c, _p, _s, v| Ok(sorted_strs(v, &c.card_oracle_tags).into_pyobject(py)?.into_any())),
     ("card_art_tags", |py| intern!(py, "card_art_tags"), |py, _c, p, _s, v| Ok(sorted_strs(v, &p.card_art_tags).into_pyobject(py)?.into_any())),
     ("card_is_tags", |py| intern!(py, "card_is_tags"), |py, _c, p, _s, v| Ok(sorted_strs(v, &p.card_is_tags).into_pyobject(py)?.into_any())),
@@ -15504,7 +15536,12 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 // the field). Neither archived row grows -- both ids ride padding the rows already had (272 and
 // 32 bytes before and after, pinned by `the_printed_artist_is_free_in_both_rows`) -- so the
 // header's sizes cannot see the fields that moved, and this constant is the only guard.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026100101;
+//
+// 2026100102 — `OracleCard` GAINS `card_keywords_printed`, Scryfall's `keywords` in its own casing
+// and order. The row does not grow -- 256 bytes before and after, the pin in
+// `the_overflow_id_is_free_in_the_row` -- but the fields after it move, so the header's sizes
+// cannot see it and this constant is the only guard.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026100102;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -16167,6 +16204,7 @@ impl QueryEngine {
 
                     card_subtypes: std::mem::take(&mut row.card_subtypes),
                     card_keywords: std::mem::take(&mut row.card_keywords),
+                    card_keywords_printed: std::mem::take(&mut row.card_keywords_printed),
                     card_oracle_tags: std::mem::take(&mut row.card_oracle_tags),
                     card_legalities: row.card_legalities,
                     mana_cost: row.mana_cost.clone(),
