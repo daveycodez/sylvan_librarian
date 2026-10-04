@@ -1495,3 +1495,88 @@ class TestRouterDispatchScope:
                 assert picked[0] in scope, f"{query}@{limit}: picked {picked[0]}, which this acquire cannot run"
                 checked += 1
         assert checked, "no query in PLANE_QUERIES acquired through a plane or candidate list"
+
+
+class TestCleaveReadings:
+    """A cleave card's `o:` text is three readings, joined by one line break.
+
+    Every expectation is a probe measured on api.scryfall.com, 2026-10-04, scoped to the one card.
+    The rows go through `reload`, so the substring sets and the trigram postings that narrow a
+    regex are built from the stored string exactly as they are in production. `fo:` keeps the
+    printed text alone (`oracle_full_lower_id` is not touched), and has no probe here because this
+    parser has no `fo:` alias on this branch.
+    """
+
+    _REMINDER = "(You may cast this spell for its cleave cost. If you do, remove the words in square brackets.)"
+    _CARDS = (
+        ("Fierce Retribution", f"Cleave {{5}}{{W}} {_REMINDER}\nDestroy target [attacking] creature."),
+        ("Alchemist's Retrieval", f"Cleave {{1}}{{U}} {_REMINDER}\nReturn target nonland permanent [you control] to its owner's hand."),
+        (
+            "Dig Up",
+            f"Cleave {{1}}{{B}}{{B}}{{G}} {_REMINDER}\n"
+            "Search your library for a [basic land] card, [reveal it,] put it into your hand, then shuffle.",
+        ),
+        ("Wash Away", f"Cleave {{1}}{{U}}{{U}} {_REMINDER}\nCounter target spell [that wasn't cast from its owner's hand]."),
+        # Brackets without the keyword: not a cleave card, and searched as printed.
+        ("Carth the Lion", "Planeswalkers' loyalty abilities you activate cost an additional [+1] to activate."),
+        ("Murder", "Destroy target creature."),
+    )
+
+    @pytest.fixture(name="cleave_engine")
+    def cleave_engine_fixture(self, fresh_engine: Callable[[], QueryEngine]) -> QueryEngine:
+        e = fresh_engine()
+        e.reload(
+            [
+                {
+                    "card_name": name,
+                    "card_name_folded": name.lower(),
+                    "type_line": "Instant",
+                    "oracle_id": str(uuid.uuid4()),
+                    "scryfall_id": str(uuid.uuid4()),
+                    "oracle_text": text,
+                }
+                for name, text in self._CARDS
+            ]
+        )
+        return e
+
+    @staticmethod
+    def _found(engine: QueryEngine, query: str) -> set[str]:
+        return set(_names(_run(engine, query, fields=["name"])[1]))
+
+    @pytest.mark.parametrize(
+        argnames=("query", "expected"),
+        argvalues=[
+            # The three readings: as printed, without the bracket characters, without the words.
+            ('o:"destroy target [attacking] creature"', {"Fierce Retribution"}),
+            ('o:"destroy target attacking creature"', {"Fierce Retribution"}),
+            ('o:"destroy target creature"', {"Fierce Retribution", "Murder"}),
+            (r"o:/^destroy target creature\.$/", {"Fierce Retribution", "Murder"}),
+            # The whole text three times, keyword line included, and not four.
+            (r"o:/cleave(.|\n)*cleave(.|\n)*cleave/", {"Fierce Retribution", "Alchemist's Retrieval", "Dig Up", "Wash Away"}),
+            (r"o:/cleave(.|\n)*cleave(.|\n)*cleave(.|\n)*cleave/", set()),
+            # In that order, one line break between.
+            (r"o:/\[attacking\](.|\n)*target attacking creature/", {"Fierce Retribution"}),
+            (r"o:/target attacking(.|\n)*target creature\./", {"Fierce Retribution"}),
+            (r"o:/target creature\.(.|\n)*\[attacking\]/", set()),
+            (r"o:/creature\.\ncleave/", {"Fierce Retribution"}),
+            (r"o:/creature\.\n\n/", set()),
+            # The whitespace BEFORE the bracket goes with the words, and nothing goes by halves.
+            ('o:"target spell."', {"Wash Away"}),
+            ('o:"target spell ."', set()),
+            ('o:"for a card, put it"', {"Dig Up"}),
+            ('o:"for a basic land card, reveal it, put"', {"Dig Up"}),
+            ('o:"for a card, reveal it, put"', set()),
+            # Brackets alone are not cleave.
+            ('o:"additional +1 to activate"', set()),
+            ('o:"additional [+1] to activate"', {"Carth the Lion"}),
+        ],
+    )
+    def test_o_finds_a_cleave_card_under_each_reading(self, cleave_engine: QueryEngine, query: str, expected: set[str]) -> None:
+        assert self._found(cleave_engine, query) == expected
+
+    def test_a_negated_term_reads_the_same_three_readings(self, cleave_engine: QueryEngine) -> None:
+        # `-o:/permanents? you (own|control)/` drops Alchemist's Retrieval on Scryfall: its
+        # unbracketed reading says "permanent you control".
+        assert "Alchemist's Retrieval" not in self._found(cleave_engine, r"-o:/permanents? you (own|control)/")
+        assert "Alchemist's Retrieval" in self._found(cleave_engine, r"-o:/creatures? you (own|control)/")
