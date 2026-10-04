@@ -655,6 +655,51 @@ pub(crate) enum FilterExpr {
     /// best member of the class, a filter shows every member. Closing it is a study with a
     /// holdout, the same kind that produced the class, and it moves the prefer too.
     Atypical(super::PreferClassIds),
+
+    /// The CARD half of Scryfall's `lore:` — `word`, as a LITERAL substring, in the card's name,
+    /// its oracle text or its type line. `build_binary` ORs it with `LorePrinting`, the other two
+    /// of the five places the keyword reads. Measured on api.scryfall.com 2026-10-04 by reading
+    /// which fields of every matched printing hold the needle, and by set difference against the
+    /// keyword for each field:
+    ///
+    ///   name         the card's name as printed, joined ` // `, accents kept: `lore:" // " e:khm`
+    ///                is the 16 two-faced cards, `lore:"lim-dul"` 0 against `lore:"lim-dûl"` 35
+    ///   oracle text  without its reminder text: `lore:ft e:khm` is 22, where the Sagas'
+    ///                "(… after your draw step …)" would make it 41, and `lore:"after your draw
+    ///                step" e:khm` is nothing
+    ///   type line    a plain substring of the line, not a type word: `lore:god` is 486 where
+    ///                the four other columns give 468 — it has every Demigod
+    ///   flavor name  the printing's, or one face's: `lore:godzilla` 8, `lore:dracula` 9 against
+    ///                the 4 a name search finds; accent-sensitive, never two faces joined
+    ///   flavor text  the printing's own
+    ///
+    /// TWO leaves rather than one so the card half is asked once per card: at the top level
+    /// `card_pass` settles it there and walks the printings of a card that missed with
+    /// `LorePrinting` alone. One leaf reading all five re-read the name, rules text and type line
+    /// for every printing of every such card.
+    ///
+    /// Card-invariant and TWO-valued: a card with no rules text simply does not match, so with
+    /// `LorePrinting` two-valued too, `-lore:x` is the complement (`-lore:zzzzqq e:khm` is all
+    /// 305). `word` is normalized by `lore_needle`; `finder` is its searcher, built once rather
+    /// than per string. No index narrows it: three short strings per card.
+    LoreCard {
+        word: String,
+        finder: memmem::Finder<'static>,
+    },
+
+    /// The PRINTING half of `lore:` — the needle is in this printing's flavor text, or in a
+    /// flavor name it is sold under, the card's or one face's. See `LoreCard`.
+    ///
+    /// `flavor_gids` is the flavor-text field resolved by bind() against the distinct flavor
+    /// texts, exactly as `FlavorMatch` is — sorted global string ids of the texts holding the
+    /// needle — so a printing is an integer binary search; None until bound, when the printing's
+    /// own text is scanned instead. Store-bound, like `FlavorMatch`. Two-valued, which `ft:` is
+    /// not asked to be: a printing with no flavor text or flavor name is a plain False.
+    LorePrinting {
+        word: String,
+        finder: memmem::Finder<'static>,
+        flavor_gids: Option<Vec<u32>>,
+    },
 }
 
 /// Verifier per-candidate cost estimates, in hundredths of a nanosecond
@@ -732,6 +777,11 @@ pub(crate) fn verify_cost_tier(f: &FilterExpr) -> u32 {
     match f {
         FilterExpr::TextRegex { regex, .. } => regex_tier(regex.as_str()),
         FilterExpr::TextContains { .. } => TEXT_SCAN_NS100,
+        // Substring scans of the name, the rules text and the type line: the same kind of work
+        // as TextContains, a small multiple of it.
+        FilterExpr::LoreCard { .. } => TEXT_SCAN_NS100,
+        // Bound, a binary search like FlavorMatch, and two field reads for the flavor names.
+        FilterExpr::LorePrinting { .. } => SET_LOOKUP_NS100,
         // Two flag bits, one interned-border read, then a handful of short `Vec<u16>` scans over
         // the printing's frame effects and promo types — a few lookups, no text.
         FilterExpr::Atypical(_) => SET_LOOKUP_NS100,
@@ -929,6 +979,10 @@ fn leaf_compares_printing_field(f: &FilterExpr) -> bool {
         // The frame class is read entirely off the PRINTING (its compat flags, border, frame
         // effects, promo types, finishes) — a card's plain printing and its borderless one differ.
         FilterExpr::Atypical(_) => true,
+        // `lore:`'s card half is the name, rules text and type line; its printing half the
+        // flavor text and flavor name.
+        FilterExpr::LoreCard { .. } => false,
+        FilterExpr::LorePrinting { .. } => true,
         // Composites are composed by the two callers, which differ on `all` vs `any`; reaching here with
         // one is a bug in whichever caller forgot to handle it, not a case to answer silently.
         FilterExpr::And(_) | FilterExpr::Or(_) | FilterExpr::Not(_) => {
@@ -1120,6 +1174,13 @@ impl FilterExpr {
                 let finder = memmem::Finder::new(word.as_bytes()); // built once, reused (see ArtistLower)
                 let (gids, dense_ids) = flavor_match_sets(flavor, strings, mask, |s| finder.find(s.as_bytes()).is_some());
                 *self = FilterExpr::FlavorMatch { gids, dense_ids };
+            }
+            // `lore:`'s flavor-text field, resolved the same way; the leaf stays a `LorePrinting`,
+            // since the flavor names are still to be read.
+            FilterExpr::LorePrinting { word, finder, flavor_gids } => {
+                let mask = flavor_fingerprint(word.as_str());
+                let (gids, _) = flavor_match_sets(flavor, strings, mask, |s| finder.find(s.as_bytes()).is_some());
+                *flavor_gids = Some(gids);
             }
             FilterExpr::TextExact { field: TextField::FlavorTextLower, op, value } => {
                 let (op, value) = (*op, std::mem::take(value));
@@ -1722,6 +1783,30 @@ impl FilterExpr {
                 let Some(p) = printing else { return Tri::PrintingDep };
                 tri_bool(super::printing_is_atypical(p, ids, strings))
             }
+
+            // Two-valued: no field here is NULL in a way the answer can see (a missing string is
+            // simply not a match).
+            FilterExpr::LoreCard { word, finder } => {
+                let holds = |s: &str| finder.find(s.as_bytes()).is_some();
+                tri_bool(
+                    holds(super::lower_name(card, strings))
+                        || str_at(strings, u32::from(card.oracle_text_lower_id)).is_some_and(|s| holds(&without_reminder_text(s)))
+                        || str_at(strings, u32::from(card.type_line_id)).is_some_and(|s| contains_caseless(s, word)),
+                )
+            }
+
+            FilterExpr::LorePrinting { word, finder, flavor_gids } => {
+                let Some(p) = printing else { return Tri::PrintingDep };
+                let text = u32::from(p.flavor_text_lower_id);
+                let in_text = match flavor_gids {
+                    Some(gids) => gids.binary_search(&text).is_ok(),
+                    None => str_at(strings, text).is_some_and(|s| finder.find(s.as_bytes()).is_some()),
+                };
+                // The flavor name is stored as Scryfall sent it (the folded twin has lost the
+                // accents `lore:` compares), so it is lowercased here; ~650 printings carry one.
+                let named = |id: u32| str_at(strings, id).is_some_and(|name| contains_caseless(name, word));
+                tri_bool(in_text || named(u32::from(p.flavor_name_id)) || p.faces.iter().any(|f| named(u32::from(f.flavor_name_id))))
+            }
         }
     }
 }
@@ -1997,7 +2082,93 @@ fn build_binary(kw: &Value) -> Result<FilterExpr, String> {
         return Ok(FilterExpr::CollectionCmp { field: coll_field, op: cmp_op, value, value_id: None });
     }
 
+    // `lore:` — see `FilterExpr::LoreCard`. `=` is `:` (`lore=jace` and `lore:jace` are both 171 on
+    // api.scryfall.com, 2026-10-04). A comparison matches nothing there (`lore>jace`, `lore!=jace`)
+    // and a regex is not a `lore:` value; both are declined to the SQL path, which answers them.
+    if attr == "lore" {
+        if rhs["node_type"].as_str() == Some("RegexValueNode") {
+            return Err("regex not supported on lore".to_string());
+        }
+        if !matches!(op, ":" | "=") {
+            return Err(format!("operator {op:?} is not supported on lore"));
+        }
+        let word = lore_needle(rhs_value_str(rhs));
+        let finder = memmem::Finder::new(word.as_bytes()).into_owned();
+        // The card half first: it settles most matches without a printing being read.
+        return Ok(FilterExpr::Or(vec![
+            FilterExpr::LoreCard { word: word.clone(), finder: finder.clone() },
+            FilterExpr::LorePrinting { word, finder, flavor_gids: None },
+        ]));
+    }
+
     build_text_filter(attr, op, rhs)
+}
+
+/// The needle `lore:` searches for, from the value as typed. Mirrors `lore_needle` in
+/// api/parsing/card_query_nodes.py, which normalizes the SQL path's pattern the same way.
+///
+/// Measured on api.scryfall.com 2026-10-04: case is ignored (`lore:JACE` 171 = `lore:jace`); `æ`
+/// reads as `ae` (`lore:æther -lore:aether` and its converse both match nothing); a run of spaces
+/// is one space and an edge space is kept (`lore:"god  of" e:khm` 17 = `lore:"god of"`, while
+/// `lore:" of " e:khm` is 174, `lore:"of "` 176 and `lore:" of"` 175).
+fn lore_needle(raw: &str) -> String {
+    let mut word = String::with_capacity(raw.len());
+    for c in raw.to_lowercase().chars() {
+        match c {
+            'æ' => word.push_str("ae"),
+            ' ' if word.ends_with(' ') => {}
+            _ => word.push(c),
+        }
+    }
+    word
+}
+
+/// Rules text as `lore:` reads it: every `( … )` run removed, with the whitespace immediately
+/// before it. Mirrors the `regexp_replace` in LORE_SQL_TEMPLATE (api/parsing/card_query_nodes.py).
+///
+/// Measured on api.scryfall.com 2026-10-04: `lore:ft e:khm` is 22 cards, and 19 more Kaldheim
+/// cards hold "ft" only in reminder text — the Sagas' "(As this Saga enters and after your draw
+/// step, …)". The space goes with the parenthesis, so "Flying (This creature …)" reads "Flying".
+/// Borrowed when there is nothing to remove, which is most cards; an unclosed `(` — no real card
+/// has one — strips to the end.
+fn without_reminder_text(text: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = text.as_bytes();
+    if !bytes.contains(&b'(') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    // Start of the run not yet copied out, and the floor of the walk back over whitespace.
+    let mut kept = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'(' {
+            i += 1;
+            continue;
+        }
+        // Only ASCII bytes compare true, so `start` always lands on a char boundary.
+        let mut start = i;
+        while start > kept && bytes[start - 1].is_ascii_whitespace() {
+            start -= 1;
+        }
+        out.push_str(&text[kept..start]);
+        i = text[i..].find(')').map_or(bytes.len(), |off| i + off + 1);
+        kept = i;
+    }
+    out.push_str(&text[kept..]);
+    std::borrow::Cow::Owned(out)
+}
+
+/// `needle` — already lowercase — as a substring of `hay` ignoring case, for the two strings
+/// `lore:` reads that the store keeps in DISPLAY case (the type line and the flavor name) and
+/// has no lowercase twin of. Equal to `hay.to_lowercase().contains(needle)`, without the
+/// allocation unless `hay` holds a non-ASCII letter that lowercasing would change: a type line's
+/// only non-ASCII character is its em dash.
+fn contains_caseless(hay: &str, needle: &str) -> bool {
+    if hay.chars().any(|c| !c.is_ascii() && !c.to_lowercase().eq(std::iter::once(c))) {
+        return hay.to_lowercase().contains(needle);
+    }
+    let (hay, needle) = (hay.as_bytes(), needle.as_bytes());
+    needle.is_empty() || hay.windows(needle.len()).any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 fn rhs_value_str(rhs: &Value) -> &str {

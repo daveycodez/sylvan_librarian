@@ -38,7 +38,7 @@ import pytest
 
 from api.card_processing import preprocess_card
 from api.parsing import parse_scryfall_query
-from card_engine import ENGINE_COLUMNS, QueryEngine, UnknownFieldError
+from card_engine import ENGINE_COLUMNS, QueryEngine, RetryableQueryError, UnknownFieldError
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
@@ -1117,6 +1117,89 @@ class TestCardProperties:
         total, cards = _run(engine, "ft:dragon")
         assert total == 5
         assert all(c["name"] == "Shivan Dragon" for c in cards)
+
+    def test_lore_is_a_substring_of_five_fields(self, fresh_engine: Callable[[], QueryEngine]) -> None:
+        """`lore:` through the parser: the name, flavor name, flavor text, oracle text or type line.
+
+        Nothing new is stored -- `flavor_name` and `card_faces` are columns ENGINE_COLUMNS already
+        selects. Eight printings, shaped like what the keyword was measured on (api.scryfall.com
+        2026-10-04: `lore:jace` 171, `lore:godzilla` 8, `lore:god` with every Demigod,
+        `lore:"lim-dul"` 0 against `lore:"lim-dûl"` 35):
+
+            0-4  Black Lotus x5: 0 has the flavor text "Jace was here.", 1 the flavor name
+                 "Godzilla, Primeval Champion", 2 the flavor name "Théoden, Strength Restored"
+            5    Monastery Messenger, retyped "Legendary Creature — Demigod"
+            6    Cathedral Membrane, with the flavor name "Dracula, Lord of Blood" on a FACE
+            7    Fireball, renamed "Lim-Dûl's Vault"
+        """
+        assert {"flavor_name", "card_faces", "flavor_text", "oracle_text", "type_line", "card_name"} <= set(ENGINE_COLUMNS)
+        fixture = json.loads(_FIXTURE.read_text())
+        rows = [r for r in fixture if r["card_name"] == "Black Lotus"]
+        rows += [
+            next(r for r in fixture if r["card_name"] == name) for name in ("Monastery Messenger", "Cathedral Membrane", "Fireball")
+        ]
+        assert len(rows) == 8
+        rows[0]["flavor_text"] = "Jace was here."
+        rows[1]["flavor_name"] = "Godzilla, Primeval Champion"
+        rows[2]["flavor_name"] = "Théoden, Strength Restored"
+        rows[5]["type_line"] = "Legendary Creature — Demigod"
+        rows[6]["card_faces"] = [
+            {"name": "Cathedral Membrane", "flavor_name": "Dracula, Lord of Blood"},
+            {"name": "Cathedral Membrane"},
+        ]
+        rows[7]["card_name"] = "Lim-Dûl's Vault"
+        rows[7]["card_name_folded"] = "lim-dul's vault"
+        e = fresh_engine()
+        e.reload(rows)
+        by_id = {rows[i]["scryfall_id"]: i for i in range(8)}
+
+        def found(query: str) -> list[int]:
+            _, cards = _run(e, query, fields=["scryfall_id"])
+            return sorted(by_id[str(c["scryfall_id"])] for c in cards)
+
+        everything = list(range(8))
+        # The name settles the card for all its printings; `=` and case change nothing.
+        assert found("lore:lotus") == found("lore=lotus") == found("lore:LOTUS") == [0, 1, 2, 3, 4]
+        # The oracle text, as a phrase; a run of spaces in the value is one space.
+        assert found('lore:"three mana"') == found('lore:"three   mana"') == [0, 1, 2, 3, 4]
+        assert found("lore:threemana") == []
+        # Reminder text is not rules text: Cathedral Membrane's "({W/P} can be paid with either
+        # {W} or 2 life.)" is nowhere, and its "Defender" still is.
+        assert found('lore:"2 life"') == found('lore:"can be paid"') == []
+        assert found('o:"2 life"') == [6]
+        assert found("lore:defender") == [6]
+        # The flavor text is the printing's own.
+        assert found("lore:jace") == found('lore:"was here"') == [0]
+        # The flavor name: the printing's, or one face's. Accents are compared.
+        assert found("lore:godzilla") == [1]
+        assert found("lore:théoden") == found("lore:THÉODEN") == [2]
+        assert found("lore:theoden") == []
+        assert found("lore:dracula") == found('lore:"lord of blood"') == [6]
+        # The type line is a plain substring: a Demigod is `lore:god`. So is Godzilla.
+        assert found("lore:demigod") == [5]
+        assert found("lore:god") == [1, 5]
+        assert found('lore:"creature — demigod"') == [5]
+        # The name as printed, not the folded one `name:` searches.
+        assert found('lore:"lim-dûl"') == [7]
+        assert found('lore:"lim-dul"') == []
+        assert found('name:"lim-dul"') == [7]
+        # `æ` in the value reads as `ae`.
+        assert found("lore:æther") == found("lore:aether") == []
+
+        # Two-valued: the negation is the complement, printing by printing.
+        assert found("-lore:jace") == [1, 2, 3, 4, 5, 6, 7]
+        assert found("-lore:godzilla") == [0, 2, 3, 4, 5, 6, 7]
+        assert found("-lore:zzzzqq") == everything
+        assert found("lore:zzzzqq") == []
+        assert found("lore:godzilla or lore:dracula") == [1, 6]
+        assert found("lore:lotus -lore:jace") == [1, 2, 3, 4]
+        # A metacharacter-free regex is the text it spells.
+        assert found("lore:/godzilla/") == [1]
+
+        # A comparison and a real regex are declined, so the SQL path answers them.
+        for query in ("lore>jace", "lore!=jace", "lore<=jace", "lore:/^jace$/"):
+            with pytest.raises(RetryableQueryError):
+                _run(e, query)
 
 
 class TestPriceFilters:

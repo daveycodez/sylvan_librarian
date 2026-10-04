@@ -15206,3 +15206,183 @@ fn limit_zero_yields_no_rows_and_the_full_total() {
         }
     }
 }
+
+/// `lore:` is a literal substring of the name, the flavor name, the flavor text, the oracle text
+/// or the type line. Three cards under `unique=printing`, so each printing is its own row:
+///
+///   card 1  "Jace Beleren", Legendary Planeswalker — Jace,                    printings 1, 2
+///             "Draw a card. (Then shuffle.)\nFlying (It soars.)\nHaste"
+///   card 2  "Titanoth Rex", Legendary Creature — Demigod, "trample"           printings 3, 4, 5, 6
+///             3  flavor text "jace was here."
+///             4  flavor name "Godzilla, Primeval Champion"
+///             5  a FACE's flavor name "Dracula, Lord of Blood"
+///             6  nothing of its own
+///   card 3  "Lim-Dûl's Vault", Instant, "search for an aether vial."          printings 7, 8, 9
+///             8  flavor name "Théoden, Strength Restored"
+///             9  flavor name "Éowyn, Fearless Knight"
+///
+/// The measured part (api.scryfall.com 2026-10-04): `lore:jace` = `lore=jace` = `lore:JACE` 171;
+/// `lore:god` has every Demigod `t:god` leaves out; `lore:godzilla` 8 and `lore:dracula` 9 are
+/// flavor names; `lore:"lim-dul"` 0 against `lore:"lim-dûl"` 35 and `lore:"theoden, strength
+/// restored"` 0 against `théoden` 1; `lore:æther` = `lore:aether`; `lore:"god  of"` =
+/// `lore:"god of"`; `-lore:zzzzqq e:khm` is all 305, the complement; and `lore:ft e:khm` is 22
+/// where reminder text would make it 41.
+#[test]
+fn lore_is_a_literal_substring_of_five_fields() {
+    fn leaf(op: &str, rhs: serde_json::Value) -> Result<FilterExpr, String> {
+        let json = serde_json::json!({
+            "node_type": "CardBinaryOperatorNode",
+            "kwargs": {
+                "lhs": { "node_type": "CardAttributeNode", "kwargs": { "attribute_name": "lore", "original_attribute": "lore" } },
+                "op": op,
+                "rhs": rhs
+            }
+        });
+        super::filter::build_filter(&json)
+    }
+    fn text(value: &str) -> serde_json::Value {
+        serde_json::json!({ "node_type": "StringValueNode", "kwargs": { "value": value } })
+    }
+    fn ids(data: &CardData, mut filter: FilterExpr) -> Vec<u128> {
+        let bytes = rkyv::to_bytes::<Error>(data).expect("serialize");
+        let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+        filter.bind(&a.coll_vocab, &a.artist_vocab, &a.mana_vocab, &a.indexes.flavor, &a.strings);
+        let (_, page) = run_query(&QueryCtx::from(a), &mut filter, None, "printing", "default", "name", "asc", 100, 0);
+        let mut out: Vec<u128> = page.iter().map(|r| u128::from(r.1.scryfall_id)).collect();
+        out.sort_unstable();
+        out
+    }
+    fn intern(data: &mut CardData, s: &str) -> u32 {
+        data.strings.push(s.to_owned());
+        (data.strings.len() - 1) as u32
+    }
+    fn describe(data: &mut CardData, card: usize, name: &str, type_line: &str, oracle_text: &str) {
+        data.cards[card].card_name_lower = InlineStr::from_str(&name.to_lowercase());
+        data.cards[card].card_name_id = intern(data, name);
+        data.cards[card].type_line_id = intern(data, type_line);
+        data.cards[card].oracle_text_id = intern(data, oracle_text);
+        data.cards[card].oracle_text_lower_id = intern(data, &oracle_text.to_lowercase());
+    }
+    let lore = |value: &str| leaf(":", text(value)).expect("lore: builds");
+    let not = |f: FilterExpr| FilterExpr::Not(Box::new(f));
+
+    let mut vocab = VocabInterner::new();
+    let cards = vec![
+        stub_card(1, TYPE_PLANESWALKER, &[], &mut vocab),
+        stub_card(2, TYPE_CREATURE, &[], &mut vocab),
+        stub_card(3, TYPE_INSTANT, &[], &mut vocab),
+    ];
+    let mut data = store_of(cards, &[2, 4, 3], vocab);
+    describe(&mut data, 0, "Jace Beleren", "Legendary Planeswalker \u{2014} Jace", "Draw a card. (Then shuffle.)\nFlying (It soars.)\nHaste");
+    describe(&mut data, 1, "Titanoth Rex", "Legendary Creature \u{2014} Demigod", "Trample");
+    describe(&mut data, 2, "Lim-D\u{fb}l's Vault", "Instant", "Search for an Aether Vial.");
+    // Every printing has a flavor text id, as the loader's do: "" when the printing has none.
+    let empty = intern(&mut data, "");
+    for p in &mut data.printings {
+        p.flavor_text_lower_id = empty;
+    }
+    data.printings[2].flavor_text_lower_id = intern(&mut data, "jace was here.");
+    data.printings[3].flavor_name_id = intern(&mut data, "Godzilla, Primeval Champion");
+    let dracula = intern(&mut data, "Dracula, Lord of Blood");
+    data.printings[4].faces = vec![
+        PrintingFace { illustration_id: 5, card_artist_vid: ARTIST_NONE, card_artist_name_id: NONE_STR, flavor_text_id: NONE_STR, flavor_name_id: dracula },
+        PrintingFace { illustration_id: 5, card_artist_vid: ARTIST_NONE, card_artist_name_id: NONE_STR, flavor_text_id: NONE_STR, flavor_name_id: NONE_STR },
+    ];
+    data.printings[7].flavor_name_id = intern(&mut data, "Th\u{e9}oden, Strength Restored");
+    data.printings[8].flavor_name_id = intern(&mut data, "\u{c9}owyn, Fearless Knight");
+    // bind() resolves the flavor-text field against this index, as it does `ft:`.
+    data.indexes.flavor = build_flavor_index(&data.printings, &data.strings);
+    let all: Vec<u128> = (1..=9).collect();
+    let none = Vec::<u128>::new;
+
+    // The NAME settles the card for every printing of it; the FLAVOR TEXT answers one printing.
+    assert_eq!(ids(&data, lore("jace")), vec![1, 2, 3]);
+    assert_eq!(ids(&data, lore("JACE")), vec![1, 2, 3], "case is ignored");
+    assert_eq!(ids(&data, leaf("=", text("jace")).expect("= builds")), vec![1, 2, 3], "= reads as :");
+    assert_eq!(ids(&data, lore("was here")), vec![3]);
+    // ORACLE TEXT, and a run of spaces in the value is one space.
+    assert_eq!(ids(&data, lore("draw a")), vec![1, 2]);
+    assert_eq!(ids(&data, lore("draw   a")), vec![1, 2]);
+    assert_eq!(ids(&data, lore("drawa")), none(), "a literal substring: no space is not a space");
+    // REMINDER TEXT is not rules text: a word only a reminder holds is nowhere, and the space
+    // before the parenthesis goes with it, so "card." is followed by the line break.
+    assert_eq!(ids(&data, lore("shuffle")), none());
+    assert_eq!(ids(&data, lore("soars")), none());
+    assert_eq!(ids(&data, lore("(")), none());
+    assert_eq!(ids(&data, lore("flying")), vec![1, 2]);
+    assert_eq!(ids(&data, lore("card. ")), none(), "the space before a reminder is removed with it");
+    assert_eq!(ids(&data, lore("haste")), vec![1, 2], "the text after a reminder is still read");
+    // An edge space is kept: "rex" ends the name, so "rex " is nowhere.
+    assert_eq!(ids(&data, lore("rex")), vec![3, 4, 5, 6]);
+    assert_eq!(ids(&data, lore("rex ")), none());
+    // TYPE LINE, as a plain substring: a Demigod is `lore:god`, where `t:god` is the type word.
+    // Printing 4's flavor name holds "god" too, and is already in.
+    assert_eq!(ids(&data, lore("god")), vec![3, 4, 5, 6]);
+    assert_eq!(ids(&data, lore("creature \u{2014} demigod")), vec![3, 4, 5, 6], "the line as printed, dash and all");
+    assert_eq!(ids(&data, lore("LEGENDARY")), vec![1, 2, 3, 4, 5, 6]);
+    // FLAVOR NAME: the printing's, or one face's.
+    assert_eq!(ids(&data, lore("godzilla")), vec![4]);
+    assert_eq!(ids(&data, lore("lord of blood")), vec![5]);
+    // Accents are compared, in the name and in the flavor name; case still is not.
+    assert_eq!(ids(&data, lore("lim-d\u{fb}l")), vec![7, 8, 9]);
+    assert_eq!(ids(&data, lore("lim-dul")), none());
+    assert_eq!(ids(&data, lore("th\u{e9}oden, strength restored")), vec![8]);
+    assert_eq!(ids(&data, lore("theoden, strength restored")), none());
+    assert_eq!(ids(&data, lore("\u{e9}owyn")), vec![9], "a non-ASCII capital is lowercased like any other");
+    assert_eq!(ids(&data, lore("\u{c9}OWYN")), vec![9]);
+    // `æ` in the value reads as `ae`.
+    assert_eq!(ids(&data, lore("aether")), vec![7, 8, 9]);
+    assert_eq!(ids(&data, lore("\u{e6}ther")), vec![7, 8, 9]);
+    assert_eq!(ids(&data, lore("\u{c6}THER")), vec![7, 8, 9]);
+
+    // TWO-valued: the negation is the complement, printing by printing, and a printing with no
+    // flavor text and no flavor name is a plain False.
+    assert_eq!(ids(&data, not(lore("jace"))), vec![4, 5, 6, 7, 8, 9]);
+    assert_eq!(ids(&data, not(lore("godzilla"))), vec![1, 2, 3, 5, 6, 7, 8, 9]);
+    assert_eq!(ids(&data, not(lore("zzzzqq"))), all);
+    assert_eq!(ids(&data, lore("zzzzqq")), none());
+    // The empty value is a substring of every name.
+    assert_eq!(ids(&data, lore("")), all);
+    // It composes: a printing-level miss inside an Or, a card-level hit inside an And.
+    assert_eq!(ids(&data, FilterExpr::Or(vec![lore("godzilla"), lore("dracula")])), vec![4, 5]);
+    assert_eq!(ids(&data, FilterExpr::And(vec![lore("rex"), not(lore("was here"))])), vec![4, 5, 6]);
+
+    // Two leaves under an Or: the card's own fields, then the printing's. A card-level hit is
+    // True for the card; a miss waits for a printing, and `card_pass` then walks its printings
+    // with the printing half ALONE — the card half is not asked again.
+    // Unbound here, so the printing's flavor text is scanned; bound below, it is looked up.
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let jace = lore("jace");
+    let FilterExpr::Or(halves) = &jace else { panic!("lore: is an Or of its two halves") };
+    assert!(matches!(halves.as_slice(), [FilterExpr::LoreCard { .. }, FilterExpr::LorePrinting { flavor_gids: None, .. }]));
+    assert!(!super::filter::touches_printing_field(&halves[0]));
+    assert!(matches!(halves[0].eval_card(&a.cards[0], &a.strings), Tri::True));
+    assert!(matches!(halves[0].eval_card(&a.cards[1], &a.strings), Tri::False));
+    let (mut residual, mut residual_is_or) = (Vec::new(), false);
+    assert!(matches!(jace.card_pass(&a.cards[0], &a.strings, &mut residual, &mut residual_is_or, 0), Tri::True));
+    assert!(residual.is_empty());
+    assert!(matches!(jace.card_pass(&a.cards[1], &a.strings, &mut residual, &mut residual_is_or, 0), Tri::PrintingDep));
+    assert!(residual_is_or);
+    assert!(matches!(residual.as_slice(), [FilterExpr::LorePrinting { .. }]));
+    assert!(matches!(jace.eval_card(&a.cards[0], &a.strings), Tri::True));
+    assert!(matches!(jace.eval_card(&a.cards[1], &a.strings), Tri::PrintingDep));
+    assert!(matches!(jace.eval_card(&a.cards[2], &a.strings), Tri::PrintingDep));
+    assert!(FilterExpr::residual_matches(&a.cards[1], &a.printings[2], &a.strings, &[&jace], false));
+    assert!(!FilterExpr::residual_matches(&a.cards[1], &a.printings[3], &a.strings, &[&jace], false));
+    let mut bound = lore("jace");
+    bound.bind(&a.coll_vocab, &a.artist_vocab, &a.mana_vocab, &a.indexes.flavor, &a.strings);
+    let FilterExpr::Or(halves) = &bound else { panic!("binding keeps the Or") };
+    assert!(matches!(&halves[1], FilterExpr::LorePrinting { flavor_gids: Some(gids), .. } if gids.len() == 1));
+    assert!(FilterExpr::residual_matches(&a.cards[1], &a.printings[2], &a.strings, &[&bound], false));
+    assert!(!FilterExpr::residual_matches(&a.cards[1], &a.printings[3], &a.strings, &[&bound], false));
+    assert!(super::estimator::has_printing_varying_leaf(&lore("jace")));
+    assert!(super::filter::touches_printing_field(&lore("jace")));
+
+    // A comparison and a regex are not `lore:` values; the engine declines both to the SQL path.
+    for op in ["!=", "<", "<=", ">", ">="] {
+        assert!(leaf(op, text("jace")).is_err(), "{op}");
+    }
+    let regex = serde_json::json!({ "node_type": "RegexValueNode", "kwargs": { "value": "jace" } });
+    assert!(leaf(":", regex).is_err());
+}

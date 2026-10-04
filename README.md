@@ -75,6 +75,7 @@ Sylvan Librarian is an open source implementation of Scryfall, a Magic: The Gath
 | **Basic Search**           | `name:`, `oracle:`                            | ✔        | ✔           | Full substring search with pattern matching               |
 | **Type Search**            | `type:`, `t:`                                 | ✔        | ✔           | Exact matching with intelligent autocomplete              |
 | **Flavor Text**            | `flavor:`                                     | ✔        | ✔           | Full text search with pattern matching                    |
+| **Lore**                   | `lore:`                                       | ✔        | ✔           | Name, flavor name, flavor text, oracle text or type line  |
 | **Artist Search**          | `artist:`, `a:`                               | ✔        | ✔           | Full text search with trigram indexing                    |
 | **Set Search**             | `set:`, `s:`                                  | ✔        | ✔           | Dedicated indexed column with exact matching              |
 | **Rarity Search**          | `rarity:`, `r:`                               | ✔        | ✔           | Integer-based ordering with all comparison operators      |

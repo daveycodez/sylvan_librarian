@@ -48,6 +48,18 @@ class TestParsingErrorHandling:
         assert exc_info.value.title == "Invalid Search Query"
         assert exc_info.value.description == f'Failed to parse query: "{query}"'
 
+    def test_a_regular_expression_on_lore_raises_bad_request(self) -> None:
+        """`lore:` takes text, so a real regular expression is a 400 rather than a silent nothing.
+
+        It parses -- the grammar allows a regex after any keyword -- and is refused where the SQL
+        is generated, which is also where the engine declines it to.
+        """
+        query = "lore:/^jace$/"
+        with pytest.raises(falcon.HTTPBadRequest) as exc_info:
+            self.api_resource._search(query=query)
+        assert exc_info.value.title == "Invalid Search Query"
+        assert exc_info.value.description == f'Failed to parse query: "{query}"'
+
 
 @pytest.mark.usefixtures("engine_enabled")
 class TestSearchRouting:
