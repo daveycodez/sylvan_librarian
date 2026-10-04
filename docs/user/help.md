@@ -239,6 +239,10 @@ o:/\spp/             cards that put a +X/+X counter somewhere
 
 Inside a character class nothing is expanded: `[\sm]` is still "whitespace or the letter m".
 
+**A pattern reads rules text one line at a time.** `^` and `$` anchor to a line, and neither `.`
+nor a negated class crosses a line break: `o:/enters tapped, [^.]*untap/` does not run from a
+trigger line into the bullet under it. `\n`, `\s` and `(.|\n)` do cross.
+
 **Word boundaries** may be spelled the PostgreSQL way — `\y` and `\Y` for a boundary and a
 non-boundary, `\m` and `\M` for the start and end of a word — as well as the usual `\b`/`\B`.
 
