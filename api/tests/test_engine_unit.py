@@ -38,7 +38,7 @@ import pytest
 
 from api.card_processing import preprocess_card
 from api.parsing import parse_scryfall_query
-from card_engine import ENGINE_COLUMNS, QueryEngine, UnknownFieldError
+from card_engine import ENGINE_COLUMNS, QueryEngine, RetryableQueryError, UnknownFieldError
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
@@ -1001,6 +1001,89 @@ class TestCardProperties:
         _, default = _run(e, "is:default", fields=fields)
         assert sorted(by_id[str(c["scryfall_id"])] for c in atypical) == [0, 1, 2, 3]
         assert sorted(by_id[str(c["scryfall_id"])] for c in default) == [4]
+
+    def test_external_ids_stamp_and_usdfoil_read_the_printing_compat_fields(self, fresh_engine: Callable[[], QueryEngine]) -> None:
+        """`mtgoid:`, `arenaid:`, `tcgplayerid:`, `multiverseid:`, `stamp:` and `usdfoil` through the parser.
+
+        Nothing new is stored: `card_compat_blob`, which ENGINE_COLUMNS already selects, carries every
+        field. Four printings of one card, shaped like the printings the behaviour was measured on
+        (api.scryfall.com 2026-10-04): 0 is khm/1 (no foil or etched id), 1 is usg/306 (both MTGO
+        ids), 2 has no ids and no stamp, 3 has both MTGO ids and an arena id.
+        """
+        assert "card_compat_blob" in ENGINE_COLUMNS
+        rows = json.loads(_FIXTURE.read_text())[:4]
+        assert {r["card_name"] for r in rows} == {"Black Lotus"}
+        blobs = [
+            {
+                "mtgo_id": 87321,
+                "arena_id": 75036,
+                "tcgplayer_id": 230675,
+                "multiverse_ids": [503605],
+                "security_stamp": "oval",
+                "prices": {"usd": "1.00", "usd_foil": "1.25"},
+            },
+            {
+                "mtgo_id": 12345,
+                "mtgo_foil_id": 12346,
+                "tcgplayer_id": 400,
+                "tcgplayer_etched_id": 401,
+                "multiverse_ids": [1, 2],
+                "security_stamp": "triangle",
+                "prices": {"usd": "1.00", "usd_foil": None},
+            },
+            {"multiverse_ids": [], "prices": {"usd": "1.00", "usd_foil": "0.25"}},
+            {"mtgo_id": 500, "mtgo_foil_id": 501, "arena_id": 600, "multiverse_ids": [], "security_stamp": "oval"},
+        ]
+        for row, blob in zip(rows, blobs, strict=True):
+            row["card_compat_blob"] = blob
+            row["price_usd"] = 1.0
+        e = fresh_engine()
+        e.reload(rows)
+        by_id = {rows[i]["scryfall_id"]: i for i in range(4)}
+
+        def found(query: str) -> list[int]:
+            _, cards = _run(e, query, fields=["scryfall_id"])
+            return sorted(by_id[str(c["scryfall_id"])] for c in cards)
+
+        # One printing per id, under every spelling; the foil and etched ids name it too.
+        for query in ("mtgoid:87321", "mtgo_id:87321", "mtgo:87321", "mtgoid=87321", "mtgoid:87321a", 'mtgoid:"87321"'):
+            assert found(query) == [0], query
+        assert found("mtgoid:12346") == [1]
+        assert found("arenaid:75036") == found("arena_id:75036") == found("arena:75036") == [0]
+        assert found("tcgplayerid:230675") == found("tcgplayer_id:230675") == found("tcgplayer:230675") == [0]
+        assert found("tcgplayerid:401") == [1]
+        assert found("multiverseid:503605") == found("multiverse_id:503605") == found("multiverse:503605") == [0]
+        assert found("multiverseid:2") == [1]
+        assert found("mtgoid:abc") == found("mtgoid:0") == found("arenaid:87321") == []
+
+        # Negation is three-valued over the keyword's columns: a printing missing either MTGO id
+        # is NULL, so `-mtgoid:` keeps only the ones holding both and matching neither.
+        assert found("-mtgoid:87321") == [1, 3]
+        assert found("-mtgoid:12346") == [3]
+        assert found("-mtgoid:99999999") == [1, 3]
+        assert found("-tcgplayerid:230675") == [1]
+        assert found("-arenaid:75036") == [3]
+        # A list is never NULL.
+        assert found("-multiverseid:503605") == [1, 2, 3]
+
+        # stamp: is two-valued -- no stamp is FALSE, so the negation keeps it.
+        assert found("stamp:oval") == found("stamp:OVAL") == found("stamp=oval") == [0, 3]
+        assert found("-stamp:oval") == [1, 2]
+        assert found("stamp:heart") == []
+        assert found("-stamp:heart") == [0, 1, 2, 3]
+
+        # usdfoil is the printing's own foil price, NULL where it has none.
+        assert found("usdfoil>=1") == [0]
+        assert found("usdfoil<1") == found("usdfoil=0.25") == [2]
+        assert found("usdfoil>=0") == [0, 2]
+        assert found("-usdfoil>=0") == []
+        assert found("usdfoil>usd") == [0]
+        assert found("usd>usdfoil") == [2]
+
+        # A comparison on an id or a stamp is declined, so the SQL path answers it (with FALSE).
+        for query in ("mtgoid>5", "arenaid<5", "tcgplayerid>=5", "multiverseid!=5", "stamp>oval"):
+            with pytest.raises(RetryableQueryError):
+                _run(e, query)
 
     def test_layout_normal(self, engine: QueryEngine) -> None:
         # All fixture cards are normal layout

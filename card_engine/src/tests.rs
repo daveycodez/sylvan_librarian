@@ -2162,6 +2162,7 @@ fn fuzz_num_field_str(f: NumField) -> &'static str {
         NumField::Cmc => "cmc", NumField::Power => "power", NumField::Toughness => "toughness", NumField::Loyalty => "loyalty",
         NumField::RarityInt => "rarity", NumField::CollectorNumberInt => "cn", NumField::EdhrEc => "edhrec",
         NumField::PriceUsd => "usd", NumField::PriceEur => "eur", NumField::PriceTix => "tix", NumField::PreferScore => "prefer",
+        NumField::PriceUsdFoil => "usdfoil",
     }
 }
 fn fuzz_num_expr_str(e: &NumExpr) -> String {
@@ -14530,6 +14531,166 @@ fn is_atypical_is_the_same_class_the_prefer_ranks_by() {
     assert_eq!(ids(&data, atypical()), vec![3]);
     assert_eq!(ids(&data, default()), vec![1, 2, 4]);
     assert_eq!(ids(&data, FilterExpr::And(vec![atypical(), default()])), Vec::<u128>::new(), "no printing is both");
+}
+
+/// `mtgoid:` / `arenaid:` / `tcgplayerid:` / `multiverseid:`, `stamp:` and `usdfoil` are answered
+/// off the `CompatFields` the card object is emitted from. Four printings of one card under
+/// `unique=printing`, so each printing is its own row and every negation is readable as a set:
+///
+///   id 1  mtgo 87321 (no foil id), arena 75036, tcgplayer 230675 (no etched id),
+///         multiverse [503605], stamp oval, usd 1.00, usd_foil 1.25      — khm/1's shape
+///   id 2  mtgo 12345 + foil 12346, tcgplayer 400 + etched 401, multiverse [1, 2],
+///         stamp triangle, no foil price                                  — usg/306's shape
+///   id 3  no ids, no stamp, usd_foil 0.25
+///   id 4  mtgo 500 + foil 501, arena 600, stamp oval, no foil price
+///
+/// The negations are the measured part (api.scryfall.com 2026-10-04): `-arenaid:75036 e:khm` is
+/// 304 of 305, `-mtgoid:87321 e:khm` matches nothing because no Kaldheim printing has a foil id,
+/// `-mtgoid:12346 e:usg` is 331 of 335, `-multiverseid:503605 e:khm` is 304, and
+/// `stamp:oval e:khm` 94 beside `-stamp:oval e:khm` 216.
+#[test]
+fn external_ids_stamp_and_usdfoil_are_answered_from_the_compat_fields() {
+    fn leaf(attr: &str, orig: &str, op: &str, rhs: serde_json::Value) -> Result<FilterExpr, String> {
+        let json = serde_json::json!({
+            "node_type": "CardBinaryOperatorNode",
+            "kwargs": {
+                "lhs": { "node_type": "CardAttributeNode", "kwargs": { "attribute_name": attr, "original_attribute": orig } },
+                "op": op,
+                "rhs": rhs
+            }
+        });
+        super::filter::build_filter(&json)
+    }
+    fn text(value: &str) -> serde_json::Value {
+        serde_json::json!({ "node_type": "StringValueNode", "kwargs": { "value": value } })
+    }
+    fn number(value: f64) -> serde_json::Value {
+        serde_json::json!({ "node_type": "NumericValueNode", "kwargs": { "value": value } })
+    }
+    fn ids(data: &CardData, mut filter: FilterExpr) -> Vec<u128> {
+        let bytes = rkyv::to_bytes::<Error>(data).expect("serialize");
+        let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+        // `run_query` does not bind; the production entry point does, with these arguments.
+        filter.bind(&a.coll_vocab, &a.artist_vocab, &a.mana_vocab, &a.indexes.flavor, &a.strings);
+        let (_, page) = run_query(&QueryCtx::from(a), &mut filter, None, "printing", "default", "name", "asc", 100, 0);
+        let mut out: Vec<u128> = page.iter().map(|r| u128::from(r.1.scryfall_id)).collect();
+        out.sort_unstable();
+        out
+    }
+    let not = |f: FilterExpr| FilterExpr::Not(Box::new(f));
+    let id = |attr: &str, value: &str| leaf(attr, attr, ":", text(value)).expect("an id equality builds");
+    let stamp = |value: &str| leaf("security_stamp", "stamp", ":", text(value)).expect("stamp: builds");
+    let usdfoil = |op: &str, dollars: f64| leaf("price_usd_foil", "usdfoil", op, number(dollars)).expect("usdfoil builds");
+    let none = Vec::<u128>::new;
+
+    let mut vocab = VocabInterner::new();
+    // Interned out of order on purpose: store_of renumbers the vocab, and the stamp ids below
+    // are read back from the renumbered table, as the loader's are.
+    for word in ["triangle", "oval", "acorn"] {
+        vocab.intern(word.to_owned()).expect("vocab");
+    }
+    let card = stub_card(1, TYPE_CREATURE, &[], &mut vocab);
+    let mut data = store_of(vec![card], &[4], vocab);
+    let word_id = |data: &CardData, word: &str| data.coll_vocab.iter().position(|w| w == word).expect("interned") as u16;
+    let (oval, triangle) = (word_id(&data, "oval"), word_id(&data, "triangle"));
+    data.printings[0].price_usd = Some(100);
+    data.printings[0].compat = CompatFields {
+        mtgo_id: NonZeroU32::new(87_321),
+        arena_id: NonZeroU32::new(75_036),
+        tcgplayer_id: NonZeroU32::new(230_675),
+        multiverse_ids: vec![503_605],
+        security_stamp_id: oval,
+        price_usd_foil: NonZeroU32::new(125),
+        ..CompatFields::default()
+    };
+    data.printings[1].compat = CompatFields {
+        mtgo_id: NonZeroU32::new(12_345),
+        mtgo_foil_id: NonZeroU32::new(12_346),
+        tcgplayer_id: NonZeroU32::new(400),
+        tcgplayer_etched_id: NonZeroU32::new(401),
+        multiverse_ids: vec![1, 2],
+        security_stamp_id: triangle,
+        ..CompatFields::default()
+    };
+    data.printings[2].price_usd = Some(100);
+    data.printings[2].compat = CompatFields { price_usd_foil: NonZeroU32::new(25), ..CompatFields::default() };
+    data.printings[3].compat = CompatFields {
+        mtgo_id: NonZeroU32::new(500),
+        mtgo_foil_id: NonZeroU32::new(501),
+        arena_id: NonZeroU32::new(600),
+        security_stamp_id: oval,
+        ..CompatFields::default()
+    };
+
+    // One printing by each id; the FOIL and ETCHED ids name their printing too.
+    assert_eq!(ids(&data, id("mtgo_id", "87321")), vec![1]);
+    assert_eq!(ids(&data, id("mtgo_id", "12345")), vec![2]);
+    assert_eq!(ids(&data, id("mtgo_id", "12346")), vec![2], "mtgo_foil_id");
+    assert_eq!(ids(&data, id("arena_id", "75036")), vec![1]);
+    assert_eq!(ids(&data, id("tcgplayer_id", "230675")), vec![1]);
+    assert_eq!(ids(&data, id("tcgplayer_id", "401")), vec![2], "tcgplayer_etched_id");
+    assert_eq!(ids(&data, id("multiverse_id", "503605")), vec![1]);
+    assert_eq!(ids(&data, id("multiverse_id", "2")), vec![2], "any member of the list");
+    assert_eq!(ids(&data, leaf("mtgo_id", "mtgoid", "=", text("87321")).expect("= builds")), vec![1], "= reads as :");
+    // Namespaces are separate: 75036 is an arena id, not an mtgo one.
+    assert_eq!(ids(&data, id("mtgo_id", "75036")), none());
+
+    // The value is its leading digits; no digits, a zero, or an overflow name nothing.
+    for spelled in ["87321a", "87321.0", "87321 "] {
+        assert_eq!(ids(&data, id("mtgo_id", spelled)), vec![1], "{spelled:?}");
+    }
+    for spelled in ["abc", "", "0", "-1", "a87321", "99999999999"] {
+        assert_eq!(ids(&data, id("mtgo_id", spelled)), none(), "{spelled:?}");
+        assert_eq!(ids(&data, id("multiverse_id", spelled)), none(), "{spelled:?}");
+    }
+
+    // THREE-valued negation. A printing holding BOTH mtgo ids and matching neither is False (the
+    // negation keeps it); one missing either id is NULL and survives neither polarity.
+    assert_eq!(ids(&data, not(id("mtgo_id", "87321"))), vec![2, 4], "id 3 has no ids: NULL");
+    assert_eq!(ids(&data, not(id("mtgo_id", "12346"))), vec![4], "id 1 has no foil id: NULL");
+    assert_eq!(ids(&data, not(id("mtgo_id", "99999999"))), vec![2, 4], "an id no printing has");
+    assert_eq!(ids(&data, not(id("mtgo_id", "abc"))), vec![2, 4]);
+    assert_eq!(ids(&data, not(id("tcgplayer_id", "230675"))), vec![2]);
+    // One column: False wherever the printing has an arena id at all.
+    assert_eq!(ids(&data, not(id("arena_id", "75036"))), vec![4]);
+    assert_eq!(ids(&data, not(id("arena_id", "abc"))), vec![1, 4]);
+    // A list is never NULL: a plain complement.
+    assert_eq!(ids(&data, not(id("multiverse_id", "503605"))), vec![2, 3, 4]);
+    assert_eq!(ids(&data, not(id("multiverse_id", "abc"))), vec![1, 2, 3, 4]);
+
+    // Equality only: a comparison is declined to the SQL path, which answers FALSE.
+    for attr in ["mtgo_id", "arena_id", "tcgplayer_id", "multiverse_id", "security_stamp"] {
+        for op in [">", "<", ">=", "<=", "!="] {
+            assert!(leaf(attr, attr, op, text("5")).is_err(), "{attr} {op}");
+        }
+    }
+
+    // stamp: is TWO-valued — a printing with no stamp is False, so the negation keeps it.
+    assert_eq!(ids(&data, stamp("oval")), vec![1, 4]);
+    assert_eq!(ids(&data, stamp("OVAL")), vec![1, 4], "case-insensitive");
+    assert_eq!(ids(&data, stamp("triangle")), vec![2]);
+    assert_eq!(ids(&data, not(stamp("oval"))), vec![2, 3]);
+    // A stamp in the vocab that no printing carries, and one not in the vocab at all.
+    assert_eq!(ids(&data, stamp("acorn")), none());
+    assert_eq!(ids(&data, stamp("heart")), none());
+    assert_eq!(ids(&data, not(stamp("heart"))), vec![1, 2, 3, 4]);
+    assert_eq!(ids(&data, stamp("")), none(), "the empty value is not 'no stamp'");
+
+    // usdfoil is the printing's own foil price: NULL where it has none.
+    assert_eq!(ids(&data, usdfoil(">=", 1.0)), vec![1]);
+    assert_eq!(ids(&data, usdfoil("<", 1.0)), vec![3]);
+    assert_eq!(ids(&data, usdfoil("=", 0.25)), vec![3]);
+    assert_eq!(ids(&data, usdfoil(">=", 0.0)), vec![1, 3]);
+    assert_eq!(ids(&data, not(usdfoil(">=", 0.0))), none(), "no foil price is NULL, not zero");
+    // ...and a different number from `usd` on the same printing, comparable on either side.
+    let field = |attr: &str, orig: &str| serde_json::json!({ "node_type": "CardAttributeNode", "kwargs": { "attribute_name": attr, "original_attribute": orig } });
+    assert_eq!(ids(&data, leaf("price_usd_foil", "usdfoil", ">", field("price_usd", "usd")).expect("builds")), vec![1]);
+    assert_eq!(ids(&data, leaf("price_usd", "usd", ">", field("price_usd_foil", "usdfoil")).expect("builds")), vec![3]);
+
+    // All three are printing-level: the card-space pass must defer to the printing.
+    for f in [id("mtgo_id", "87321"), stamp("oval"), usdfoil(">=", 1.0)] {
+        assert!(super::estimator::has_printing_varying_leaf(&f));
+    }
 }
 
 /// `prefer:borderless` is "the best-looking printing that is still this card": Najeela's shape.

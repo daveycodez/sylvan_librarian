@@ -87,6 +87,7 @@ pub(crate) fn has_printing_varying_leaf(f: &FilterExpr) -> bool {
                     | NumField::PriceUsd
                     | NumField::PriceEur
                     | NumField::PriceTix
+                    | NumField::PriceUsdFoil
                     | NumField::PreferScore
             ),
             NumExpr::Arith(lhs, _, rhs) => num_varying(lhs) || num_varying(rhs),
@@ -95,6 +96,8 @@ pub(crate) fn has_printing_varying_leaf(f: &FilterExpr) -> bool {
     match f {
         FilterExpr::NumericCmp { lhs, rhs, .. } => num_varying(lhs) || num_varying(rhs),
         FilterExpr::DateCmp { .. } | FilterExpr::YearCmp { .. } => true,
+        // A printing's marketplace ids and its security stamp are per-printing facts.
+        FilterExpr::ExternalIdMatch { .. } | FilterExpr::StampMatch { .. } => true,
         FilterExpr::ArtistMatch { .. } | FilterExpr::FlavorMatch { .. } => true,
         FilterExpr::TextContains { field, .. } => matches!(field, TextSearchField::FlavorTextLower),
         FilterExpr::TextExact { field, .. } | FilterExpr::TextRegex { field, .. } => matches!(
@@ -394,7 +397,8 @@ fn estimate_leaf(f: &FilterExpr, indexes: &Archived<CardIndexes>, n_cards: u32, 
                     Some(Some((lo, hi))) => project(range_count(&indexes.collector_number, lo, hi), n_cards, n_printings),
                 },
                 // Unindexed fields (loyalty/edhrec/prefer_score) → sound unknown.
-                NumField::Loyalty | NumField::EdhrEc | NumField::PreferScore => unknown(n),
+                // Unindexed: `usdfoil` reads CompatFields, which has no range index.
+                NumField::Loyalty | NumField::EdhrEc | NumField::PreferScore | NumField::PriceUsdFoil => unknown(n),
             }
         }
 
@@ -483,6 +487,10 @@ fn estimate_leaf(f: &FilterExpr, indexes: &Archived<CardIndexes>, n_cards: u32, 
         // gids.len() an undercount; not exercised here).
         FilterExpr::NameMatch { ids } => exact(ids.len() as u32),
         FilterExpr::OracleMatch { gids } => exact(gids.len() as u32),
+
+        // An external id names a printing or two and a stamp a class of them; neither has an
+        // index to count through, so "unknown" is the sound answer.
+        FilterExpr::ExternalIdMatch { .. } | FilterExpr::StampMatch { .. } => unknown(n),
 
         FilterExpr::DateCmp { op, value } => match date_range_bounds(*op, *value) {
             None => unknown(n),
