@@ -150,6 +150,14 @@ _MELD_ROLE_SQL = (
 # DFC frame effects) are deliberately absent: they are frame_effects/security_stamp members that
 # `frame:`/`stamp:` reach, and a row would answer where Scryfall refuses. Every new row is sparse
 # -- the largest, promopack, is 2,599 cards -- so none of them reopens the density question.
+#
+# That enumeration paged the printings of eight queries and its candidates were the members it
+# saw. A second sweep on 2026-10-04 probed 619 candidate `is:` values directly and found six the
+# first never reached: `contentwarning` (the `content_warning` flag) and the promo types
+# `premiereshop`, `schinesealtart`, `setextension`, `singularityfoil` and `themepack` -- 6, 37,
+# 46, 1 and 30 cards. Each was checked in both directions: every printing Scryfall returns for
+# the value carries the member, and the rows of the 2026-10-03 bulk file carrying each promo
+# type number exactly Scryfall's printings (51, 61, 50, 1 and 33).
 BOOLEAN_IS_TAGS: dict[str, str] = {
     # Alphabetized by key. Expressions read either a plain top-level boolean (reserved,
     # gamechanger, spotlight), promo_types/keywords/finishes array membership, or a
@@ -168,6 +176,11 @@ BOOLEAN_IS_TAGS: dict[str, str] = {
     "commanderpromo": "cards.raw_card_blob->'promo_types' @> '\"commanderpromo\"'",
     "concept": "cards.raw_card_blob->'promo_types' @> '\"concept\"'",
     "confettifoil": "cards.raw_card_blob->'promo_types' @> '\"confettifoil\"'",
+    # Scryfall's `content_warning` flag: `is:contentwarning` is 7 cards / 28 printings on
+    # api.scryfall.com (2026-10-04), every one carrying the flag. A top-level boolean like
+    # `reserved`, found with five more promo types by a second sweep -- see "Six more" in
+    # docs/issues/00985-is-tag-remaining-coverage.md.
+    "contentwarning": "cards.raw_card_blob->'content_warning' = 'true'::jsonb",
     "convention": "cards.raw_card_blob->'promo_types' @> '\"convention\"'",
     "cosmicfoil": "cards.raw_card_blob->'promo_types' @> '\"cosmicfoil\"'",
     "datestamped": "cards.raw_card_blob->'promo_types' @> '\"datestamped\"'",
@@ -254,6 +267,7 @@ BOOLEAN_IS_TAGS: dict[str, str] = {
     "playpromo": "cards.raw_card_blob->'promo_types' @> '\"playpromo\"'",
     "portrait": "cards.raw_card_blob->'promo_types' @> '\"portrait\"'",
     "poster": "cards.raw_card_blob->'promo_types' @> '\"poster\"'",
+    "premiereshop": "cards.raw_card_blob->'promo_types' @> '\"premiereshop\"'",
     "prerelease": "cards.raw_card_blob->'promo_types' @> '\"prerelease\"'",
     "promo": "cards.raw_card_blob->'promo' = 'true'::jsonb",
     "promopack": "cards.raw_card_blob->'promo_types' @> '\"promopack\"'",
@@ -266,12 +280,15 @@ BOOLEAN_IS_TAGS: dict[str, str] = {
     "resale": "cards.raw_card_blob->'promo_types' @> '\"resale\"'",
     "reserved": "cards.raw_card_blob->'reserved' = 'true'::jsonb",
     "ripplefoil": "cards.raw_card_blob->'promo_types' @> '\"ripplefoil\"'",
+    "schinesealtart": "cards.raw_card_blob->'promo_types' @> '\"schinesealtart\"'",
     "scroll": "cards.raw_card_blob->'promo_types' @> '\"scroll\"'",
     "scryfallpreview": "cards.raw_card_blob->'preview'->>'source' = 'Scryfall'",
     "serialized": "cards.raw_card_blob->'promo_types' @> '\"serialized\"'",
     "set_promo": "cards.raw_card_blob->'promo_types' @> '\"setpromo\"'",
+    "setextension": "cards.raw_card_blob->'promo_types' @> '\"setextension\"'",
     "silverfoil": "cards.raw_card_blob->'promo_types' @> '\"silverfoil\"'",
     "silverscroll": "cards.raw_card_blob->'promo_types' @> '\"silverscroll\"'",
+    "singularityfoil": "cards.raw_card_blob->'promo_types' @> '\"singularityfoil\"'",
     "sldbonus": "cards.raw_card_blob->'promo_types' @> '\"sldbonus\"'",
     "sourcematerial": "cards.raw_card_blob->'promo_types' @> '\"sourcematerial\"'",
     "spotlight": "cards.raw_card_blob->'story_spotlight' = 'true'::jsonb",
@@ -283,6 +300,7 @@ BOOLEAN_IS_TAGS: dict[str, str] = {
     "storechampionship": "cards.raw_card_blob->'promo_types' @> '\"storechampionship\"'",
     "surgefoil": "cards.raw_card_blob->'promo_types' @> '\"surgefoil\"'",
     "textured": "cards.raw_card_blob->'promo_types' @> '\"textured\"'",
+    "themepack": "cards.raw_card_blob->'promo_types' @> '\"themepack\"'",
     "thick": "cards.raw_card_blob->'promo_types' @> '\"thick\"'",
     "tourney": "cards.raw_card_blob->'promo_types' @> '\"tourney\"'",
     "universesbeyond": "cards.raw_card_blob->'promo_types' @> '\"universesbeyond\"'",

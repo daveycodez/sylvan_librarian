@@ -260,6 +260,49 @@ class TestBooleanIsTags:
         api_resource.admin._upsert_cards([card])
         assert _is_tags_for(api_resource, card["id"]).get("serialized") is True
 
+    @pytest.mark.parametrize("member", ["premiereshop", "schinesealtart", "setextension", "singularityfoil", "themepack"])
+    def test_promo_type_the_first_enumeration_never_paged_lands_as_is_tag(self, api_resource: APIResource, member: str) -> None:
+        """Five `promo_types` members found by probing `is:` values rather than paging printings.
+
+        On api.scryfall.com (2026-10-04) `is:premiereshop` is 6 cards, `is:schinesealtart` 37,
+        `is:setextension` 46, `is:singularityfoil` 1 and `is:themepack` 30; each was a silent zero
+        here. The tag is the member's own name, and no other of the five rides along.
+        """
+        card = make_raw_card(name=f"Swept Promo Type {member}")
+        card["promo_types"] = [member]
+        api_resource.admin._upsert_cards([card])
+        tags = _is_tags_for(api_resource, card["id"])
+        assert tags.get(member) is True
+        others = {"premiereshop", "schinesealtart", "setextension", "singularityfoil", "themepack"} - {member}
+        assert not others & tags.keys()
+
+    def test_content_warning_flag_lands_as_contentwarning(self, api_resource: APIResource) -> None:
+        """`is:contentwarning` reads Scryfall's `content_warning` flag: 7 cards there (2026-10-04)."""
+        card = make_raw_card(name="Content Warning Import Test")
+        card["content_warning"] = True
+        api_resource.admin._upsert_cards([card])
+        assert _is_tags_for(api_resource, card["id"]).get("contentwarning") is True
+
+    def test_content_warning_false_or_absent_sets_no_tag(self, api_resource: APIResource) -> None:
+        """Exactly `true`, like every boolean row: a false flag and a missing one write nothing."""
+        unwarned = make_raw_card(name="Content Warning False")
+        unwarned["content_warning"] = False
+        plain = make_raw_card(name="Content Warning Absent")
+        api_resource.admin._upsert_cards([unwarned, plain])
+        assert "contentwarning" not in _is_tags_for(api_resource, unwarned["id"])
+        assert "contentwarning" not in _is_tags_for(api_resource, plain["id"])
+
+    def test_content_warning_removal_strips_the_tag(self, api_resource: APIResource) -> None:
+        """The sync converges both ways: a re-import without the flag removes the tag."""
+        card = make_raw_card(name="Content Warning Withdrawn")
+        card["content_warning"] = True
+        api_resource.admin._upsert_cards([card])
+        assert _is_tags_for(api_resource, card["id"]).get("contentwarning") is True
+        reimport = make_raw_card(card_id=card["id"], name="Content Warning Withdrawn")
+        reimport["oracle_text"] = "changed so the reimport writes"
+        api_resource.admin._upsert_cards([reimport])
+        assert "contentwarning" not in _is_tags_for(api_resource, card["id"])
+
     @staticmethod
     def _meld_all_parts(own_id: str, own_role: str) -> list[dict]:
         """A meld card's `all_parts`: this card in `own_role`, plus the other two members."""

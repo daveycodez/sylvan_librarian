@@ -153,6 +153,28 @@ a `BOOLEAN_IS_TAGS` row (every one sparse; the largest, `promopack`, is 2,599 ca
 `stepandcompleat`, `storechampionship`, `surgefoil`, `textured`, `thick`, `tourney`,
 `upsidedown`, `vault`, `wizardsplaynetwork`.
 
+#### Six more (2026-10-04)
+
+The enumeration above paged the printings of eight queries, so its candidates were the members
+those pages happened to carry. A second sweep probed 619 candidate `is:` values against
+api.scryfall.com directly and found six that answer there and were a silent zero here:
+
+| value | what it reads | Scryfall, cards / printings | rows the importer keeps (2026-10-03 bulk) |
+| --- | --- | ---: | ---: |
+| `is:contentwarning` | the `content_warning` flag | 7 / 28 | 26 |
+| `is:premiereshop` | `promo_types` | 6 / 51 | 51 |
+| `is:schinesealtart` | `promo_types` | 37 / 61 | 61 |
+| `is:setextension` | `promo_types` | 46 / 50 | 50 |
+| `is:singularityfoil` | `promo_types` | 1 / 1 | 1 |
+| `is:themepack` | `promo_types` | 30 / 33 | 33 |
+
+Each was established in both directions over printings (`unique=prints`): every printing Scryfall
+returns carries the member, and the rows of the 2026-10-03 `default_cards` bulk file carrying each
+promo type number exactly Scryfall's printings (51, 61, 50, 1, 33; the flag is on 29 rows). All six are `BOOLEAN_IS_TAGS` rows of the existing two shapes -- a top-level
+boolean and `promo_types` membership -- so the import syncs them with no other change. The
+content-warning rows the importer drops are the three MTGO-only printings (me1/6, me3/5,
+prm/35926), by the `paper` filter in `preprocess_card`; the cards are all still found.
+
 Seven spellings Scryfall also accepts are rewrites in `_DERIVED_EXPANSIONS` rather than rows,
 because the tag under either spelling is the same tag: `is:setpromo`, `is:mediainsert`,
 `is:planeswalkerdeck`, `is:judgegift`, `is:arenaleague`, `is:intropack` (the concatenated
