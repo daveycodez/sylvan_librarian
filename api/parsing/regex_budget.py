@@ -78,18 +78,25 @@ def _translate_are_escapes(pattern: str) -> str:
     r"""Rewrite the escapes Python's ``re`` cannot spell, and fold each ``\s…`` shorthand to one token.
 
     ``o:/.../`` is documented against PostgreSQL's ``~*``, whose word-boundary
-    escapes are ``\y``/``\Y``/``\m``/``\M``. Python's ``re`` rejects all four
-    outright, so measuring a pattern's budget with ``re._parser`` requires the
-    same rewrite ``CompiledRegex`` applies before handing the pattern to the
-    engine -- keep this table and the one in ``card_engine/src/regex_compat.rs``
-    in step, or a pattern the engine runs is one this module cannot cost.
+    escapes are ``\y`` and ``\m``. Python's ``re`` rejects both outright, so
+    measuring a pattern's budget with ``re._parser`` requires the same rewrite
+    ``CompiledRegex`` applies before handing the pattern to the engine -- keep
+    this table and the one in ``card_engine/src/regex_compat.rs`` in step, or a
+    pattern the engine runs is one this module cannot cost.
 
-    ``\m``/``\M`` have no Python spelling either and become lookaround, which is
-    what the engine does with them. They therefore COST lookaround budget here,
-    and that is the honest accounting: they are exactly what puts the pattern on
-    the backtracking engine that ``MAX_LOOKAROUNDS_PER_PATTERN`` exists to bound.
+    THE INPUT IS ALREADY LOWERCASE: ``_enforce_pattern_limits`` folds the pattern
+    first, as the engine does (``fold_query_case`` there, with the measurements),
+    because api.scryfall.com lowercases the whole query before it reads it. So
+    ``\Y`` arrives as ``\y``, ``\M`` as ``\m`` and ``\Sm`` as the ``\sm`` shorthand,
+    and the uppercase ARE constraints have no row.
 
-    ``\Z`` needs no entry -- Python and ARE agree it is end-of-string.
+    ``\m`` has no Python spelling either and becomes lookaround, which is what
+    the engine does with it. It therefore COSTS lookaround budget here, and that
+    is the honest accounting: it is exactly what puts the pattern on the
+    backtracking engine that ``MAX_LOOKAROUNDS_PER_PATTERN`` exists to bound.
+
+    ``\z`` is what ``\Z`` folds to. The engine reads it as end-of-text; Python
+    spells that ``\Z`` and rejects ``\z`` before 3.14, so it is written back.
 
     THE ``\s…`` SHORTHANDS ARE MEASURED AS ONE TOKEN EACH, not as the expansions
     ``card_engine/src/regex_compat.rs`` substitutes. Python's ``re`` would otherwise read ``\sm``
@@ -165,9 +172,8 @@ _SHORTHAND_TOKEN = "\ue000"
 
 _ARE_ESCAPES = {
     "y": r"\b",
-    "Y": r"\B",
     "m": r"(?<!\w)(?=\w)",
-    "M": r"(?<=\w)(?!\w)",
+    "z": r"\Z",
 }
 
 
@@ -176,7 +182,8 @@ def _enforce_pattern_limits(pattern: str) -> None:
         raise QueryBudgetExceeded(kind="regex_pattern")
 
     try:
-        parsed = sre_parser.parse(_translate_are_escapes(pattern), re.IGNORECASE)
+        # Lowercased first, because that is the pattern the engine compiles.
+        parsed = sre_parser.parse(_translate_are_escapes(pattern.lower()), re.IGNORECASE)
     except re.error as exc:
         raise InvalidRegexPatternError(reason=_python_regex_error_reason(exc)) from None
 

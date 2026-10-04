@@ -243,8 +243,13 @@ Inside a character class nothing is expanded: `[\sm]` is still "whitespace or th
 nor a negated class crosses a line break: `o:/enters tapped, [^.]*untap/` does not run from a
 trigger line into the bullet under it. `\n`, `\s` and `(.|\n)` do cross.
 
-**Word boundaries** may be spelled the PostgreSQL way — `\y` and `\Y` for a boundary and a
-non-boundary, `\m` and `\M` for the start and end of a word — as well as the usual `\b`/`\B`.
+**Word boundaries** may be spelled the PostgreSQL way — `\y` for a boundary and `\m` for the
+start of a word — as well as the usual `\b`.
+
+**A pattern is lowercased before it is read**, as Scryfall lowercases the whole query. For the
+letters that changes nothing, since matching ignores case anyway; for an escape it does: `\S` is
+`\s`, `\W` is `\w`, `\D` is `\d`, `\B` is `\b`. So `[\s\S]*` is a run of whitespace, not "anything" —
+write `(.|\n)*` to cross lines.
 
 ---
 

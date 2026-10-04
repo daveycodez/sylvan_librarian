@@ -57,6 +57,9 @@ already cheap never come near the ceiling, and the ones that can are the ones th
 **ARE escape translation** rewrites `\y`→`\b`, `\Y`→`\B`, `\Z`→`\z` (exact
 equivalents, so those stay linear) and `\m`/`\M` to lookaround (no equivalent,
 so those go backtracking). Bracket expressions are copied through untouched.
+(Since superseded for the three uppercase spellings: the pattern is lowercased
+before it is translated, as api.scryfall.com lowercases it, so `\Y`, `\M` and
+`\Z` arrive as `\y`, `\m` and `\z` — see `fold_query_case`.)
 
 The parse-time budget (`api/parsing/regex_budget.py`) measures patterns with
 Python's `re._parser`, which rejects all four word-boundary escapes outright, so

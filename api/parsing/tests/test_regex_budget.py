@@ -6,7 +6,7 @@ import pytest
 
 from api.parsing import parse_scryfall_query
 from api.parsing.query_budget import QUERY_REGEX_REJECTED_MESSAGE, InvalidRegexPatternError, QueryBudgetExceeded
-from api.parsing.regex_budget import MAX_PATTERN_UTF8_BYTES, MAX_REGEX_LEAVES_PER_QUERY
+from api.parsing.regex_budget import MAX_PATTERN_UTF8_BYTES, MAX_REGEX_LEAVES_PER_QUERY, _translate_are_escapes
 
 
 class TestRegexBudgetAcceptsLegitPatterns:
@@ -126,12 +126,34 @@ class TestAreWordBoundaryEscapes:
             parse_scryfall_query(r"o:/[\y]lit/")
 
     def test_word_start_escapes_spend_lookaround_budget(self) -> None:
-        # `\m`/`\M` have no linear spelling: they become lookaround on the engine,
-        # which is exactly what the lookaround cap is there to bound. Three of them
-        # is six lookarounds, past MAX_LOOKAROUNDS_PER_PATTERN.
+        # `\m` has no linear spelling: it becomes lookaround on the engine, which is
+        # exactly what the lookaround cap is there to bound. Three of them is six
+        # lookarounds, past MAX_LOOKAROUNDS_PER_PATTERN.
         with pytest.raises(QueryBudgetExceeded) as exc_info:
             parse_scryfall_query(r"o:/\ma\mb\mc/")
         assert exc_info.value.kind == "regex_pattern"
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            # `\X20` is `\x20` once folded; Python's `re` has no `\X` and called it a bad escape.
+            r"o:/destroy\X20target/",
+            # `\Sm` is the `\sm` mana-symbol shorthand once folded, a literal token each. Read with
+            # its case kept it is seventy non-whitespace classes, past MAX_REGEX_AST_NODES.
+            "o:/" + r"\Sm" * 70 + "/",
+        ],
+    )
+    def test_the_pattern_is_measured_lowercased(self, query: str) -> None:
+        # api.scryfall.com lowercases the query before it reads it and so does the engine
+        # (`fold_query_case` in card_engine/src/regex_compat.rs), so the pattern costed here
+        # has to be the folded one or a pattern the engine runs is refused at parse time.
+        parse_scryfall_query(query)
+
+    def test_end_of_text_survives_the_fold(self) -> None:
+        # `\Z` folds to `\z`, which the engine reads as end-of-text and `re` only learned in
+        # 3.14: it is measured as `\Z` rather than refused as a bad escape.
+        assert _translate_are_escapes(r"lifelink\Z".lower()) == r"lifelink\Z"
+        parse_scryfall_query(r"o:/lifelink\Z/")
 
     def test_still_rejects_a_genuinely_bad_escape(self) -> None:
         with pytest.raises(InvalidRegexPatternError):
