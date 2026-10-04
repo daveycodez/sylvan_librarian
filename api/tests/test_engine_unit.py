@@ -688,6 +688,37 @@ class TestFractionalManaValue:
         assert _names(cards) == [f"Card {cmc}" for cmc in _HALF_MANA_CMCS]
 
 
+class TestManaValueParity:
+    """`mv:even` / `mv:odd`, from the query string to the engine's verdict.
+
+    Measured on api.scryfall.com 2026-10-03 (corpus `mv>=0` = 33,649): `mv:even` 17,331 and
+    `mv:odd` 16,317 are one short of the corpus, and `-(mv:even or mv:odd)` is the one —
+    Little Girl, whose mana value is 0.5 and is NEITHER. The store is `half_mana_engine`'s,
+    which holds two halves (0.5 and 2.5) beside 0, 1 and 3.
+    """
+
+    def test_even_and_odd_split_the_whole_mana_values(self, half_mana_engine: QueryEngine) -> None:
+        assert _names(_run(half_mana_engine, "mv:even", orderby="cmc")[1]) == ["Card 0.0"]
+        assert _names(_run(half_mana_engine, "mv:odd", orderby="cmc")[1]) == ["Card 1.0", "Card 3.0"]
+
+    def test_a_half_is_neither(self, half_mana_engine: QueryEngine) -> None:
+        """False under both words, so the negated group finds it — as Scryfall's finds Little Girl."""
+        assert _run(half_mana_engine, "mv:even mv=0.5")[0] == 0
+        assert _run(half_mana_engine, "mv:odd mv=0.5")[0] == 0
+        assert _run(half_mana_engine, "mv:even or mv:odd")[0] == 3
+        assert _names(_run(half_mana_engine, "-(mv:even or mv:odd)", orderby="cmc")[1]) == ["Card 0.5", "Card 2.5"]
+
+    def test_every_spelling_is_the_same_search(self, half_mana_engine: QueryEngine) -> None:
+        for query in ("cmc:even", "manavalue=even", "mv=even", "mv:EVEN", 'mv:"even"'):
+            assert _names(_run(half_mana_engine, query)[1]) == ["Card 0.0"], query
+        for query in ("cmc=odd", "manavalue:odd", "mv=odd"):
+            assert _run(half_mana_engine, query)[0] == 2, query
+
+    def test_it_composes_with_other_terms(self, half_mana_engine: QueryEngine) -> None:
+        assert _names(_run(half_mana_engine, "mv:odd mv>1")[1]) == ["Card 3.0"]
+        assert _run(half_mana_engine, "-(mv:odd)")[0] == 3
+
+
 class TestFractionalPowerAndToughness:
     """Power and toughness are strings in Scryfall's schema, and eleven cards print a half.
 

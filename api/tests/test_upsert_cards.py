@@ -306,6 +306,26 @@ class TestFractionalManaValue:
         zero = {c["name"] for c in api_resource._search_sql(**search_kwargs("mv=0", limit=100))["cards"]}
         assert "Half Mana Search Test" not in zero
 
+    def test_parity_is_answered_through_the_sql_search_path(self, api_resource: APIResource) -> None:
+        """`mv:even` / `mv:odd` run in real Postgres, where the column is `real` and has no `%`.
+
+        Scoped by name, so the session-shared database's other rows cannot crowd these three
+        off the page: a whole even, a whole odd, and the half that is neither.
+        """
+        for name, cost, cmc in (("Parity Search Even", "{2}", 2.0), ("Parity Search Odd", "{3}", 3.0), ("Parity Search Half", "{HW}", 0.5)):
+            card = make_raw_card(name=name)
+            card["mana_cost"] = cost
+            card["cmc"] = cmc
+            api_resource.admin._upsert_cards([card])
+
+        def found(query: str) -> set[str]:
+            return {c["name"] for c in api_resource._search_sql(**search_kwargs(f'{query} name:"Parity Search"', limit=100))["cards"]}
+
+        assert found("mv:even") == {"Parity Search Even"}
+        assert found("mv:odd") == {"Parity Search Odd"}
+        assert found("-(mv:even or mv:odd)") == {"Parity Search Half"}
+        assert found("-mv:even") == {"Parity Search Odd", "Parity Search Half"}
+
     def test_the_column_is_not_an_integer_type(self, api_resource: APIResource) -> None:
         """The column type is asserted directly, not just inferred from a round trip.
 
