@@ -277,8 +277,23 @@ impl CompiledRegex {
         let cased = format!("{QUERY_REGEX_FLAGS}{translated}");
         match Regex::new(&cased) {
             Ok(re) => Ok(CompiledRegex { engine: RegexEngine::Fast(re), self_reference }),
+            // `.seek(true)`. Without it fancy_regex searches by trying the VM at EVERY character
+            // of the haystack, and each failed attempt costs one backtrack per top-level
+            // alternative — so the budget measured the LENGTH OF THE TEXT, not the pattern.
+            // `(?<!any )(number of|for each)…|…|…|…` spends over five per character and exhausts
+            // 8,192 on any text past ~1,450 characters. The longest rules text in this corpus is
+            // 777 (Ral, Monsoon Mage), so that pattern stayed under; sixteen alternatives behind
+            // the same lookbehind do not, and the query is then refused for the length of a card
+            // it could never have matched.
+            //
+            // With it, fancy_regex derives the pattern's lookaround-free over-approximation
+            // (lookarounds dropped, backreferences inlined), finds candidate positions with that
+            // on the LINEAR engine, and runs the VM only there. A text with no candidate costs no
+            // budget at all and no VM entry, which is nearly every card. A pattern with nothing to
+            // seek on (`(?=a)(?=b)`) keeps the old search.
             Err(linear_err) => match fancy_regex::RegexBuilder::new(&cased)
                 .backtrack_limit(REGEX_BACKTRACK_LIMIT)
+                .seek(true)
                 .build()
             {
                 Ok(re) => Ok(CompiledRegex { engine: RegexEngine::Backtrack(Arc::new(re)), self_reference }),
