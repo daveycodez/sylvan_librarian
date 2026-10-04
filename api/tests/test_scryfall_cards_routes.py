@@ -22,6 +22,7 @@ from cachebox import LRUCache
 
 from api.enums import CardOrdering, SortDirection, UniqueOn, resolve_direction
 from api.parsing import AttributeNode, BinaryOperatorNode, NotNode, OrNode, StringValueNode, parse_scryfall_query
+from api.parsing.query_budget import QUERY_REGEX_REJECTED_MESSAGE
 from api.scryfall_compat import routes as routes_module
 from api.scryfall_compat.objects import MAX_COLLECTION_IDENTIFIERS, PAGE_SIZE
 from api.scryfall_compat.routes import _csv_cell, _csv_mana_cost, _csv_price
@@ -1187,9 +1188,9 @@ class TestSearch:
         assert "dir=desc" in body["next_page"]
 
     def test_a_directive_warning_is_reported_once(self, compat_corpus: APIResource):
-        """The route folds for the echo and `_search` folds for the search; only one may speak."""
+        """In Scryfall's sentence, typographic quotes and all, and by the term policy alone."""
         body = payload(dispatch(compat_corpus, "/cards/search", urlencode({"q": "t:creature unique:bogus"})))
-        assert body["warnings"] == ['Unknown unique mode "bogus" was ignored']
+        assert body["warnings"] == ["Unknown unique mode \u201cbogus\u201d was ignored"]
 
     def test_page_size_matches_scryfall(self):
         assert PAGE_SIZE == 175
@@ -1303,6 +1304,207 @@ class TestSearch:
     def test_an_unrecognized_unique_mode_is_silent_as_scryfalls_is(self, compat_corpus: APIResource, unique):
         body = payload(dispatch(compat_corpus, "/cards/search", f"q=%21%22Compat+Bolt%22&unique={unique}"))
         assert "warnings" not in body
+
+
+class TestDisplayOptionsInTheQuery:
+    """`unique:`, `order:`, `include:` and the rest, written in `q`, are display options and not terms.
+
+    Measured on api.scryfall.com 2026-10-03; the requests are in query_terms.py beside
+    `_DISPLAY_OPTION_VALUES` and `_INCLUDE_KEYWORD`.
+    """
+
+    def test_the_policys_vocabulary_is_the_folds(self):
+        """The term policy lists the values `_fold_directives` accepts, and may not drift from it."""
+        from api.api_resource import _DIRECTIVE_TABLES  # noqa: PLC0415
+        from api.scryfall_compat.query_terms import _DISPLAY_OPTION_VALUES  # noqa: PLC0415
+
+        assert set(_DISPLAY_OPTION_VALUES) == set(_DIRECTIVE_TABLES)
+        for name, (_noun, values) in _DISPLAY_OPTION_VALUES.items():
+            assert values == set(_DIRECTIVE_TABLES[name][1]), name
+
+    @pytest.mark.parametrize("query", ["unique:prints", "order:cmc", "prefer:oldest", "display:grid", "unique:prints order:cmc"])
+    def test_a_query_of_nothing_but_options_is_all_terms_ignored(self, compat_corpus: APIResource, query):
+        """This surface answered the whole corpus; Scryfall answers a 400 with `warnings: null`."""
+        resp = dispatch(compat_corpus, "/cards/search", urlencode({"q": query}))
+        assert resp.status == falcon.HTTP_400
+        assert payload(resp) == {
+            "object": "error",
+            "code": "bad_request",
+            "status": 400,
+            "warnings": None,
+            "details": "All of your terms were ignored.",
+        }
+
+    def test_an_unknown_option_alone_carries_its_warning_into_the_400(self, compat_corpus: APIResource):
+        resp = dispatch(compat_corpus, "/cards/search", urlencode({"q": "unique:nonsense"}))
+        assert resp.status == falcon.HTTP_400
+        body = payload(resp)
+        assert body["details"] == "All of your terms were ignored."
+        assert body["warnings"] == ["Unknown unique mode \u201cnonsense\u201d was ignored"]
+
+    def test_an_equals_sign_does_not_make_an_option(self, compat_corpus: APIResource):
+        """`unique=prints` beside a term is that term's answer carrying the unknown-keyword sentence."""
+        body = payload(dispatch(compat_corpus, "/cards/search", urlencode({"q": '!"Compat Bolt" unique=prints'})))
+        assert body["total_cards"] == 1
+        assert body["warnings"] == [
+            "Invalid expression \u201cunique=prints\u201d was ignored. Unknown keyword \u201cunique\u201d.",
+        ]
+
+    def test_a_display_mode_is_accepted_silently(self, compat_corpus: APIResource):
+        body = payload(dispatch(compat_corpus, "/cards/search", urlencode({"q": '!"Compat Bolt" display:grid'})))
+        assert body["total_cards"] == 1
+        assert "warnings" not in body
+
+    @pytest.mark.parametrize(
+        "query",
+        ['(unique:prints !"Compat Bolt")', '!"Compat Bolt" (include:extras or t:creature)', '(order:nonsense !"Compat Bolt")'],
+    )
+    def test_an_option_inside_parentheses_is_scryfalls_own_400(self, compat_corpus: APIResource, query):
+        resp = dispatch(compat_corpus, "/cards/search", urlencode({"q": query}))
+        assert resp.status == falcon.HTTP_400
+        assert payload(resp) == {
+            "object": "error",
+            "code": "bad_request",
+            "status": 400,
+            "warnings": None,
+            "details": "Display options may not be specified inside parentheses.",
+        }
+
+    def test_a_negated_option_and_one_beside_an_or_apply_without_comment(self, compat_corpus: APIResource, monkeypatch):
+        """A `-` changes nothing, and the option is removed before the connectors are read."""
+        seen = {}
+        original = compat_corpus._search
+        monkeypatch.setattr(compat_corpus, "_search", lambda **kw: (seen.update(kw), original(**kw))[1])
+        body = payload(dispatch(compat_corpus, "/cards/search", urlencode({"q": "-unique:prints or t:creature order:cmc"})))
+        assert seen["query"] == "t:creature"
+        assert seen["unique"] is UniqueOn.PRINTING
+        assert seen["orderby"] is CardOrdering.CMC
+        assert "warnings" not in body
+
+    # ── include: ─────────────────────────────────────────────────────────────
+
+    def test_include_extras_opens_the_gate_the_parameter_opens(self, compat_corpus: APIResource):
+        """`!"…"` fires no trigger, so without the option this is the 404 the default lane answers."""
+        body = payload(dispatch(compat_corpus, "/cards/search", urlencode({"q": '!"Compat Substitute" include:extras'})))
+        assert [card["id"] for card in body["data"]] == [EXTRA_ID]
+        assert "warnings" not in body
+
+    def test_the_option_beats_a_parameter_that_says_false(self, compat_corpus: APIResource, monkeypatch):
+        seen = {}
+        original = compat_corpus._search
+        monkeypatch.setattr(compat_corpus, "_search", lambda **kw: (seen.update(kw), original(**kw))[1])
+        query = urlencode({"q": '!"Compat Substitute" include:extras', "include_extras": "false"})
+        body = payload(dispatch(compat_corpus, "/cards/search", query))
+        assert [card["id"] for card in body["data"]] == [EXTRA_ID]
+        assert seen["include_extras"] is True
+        assert seen["include_variations"] is False
+        assert seen["include_multilingual"] is False
+
+    @pytest.mark.parametrize(
+        ("value", "flags"),
+        [
+            ("extras", (True, False, False)),
+            ("variations", (False, True, False)),
+            ("multilingual", (False, False, True)),
+            ("all", (True, True, True)),
+            ("everything", (True, True, True)),
+            ("funny", (False, False, False)),
+        ],
+    )
+    def test_each_include_value_reaches_the_search_as_its_parameter_would(
+        self, compat_corpus: APIResource, monkeypatch, value, flags
+    ):
+        seen = {}
+        original = compat_corpus._search
+        monkeypatch.setattr(compat_corpus, "_search", lambda **kw: (seen.update(kw), original(**kw))[1])
+        dispatch(compat_corpus, "/cards/search", urlencode({"q": f"t:creature include:{value}"}))
+        assert seen["query"] == "t:creature"
+        assert (seen["include_extras"], seen["include_variations"], seen["include_multilingual"]) == flags
+
+    def test_next_page_echoes_the_flags_the_option_set(self, compat_corpus: APIResource, monkeypatch):
+        monkeypatch.setattr("api.scryfall_compat.routes.PAGE_SIZE", 1)
+        body = payload(dispatch(compat_corpus, "/cards/search", urlencode({"q": "t:creature include:all"})))
+        assert body["has_more"] is True
+        assert "include_extras=true" in body["next_page"]
+        assert "include_variations=true" in body["next_page"]
+        assert "include_multilingual=true" in body["next_page"]
+
+    def test_an_unknown_include_value_opens_nothing_and_the_page_carries_the_warning(self, compat_corpus: APIResource):
+        """The sentence really is the `direction:` one."""
+        body = payload(dispatch(compat_corpus, "/cards/search", urlencode({"q": '!"Compat Bolt" include:foo'})))
+        assert body["total_cards"] == 1
+        assert body["warnings"] == ["Unknown direction choice \u201cfoo\u201d was ignored"]
+        resp = dispatch(compat_corpus, "/cards/search", urlencode({"q": '!"Compat Substitute" include:foo'}))
+        assert resp.status == falcon.HTTP_404
+
+    def test_include_alone_is_the_400_with_no_warnings(self, compat_corpus: APIResource):
+        resp = dispatch(compat_corpus, "/cards/search", urlencode({"q": "include:extras"}))
+        assert resp.status == falcon.HTTP_400
+        body = payload(resp)
+        assert body["details"] == "All of your terms were ignored."
+        assert body["warnings"] is None
+
+    def test_the_random_draw_reads_include_too(self, compat_corpus: APIResource):
+        resp = dispatch(compat_corpus, "/cards/random", urlencode({"q": '!"Compat Substitute"'}))
+        assert resp.status == falcon.HTTP_404
+        body = payload(dispatch(compat_corpus, "/cards/random", urlencode({"q": '!"Compat Substitute" include:extras'})))
+        assert body["id"] == EXTRA_ID
+
+    def test_the_random_draw_refuses_a_nested_option(self, compat_corpus: APIResource):
+        resp = dispatch(compat_corpus, "/cards/random", urlencode({"q": "(include:extras t:creature)"}))
+        assert resp.status == falcon.HTTP_400
+        assert payload(resp)["details"] == "Display options may not be specified inside parentheses."
+
+
+class TestRegexesScryfallWillNotRun:
+    """A regex Scryfall ignores is ignored here, with its sentence, and the rest of the query answers."""
+
+    @pytest.mark.parametrize(
+        ("pattern", "echo", "reason"),
+        [
+            ("(((a)))", "o:/(((a)))/", "Too many nested groups."),
+            ("." * 90, "o:/................\u2026", "Regular expression too complex."),
+            ("a{51}", "o:/a{51}/", "Too much repetition."),
+            ("(?i)bolt", "o:/(?i)bolt/", "Invalid regular expression: quantifier operand invalid."),
+            ("\\p{L}olt", "o:/\\p{L}olt/", "Invalid regular expression: invalid escape \\ sequence."),
+            # Scryfall would run this one; the parser's own budget will not, and says so the same way.
+            ("(?=a)(?=b)(?=c)(?=d)(?=e)x", "o:/(?=a)(?=b)(?=c)(\u2026", "Regular expression too complex."),
+        ],
+    )
+    def test_beside_another_term_it_is_a_warning_on_a_200(self, compat_corpus: APIResource, pattern, echo, reason):
+        body = payload(dispatch(compat_corpus, "/cards/search", urlencode({"q": f'!"Compat Bolt" o:/{pattern}/'})))
+        assert body["total_cards"] == 1
+        assert body["warnings"] == [f"Invalid expression \u201c{echo}\u201d was ignored. {reason}"]
+
+    def test_alone_it_is_the_400_that_carries_the_warning(self, compat_corpus: APIResource):
+        resp = dispatch(
+            compat_corpus, "/cards/search", urlencode({"q": "o:/destroy ((target (nonblack|nonwhite))|that) creature/"})
+        )
+        assert resp.status == falcon.HTTP_400
+        assert payload(resp) == {
+            "object": "error",
+            "code": "bad_request",
+            "status": 400,
+            "warnings": ["Invalid expression \u201co:/destroy ((target\u2026\u201d was ignored. Too many nested groups."],
+            "details": "All of your terms were ignored.",
+        }
+
+    def test_a_backreference_matches_nothing_instead_of_refusing_the_query(self, compat_corpus: APIResource):
+        r"""`t:creature name:/^(.)\1\1/` is Scryfall's plain 404, with no warnings."""
+        resp = dispatch(compat_corpus, "/cards/search", urlencode({"q": "s:sfc name:/(o)\\1/"}))
+        assert resp.status == falcon.HTTP_404
+        assert payload(resp)["code"] == "not_found"
+        # The complement of nothing is everything the rest of the query matches.
+        negated = payload(dispatch(compat_corpus, "/cards/search", urlencode({"q": "s:sfc -name:/(.)\\1/"})))
+        plain = payload(dispatch(compat_corpus, "/cards/search", urlencode({"q": "s:sfc"})))
+        assert negated["total_cards"] == plain["total_cards"]
+        assert "warnings" not in negated
+
+    def test_search_keeps_the_budget_as_its_own_refusal(self, compat_corpus: APIResource):
+        """Only this surface drops the term; `/search` answers the budget's 400 as it did."""
+        with pytest.raises(falcon.HTTPBadRequest) as refused:
+            compat_corpus._search(query="t:creature o:/(?=a)(?=b)(?=c)(?=d)(?=e)x/", limit=10)
+        assert refused.value.description == QUERY_REGEX_REJECTED_MESSAGE
 
 
 class TestVariationsGate:

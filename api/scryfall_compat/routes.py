@@ -63,7 +63,7 @@ from api.scryfall_compat.objects import (
     sql_row_to_engine_row,
     to_scryfall_card,
 )
-from api.scryfall_compat.query_terms import _UUID_V4_RE, scryfall_term_policy
+from api.scryfall_compat.query_terms import _UUID_V4_RE, SCRYFALL_ONLY_ORDERS, TermPolicyResult, scryfall_term_policy
 from api.settings import settings
 from api.utils import db_utils
 from api.utils.routing import route
@@ -201,7 +201,8 @@ _ORDER_MAP: dict[str, CardOrdering] = {str(member): member for member in CardOrd
 # into a column; `review` is Scryfall-internal with no public input and is not reproducible at all.
 # Both fall back to `name`, which is what Scryfall does with an order it does not recognize
 # (measured 2026-08-09: it falls back silently), and add a warning saying so.
-_SCRYFALL_ONLY_ORDERS = ("penny", "review")
+# One list, kept beside the in-query `order:` option that words its warning the same way.
+_SCRYFALL_ONLY_ORDERS = SCRYFALL_ONLY_ORDERS
 
 # Scryfall's `dir` vocabulary. `auto` is not resolved here -- it reaches `_search` as AUTO and is
 # folded against the ordering there, so this route and /search agree on what auto means.
@@ -363,27 +364,52 @@ _ORACLE_ID_ATTRIBUTE = "oracle_id"
 _ORACLE_ID_TRIGGER_OPERATORS = frozenset({":", "="})
 
 
+def _policy_refusal(policy: TermPolicyResult) -> dict[str, Any] | None:
+    """The 400 Scryfall answers a query the term policy could not leave anything of, or None.
+
+    Three sentences for three mistakes, in the order Scryfall decides them: parentheses that do not
+    balance, a display option inside a group, and a query whose every term was ignored -- which is
+    also what a query of nothing but display options is, with `warnings: null`.
+
+    Args:
+        policy: What `scryfall_term_policy` made of the raw query.
+
+    Returns:
+        The error object, or None when a query survived.
+    """
+    if policy.unclosed_parens:
+        return bad_request_error(_UNCLOSED_PARENS_DETAILS, warnings=None)
+    if policy.nested_display_option:
+        return bad_request_error(_NESTED_DISPLAY_OPTIONS_DETAILS, warnings=None)
+    if policy.all_ignored:
+        return bad_request_error(_ALL_IGNORED_DETAILS, warnings=policy.warnings)
+    return None
+
+
 def _fold_directives_for_echo(
-    parsed: Query,
+    directives: Sequence[tuple[str, str, bool]],
     *,
     unique: UniqueOn,
     orderby: CardOrdering,
     direction: SortDirection,
     prefer: PreferOrder,
 ) -> tuple[UniqueOn, CardOrdering, SortDirection, PreferOrder]:
-    """The effective result shape after the query's own directives, warnings discarded.
+    """The effective result shape after the query's own display options, warnings discarded.
 
     THE SAME FOLD `_search` RUNS, reached through the same helper rather than reimplemented --
-    a second copy of Scryfall's precedence rules is exactly the thing that drifts. It is run
-    twice per request (here for the `next_page` echo, and again inside `_search` for the search
-    itself) and that is safe because folding is idempotent: a directive SETS a value, so folding
-    it over a value it already set changes nothing.
+    a second copy of Scryfall's precedence rules is exactly the thing that drifts.
 
-    Warnings are dropped here and taken from the search result instead, so the response reports
-    each one once.
+    The options arrive from the term policy, which lifts them out of the query text before the
+    parser reads it (query_terms.py, `_display_option`): that is what lets a query of nothing but
+    options be Scryfall's "All of your terms were ignored.", and an unknown value be Scryfall's
+    sentence. So `_search` is handed a query with no directive left in it and the values folded
+    here as its parameters, and there is one fold per request.
+
+    Warnings are dropped: the policy has already said what Scryfall says about a value it does
+    not know, and this surface does not announce a repeated option, as Scryfall does not.
 
     Args:
-        parsed: The parsed query, read for its directives.
+        directives: The `(name, value, nested)` triples the term policy lifted, in source order.
         unique: The unique mode from the query parameters.
         orderby: The ordering from the query parameters.
         direction: The sort direction from the query parameters.
@@ -397,7 +423,7 @@ def _fold_directives_for_echo(
     from api.api_resource import _fold_directives  # noqa: PLC0415
 
     unique, orderby, direction, prefer, _warnings = _fold_directives(
-        parsed.directives,
+        directives,
         unique=unique,
         orderby=orderby,
         direction=direction,
@@ -610,6 +636,10 @@ _EMPTY_QUERY_DETAILS = "You didn‘t enter anything to search for."  # noqa: RUF
 _ALL_IGNORED_DETAILS = "All of your terms were ignored."
 # Scryfall's sentence for a query whose parentheses do not balance, in either direction.
 _UNCLOSED_PARENS_DETAILS = "Your search contains unclosed parentheses."
+# A display option -- `unique:`, `order:`, `include:` and the rest -- written inside a group.
+# Measured 2026-09-27 for every option name, a negated one and an unknown value included: the
+# refusal comes before the value is read, and carries `warnings: null`.
+_NESTED_DISPLAY_OPTIONS_DETAILS = "Display options may not be specified inside parentheses."
 # `/cards/random`'s own miss sentence, which names what it could not do rather than the query.
 _RANDOM_NO_MATCH_DETAILS = "0 cards matched this search, a random card could not be returned."
 # Scryfall's wording for `/cards/named` with neither parameter -- backticks and no full stop.
@@ -1708,10 +1738,11 @@ class ScryfallCardsRoutes:
         set term enables it, and nothing that enables extras does either -- the two gates are
         independent, and a query may cross both.
 
-        In-query directives (`unique:`, `order:`/`sort:`, `dir:`/`direction:`, `prefer:`) reach
-        the search through `_search`'s own fold and override the query parameter of the same
-        meaning, and `next_page` echoes the values that were SERVED rather than the ones that were
-        sent -- so a client following the link verbatim pages the same result set.
+        In-query display options (`unique:`, `order:`/`sort:`, `dir:`/`direction:`, `prefer:`,
+        `include:`, `display:`) are lifted out of `q` by the term policy and folded over the query
+        parameter of the same meaning, which they override; `next_page` echoes the values that were
+        SERVED rather than the ones that were sent -- so a client following the link verbatim pages
+        the same result set.
 
         Args:
             falcon_response: The Falcon response to write to.
@@ -1749,18 +1780,9 @@ class ScryfallCardsRoutes:
         # the terms this API cannot honor leave the query carrying a warning, and only a query with
         # NOTHING left is a bad request. See query_terms.py for the measurements behind every rule.
         policy = scryfall_term_policy(q)
-        if policy.unclosed_parens:
-            return self._scryfall_respond(
-                falcon_response,
-                bad_request_error(_UNCLOSED_PARENS_DETAILS, warnings=None),
-                pretty=is_pretty,
-            )
-        if policy.all_ignored:
-            return self._scryfall_respond(
-                falcon_response,
-                bad_request_error(_ALL_IGNORED_DETAILS, warnings=policy.warnings),
-                pretty=is_pretty,
-            )
+        refusal = _policy_refusal(policy)
+        if refusal is not None:
+            return self._scryfall_respond(falcon_response, refusal, pretty=is_pretty)
         warnings: list[str] = list(policy.warnings)
 
         # An unrecognized `unique` is Scryfall's default, SILENTLY: `unique=printing`,
@@ -1808,7 +1830,7 @@ class ScryfallCardsRoutes:
         # `_fold_directives`' documented rule, which is why this is the shared implementation
         # rather than a second one that could drift from `/search`.
         unique_on, orderby, direction, prefer = _fold_directives_for_echo(
-            parsed,
+            [*policy.directives, *parsed.directives],
             unique=unique_on,
             orderby=orderby,
             direction=direction,
@@ -1825,7 +1847,11 @@ class ScryfallCardsRoutes:
             # before searching: a set term enables extras iff that set holds one. Asked only when
             # the query actually named a set, so an ordinary page never pays for the table.
             forced = not self._sets_with_extras().isdisjoint(triggers.sets)
-        effective_extras = forced or _as_bool(include_extras)
+        # ...and so does the query's own `include:extras`, a display option the term policy lifted
+        # out: it beats a parameter that says false, in the rows and in the echo (`include:extras
+        # cmc=3` sent with `include_extras=false` is 8,302 echoing true, measured 2026-10-03).
+        effective_extras = forced or policy.include_extras or _as_bool(include_extras)
+        effective_multilingual = policy.include_multilingual or _as_bool(include_multilingual)
 
         # AND THE SAME STORY FOR `include_variations`, WITH A DIFFERENT TRIGGER RULE -- which is
         # why this is its own walk and not a second reading of `triggers`. Every unconditional
@@ -1839,7 +1865,9 @@ class ScryfallCardsRoutes:
         # sent with `include_variations=false` answers 51,566 and echoes true.
         from api.api_resource import VARIATION_IS_TAG  # noqa: PLC0415
 
-        effective_variations = _mentions_is_tag(parsed, VARIATION_IS_TAG) or _as_bool(include_variations)
+        effective_variations = (
+            _mentions_is_tag(parsed, VARIATION_IS_TAG) or policy.include_variations or _as_bool(include_variations)
+        )
 
         try:
             result = self._search(
@@ -1855,7 +1883,7 @@ class ScryfallCardsRoutes:
                 # auto-enable above is what can override it. Fixing both on the way in keeps
                 # "absent" from meaning anything.
                 include_extras=effective_extras,
-                include_multilingual=_as_bool(include_multilingual),
+                include_multilingual=effective_multilingual,
                 include_variations=effective_variations,
             )
         except falcon.HTTPBadRequest as err:
@@ -1892,7 +1920,7 @@ class ScryfallCardsRoutes:
                     # the page it came from. Measured 2026-08-16 over 57 set probes plus the
                     # unconditional families: the echo agreed with what was served in every one.
                     "include_extras": str(effective_extras).lower(),
-                    "include_multilingual": str(_as_bool(include_multilingual)).lower(),
+                    "include_multilingual": str(effective_multilingual).lower(),
                     "include_variations": str(effective_variations).lower(),
                     # RESOLVED, not raw -- see _UNIQUE_ECHO. This is what keeps the link correct
                     # now that the in-query directives (#893) fold here: `q` echoes verbatim,
@@ -2658,18 +2686,9 @@ class ScryfallCardsRoutes:
             # term was silently dropped is a random card from the WHOLE corpus, which is the worst
             # of the available answers.
             policy = scryfall_term_policy(q)
-            if policy.unclosed_parens:
-                return self._scryfall_respond(
-                    falcon_response,
-                    bad_request_error(_UNCLOSED_PARENS_DETAILS, warnings=None),
-                    pretty=is_pretty,
-                )
-            if policy.all_ignored:
-                return self._scryfall_respond(
-                    falcon_response,
-                    bad_request_error(_ALL_IGNORED_DETAILS, warnings=policy.warnings),
-                    pretty=is_pretty,
-                )
+            refusal = _policy_refusal(policy)
+            if refusal is not None:
+                return self._scryfall_respond(falcon_response, refusal, pretty=is_pretty)
             try:
                 parsed = parse_scryfall_query(policy.query)
             except ValueError:
@@ -2720,8 +2739,11 @@ class ScryfallCardsRoutes:
                 _apply_variations_default,
             )
 
-            effective_variations = _mentions_is_tag(parsed, VARIATION_IS_TAG) or _as_bool(include_variations)
-            _apply_extras_default(parsed, include_extras=forced or _as_bool(include_extras))
+            # The query's own `include:` options open the same two gates the parameters open.
+            effective_variations = (
+                _mentions_is_tag(parsed, VARIATION_IS_TAG) or policy.include_variations or _as_bool(include_variations)
+            )
+            _apply_extras_default(parsed, include_extras=forced or policy.include_extras or _as_bool(include_extras))
             _apply_variations_default(parsed, include_variations=effective_variations)
             where, params = generate_sql_query(parsed)
 
