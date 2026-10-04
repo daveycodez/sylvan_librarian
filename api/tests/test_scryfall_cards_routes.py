@@ -1507,6 +1507,35 @@ class TestRegexesScryfallWillNotRun:
         assert refused.value.description == QUERY_REGEX_REJECTED_MESSAGE
 
 
+class TestManyFacedText:
+    """A card with more than two faces has no searchable rules text.
+
+    Measured on api.scryfall.com 2026-10-04, each scoped `!"Who // What // When // Where // Why"`:
+    `o:target`, `o:destroy`, `o:/target/` and `o:/./` are 404 and `o:/^$/` is 1. The corpus card is
+    this module's five-part name, whose every face reads "<name> does nothing."
+    """
+
+    @pytest.mark.parametrize("term", ["o:nothing", 'o:"does nothing"', "o:/nothing/", "o:/./"])
+    def test_no_term_finds_it_through_a_face(self, compat_corpus: APIResource, term):
+        resp = dispatch(compat_corpus, "/cards/search", urlencode({"q": f'!"{WHO_NAME}" {term}'}))
+        assert resp.status == falcon.HTTP_404
+
+    def test_the_text_is_there_and_empty(self, compat_corpus: APIResource):
+        body = payload(dispatch(compat_corpus, "/cards/search", urlencode({"q": f'!"{WHO_NAME}" o:/^$/'})))
+        assert [card["id"] for card in body["data"]] == [WHO_ID]
+
+    def test_the_card_object_still_prints_every_face(self, compat_corpus: APIResource):
+        body = payload(dispatch(compat_corpus, "/cards/search", urlencode({"q": f'!"{WHO_NAME}"'})))
+        (card,) = body["data"]
+        assert [face["oracle_text"] for face in card["card_faces"]] == [f"{part} does nothing." for part in WHO_NAME.split(" // ")]
+
+    @pytest.mark.parametrize("term", ['o:"top card of your library"', "o:flying", "o:/flying/"])
+    def test_a_two_faced_card_is_searched_through_either_face_as_ever(self, compat_corpus: APIResource, term):
+        query = urlencode({"q": f'!"Compat Delver // Compat Aberration" {term}'})
+        body = payload(dispatch(compat_corpus, "/cards/search", query))
+        assert [card["id"] for card in body["data"]] == [DELVER_ID]
+
+
 class TestVariationsGate:
     """`include_variations`, its auto-enable, and its independence from the extras gate."""
 

@@ -16784,3 +16784,17 @@ fn limit_zero_yields_no_rows_and_the_full_total() {
         }
     }
 }
+
+/// A card with more than two faces is searched as if it had no rules text; one or two faces are
+/// searched as ever. Measured on api.scryfall.com 2026-10-04: `!"Who // What // When // Where //
+/// Why" o:target` is 404 and `o:/^$/` is 1, and the three-faced Smelt // Herd // Saw is the same.
+#[test]
+fn a_card_with_more_than_two_faces_has_no_searchable_text() {
+    use super::searched_oracle_text as searched;
+    let text = "Target player gains X life.\n//\nDestroy target artifact.";
+    assert_eq!(searched(text, 0), text, "a single-faced card has no faces to count");
+    assert_eq!(searched(text, 1), text);
+    assert_eq!(searched(text, 2), text, "a two-faced split card is searched through its faces");
+    assert_eq!(searched(text, 3), "", "Smelt // Herd // Saw");
+    assert_eq!(searched(text, 5), "", "Who // What // When // Where // Why");
+}

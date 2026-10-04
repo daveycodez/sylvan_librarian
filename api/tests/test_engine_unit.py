@@ -1656,3 +1656,68 @@ class TestRouterDispatchScope:
                 assert picked[0] in scope, f"{query}@{limit}: picked {picked[0]}, which this acquire cannot run"
                 checked += 1
         assert checked, "no query in PLANE_QUERIES acquired through a plane or candidate list"
+
+
+class TestManyFacedText:
+    """A card with more than two faces has no searchable rules text.
+
+    Measured on api.scryfall.com 2026-10-04, each scoped `!"Who // What // When // Where // Why"`
+    (five instants): `o:target`, `o:destroy`, `o:"destroy target artifact"`, `o:/target/` and `o:/./`
+    are 404, and `o:/^$/` is 1 -- the text is there, and empty. The three-faced Smelt // Herd // Saw
+    is the same, and a two-faced split card is searched through its faces as ever.
+    """
+
+    _FACES = (
+        ("Who", "Target player gains X life."),
+        ("What", "Destroy target artifact."),
+        ("When", "Counter target creature spell."),
+        ("Where", "Destroy target land."),
+        ("Why", "Destroy target enchantment."),
+    )
+
+    @classmethod
+    def _row(cls, face_count: int) -> dict:
+        """A split card of the first `face_count` faces, shaped as the import writes a merged row."""
+        faces = cls._FACES[:face_count]
+        name = " // ".join(face_name for face_name, _text in faces)
+        return {
+            "card_name": name,
+            "card_name_folded": name.lower(),
+            "card_layout": "split",
+            "type_line": " // ".join(["Instant"] * face_count),
+            "card_types": ["Instant"],
+            "oracle_id": str(uuid.uuid4()),
+            "scryfall_id": str(uuid.uuid4()),
+            "oracle_text": "\n//\n".join(text for _face_name, text in faces),
+            "card_faces": [
+                {"name": face_name, "type_line": "Instant", "oracle_text": text, "mana_cost": "{W}"} for face_name, text in faces
+            ],
+        }
+
+    @pytest.fixture(name="faced_engine")
+    def faced_engine_fixture(self, fresh_engine: Callable[[], QueryEngine]) -> QueryEngine:
+        e = fresh_engine()
+        e.reload([self._row(face_count) for face_count in (2, 3, 5)])
+        return e
+
+    @staticmethod
+    def _found(engine: QueryEngine, query: str) -> set[str]:
+        return set(_names(_run(engine, query, fields=["name"])[1]))
+
+    @pytest.mark.parametrize("query", ["o:target", "o:destroy", 'o:"destroy target artifact"', "o:/target/", "o:/./"])
+    def test_only_the_two_faced_card_is_found_through_its_text(self, faced_engine: QueryEngine, query: str) -> None:
+        assert self._found(faced_engine, query) == {"Who // What"}
+
+    def test_the_text_of_the_others_is_there_and_empty(self, faced_engine: QueryEngine) -> None:
+        assert self._found(faced_engine, "o:/^$/") == {"Who // What // When", "Who // What // When // Where // Why"}
+
+    def test_a_negated_term_keeps_them(self, faced_engine: QueryEngine) -> None:
+        assert self._found(faced_engine, "-o:target") == {"Who // What // When", "Who // What // When // Where // Why"}
+
+    def test_the_name_and_the_type_still_find_all_three(self, faced_engine: QueryEngine) -> None:
+        assert len(self._found(faced_engine, "name:what")) == 3
+        assert len(self._found(faced_engine, "t:instant")) == 3
+
+    def test_the_emitted_text_is_untouched(self, faced_engine: QueryEngine) -> None:
+        _total, cards = _run(faced_engine, 'name:"why"', fields=["name", "oracle_text"])
+        assert cards == [{"name": "Who // What // When // Where // Why", "oracle_text": self._row(5)["oracle_text"]}]

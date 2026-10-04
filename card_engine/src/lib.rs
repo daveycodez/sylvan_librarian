@@ -1755,6 +1755,34 @@ fn opt_str_list_color_mask(d: &Bound<PyDict>, key: &str) -> Option<u8> {
     d.get_item(key).ok().flatten().filter(|v| !v.is_none()).map(|_| str_list_color_mask(d, key))
 }
 
+/// The oracle text `o:` gets to search, given how many faces the card has: all of it, or — for a
+/// card with MORE THAN TWO faces — none.
+///
+/// api.scryfall.com searches no rules text at all on a card with three or more faces. Measured
+/// 2026-10-04 on Who // What // When // Where // Why, whose five faces read "Target player gains
+/// X life.", "Destroy target artifact.", "Counter target creature spell.", "Destroy target land."
+/// and "Destroy target enchantment.", each scoped `!"Who // What // When // Where // Why"`:
+///
+/// | query | answer |
+/// |---|---|
+/// | (the name alone), `t:instant`, `name:/what/` | 1 |
+/// | `o:target`, `o:destroy`, `o:"destroy target artifact"`, `o:/target/`, `o:/./` | 404 |
+/// | `fo:target`, `fo:/target/` | 404 |
+/// | `o:/^$/`, `fo:/^$/` | 1 — the text is there, and empty |
+///
+/// and the three-faced Smelt // Herd // Saw is the same (`include:extras o:/./` 404, `o:/^$/` 1).
+/// A two-faced split card is searched face by face as ever (`!"Fire // Ice" o:/^tap target
+/// permanent\.$/` is 1). Three cards in the corpus have more than two faces — these two and
+/// There // They're // Their — and the first is not an extra.
+///
+/// Decided where the search column is interned rather than per query: a quoted phrase is answered
+/// from a bound set of text ids with no card in hand, so a per-card check at query time would
+/// miss it. The text the card object PRINTS is untouched: `oracle_text_id` and each face keep
+/// theirs.
+pub(crate) fn searched_oracle_text(oracle_text: &str, face_count: usize) -> &str {
+    if face_count > 2 { "" } else { oracle_text }
+}
+
 /// The card's faces, front first; empty for the ~82% of cards with one face.
 ///
 /// Keys here are Scryfall's own (see `_FACE_OBJECT_FIELDS` in api/card_processing.py), not the
@@ -1838,7 +1866,14 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
     // Already lowercased + accent-folded in Python (fold_accents(), #649); read as-is.
     let card_name_folded = InlineStr::<61>::from_str(&opt_str(d, "card_name_folded").unwrap_or_default());
     let oracle_text = opt_str(d, "oracle_text").unwrap_or_default();
-    let oracle_text_lower_id = it.intern(oracle_text.to_lowercase());
+    // A card with more than two faces is searched as if it had no text — see `searched_oracle_text`.
+    let face_count = d
+        .get_item("card_faces")
+        .ok()
+        .flatten()
+        .and_then(|v| v.cast::<PyList>().ok().map(|l| l.len()))
+        .unwrap_or(0);
+    let oracle_text_lower_id = it.intern(searched_oracle_text(&oracle_text, face_count).to_lowercase());
     let flavor_text = opt_str(d, "flavor_text").unwrap_or_default();
     let flavor_text_lower_id = it.intern(flavor_text.to_lowercase());
     // Lowercased into the artist vocab for search, original case into the string table for the
@@ -17098,7 +17133,13 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 //                from the parent's archive, and the two branches had been sharing 2026082707 for
 //                two layouts -- exactly the collision this constant exists to prevent -- so the
 //                child takes its own number from here on.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026090809;
+//   2026100301 — A CARD WITH MORE THAN TWO FACES HAS NO SEARCHABLE RULES TEXT
+//                (`searched_oracle_text`). No layout moves; three cards' `oracle_text_lower_id`
+//                now intern the empty string, and with them the oracle trigram index and the
+//                bound substring sets, which are built from that column. An archive written by
+//                the older code would keep answering `o:target` with Who // What // When //
+//                Where // Why, and nothing in the header could say so.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026100301;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
