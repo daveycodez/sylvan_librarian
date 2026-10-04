@@ -179,6 +179,18 @@ _DERIVED_EXPANSIONS: dict[tuple[str, str], str] = {
     # frame_effects member into card_frame_data, so it reaches the column as colorshifted does.
     ("is", "borderless"): "border:borderless",
     ("is", "tombstone"): "frame:tombstone",
+    # Other words Scryfall accepts for a stored tag, each the same list as its target on 2026-10-04
+    # (every symmetric difference empty): the `...id` spellings of the four marketplace and artwork
+    # presence tests, `ci` and `colorindicator` for the colour-indicator class, and
+    # `displaycommander` -- the thick-stock display commanders, all 97 printings of which carry the
+    # `thick` promo type and no other printing does.
+    ("is", "cardmarketid"): "is:cardmarket",
+    ("is", "illustrationid"): "is:illustration",
+    ("is", "multiverseid"): "is:multiverse",
+    ("is", "tcgplayerid"): "is:tcgplayer",
+    ("is", "ci"): "is:indicator",
+    ("is", "colorindicator"): "is:indicator",
+    ("is", "displaycommander"): "is:thick",
 }
 
 

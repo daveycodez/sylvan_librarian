@@ -187,3 +187,68 @@ The candidates Scryfall itself rejects as `is:` values -- `acorn`, `oval`, `tria
 `circle`, `snow`, `devoid`, `legendary`, `inverted`, `lesson`, `enchantment` and the DFC frame
 effects -- are deliberately absent: they are `frame_effects`/`security_stamp` members that
 `frame:`/`stamp:` reach, and a row would answer where Scryfall refuses.
+
+#### A third sweep (2026-10-04): fields, lists and set types
+
+The same probing of `is:` values found 22 more that answer on api.scryfall.com and were a silent
+zero here, and one row that answered the wrong list. Only one is a promo type. Every count below is
+api.scryfall.com on 2026-10-04 with extras and variations in (`unique=prints`), against the same
+day's `default_cards` bulk file (118,470 rows; Scryfall held five more printings by then), and
+each row of the bulk file satisfying a rule was counted by a second, independent model of it.
+
+| value | what it reads | Scryfall | rows the importer keeps |
+| --- | --- | ---: | ---: |
+| `is:mtgoid` | a `mtgo_id` -- not the foil id | 63,197 | 57,365 |
+| `is:arenaid` | an `arena_id` | 19,830 | 16,761 |
+| `is:tcgplayer` | a `tcgplayer_id` -- not the etched id | 102,340 | 97,558 |
+| `is:cardmarket` | a `cardmarket_id` | 100,433 | 96,437 |
+| `is:multiverse` | a non-empty `multiverse_ids` | 69,535 | 64,364 |
+| `is:illustration` | an `illustration_id` on the printing or a face | 117,712 | 99,755 |
+| `is:image` | an `image_status` other than `missing` | 118,313 | 99,762 |
+| `is:placeholderimage` | `image_status: placeholder` | 575 | 569 |
+| `is:back` | a `card_back_id` other than the one shared Magic back | 3,331 | 2,606 |
+| `is:indicator` | a colour indicator on the printing or a face | 1,006 | 918 |
+| `is:fbb` | the sets fbb, bchr, ren, rin and 4bb | 1,001 | 990 |
+| `is:tron` | Urza's Mine, Power Plant and Tower, by name | 96 | 78 |
+| `is:vergeland` | the ten Verges, by name | 45 | 45 |
+| `is:timeshifted` | frame 1997 in tsb or tsr, or `special` in plst | 247 | 247 |
+| `is:moonlitland` | the `moonlitland` promo type | 5 | 5 |
+| `is:dueldeck` | `set_type = duel_deck` | 1,945 | 1,838 |
+| `is:fromthevault` | `set_type = from_the_vault` | 157 | 156 |
+
+The negation of each is the plain complement (a tag is present or it is not): `-is:image` is 162 on
+Scryfall and 0 here, `-is:tcgplayer` 16,135 and 2,204.
+
+`is:image` is "not `missing`", which a printing with no status at all would satisfy; every card
+object in the bulk files carries a status, so the row requires one.
+
+Seven more spellings are rewrites, as the earlier ones are, because the tag under either
+spelling is the same tag: `is:tcgplayerid`, `is:cardmarketid`, `is:multiverseid`,
+`is:illustrationid` (each the same list as its target, both polarities), `is:ci` and
+`is:colorindicator` (= `is:indicator`, 1,006), and `is:displaycommander` (= `is:thick`: all 97
+printings of the thick-stock display commanders carry the `thick` promo type, and no other does).
+
+**`is:scryfallpreview` changes.** The row read `preview.source = 'Scryfall'`, which 325 printings
+carry, 321 of them the 2026 `slz` set (whose `source_uri` is the set page or null) and none of which
+is in Scryfall's answer: `is:scryfallpreview` is 7 printings there. The four that are in it carry
+the card's own page as the source URI; the other three (uma/50, grn/103 and the List reprint of it,
+plst/GRN-103) carry no `preview` object at all, so they are named by set and collector number. 7 of
+7 on Scryfall's list, 7 here.
+
+**Not rows, because the importer drops every printing they would match.** `is:unset` (1,411 on
+Scryfall: the Un-sets, all `funny` or legal nowhere), `is:attractionlights` (135: Attractions,
+`funny`), `is:minigame` (55) and `is:vanguard` (117) (legal nowhere), and `is:treasurechest` /
+`is:cube` (419: the Magic Online Treasure Chest sets, not on paper). A row for any of them would be
+a tag on no printing, so each stays the silent zero it was; add the row when the importer keeps the
+printings (`preprocess_card` filters on `legalities`, `games` and `set_type == "funny"`).
+
+**Compared printing by printing**, on set and collector number, against Scryfall's own lists
+(`game:paper`, since the importer drops the rest): for `is:back`, `is:indicator`, `is:fbb`, `is:tron`,
+`is:vergeland`, `is:timeshifted`, `is:moonlitland`, `is:scryfallpreview`, `is:dueldeck`,
+`is:fromthevault`, `is:placeholderimage` and `is:thick`, whole lists; for `-is:illustration`,
+`-is:tcgplayer` and `-is:cardmarket`, the whole complements (763, 7,003 and 8,906 printings); for the
+seven dense presence tests, the sixteen sets lea, mir, ulg, ons, 9ed, rav, tsp, zen, isd, ktk, m19,
+eld, khm, neo, dsk and fdn (4,985 to 6,080 printings each). In every one of those comparisons nothing
+here is missing from Scryfall's list and nothing Scryfall lists that the table holds is untagged:
+what is on Scryfall's list and not here is a printing the importer dropped (legal nowhere, a `funny`
+set, an `X // X` card, not on paper), the 725 of 3,331 `is:back` printings among them.

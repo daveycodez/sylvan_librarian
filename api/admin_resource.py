@@ -158,11 +158,32 @@ _MELD_ROLE_SQL = (
 # 46, 1 and 30 cards. Each was checked in both directions: every printing Scryfall returns for
 # the value carries the member, and the rows of the 2026-10-03 bulk file carrying each promo
 # type number exactly Scryfall's printings (51, 61, 50, 1 and 33).
+#
+# The same sweep found the values that are not promo types at all: a field the printing carries
+# (`mtgoid`, `arenaid`, `tcgplayer`, `cardmarket`, `multiverse`, `illustration`, `image`,
+# `placeholderimage`, `back`, `indicator`), a list of sets or of names (`fbb`, `timeshifted`,
+# `tron`, `vergeland`), a set type (`dueldeck`, `fromthevault`) and one more promo type
+# (`moonlitland`). Each row says what it reads; docs/issues/00985-is-tag-remaining-coverage.md has
+# the Scryfall counts, what the importer's filters change, and the values that are NOT rows because
+# the importer drops every printing they would match (`unset`, `attractionlights`, `minigame`,
+# `vanguard`, `treasurechest`). The expressions read the blob only (`raw_card_blob->>'set'`,
+# `->>'name'`), so the subquery below still provides every column they need. The presence tests
+# are dense on purpose: they have no sparse side to store, and #1003 made a dense value a bitmap.
 BOOLEAN_IS_TAGS: dict[str, str] = {
     # Alphabetized by key. Expressions read either a plain top-level boolean (reserved,
     # gamechanger, spotlight), promo_types/keywords/finishes array membership, or a
     # single-field lookup (set_type, preview.source).
     "arena_league": "cards.raw_card_blob->'promo_types' @> '\"arenaleague\"'",
+    # `is:arenaid`: the printing CARRIES an Arena id. Presence of a field, read off the blob; a JSON
+    # null (Scryfall omits the key instead) would not count. Measured against api.scryfall.com
+    # 2026-10-04 -- see docs/issues/00985-is-tag-remaining-coverage.md, "A third sweep".
+    "arenaid": "jsonb_typeof(cards.raw_card_blob->'arena_id') = 'number'",
+    # `is:back`: a `card_back_id` that is not the one shared Magic back -- the printings with a back
+    # of their own (3,331 on Scryfall). NOT "is double-faced": no two-sided card is in it.
+    "back": (
+        "cards.raw_card_blob->>'card_back_id' IS NOT NULL "
+        "AND cards.raw_card_blob->>'card_back_id' <> '0aeebaf5-8c7d-4636-9e82-8c27447861f7'"
+    ),
     "beginnerbox": "cards.raw_card_blob->'promo_types' @> '\"beginnerbox\"'",
     "booster": "cards.raw_card_blob->'booster' = 'true'::jsonb",
     "boosterfun": "cards.raw_card_blob->'promo_types' @> '\"boosterfun\"'",
@@ -171,6 +192,7 @@ BOOLEAN_IS_TAGS: dict[str, str] = {
     "bringafriend": "cards.raw_card_blob->'promo_types' @> '\"bringafriend\"'",
     "bundle": "cards.raw_card_blob->'promo_types' @> '\"bundle\"'",
     "buyabox": "cards.raw_card_blob->'promo_types' @> '\"buyabox\"'",
+    "cardmarket": "jsonb_typeof(cards.raw_card_blob->'cardmarket_id') = 'number'",
     "chocobotrackfoil": "cards.raw_card_blob->'promo_types' @> '\"chocobotrackfoil\"'",
     "commanderparty": "cards.raw_card_blob->'promo_types' @> '\"commanderparty\"'",
     "commanderpromo": "cards.raw_card_blob->'promo_types' @> '\"commanderpromo\"'",
@@ -191,11 +213,16 @@ BOOLEAN_IS_TAGS: dict[str, str] = {
     "draculaseries": "cards.raw_card_blob->'promo_types' @> '\"draculaseries\"'",
     "draftweekend": "cards.raw_card_blob->'promo_types' @> '\"draftweekend\"'",
     "dragonscalefoil": "cards.raw_card_blob->'promo_types' @> '\"dragonscalefoil\"'",
+    "dueldeck": "cards.raw_card_blob->>'set_type' = 'duel_deck'",
     "duels": "cards.raw_card_blob->'promo_types' @> '\"duels\"'",
     "embossed": "cards.raw_card_blob->'promo_types' @> '\"embossed\"'",
     "etched": "cards.raw_card_blob->'finishes' @> '\"etched\"'",
     "event": "cards.raw_card_blob->'promo_types' @> '\"event\"'",
     "facetfoil": "cards.raw_card_blob->'promo_types' @> '\"facetfoil\"'",
+    # `is:fbb`: the foreign black-bordered editions -- every printing of fbb, bchr, ren, rin and 4bb. On
+    # Scryfall 4bb is all but its Korean and Chinese printings, which are not in `default_cards`
+    # (its 378 rows there are all Spanish), so here the set code alone is the rule.
+    "fbb": "cards.raw_card_blob->>'set' IN ('fbb', 'bchr', 'ren', 'rin', '4bb')",
     "ffi": "cards.raw_card_blob->'promo_types' @> '\"ffi\"'",
     "ffii": "cards.raw_card_blob->'promo_types' @> '\"ffii\"'",
     "ffiii": "cards.raw_card_blob->'promo_types' @> '\"ffiii\"'",
@@ -220,6 +247,7 @@ BOOLEAN_IS_TAGS: dict[str, str] = {
     "fnm": "cards.raw_card_blob->'promo_types' @> '\"fnm\"'",
     "foil": "cards.raw_card_blob->'foil' = 'true'::jsonb",
     "fracturefoil": "cards.raw_card_blob->'promo_types' @> '\"fracturefoil\"'",
+    "fromthevault": "cards.raw_card_blob->>'set_type' = 'from_the_vault'",
     "full": "cards.raw_card_blob->'full_art' = 'true'::jsonb",
     "galaxyfoil": "cards.raw_card_blob->'promo_types' @> '\"galaxyfoil\"'",
     "gamechanger": "cards.raw_card_blob->'game_changer' = 'true'::jsonb",
@@ -234,7 +262,21 @@ BOOLEAN_IS_TAGS: dict[str, str] = {
     "hires": "cards.raw_card_blob->'highres_image' = 'true'::jsonb",
     # Matches color/color, 2/color, colorless/color, and color/color/phyrexian.
     "hybrid": r"cards.mana_cost_text ~ '\{[2CWUBRG]/[WUBRG]'",
+    # `is:illustration`: the printing has artwork -- an `illustration_id` on the printing or on one of
+    # its faces (117,712 printings on Scryfall; 763 have none).
+    "illustration": (
+        "jsonb_typeof(cards.raw_card_blob->'illustration_id') = 'string' "
+        "OR jsonb_path_exists(cards.raw_card_blob, '$.card_faces[*].illustration_id')"
+    ),
+    # `is:image`: an `image_status` other than `missing` -- 118,313 printings against 162 on Scryfall.
+    # Every card object in the bulk files carries a status; one that did not would have no image.
+    "image": "COALESCE(cards.raw_card_blob->>'image_status', 'missing') <> 'missing'",
     "imagine": "cards.raw_card_blob->'promo_types' @> '\"imagine\"'",
+    # `is:indicator`: a colour indicator on the printing or on one of its faces (1,006 printings).
+    "indicator": (
+        "jsonb_array_length(COALESCE(cards.raw_card_blob->'color_indicator', '[]'::jsonb)) > 0 "
+        "OR jsonb_path_exists(cards.raw_card_blob, '$.card_faces[*].color_indicator[*]')"
+    ),
     "instore": "cards.raw_card_blob->'promo_types' @> '\"instore\"'",
     "intro_pack": "cards.raw_card_blob->'promo_types' @> '\"intropack\"'",
     "invisibleink": "cards.raw_card_blob->'promo_types' @> '\"invisibleink\"'",
@@ -253,6 +295,12 @@ BOOLEAN_IS_TAGS: dict[str, str] = {
     # result; both answered 0 here before this. See _MELD_ROLE_SQL for how "own" is decided.
     "meldpart": _MELD_ROLE_SQL.format(component="meld_part"),
     "meldresult": _MELD_ROLE_SQL.format(component="meld_result"),
+    # Crimson Vow's five WPN moonlit basics: the promo type of its own name.
+    "moonlitland": "cards.raw_card_blob->'promo_types' @> '\"moonlitland\"'",
+    # `is:mtgoid`: a `mtgo_id` -- NOT the foil id (`mtgo_foil_id` alone is one printing more).
+    "mtgoid": "jsonb_typeof(cards.raw_card_blob->'mtgo_id') = 'number'",
+    # `is:multiverse`: a non-empty `multiverse_ids`.
+    "multiverse": "jsonb_array_length(COALESCE(cards.raw_card_blob->'multiverse_ids', '[]'::jsonb)) > 0",
     "neonink": "cards.raw_card_blob->'promo_types' @> '\"neonink\"'",
     "nonfoil": "cards.raw_card_blob->'nonfoil' = 'true'::jsonb",
     "oilslick": "cards.raw_card_blob->'promo_types' @> '\"oilslick\"'",
@@ -262,6 +310,8 @@ BOOLEAN_IS_TAGS: dict[str, str] = {
     "partner": "cards.raw_card_blob->'keywords' @> '\"Partner\"'",
     # Search for `/P}` in mana costs and oracle texts.
     "phyrexian": r"(cards.mana_cost_text ~ '/P\}' OR cards.oracle_text ~ '/P\}')",
+    # `is:placeholderimage`: the image is a placeholder (575 printings).
+    "placeholderimage": "cards.raw_card_blob->>'image_status' = 'placeholder'",
     "planeswalker_deck": "cards.raw_card_blob->'promo_types' @> '\"planeswalkerdeck\"'",
     "player_rewards": "cards.raw_card_blob->'promo_types' @> '\"playerrewards\"'",
     "playpromo": "cards.raw_card_blob->'promo_types' @> '\"playpromo\"'",
@@ -282,7 +332,17 @@ BOOLEAN_IS_TAGS: dict[str, str] = {
     "ripplefoil": "cards.raw_card_blob->'promo_types' @> '\"ripplefoil\"'",
     "schinesealtart": "cards.raw_card_blob->'promo_types' @> '\"schinesealtart\"'",
     "scroll": "cards.raw_card_blob->'promo_types' @> '\"scroll\"'",
-    "scryfallpreview": "cards.raw_card_blob->'preview'->>'source' = 'Scryfall'",
+    # Not the SOURCE alone: on 2026-10-04 `is:scryfallpreview` answered 7 printings on Scryfall, and 325
+    # carry `preview.source = 'Scryfall'`, 321 of them the 2026 `slz` set, whose `source_uri` is the set
+    # page or NULL and none of which Scryfall's answer holds. The four that are in it carry the card's OWN
+    # page as the source; the other three (uma/50, grn/103 and the List reprint of it) carry no `preview`
+    # object at all, so they are named by set and collector number.
+    "scryfallpreview": (
+        "(cards.raw_card_blob->'preview'->>'source' = 'Scryfall' "
+        "AND cards.raw_card_blob->'preview'->>'source_uri' LIKE 'https://scryfall.com/card/%%') "
+        "OR (cards.raw_card_blob->>'set', cards.raw_card_blob->>'collector_number') "
+        "IN (('uma', '50'), ('grn', '103'), ('plst', 'GRN-103'))"
+    ),
     "serialized": "cards.raw_card_blob->'promo_types' @> '\"serialized\"'",
     "set_promo": "cards.raw_card_blob->'promo_types' @> '\"setpromo\"'",
     "setextension": "cards.raw_card_blob->'promo_types' @> '\"setextension\"'",
@@ -299,13 +359,29 @@ BOOLEAN_IS_TAGS: dict[str, str] = {
     "stepandcompleat": "cards.raw_card_blob->'promo_types' @> '\"stepandcompleat\"'",
     "storechampionship": "cards.raw_card_blob->'promo_types' @> '\"storechampionship\"'",
     "surgefoil": "cards.raw_card_blob->'promo_types' @> '\"surgefoil\"'",
+    # `is:tcgplayer`: a `tcgplayer_id` -- not the etched id (892 printings carry that alone).
+    "tcgplayer": "jsonb_typeof(cards.raw_card_blob->'tcgplayer_id') = 'number'",
     "textured": "cards.raw_card_blob->'promo_types' @> '\"textured\"'",
     "themepack": "cards.raw_card_blob->'promo_types' @> '\"themepack\"'",
     "thick": "cards.raw_card_blob->'promo_types' @> '\"thick\"'",
+    # `is:timeshifted`: the old-frame sheets of Time Spiral and Time Spiral Remastered, and The List's
+    # `special` reprints of them (247 printings).
+    "timeshifted": (
+        "cards.raw_card_blob->>'frame' = '1997' AND (cards.raw_card_blob->>'set' IN ('tsb', 'tsr') "
+        "OR (cards.raw_card_blob->>'set' = 'plst' AND cards.raw_card_blob->>'rarity' = 'special'))"
+    ),
     "tourney": "cards.raw_card_blob->'promo_types' @> '\"tourney\"'",
+    # `is:tron`: Urza's Mine, Power Plant and Tower -- a list of three names (96 printings).
+    "tron": "cards.raw_card_blob->>'name' IN ('Urza''s Mine', 'Urza''s Power Plant', 'Urza''s Tower')",
     "universesbeyond": "cards.raw_card_blob->'promo_types' @> '\"universesbeyond\"'",
     "upsidedown": "cards.raw_card_blob->'promo_types' @> '\"upsidedown\"'",
     "vault": "cards.raw_card_blob->'promo_types' @> '\"vault\"'",
+    # `is:vergeland`: the ten Verges (45 printings).
+    "vergeland": (
+        "cards.raw_card_blob->>'name' IN ('Blazemire Verge', 'Bleachbone Verge', 'Floodfarm Verge', 'Gloomlake Verge', "
+        "'Hushwood Verge', 'Riverpyre Verge', 'Sunbillow Verge', 'Thornspire Verge', 'Wastewood Verge', "
+        "'Willowrush Verge')"
+    ),
     "wizardsplaynetwork": "cards.raw_card_blob->'promo_types' @> '\"wizardsplaynetwork\"'",
 }
 
