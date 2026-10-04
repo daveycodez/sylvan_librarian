@@ -14175,8 +14175,9 @@ fn self_reference_expands_only_where_it_should_and_refuses_to_narrow() {
     assert!(sre("~").expect("~ compiles").has_self_reference());
     // An ESCAPED tilde expands too, which is Scryfall's: `o:/\~/` answers the same 19,228.
     assert!(sre(r"\~").expect(r"\~ compiles").has_self_reference());
-    // Inside a bracket expression nothing is rewritten, the same rule the `\s…` shorthands follow.
-    assert!(!sre("[~]").expect("[~] compiles").has_self_reference());
+    // A tilde inside a bracket expression selects the substituted text too: the pattern is not
+    // rewritten, the tilde is a literal, and `o:/have [~] deal/` is 1 on Risk Factor there.
+    assert!(sre("[~]").expect("[~] compiles").has_self_reference());
     // A pattern that asked for expansion and got none must not pay the substitution.
     assert!(!sre("draw a card").expect("compiles").has_self_reference());
     assert!(!re("~").expect("compiles").has_self_reference(), "the plain entry point never expands");
@@ -14235,6 +14236,105 @@ fn self_reference_expands_only_where_it_should_and_refuses_to_narrow() {
     assert!(!expands("mana_cost_jsonb", "mana"), "mana:/~/ is 404");
 }
 
+/// A `~` PATTERN IS MATCHED AGAINST A TEXT IN WHICH EVERY SELF-REFERENCE IS A TILDE.
+///
+/// api.scryfall.com keeps two texts per card. A pattern with no `~` reads the oracle text as
+/// printed; a pattern with a `~` anywhere reads one where the card's own name, its short name and
+/// every "this creature" / "this Vehicle" / "this card" phrase have been replaced by a literal
+/// `~`, and the pattern's tilde is an ordinary character. Every assertion below is a probe
+/// measured there on 2026-10-04, scoped to the one card (1 or 404), against that card's real text;
+/// the `|~~~` arm puts a tilde in the pattern without changing what else it can match.
+#[test]
+fn a_tilde_pattern_reads_the_text_where_every_self_reference_is_a_tilde() {
+    const RISK: usize = 0;
+    const CASE: usize = 1;
+    const MICHELANGELO: usize = 2;
+    const DEVOURER: usize = 3;
+    const HEARSE: usize = 4;
+    let rows: &[(&str, &str)] = &[
+        ("risk factor", "target opponent may have risk factor deal 4 damage to them. if that player doesn't, you draw three cards.\njump-start"),
+        ("case of the market melee", "when this case enters, it deals 1 damage to any target.\ndamage isn't removed from creatures during cleanup steps.\nto solve — three or more creatures are damaged.\nsolved — whenever you attack with one or more creatures, this case deals that much damage divided as you choose among any number of targets."),
+        ("michelangelo, on the scene", "trample\nmichelangelo enters with a +1/+1 counter on him for each land you control.\nwhen michelangelo dies, return this card to your hand."),
+        ("effluence devourer", "whenever you sacrifice effluence devourer or another creature, it perpetually gains \"{2}, exile this card from your graveyard: create an x/x green ooze creature token, where x is this card's power. activate only as a sorcery.\"\nblitz {b}{r}{g}"),
+        ("honeymoon hearse", "trample\ntap two untapped creatures you control: this vehicle becomes an artifact creature until end of turn."),
+    ];
+    let data = tilde_store(rows);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let term = |node_type: &str, value: &str| {
+        serde_json::json!({
+            "node_type": "CardBinaryOperatorNode",
+            "kwargs": {
+                "lhs": {"node_type": "CardAttributeNode", "kwargs": {"attribute_name": "oracle_text", "original_attribute": "o"}},
+                "op": ":",
+                "rhs": {"node_type": node_type, "kwargs": {"value": value}},
+            },
+        })
+    };
+    let hit = |node: serde_json::Value, i: usize| {
+        let f = super::build_filter(&node).expect("builds");
+        f.matches(&archived.cards[i], &archived.printings[i], &archived.strings)
+    };
+    let re = |pattern: &str, i: usize| hit(term("RegexValueNode", pattern), i);
+    let phrase = |value: &str, i: usize| hit(term("StringValueNode", value), i);
+
+    // ── the NAME is one tilde, and not a word ──
+    assert!(re("have risk factor deal", RISK), "no tilde: the text as printed");
+    assert!(!re("have risk factor deal|~~~", RISK), "a tilde anywhere: the name is gone");
+    assert!(re("have . deal|~~~", RISK), "and ONE character stands there");
+    assert!(re("have ~ deal", RISK));
+    assert!(re("have [~] deal", RISK), "a class can name it");
+    assert!(re(r"have \~ deal", RISK), "and so can an escape");
+    assert!(phrase("have ~ deal", RISK), "a quoted phrase is the same search");
+    assert!(!re(r"have [\w ]+ deal|~~~", RISK), "it is not a word character");
+    assert!(!re(r"~\b deal", RISK), "so no boundary stands between it and a space");
+    assert!(!re(r"have \b~", RISK));
+    assert!(re(r"have\b ~", RISK));
+
+    // ── the "this <noun>" PHRASES are tildes in the text too ──
+    assert!(re("this vehicle becomes", HEARSE));
+    assert!(!re("this vehicle becomes|~~~", HEARSE));
+    assert!(re(": . becomes|~~~", HEARSE));
+    assert!(re(": ~ becomes an artifact creature", HEARSE));
+    // A short name and a phrase in one sentence.
+    assert!(re("when . dies, return . to|~~~", MICHELANGELO));
+    assert!(!re("return this card|~~~", MICHELANGELO));
+    assert!(!re("michelangelo|~~~", MICHELANGELO));
+    // NAMES FIRST. "Case" is Case of the Market Melee's short name, so "When this Case enters"
+    // reads "when this ~ enters" and is no longer a phrase.
+    assert!(re("when this ~ enters", CASE));
+    assert!(!re("when ~ enters", CASE));
+    assert!(!re("this case|~~~", CASE));
+    // A possessive is replaced up to the apostrophe.
+    assert!(re("where x is ~'s power", DEVOURER));
+    // A bare `~` answers what it always did: all five mention themselves.
+    for (i, (name, _)) in rows.iter().enumerate() {
+        assert!(re("~", i), "o:/~/ on {name}");
+        assert!(phrase("~", i), "o:\"~\" on {name}");
+    }
+
+    // ── the reported queries' arms: each of these cards was an extra here, and is not there ──
+    // Risk Factor through `target [\w ]+` across its own name; Case of the Market Melee through
+    // `this \w+` over "this ~".
+    let deals = r"(^|[,:.—] )(~|this \w+|target [\w ]+) deals? ([1-9X]|that much|damage)";
+    assert!(!re(deals, RISK));
+    assert!(!re(deals, CASE));
+    assert!(!re(r"When (~|this \w+) (enters|dies), it deals [^.\n]*damage to any target", CASE));
+    // Michelangelo's "return this card" is "return ~".
+    assert!(!re(r"[Ww]hen ~ dies, return (it|this card)|dies, return it to the battlefield", MICHELANGELO));
+    // Effluence Devourer's "Exile this card from your graveyard:" is "exile ~ from…".
+    assert!(!re(
+        r#"sacrifice (~|this creature) or another[^.\n]*it perpetually gains "[^:\n]*Exile this card from your graveyard:"#,
+        DEVOURER
+    ));
+    assert!(re(r#"sacrifice ~ or another[^.\n]*it perpetually gains "[^:\n]*Exile ~ from your graveyard:"#, DEVOURER));
+    // Honeymoon Hearse's "This Vehicle becomes an artifact creature", under either anchor.
+    for anchor in ["^", r"(^|\n)"] {
+        let pattern = format!(r#"{anchor}[^"\n]*(~ becomes a copy of (target|that card)|This Vehicle becomes an artifact creature)"#);
+        assert!(!re(&pattern, HEARSE), "{anchor}");
+    }
+}
+
 /// A QUOTED PHRASE EXPANDS `~` TOO, which the substring entry point used to miss entirely.
 ///
 /// `fo:"~ dies"` answered 0 against 822 on api.scryfall.com while `fo:/~ dies/` answered 822 on
@@ -14288,8 +14388,8 @@ fn a_quoted_phrase_expands_the_self_reference_on_the_oracle_columns_only() {
     match super::build_filter(&node("oracle_text", "o", "~ deals 1 damage.")).expect("builds") {
         FilterExpr::TextRegex { regex, .. } => {
             assert!(regex.has_self_reference());
-            assert!(regex.is_match("\u{10400} deals 1 damage."), "the literal phrase matches");
-            assert!(!regex.is_match("\u{10400} deals 1 damageX"), "the `.` must not be a wildcard");
+            assert!(regex.is_match("~ deals 1 damage."), "the literal phrase matches");
+            assert!(!regex.is_match("~ deals 1 damageX"), "the `.` must not be a wildcard");
         }
         _ => panic!("a tilde phrase must build a text regex"),
     }

@@ -234,11 +234,11 @@ def test_plain_literal_mana_regex_does_not_lower(parse_query, query: str) -> Non
 
 
 # `~` IS A METACHARACTER in Scryfall's dialect — an automatic alias for the card's own
-# self-reference, which the engine expands into a word-bounded alternation of the card's names and
-# a fixed "this <noun>" phrase family. Reading it as the literal tilde turns `o:/~/` into the
-# substring search `o:~`, which no oracle text on earth satisfies: 404 against 19,228 on
-# api.scryfall.com (2026-08-28). The escaped form is not protected either — `o:/\~/` answers the
-# same 19,228 there.
+# self-reference, which the engine answers by matching against a text where the card's names and
+# a fixed "this <noun>" phrase family are each replaced by a tilde. Reading it as a plain literal
+# turns `o:/~/` into the substring search `o:~`, which no oracle text on earth satisfies: 404
+# against 19,228 on api.scryfall.com (2026-08-28). The escaped form is not protected either —
+# `o:/\~/` answers the same 19,228 there.
 @pytest.mark.parametrize(
     argnames=["query"],
     argvalues=[("o:/~/",), (r"o:/\~/",), ("o:/~ deals 3 damage/",), ("ft:/~/",), ("name:/~/",), ("t:/~/",)],

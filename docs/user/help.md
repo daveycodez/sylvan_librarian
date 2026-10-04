@@ -222,6 +222,12 @@ o:/~ deals/          cards that damage something by naming themselves
 o:/~/ -o:/this/      the ones that use their own name rather than a phrase
 ```
 
+A pattern that contains a `~` anywhere is matched against the rules text with every one of those
+self-references already replaced by a `~`. So in such a pattern the tilde is one ordinary
+character — not a word character, and `[~]` names it — and the name or phrase it replaced is no
+longer there to match: `o:/(~|this \w+) deals/` does not find "this creature deals" through its
+second arm, only through its first.
+
 **`\s…` shorthands** name a symbol class, and are not the whitespace escape:
 
 | | | | |
