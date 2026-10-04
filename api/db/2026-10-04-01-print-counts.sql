@@ -15,29 +15,54 @@ ALTER TABLE magic.cards ADD COLUMN IF NOT EXISTS card_paper_set_count smallint;
 ALTER TABLE magic.cards ADD COLUMN IF NOT EXISTS card_illustration_count smallint;
 ALTER TABLE magic.cards ADD COLUMN IF NOT EXISTS artist_count smallint;
 
-COMMENT ON COLUMN magic.cards.card_print_count IS 'Card-level: distinct (set code, collector number) slots over every row of this oracle_id. Scryfall''s `prints`.';
+COMMENT ON COLUMN magic.cards.card_print_count IS 'Card-level: distinct (set code, collector number) slots over every row of this oracle_id, a slot with any variation row left out. Scryfall''s `prints`.';
 COMMENT ON COLUMN magic.cards.card_set_count IS 'Card-level: distinct set codes over every row of this oracle_id. Scryfall''s `sets`.';
-COMMENT ON COLUMN magic.cards.card_paper_print_count IS 'Card-level: card_print_count over the rows whose games include paper. Scryfall''s `paperprints`.';
-COMMENT ON COLUMN magic.cards.card_paper_set_count IS 'Card-level: card_set_count over the rows whose games include paper. Scryfall''s `papersets`.';
+COMMENT ON COLUMN magic.cards.card_paper_print_count IS 'Card-level: card_print_count over the rows of paper sets (sets with any row on paper). Scryfall''s `paperprints`.';
+COMMENT ON COLUMN magic.cards.card_paper_set_count IS 'Card-level: card_set_count over the paper sets (sets with any row on paper). Scryfall''s `papersets`.';
 COMMENT ON COLUMN magic.cards.card_illustration_count IS 'Card-level: distinct illustration ids over every row of this oracle_id. Scryfall''s `illustrations`.';
 COMMENT ON COLUMN magic.cards.artist_count IS 'Printing-level: how many artists this printing credits (the length of artist_ids). Scryfall''s `artists`.';
 
 -- The backfill: the statement _build_print_counts_sql() runs per chunk, here over the whole table.
 -- Idempotent -- only rows whose numbers differ are rewritten -- and no index is added: the engine
 -- answers these keywords from memory, and the SQL fallback's scan of six smallints is cheap.
-WITH per_card AS (
+--
+-- Two rules are not what the names suggest (api.scryfall.com, 2026-10-04):
+--   * A VARIATION is not a print, by slot: a (set, collector number) with `variation: true` on any
+--     of its rows adds nothing to `prints` / `paperprints` (Embermage Goblin's ons/200★;
+--     Monstrous Growth's por/173† is flagged in four languages and not in Japanese and is still
+--     out whole). Its set and its artwork still count.
+--   * A printing is a PAPER print by its SET, not by its own `games` ("Name Sticker" Goblin's
+--     MTGO-only unf/107m is `paperprints=1`). A paper set is one with any row on paper, which is
+--     Scryfall's `digital` flag on the Set object read off the rows.
+WITH paper_sets AS (
+    SELECT DISTINCT lower(cards.card_set_code) AS set_code
+    FROM magic.cards cards
+    WHERE COALESCE(cards.raw_card_blob->'games', '[]'::jsonb) ? 'paper'
+), card_rows AS (
     SELECT
         cards.oracle_id,
-        count(DISTINCT (lower(cards.card_set_code), cards.collector_number)) AS prints,
-        count(DISTINCT lower(cards.card_set_code)) AS sets,
-        count(DISTINCT (lower(cards.card_set_code), cards.collector_number))
-            FILTER (WHERE COALESCE(cards.raw_card_blob->'games', '[]'::jsonb) ? 'paper') AS paper_prints,
-        count(DISTINCT lower(cards.card_set_code))
-            FILTER (WHERE COALESCE(cards.raw_card_blob->'games', '[]'::jsonb) ? 'paper') AS paper_sets,
-        count(DISTINCT cards.illustration_id) AS illustrations
+        lower(cards.card_set_code) AS set_code,
+        cards.collector_number,
+        cards.illustration_id,
+        paper_sets.set_code IS NOT NULL AS in_paper_set,
+        bool_or(COALESCE(cards.raw_card_blob->>'variation', 'false') = 'true') OVER (
+            PARTITION BY cards.oracle_id, lower(cards.card_set_code), cards.collector_number
+        ) AS slot_is_variation
     FROM magic.cards cards
+    LEFT JOIN paper_sets ON paper_sets.set_code = lower(cards.card_set_code)
     WHERE cards.oracle_id IS NOT NULL
-    GROUP BY cards.oracle_id
+), per_card AS (
+    SELECT
+        card_rows.oracle_id,
+        count(DISTINCT (card_rows.set_code, card_rows.collector_number))
+            FILTER (WHERE NOT card_rows.slot_is_variation) AS prints,
+        count(DISTINCT card_rows.set_code) AS sets,
+        count(DISTINCT (card_rows.set_code, card_rows.collector_number))
+            FILTER (WHERE NOT card_rows.slot_is_variation AND card_rows.in_paper_set) AS paper_prints,
+        count(DISTINCT card_rows.set_code) FILTER (WHERE card_rows.in_paper_set) AS paper_sets,
+        count(DISTINCT card_rows.illustration_id) AS illustrations
+    FROM card_rows
+    GROUP BY card_rows.oracle_id
 ), proposed AS (
     SELECT
         cards.scryfall_id,

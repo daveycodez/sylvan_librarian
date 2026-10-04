@@ -250,11 +250,12 @@ struct OracleCard {
     legality_divergent: bool,
 
     // Scryfall's count keywords -- `prints`, `sets`, `paperprints`, `papersets`, `illustrations`
-    // -- each a count over ALL of this card's printings (distinct set/collector-number slots,
-    // distinct set codes, the same two over paper printings, distinct artworks). Decided at IMPORT
-    // by `_sync_print_counts` (api/admin_resource.py), which writes the same five numbers onto
-    // every row of the card, for the reason `tri()` cannot: it holds one card and one printing
-    // and never sees the siblings. The loader takes them from the first row of the group. Plain
+    // -- each a count over ALL of this card's printings (distinct set/collector-number slots less
+    // the variations, distinct set codes, the same two over the printings of paper sets, distinct
+    // artworks). Decided at IMPORT by `_sync_print_counts` (api/admin_resource.py), which writes
+    // the same five numbers onto every row of the card, for the reason `tri()` cannot: it holds
+    // one card and one printing and never sees the siblings; the rules are in its docstring. The
+    // loader takes them from the first row of the group. Plain
     // u16 with PRINT_COUNT_NONE for "not yet counted" (a NULL column) rather than Option<u16>,
     // which archives at 4 bytes each, and declared HERE rather than beside `edhrec_rank` on
     // purpose: `oracle_id` below is 16-aligned and the fields above end at byte 129, so these

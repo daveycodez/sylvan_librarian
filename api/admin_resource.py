@@ -221,43 +221,73 @@ def _build_print_counts_sql() -> str:
     is one printing and the engine's `tri()` holds one card and one printing, so neither can count
     siblings at query time; the numbers are decided here, once per import.
 
-    The rules, measured on api.scryfall.com 2026-10-03 by reading every printing of a card and
-    binary-searching the value Scryfall holds (`!"Lightning Bolt" prints>=K`):
+    The rules, measured on api.scryfall.com 2026-10-03 and 2026-10-04 by reading every printing of
+    a card and binary-searching the value Scryfall holds (`!"Lightning Bolt" prints>=K`):
 
     - `prints`: distinct (set, collector number) SLOTS -- not rows, so a slot printed in eleven
       languages counts once -- over every printing, extras, promos and memorabilia included.
-    - `sets`: distinct set codes over the same rows (`sets=1` is `is:unique`).
-    - `paperprints` / `papersets`: the same two counts over the rows whose `games` include paper.
-      Zero is a value: a digital-only card is `paperprints=0`.
+    - A VARIATION is not a print. Embermage Goblin is ons/200 and the foil-only ons/200★, which
+      Scryfall marks `variation: true`, and is `prints=1`, `paperprints=1`. The slot is what is
+      skipped, when ANY row of it carries the flag: Monstrous Growth's por/173† is flagged in
+      four languages and not in Japanese, and the card is `prints=9` of its ten slots. Its
+      artwork and its set still count (`!"Embermage Goblin" illustrations=2`).
+    - `sets`: distinct set codes over every row (`sets=1` is `is:unique`).
+    - `paperprints` / `papersets`: the same two counts over the rows of PAPER SETS. The set
+      decides, not the row's own `games`: "Name Sticker" Goblin's only printing, unf/107m, is
+      `games: [mtgo]` in a paper set and is `paperprints=1`; Rakshasa Vizier's Arena-only
+      ktk/193y makes it 4, not 3. Zero is a value: a card printed only in digital sets is
+      `paperprints=0`.
     - `illustrations`: distinct artworks; a printing with no illustration id contributes none.
     - `artists`: how many artists the PRINTING credits, the length of its `artist_ids`.
+
+    A PAPER SET is one with any row on paper. That is Scryfall's `digital` flag on the Set object
+    read off the rows: over the 1,052 sets in the default_cards bulk file of 2026-10-03, "no card
+    of the set has paper in `games`" and `/sets`' `digital` agree on every one. Derived rather
+    than stored because this schema has no sets table.
 
     They are counts over the rows this table holds, so they are exact for a card whose every
     printing is imported and low by the printings `preprocess_card` drops.
 
     Callers pass ``num_chunks`` and ``chunk_index`` as query parameters. Chunking is by
     ``hashtext(oracle_id)`` rather than scryfall_id: the counts are per card, so every row of a
-    card must fall in the same chunk or a count taken inside a chunk would be partial. Rows with
-    a NULL oracle_id (no card to belong to) keep NULL counts.
+    card must fall in the same chunk or a count taken inside a chunk would be partial. `paper_sets`
+    is the one CTE that is NOT chunked: whether a set is on paper is a fact about every card in
+    it. Rows with a NULL oracle_id (no card to belong to) keep NULL counts.
 
     api/db/2026-10-04-01-print-counts.sql carries the same statement, unchunked, as its backfill.
     """
-    paper = "COALESCE(cards.raw_card_blob->'games', '[]'::jsonb) ? 'paper'"
-    slot = "(lower(cards.card_set_code), cards.collector_number)"
     columns = ", ".join(PRINT_COUNT_COLUMNS)
     return f"""
-WITH per_card AS (
+WITH paper_sets AS (
+    SELECT DISTINCT lower(cards.card_set_code) AS set_code
+    FROM magic.cards cards
+    WHERE COALESCE(cards.raw_card_blob->'games', '[]'::jsonb) ? 'paper'
+), card_rows AS (
     SELECT
         cards.oracle_id,
-        count(DISTINCT {slot}) AS prints,
-        count(DISTINCT lower(cards.card_set_code)) AS sets,
-        count(DISTINCT {slot}) FILTER (WHERE {paper}) AS paper_prints,
-        count(DISTINCT lower(cards.card_set_code)) FILTER (WHERE {paper}) AS paper_sets,
-        count(DISTINCT cards.illustration_id) AS illustrations
+        lower(cards.card_set_code) AS set_code,
+        cards.collector_number,
+        cards.illustration_id,
+        paper_sets.set_code IS NOT NULL AS in_paper_set,
+        bool_or(COALESCE(cards.raw_card_blob->>'variation', 'false') = 'true') OVER (
+            PARTITION BY cards.oracle_id, lower(cards.card_set_code), cards.collector_number
+        ) AS slot_is_variation
     FROM magic.cards cards
+    LEFT JOIN paper_sets ON paper_sets.set_code = lower(cards.card_set_code)
     WHERE cards.oracle_id IS NOT NULL
       AND (abs(hashtext(cards.oracle_id::text)) %% %(num_chunks)s) = %(chunk_index)s
-    GROUP BY cards.oracle_id
+), per_card AS (
+    SELECT
+        card_rows.oracle_id,
+        count(DISTINCT (card_rows.set_code, card_rows.collector_number))
+            FILTER (WHERE NOT card_rows.slot_is_variation) AS prints,
+        count(DISTINCT card_rows.set_code) AS sets,
+        count(DISTINCT (card_rows.set_code, card_rows.collector_number))
+            FILTER (WHERE NOT card_rows.slot_is_variation AND card_rows.in_paper_set) AS paper_prints,
+        count(DISTINCT card_rows.set_code) FILTER (WHERE card_rows.in_paper_set) AS paper_sets,
+        count(DISTINCT card_rows.illustration_id) AS illustrations
+    FROM card_rows
+    GROUP BY card_rows.oracle_id
 ), proposed AS (
     SELECT
         cards.scryfall_id,

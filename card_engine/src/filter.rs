@@ -209,7 +209,7 @@ fn field_num(card: &AOracleCard, printing: Option<&APrinting>, f: NumField) -> N
 }
 
 /// A card-level count column: NULL until `_sync_print_counts` has counted the card. Zero is a
-/// value, not an absence — `paperprints=0` is the digital-only cards.
+/// value, not an absence — `paperprints=0` is the cards printed only in digital sets.
 fn card_count(v: u16) -> NumVal {
     if v == super::PRINT_COUNT_NONE { NumVal::Null } else { NumVal::Known(f64::from(v)) }
 }
