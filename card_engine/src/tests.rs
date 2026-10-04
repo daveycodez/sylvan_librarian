@@ -22,6 +22,7 @@ use super::{
     TextField, TextSearchField, Tri, SortedTrigramIndex, VocabInterner, ARTIST_NONE, NONE_STR, TYPE_ARTIFACT, TYPE_CREATURE,
     TYPE_ENCHANTMENT, TYPE_INSTANT, TYPE_LAND, TYPE_LEGENDARY, TYPE_PLANESWALKER, TYPE_SNOW, TYPE_SORCERY,
     ARTIST_COUNT_NONE, PRINT_COUNT_NONE,
+    CheapestCurrency, CHEAPEST_CODES_NONE, CHEAPEST_NEGATED_TERM, CHEAPEST_TERM, CHEAPEST_UNKNOWN,
 };
 use rkyv::{rancor::Error, Archived};
 use std::collections::HashMap;
@@ -263,6 +264,7 @@ fn stub_printing(scryfall_id: u128, illustration_id: u128, prefer_score: Option<
         card_is_tags: Vec::new(),
         card_frame_data: Vec::new(),
         artist_count: ARTIST_COUNT_NONE,
+        cheapest_codes: CHEAPEST_CODES_NONE,
         artwork_group_id: 0, // placeholder; store_of overwrites via assign_artwork_groups
     }
 }
@@ -13616,4 +13618,118 @@ fn the_count_columns_ride_padding_the_rows_already_had() {
     // was padding, i.e. it does not itself start on the boundary the word would have started on.
     assert_ne!(offset_of!(APrint, artist_count) % 8, 0, "artist_count starts a new word instead of filling one");
     assert_eq!(offset_of!(APrint, card_legalities), (offset_of!(APrint, artist_count) + 1).next_multiple_of(8));
+}
+
+// ─── cheapest: ────────────────────────────────────────────────────────────────
+
+/// `cheapest:usd` / `cheapest:eur` / `cheapest:tix` read three bits per currency that
+/// `_sync_cheapest_codes` wrote at import; the engine decides nothing. Two cards, shaped on what
+/// api.scryfall.com answers (2026-10-04):
+///
+///   card 1, printings 1-5
+///     1  usd: the plain price is the lowest            -> the term, not the negated term
+///        eur: only the FOIL price is the lowest        -> BOTH (khm/400: in `cheapest:usd` and `-cheapest:usd`)
+///        tix: the lowest
+///     2  usd: not the lowest, and no foil price        -> the negated term only
+///        eur: plain and foil priced, neither lowest    -> NEITHER the term nor the negated term
+///        tix: not the lowest
+///     3  usd: only the foil price is the lowest        -> both
+///        eur, tix: unpriced                            -> the negated term only
+///     4  a priced printing of a card with no lowest price in usd or eur -> SQL NULL; tix unpriced
+///     5  not yet computed (the column is NULL)         -> NULL for every currency
+///   card 2, printing 6: the lowest in usd and eur; tix NULL
+#[test]
+fn cheapest_reads_the_answers_written_at_import() {
+    fn leaf(currency: &str, negated_term: bool) -> FilterExpr {
+        let json = serde_json::json!({ "node_type": "CheapestNode", "kwargs": { "currency": currency, "negated_term": negated_term } });
+        super::filter::build_filter(&json).expect("a cheapest term builds")
+    }
+    fn found(data: &CardData, mut filter: FilterExpr, unique: &str) -> Vec<u128> {
+        let bytes = rkyv::to_bytes::<Error>(data).expect("serialize");
+        let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+        let (_, page) = run_query(&QueryCtx::from(a), &mut filter, None, unique, "default", "name", "asc", 100, 0);
+        let mut out: Vec<u128> =
+            page.iter().map(|r| if unique == "card" { u128::from(r.0.oracle_id) } else { u128::from(r.1.scryfall_id) }).collect();
+        out.sort_unstable();
+        out
+    }
+    let not = |f: FilterExpr| FilterExpr::Not(Box::new(f));
+    let codes = |usd: u16, eur: u16, tix: u16| {
+        usd << CheapestCurrency::Usd.shift() | eur << CheapestCurrency::Eur.shift() | tix << CheapestCurrency::Tix.shift()
+    };
+    const BOTH: u16 = CHEAPEST_TERM | CHEAPEST_NEGATED_TERM;
+
+    let mut vocab = VocabInterner::new();
+    let cards = (1..=2).map(|id| stub_card(id, TYPE_CREATURE, &[], &mut vocab)).collect();
+    // Printing ids are sequential: card 1 owns 1-5, card 2 owns 6.
+    let mut data = store_of(cards, &[5, 1], vocab);
+    assert_eq!(data.printings[4].cheapest_codes, CHEAPEST_CODES_NONE, "printing 5 is the not-yet-computed row");
+    for (printing, stored) in data.printings.iter_mut().zip([
+        codes(CHEAPEST_TERM, BOTH, CHEAPEST_TERM),
+        codes(CHEAPEST_NEGATED_TERM, 0, CHEAPEST_NEGATED_TERM),
+        codes(BOTH, CHEAPEST_NEGATED_TERM, CHEAPEST_NEGATED_TERM),
+        codes(CHEAPEST_UNKNOWN, CHEAPEST_UNKNOWN, CHEAPEST_NEGATED_TERM),
+    ]) {
+        printing.cheapest_codes = stored;
+    }
+    data.printings[5].cheapest_codes = codes(CHEAPEST_TERM, CHEAPEST_TERM, CHEAPEST_UNKNOWN);
+
+    // The term, per currency: each reads its own three bits.
+    assert_eq!(found(&data, leaf("usd", false), "printing"), vec![1, 3, 6]);
+    assert_eq!(found(&data, leaf("eur", false), "printing"), vec![1, 6]);
+    assert_eq!(found(&data, leaf("tix", false), "printing"), vec![1]);
+
+    // The negated TERM is its own stored answer, not the complement: printing 3 (usd) and 1 (eur)
+    // are in both lists, and printing 2 is in neither euro list.
+    assert_eq!(found(&data, leaf("usd", true), "printing"), vec![2, 3]);
+    assert_eq!(found(&data, leaf("eur", true), "printing"), vec![1, 3]);
+    assert_eq!(found(&data, leaf("tix", true), "printing"), vec![2, 3, 4]);
+
+    // The negated GROUP is the complement of whichever polarity it wraps -- and NULL stays NULL:
+    // printing 4 (no lowest price) and 5 (not computed) are in no usd or eur list at all.
+    assert_eq!(found(&data, not(leaf("usd", false)), "printing"), vec![2]);
+    assert_eq!(found(&data, not(leaf("usd", true)), "printing"), vec![1, 6]);
+    assert_eq!(found(&data, not(leaf("eur", false)), "printing"), vec![2, 3]);
+    assert_eq!(found(&data, not(leaf("eur", true)), "printing"), vec![2, 6]);
+    assert_eq!(found(&data, not(leaf("tix", false)), "printing"), vec![2, 3, 4]);
+    assert_eq!(found(&data, not(leaf("tix", true)), "printing"), vec![1]);
+    for currency in ["usd", "eur", "tix"] {
+        let anywhere = FilterExpr::Or(vec![leaf(currency, false), not(leaf(currency, false)), leaf(currency, true), not(leaf(currency, true))]);
+        assert!(!found(&data, anywhere, "printing").contains(&5), "{currency}: an uncomputed row answers nothing");
+    }
+
+    // Under unique=card a card matches when SOME printing of it does.
+    assert_eq!(found(&data, leaf("usd", false), "card"), vec![1, 2]);
+    assert_eq!(found(&data, leaf("tix", false), "card"), vec![1]);
+    assert_eq!(found(&data, leaf("usd", true), "card"), vec![1]);
+
+    // The answer is the printing's own, and the planner has to know it; no index counts it.
+    for currency in ["usd", "eur", "tix"] {
+        for negated_term in [false, true] {
+            let f = leaf(currency, negated_term);
+            assert!(super::estimator::has_printing_varying_leaf(&f), "{currency}");
+            assert!(super::filter::touches_printing_field(&f), "{currency}");
+            assert_eq!(super::filter::verify_cost_tier(&f), super::filter::MASK_COMPARE_NS100, "{currency}");
+        }
+    }
+
+    // The Python node resolves the user's word to one of three names; anything else is refused.
+    for bad in ["dollar", "$", "USD", ""] {
+        let json = serde_json::json!({ "node_type": "CheapestNode", "kwargs": { "currency": bad, "negated_term": false } });
+        assert!(super::filter::build_filter(&json).is_err(), "{bad:?}");
+    }
+}
+
+/// The codes took two bytes of padding the printing already had, so the store does not grow for
+/// the keyword. Pinned, like the count columns, as a RELATION between offsets: `cheapest_codes`
+/// must sit between `artist_count` and the 8-aligned legality word without pushing it.
+#[test]
+fn the_cheapest_codes_ride_padding_too() {
+    use std::mem::offset_of;
+    type APrint = Archived<Printing>;
+
+    let after_artist_count = offset_of!(APrint, artist_count) + 1;
+    assert!(offset_of!(APrint, cheapest_codes) >= after_artist_count);
+    assert!(offset_of!(APrint, cheapest_codes) + 2 <= offset_of!(APrint, card_legalities));
+    assert_eq!(offset_of!(APrint, card_legalities), after_artist_count.next_multiple_of(8), "the codes pushed the legality word");
 }

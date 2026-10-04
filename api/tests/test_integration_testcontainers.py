@@ -14,8 +14,8 @@ import pytest
 from api.admin_resource import PRINT_COUNT_COLUMNS, AdminContext
 from api.api_resource import APIResource
 from api.app_context import AppContext
-from api.enums import CardOrdering, ResponseShape, SortDirection
-from api.tests.helpers import search_kwargs
+from api.enums import CardOrdering, ResponseShape, SortDirection, UniqueOn
+from api.tests.helpers import make_raw_card, search_kwargs
 from api.tests.support import override_attr
 from card_engine import QueryEngine
 
@@ -83,6 +83,48 @@ _COUNT_KEYWORD_LANE_CASES: list[tuple[str, set[str]]] = [
     ("-prints>=0", set()),
     ("-artists>=0", set()),
     ("-prints=77", {_ANGEL, _LOTUS}),
+]
+
+
+# The set test_cheapest_agrees_on_both_lanes imports its printings into; each is named below by
+# its collector number.
+_CHEAPEST_SET = "zzc"
+
+# (query, the collector numbers of _CHEAPEST_SET BOTH lanes must answer). The rows:
+#   card A   1  usd 0.50 / 0.50   eur 0.40          tix 0.02
+#            2  usd 2.94 / 1.59   eur 0.60 / 0.40   tix 0.05
+#            3  usd  --  / 0.50   (foil-only: it enters the dollar minimum, and equals it)
+#            4  unpriced
+#   card B   5  usd 5.00, eur foil 3.00, in a memorabilia set -- so card B has no lowest price
+#            6  unpriced
+#   card C   7  priced, with the column put back to NULL: a row the sync has not reached
+_CHEAPEST_LANE_CASES: list[tuple[str, set[str]]] = [
+    ("cheapest:usd", {"1", "3"}),
+    ("cheapest:$", {"1", "3"}),
+    ("cheapest=Dollar", {"1", "3"}),
+    # The negated TERM: no plain price equal to the minimum AND no foil price that is not it.
+    # Printing 3 is in both lists; printing 2, priced both ways and neither the minimum, in neither.
+    ("-cheapest:usd", {"3", "4", "6"}),
+    # The negated GROUP: the complement -- and the NULLs (5, 7) are in neither.
+    ("-(cheapest:usd)", {"2", "4", "6"}),
+    ("-(-cheapest:usd)", {"1", "2"}),
+    # Euros: the minimum is the plain price alone (0.40), and printing 2's foil equals it.
+    ("cheapest:eur", {"1", "2"}),
+    ("cheapest:€", {"1", "2"}),
+    ("-cheapest:eur", {"2", "3", "4", "6"}),
+    ("-(cheapest:eur)", {"3", "4", "6"}),
+    ("-(-cheapest:eur)", {"1"}),
+    # Tix has no foil price, so its negated term is its complement; card B has no tix at all.
+    ("cheapest:tix", {"1"}),
+    ("cheapest:mtgo", {"1"}),
+    ("-cheapest:tix", {"2", "3", "4", "5", "6"}),
+    ("-(cheapest:tix)", {"2", "3", "4", "5", "6"}),
+    ("-(-cheapest:tix)", {"1"}),
+    # Composed.
+    ("cheapest:usd cheapest:eur", {"1"}),
+    ("cheapest:usd -cheapest:usd", {"3"}),
+    ("cheapest:usd or cheapest:eur", {"1", "2", "3"}),
+    ("-(cheapest:usd or cheapest:tix)", {"2", "4", "6"}),
 ]
 
 
@@ -541,6 +583,75 @@ class TestContainerIntegration:
                 assert sql & known == expected, query
         finally:
             write(dict.fromkeys(counts, (None,) * len(PRINT_COUNT_COLUMNS)))
+            api_resource.app_context.engine = saved_engine
+            shm_path.unlink(missing_ok=True)
+            shm_path.with_suffix(".lock").unlink(missing_ok=True)
+
+    @pytest.mark.usefixtures("engine_enabled")
+    def test_cheapest_agrees_on_both_lanes(self: TestContainerIntegration, api_resource: APIResource) -> None:
+        """`cheapest:usd` / `:eur` / `:tix`, their negated terms and negated groups answer alike in SQL and the engine.
+
+        End to end: the printings go through the importer, whose sync decides `cheapest_codes`;
+        the engine is loaded from the table; and both lanes are asked the same questions, per
+        printing. That covers what the unit tests cannot -- that the migration added the column,
+        that ENGINE_COLUMNS selects it and the loader reads it, and that both kinds of NULL (the
+        unknown bit, and a column the sync has not written) come out the same on both sides.
+        """
+        card_a, card_b, card_c = (str(uuid.uuid4()) for _ in range(3))
+
+        def printing(oracle_id: str, number: str, prices: dict[str, str], set_type: str = "expansion") -> dict:
+            card = make_raw_card(name=f"Cheapest Lane {oracle_id[:8]}")
+            return card | {
+                "oracle_id": oracle_id,
+                "set": _CHEAPEST_SET,
+                "collector_number": number,
+                "set_type": set_type,
+                "prices": prices,
+            }
+
+        printings = [
+            printing(card_a, "1", {"usd": "0.50", "usd_foil": "0.50", "eur": "0.40", "tix": "0.02"}),
+            printing(card_a, "2", {"usd": "2.94", "usd_foil": "1.59", "eur": "0.60", "eur_foil": "0.40", "tix": "0.05"}),
+            printing(card_a, "3", {"usd_foil": "0.50"}),
+            printing(card_a, "4", {}),
+            printing(card_b, "5", {"usd": "5.00", "eur_foil": "3.00"}, set_type="memorabilia"),
+            printing(card_b, "6", {}),
+            printing(card_c, "7", {"usd": "1.00", "eur": "1.00", "tix": "1.00"}),
+        ]
+        numbers = {card["collector_number"] for card in printings}
+
+        def answer(search: object, query: str, unique: UniqueOn) -> list[dict]:
+            return search(**(search_kwargs(query, limit=1000) | {"unique": unique}))["cards"]
+
+        # Private store for the same reason test_cubecobra_ordering swaps one in.
+        shm_path = pathlib.Path(tempfile.gettempdir()) / f"sylvan_librarian_it_{uuid.uuid4().hex}"
+        saved_engine = api_resource.app_context.engine
+        api_resource.app_context.engine = QueryEngine(shm_path=str(shm_path))
+        try:
+            api_resource.admin._upsert_cards(printings)
+            with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
+                cursor.execute("UPDATE magic.cards SET cheapest_codes = NULL WHERE oracle_id = %s", (card_c,))
+                conn.commit()
+            api_resource.app_context.reload_engine(force=True)
+
+            for query, expected in _CHEAPEST_LANE_CASES:
+                in_set = f"e:{_CHEAPEST_SET} ({query})"
+                sql = {card["collector_number"] for card in answer(api_resource._search_sql, in_set, UniqueOn.PRINTING)}
+                engine = {card["collector_number"] for card in answer(api_resource._search_engine, in_set, UniqueOn.PRINTING)}
+                assert sql == engine, query
+                assert sql == expected, query
+                assert sql <= numbers
+                # And on rows this test did not shape: the three fixture cards, which the sync
+                # reached with whatever prices their blobs hold, grouped by card. Scoped by name
+                # because the session database also holds every other test file's cards.
+                fixture_cards = f'({query}) (name:"lightning bolt" or name:"serra angel" or name:"black lotus")'
+                sql_cards = {card["name"] for card in answer(api_resource._search_sql, fixture_cards, UniqueOn.CARD)}
+                engine_cards = {card["name"] for card in answer(api_resource._search_engine, fixture_cards, UniqueOn.CARD)}
+                assert sql_cards == engine_cards, query
+        finally:
+            with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
+                cursor.execute("DELETE FROM magic.cards WHERE card_set_code = %s", (_CHEAPEST_SET,))
+                conn.commit()
             api_resource.app_context.engine = saved_engine
             shm_path.unlink(missing_ok=True)
             shm_path.with_suffix(".lock").unlink(missing_ok=True)

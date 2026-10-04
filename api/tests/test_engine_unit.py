@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from api.parsing import parse_scryfall_query
+from api.parsing.db_info import CHEAPEST_NEGATED_TERM, CHEAPEST_SHIFTS, CHEAPEST_TERM, CHEAPEST_UNKNOWN
 from card_engine import ENGINE_COLUMNS, QueryEngine, UnknownFieldError
 
 if TYPE_CHECKING:
@@ -425,6 +426,110 @@ class TestCountKeywords:
         # The card-level counts, by contrast, are the same on every printing of the card.
         assert _run(counted, "prints=10")[0] == 10
         assert _run(counted, "artists>=prints")[0] == 0
+
+
+def _cheapest_codes(usd: int, eur: int, tix: int) -> int:
+    """`cheapest_codes` as `_sync_cheapest_codes` packs it, from the PYTHON copy of the bit layout."""
+    return usd << CHEAPEST_SHIFTS["usd"] | eur << CHEAPEST_SHIFTS["eur"] | tix << CHEAPEST_SHIFTS["tix"]
+
+
+_BOTH = CHEAPEST_TERM | CHEAPEST_NEGATED_TERM
+
+
+@pytest.fixture(scope="module", name="priced")
+def priced_fixture(fresh_engine: Callable[[], QueryEngine]) -> QueryEngine:
+    """The fixture store with `cheapest_codes` stamped on two cards, as `_sync_cheapest_codes` would.
+
+    Lightning Bolt's ten printings (in fixture order):
+      1     usd: the plain price is the lowest; eur: only the foil price is (in both lists); tix: the lowest
+      2     usd: not the lowest; eur: priced both ways, neither the lowest (in neither list); tix: not
+      3     usd: only the foil price is the lowest (in both lists); eur, tix: not
+      4-10  not the lowest in any currency
+    Black Lotus's five: priced, and the card has no lowest price in usd or eur (NULL); unpriced in tix.
+    Every other row keeps a NULL column -- the sync has not reached it.
+    """
+    rows = json.loads(_FIXTURE.read_text())
+    bolt = {
+        1: _cheapest_codes(CHEAPEST_TERM, _BOTH, CHEAPEST_TERM),
+        2: _cheapest_codes(CHEAPEST_NEGATED_TERM, 0, CHEAPEST_NEGATED_TERM),
+        3: _cheapest_codes(_BOTH, CHEAPEST_NEGATED_TERM, CHEAPEST_NEGATED_TERM),
+    }
+    seen = 0
+    for row in rows:
+        if row["card_name"] == "Lightning Bolt":
+            seen += 1
+            row["cheapest_codes"] = bolt.get(
+                seen, _cheapest_codes(CHEAPEST_NEGATED_TERM, CHEAPEST_NEGATED_TERM, CHEAPEST_NEGATED_TERM)
+            )
+        elif row["card_name"] == "Black Lotus":
+            row["cheapest_codes"] = _cheapest_codes(CHEAPEST_UNKNOWN, CHEAPEST_UNKNOWN, CHEAPEST_NEGATED_TERM)
+    e = fresh_engine()
+    e.reload([{column: row.get(column) for column in ENGINE_COLUMNS} for row in rows])
+    return e
+
+
+class TestCheapest:
+    """`cheapest:usd` / `cheapest:eur` / `cheapest:tix` through the parser and the loader.
+
+    The engine decides nothing: the answers are one smallint `_sync_cheapest_codes` writes at
+    import and ENGINE_COLUMNS selects. The codes are packed here with the Python constants
+    (api/parsing/db_info.py) and read by the Rust ones, so this is also what pins the two copies
+    of the bit layout to each other.
+    """
+
+    def test_the_codes_column_is_selected_for_the_engine(self) -> None:
+        """A Rust field is inert until ENGINE_COLUMNS selects its column."""
+        assert "cheapest_codes" in ENGINE_COLUMNS
+
+    @pytest.mark.parametrize(
+        ("query", "total"),
+        [
+            # The term.
+            ("cheapest:usd", 2),
+            ("cheapest:eur", 1),
+            ("cheapest:tix", 1),
+            # Every word for a currency, any case, `=` as `:`.
+            ("cheapest:$", 2),
+            ("cheapest=dollar", 2),
+            ("CHEAPEST:USD", 2),
+            ("cheapest:euro", 1),
+            ("cheapest:€", 1),
+            ("cheapest:mtgo", 1),
+            # The negated TERM is its own answer: Bolt's printing 3 is in both dollar lists, its
+            # printing 2 in neither euro list.
+            ("-cheapest:usd", 9),
+            ("-cheapest:eur", 9),
+            ("-cheapest:tix", 9 + 5),
+            # The negated GROUP is the complement of whichever it wraps, and Black Lotus's NULL
+            # stays out of both.
+            ("-(cheapest:usd)", 8),
+            ("-(-cheapest:usd)", 1),
+            ("-(cheapest:eur)", 9),
+            ("-(-cheapest:eur)", 1),
+            ("-(cheapest:tix)", 9 + 5),
+            ("-(-cheapest:tix)", 1),
+            # A row the sync has not reached is in neither a term nor its complement.
+            ("cheapest:usd or -(cheapest:usd)", 10),
+            ("-cheapest:usd or -(-cheapest:usd)", 10),
+            ("cheapest:tix or -(cheapest:tix)", 10 + 5),
+            # Composed with other terms.
+            ("cheapest:usd cheapest:eur", 1),
+            ("cheapest:usd -cheapest:usd", 1),
+            ("cheapest:usd t:instant", 2),
+            ("cheapest:usd t:artifact", 0),
+            ("-cheapest:tix t:artifact", 5),
+        ],
+    )
+    def test_printings(self, priced: QueryEngine, query: str, total: int) -> None:
+        assert _run(priced, query)[0] == total
+
+    def test_under_unique_card_a_card_matches_when_some_printing_does(self, priced: QueryEngine) -> None:
+        assert set(_names(_run(priced, "cheapest:usd", unique="card")[1])) == {"Lightning Bolt"}
+        assert set(_names(_run(priced, "-cheapest:tix", unique="card")[1])) == {"Lightning Bolt", "Black Lotus"}
+        assert _run(priced, "cheapest:usd", unique="card")[0] == 1
+        # The unknown bit: Black Lotus answers no dollar question at all.
+        for query in ("cheapest:usd", "-cheapest:usd", "-(cheapest:usd)", "-(-cheapest:usd)"):
+            assert "Black Lotus" not in _names(_run(priced, query, unique="card")[1]), query
 
 
 class TestArithmetic:

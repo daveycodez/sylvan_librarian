@@ -93,4 +93,7 @@ ENGINE_COLUMNS: list[str] = [
     "card_paper_set_count",
     "card_illustration_count",
     "artist_count",
+    # `cheapest:usd` / `cheapest:eur` / `cheapest:tix`: the printing's stored answers, one
+    # smallint _sync_cheapest_codes writes at import.
+    "cheapest_codes",
 ]

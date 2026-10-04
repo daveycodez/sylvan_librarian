@@ -540,6 +540,24 @@ pub(crate) enum FilterExpr {
     Not(Box<FilterExpr>),
     ExactName(String),
 
+    /// Scryfall's `cheapest:usd` / `cheapest:eur` / `cheapest:tix`: the printing carries its card's
+    /// lowest price in that currency. Read off `Printing.cheapest_codes`, which
+    /// `_sync_cheapest_codes` (api/admin_resource.py) wrote at import; its docstring carries the
+    /// measured rule.
+    ///
+    /// `negated_term` is `-cheapest:usd`, which on api.scryfall.com is an expression of its own
+    /// and NOT the complement of the term (5 printings of Kaldheim where the term is 222 of 407).
+    /// The parsers fold the term's own `-` into this flag, so a `Not` over either polarity stays
+    /// what Scryfall's negated GROUP is, the complement: `-(cheapest:usd) e:khm` 185,
+    /// `-(-cheapest:usd) e:khm` 402.
+    ///
+    /// Three-valued: a priced printing of a card with no lowest price is SQL NULL, in neither
+    /// list nor either complement.
+    Cheapest {
+        currency: super::CheapestCurrency,
+        negated_term: bool,
+    },
+
     NumericCmp {
         lhs: NumExpr,
         op: CmpOp,
@@ -746,8 +764,10 @@ pub(crate) fn verify_cost_tier(f: &FilterExpr) -> u32 {
         FilterExpr::Not(inner) => verify_cost_tier(inner),
         // Exhaustive, not `_ => MASK_COMPARE_NS100`: a new variant must get a
         // considered cost here rather than silently inheriting the cheapest.
+        // (`Cheapest` is one u16 load, a shift and two bit tests.)
         FilterExpr::True
         | FilterExpr::ExactName(_)
+        | FilterExpr::Cheapest { .. }
         | FilterExpr::NumericCmp { .. }
         | FilterExpr::TextExact { .. }
         | FilterExpr::ColorCmp { .. }
@@ -912,6 +932,8 @@ fn leaf_compares_printing_field(f: &FilterExpr) -> bool {
         FilterExpr::NumericCmp { lhs, rhs, .. } => num_pdep(lhs) || num_pdep(rhs),
         FilterExpr::DateCmp { .. } | FilterExpr::YearCmp { .. } => true,
         FilterExpr::ArtistMatch { .. } | FilterExpr::FlavorMatch { .. } => true,
+        // The cheapest codes are the printing's own: one printing of a card is its cheapest, the next is not.
+        FilterExpr::Cheapest { .. } => true,
         // Exhaustive over TextSearchField (no `matches!`), same reason as num_pdep.
         FilterExpr::TextContains { field, .. } => match field {
             TextSearchField::FlavorTextLower => true,
@@ -1500,6 +1522,11 @@ impl FilterExpr {
 
             FilterExpr::ExactName(lower) => tri_bool(card.card_name_lower.as_str() == lower.as_str()),
 
+            FilterExpr::Cheapest { currency, negated_term } => {
+                let Some(p) = printing else { return Tri::PrintingDep };
+                super::cheapest_answer(u16::from(p.cheapest_codes), *currency, *negated_term).map_or(Tri::Null, tri_bool)
+            }
+
             FilterExpr::NumericCmp { lhs, op, rhs } => {
                 numeric_cmp_tri(lhs, *op, rhs, &|f| field_num(card, printing, f))
             }
@@ -1820,6 +1847,16 @@ pub(crate) fn build_filter(v: &Value) -> Result<FilterExpr, String> {
         "ExactNameNode" => {
             let value = kw["value"].as_str().unwrap_or("").to_string();
             Ok(FilterExpr::ExactName(value))
+        }
+
+        // `cheapest:<currency>`. The Python node has already resolved the word the user typed
+        // (`$`, `dollar`, `mtgo`, ...) to one of three canonical names, and folded a `-` written
+        // directly on the term into `negated_term`; a `-` on a group arrives as a NotNode.
+        "CheapestNode" => {
+            let name = kw["currency"].as_str().unwrap_or("");
+            let currency = super::CheapestCurrency::from_name(name).ok_or_else(|| format!("unknown currency: {name}"))?;
+            let negated_term = kw["negated_term"].as_bool().unwrap_or(false);
+            Ok(FilterExpr::Cheapest { currency, negated_term })
         }
 
         "CardBinaryOperatorNode" => build_binary(kw),
