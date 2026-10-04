@@ -11,7 +11,7 @@ import datetime
 from dataclasses import dataclass
 from enum import Enum, auto
 
-from api.parsing.card_query_nodes import CardAttributeNode, CardBinaryOperatorNode, CheapestNode, ExactNameNode
+from api.parsing.card_query_nodes import CardAttributeNode, CardBinaryOperatorNode, CheapestNode, ExactNameNode, NewNode
 from api.parsing.colors import COLOR_ALIAS_TO_CODES
 from api.parsing.db_info import ALIAS_TO_FIELD_INFOS, CHEAPEST_CURRENCY_SYMBOLS, ParserClass
 from api.parsing.mana_symbols import first_invalid_mana_symbol
@@ -553,9 +553,10 @@ class Parser:
                 return CardBinaryOperatorNode(lhs, op, self.parse_num_expr_value())
             return lhs
 
-        # ── `cheapest:` — a closed vocabulary of currencies, and a node of its own ──
-        if pc == ParserClass.CURRENCY and next_tok.type == TT.OP:
-            return self.parse_cheapest()
+        # ── `cheapest:` (a closed vocabulary of currencies) and `new:` (a closed vocabulary of
+        #    which only `rarity` is answered): each a node of its own ──
+        if pc in (ParserClass.CURRENCY, ParserClass.NEW) and next_tok.type == TT.OP:
+            return self.parse_cheapest() if pc == ParserClass.CURRENCY else self.parse_new()
 
         # ── known non-NUMERIC attribute ──
         bang_alias = pc is not None and next_tok.type == TT.BANG and pc in _BANG_ALIAS_CLASSES
@@ -815,6 +816,28 @@ class Parser:
         self.consume()
         try:
             return CheapestNode.from_word(str(tok.value))
+        except ValueError as exc:
+            msg = f"{exc} at position {tok.pos}"
+            raise ParseError(msg) from exc
+
+    def parse_new(self) -> NewNode:
+        """Parse the operator and value of `new:`: `:` or `=`, then one of the words answered.
+
+        Scryfall honours sixteen `new:` words and ignores the rest with a warning; only `rarity`
+        is answered here, and any other word or operator is refused, as an unknown colour is.
+        The word may be quoted.
+        """
+        op_tok = self.consume()  # OP
+        if op_tok.value not in (":", "="):
+            msg = f"new takes ':' or '=', got {op_tok.value!r} at position {op_tok.pos}"
+            raise ParseError(msg)
+        tok = self.peek()
+        if tok.type not in (TT.WORD, TT.QUOTED):
+            msg = f"Expected a new: value, got {tok.value!r} at position {tok.pos}"
+            raise ParseError(msg)
+        self.consume()
+        try:
+            return NewNode.from_word(str(tok.value))
         except ValueError as exc:
             msg = f"{exc} at position {tok.pos}"
             raise ParseError(msg) from exc

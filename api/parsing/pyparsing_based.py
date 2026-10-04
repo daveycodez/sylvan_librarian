@@ -22,7 +22,7 @@ from pyparsing import (
     one_of,
 )
 
-from api.parsing.card_query_nodes import CardAttributeNode, CheapestNode, ExactNameNode, to_card_query_ast
+from api.parsing.card_query_nodes import CardAttributeNode, CheapestNode, ExactNameNode, NewNode, to_card_query_ast
 from api.parsing.colors import COLOR_ALIAS_TO_CODES
 from api.parsing.db_info import (
     CHEAPEST_CURRENCY_SYMBOLS,
@@ -364,6 +364,32 @@ def create_cheapest_parsers(quoted_string: ParserElement) -> tuple[ParserElement
     return cheapest_condition, negated_cheapest_condition
 
 
+def create_new_parser(quoted_string: ParserElement) -> ParserElement:
+    """Create the parser for `new:<value>`.
+
+    Takes `:` or `=` only and a word, bare or quoted, validated in the parse action against the
+    values Scryfall's `new:` is answered for here (`rarity`); it mirrors hand_parser.parse_new.
+    A `-` in front is the ordinary negation: `-new:rarity` is the complement, so no folding is
+    needed as it is for `cheapest:`.
+
+    Args:
+        quoted_string: The shared quoted-string element.
+
+    Returns:
+        The `new:` condition.
+    """
+
+    def make_new_node(tokens: list[object]) -> NewNode:
+        """Create a NewNode from [attribute, operator, value word]."""
+        word = tokens[2]
+        return NewNode.from_word(word[1] if isinstance(word, tuple) else str(word))
+
+    new_attr_word = create_attribute_parser(ParserClass.NEW)
+    new_condition = new_attr_word + one_of(": =") + (quoted_string | Regex(r"\w+"))
+    new_condition.set_parse_action(make_new_node)
+    return new_condition
+
+
 def create_all_condition_parsers(basic_parsers: dict, mana_parsers: dict, color_parsers: dict) -> dict[str, ParserElement]:
     """Create all condition parsers using factory functions.
 
@@ -433,6 +459,7 @@ def create_all_condition_parsers(basic_parsers: dict, mana_parsers: dict, color_
     year_condition = create_condition_parser(year_attr_word, year_value, operators=EQ_ALIAS_OPERATORS)
 
     cheapest_condition, negated_cheapest_condition = create_cheapest_parsers(quoted_string)
+    new_condition = create_new_parser(quoted_string)
 
     attr_attr_condition = (
         (numeric_attr_word + DEFAULT_OPERATORS + numeric_attr_word)
@@ -454,6 +481,7 @@ def create_all_condition_parsers(basic_parsers: dict, mana_parsers: dict, color_
         | date_condition
         | year_condition
         | cheapest_condition
+        | new_condition
         | unified_numeric_comparison
         | text_condition
         | attr_attr_condition

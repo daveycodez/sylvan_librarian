@@ -15,13 +15,15 @@ from api.admin_resource import (
     AdminResource,
     _build_boolean_is_tags_sql,
     _build_cheapest_codes_sql,
+    _build_new_rarity_sql,
     _build_print_counts_sql,
 )
 from api.api_resource import APIResource
 from api.card_processing import preprocess_card
 from api.db.bulk_upsert import bulk_upsert
 from api.parsing import QueryContext
-from api.parsing.card_query_nodes import CheapestNode
+from api.parsing.card_query_nodes import CheapestNode, NewNode
+from api.release_batches import RELEASE_BATCHES
 from api.scryfall_bulk_data_fetcher import BulkDataKey
 from api.tests.helpers import make_raw_card
 from api.tests.support import mock_app_context
@@ -760,6 +762,276 @@ class TestCheapestCodes:
 
         assert _usd(api_resource, malformed["id"]) == (False, True)
         assert _usd(api_resource, sound["id"]) == (True, False)
+
+
+# ---------------------------------------------------------------------------
+# `new:rarity` tests
+# ---------------------------------------------------------------------------
+
+
+class TestBuildNewRaritySql:
+    """_build_new_rarity_sql chunks by ORACLE id, and the migration backfills with the same statement."""
+
+    def test_sql_chunks_by_oracle_id_with_bound_parameters(self) -> None:
+        sql = _build_new_rarity_sql()
+        # A card's first printing at a rarity is over all its rows, so they must share a chunk.
+        assert "hashtext(cards.oracle_id::text)" in sql
+        assert "hashtext(cards.scryfall_id::text)" not in sql
+        assert "%(num_chunks)s" in sql
+        assert "%(chunk_index)s" in sql
+        # Only rows whose flag differs are rewritten.
+        assert "cards.new_rarity IS DISTINCT FROM proposed.new_rarity" in sql
+
+    def test_the_unchunked_statement_has_no_parameters(self) -> None:
+        sql = _build_new_rarity_sql(chunked=False)
+        assert "%(" not in sql
+        assert "hashtext" not in sql
+
+    def test_migration_backfill_decides_the_same_way(self) -> None:
+        """The migration's one-off backfill is the unchunked sync statement, release batches and all."""
+        migration = next(m for m in get_migrations() if m["file_name"] == "2026-10-04-03-new-rarity.sql")["file_contents"]
+
+        def statement(sql: str) -> list[str]:
+            # The whole statement, from the first CTE to the end, whitespace folded.
+            return sql[sql.index("WITH release_batches") :].rstrip().rstrip(";").split()
+
+        assert statement(migration) == statement(_build_new_rarity_sql(chunked=False))
+
+    def test_every_release_batch_is_in_the_statement(self) -> None:
+        sql = _build_new_rarity_sql()
+        assert sql.count("\n    (") == len(RELEASE_BATCHES)
+        for date, set_code, batch in RELEASE_BATCHES:
+            assert f"({date}, '{set_code}', {batch})" in sql
+
+    def test_the_release_batch_table_is_well_formed(self) -> None:
+        keys = [(date, set_code) for date, set_code, _ in RELEASE_BATCHES]
+        assert keys == sorted(keys), "kept sorted so a diff of a refresh is readable"
+        assert len(set(keys)) == len(keys), "one batch per (date, set)"
+        for date, set_code, batch in RELEASE_BATCHES:
+            assert 19930801 <= date <= 20991231
+            assert set_code == set_code.lower()
+            assert set_code.isalnum()
+            assert batch >= 1, "batch 0 is what an unlisted (date, set) already is"
+
+
+def _new_rarity_printing(
+    oracle_id: str, set_code: str, number: str, released_at: str, rarity: str = "rare", **extra: object
+) -> dict:
+    """One raw printing of the card `oracle_id` for the `new:rarity` tests."""
+    card = make_raw_card(name=f"New Rarity Test {oracle_id[:8]}", rarity=rarity)
+    return (
+        card
+        | {
+            "oracle_id": oracle_id,
+            "set": set_code,
+            "collector_number": number,
+            "released_at": released_at,
+            "set_type": "expansion",
+        }
+        | extra
+    )
+
+
+def _new_rarity(api_resource: APIResource, *cards: dict) -> list:
+    """`new:rarity` for each card, through the SQL the parser generates (so the sync and the leaf are tested together)."""
+    sql = NewNode("rarity").to_sql(QueryContext())
+    with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            f"SELECT card.scryfall_id::text AS sid, ({sql}) AS answer FROM magic.cards AS card WHERE card.scryfall_id = ANY(%(ids)s::uuid[])",
+            {"ids": [card["id"] for card in cards]},
+        )
+        answers = {row["sid"]: row["answer"] for row in cursor.fetchall()}
+    return [answers[card["id"]] for card in cards]
+
+
+def _new_rarity_complement(api_resource: APIResource, *cards: dict) -> list:
+    """`-new:rarity` for each card."""
+    sql = NewNode("rarity").to_sql(QueryContext())
+    with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            f"SELECT card.scryfall_id::text AS sid, (NOT ({sql})) AS answer FROM magic.cards AS card WHERE card.scryfall_id = ANY(%(ids)s::uuid[])",
+            {"ids": [card["id"] for card in cards]},
+        )
+        answers = {row["sid"]: row["answer"] for row in cursor.fetchall()}
+    return [answers[card["id"]] for card in cards]
+
+
+class TestNewRarity:
+    """`new_rarity` is written at import: is this printing the first of its card at its rarity?
+
+    Each rule below was measured on api.scryfall.com 2026-10-04 (38,943 of 38,943 printings); the
+    docstring of `_build_new_rarity_sql` carries them.
+    """
+
+    def test_the_earliest_printing_at_each_rarity_is_new(self, api_resource: APIResource) -> None:
+        oracle_id = str(uuid.uuid4())
+        first = _new_rarity_printing(oracle_id, "nra", "1", "2001-01-01", "rare")
+        reprint = _new_rarity_printing(oracle_id, "nrb", "1", "2005-01-01", "rare")
+        other_rarity = _new_rarity_printing(oracle_id, "nrc", "1", "2010-01-01", "uncommon")
+        later_other_rarity = _new_rarity_printing(oracle_id, "nrd", "1", "2012-01-01", "uncommon")
+        api_resource.admin._upsert_cards([reprint, later_other_rarity, first, other_rarity])
+
+        cards = [first, reprint, other_rarity, later_other_rarity]
+        assert _new_rarity(api_resource, *cards) == [True, False, True, False]
+        assert _new_rarity_complement(api_resource, *cards) == [False, True, False, True], "the plain complement"
+
+    def test_two_cards_are_ranked_apart(self, api_resource: APIResource) -> None:
+        one = _new_rarity_printing(str(uuid.uuid4()), "nre", "1", "2001-01-01")
+        two = _new_rarity_printing(str(uuid.uuid4()), "nre", "2", "2001-01-01")
+        api_resource.admin._upsert_cards([one, two])
+        assert _new_rarity(api_resource, one, two) == [True, True]
+
+    def test_a_card_with_a_single_printing_is_new_at_its_rarity(self, api_resource: APIResource) -> None:
+        only = _new_rarity_printing(str(uuid.uuid4()), "nrf", "1", "2015-06-01", "mythic")
+        api_resource.admin._upsert_cards([only])
+        assert _new_rarity(api_resource, only) == [True]
+
+    def test_the_collector_number_compares_as_its_first_integer(self, api_resource: APIResource) -> None:
+        """9 before 10 (not the string order), `236s` is 236, `GRN-103` is 103, and a lone star is 0."""
+        for numbers, first_number in [
+            (("10", "9"), "9"),
+            (("236s", "100"), "100"),
+            (("GRN-103", "104"), "GRN-103"),
+            (("\u2605", "1"), "\u2605"),
+            (("A25-141", "26"), "A25-141"),
+        ]:
+            oracle_id = str(uuid.uuid4())
+            printings = [_new_rarity_printing(oracle_id, f"n{i}x", number, "2001-01-01") for i, number in enumerate(numbers)]
+            api_resource.admin._upsert_cards(printings)
+            expected = [number == first_number for number in numbers]
+            assert _new_rarity(api_resource, *printings) == expected, numbers
+
+    def test_a_variation_sorts_after_its_plain_twin(self, api_resource: APIResource) -> None:
+        """Same date, number and rarity: the variation loses even though its id sorts first."""
+        oracle_id = str(uuid.uuid4())
+        variation = _new_rarity_printing(oracle_id, "nrg", "5", "2001-01-01", variation=True)
+        plain = _new_rarity_printing(oracle_id, "nrh", "5", "2001-01-01")
+        variation["id"], plain["id"] = "00000000-0000-4000-8000-000000000001", "ffffffff-ffff-4fff-bfff-ffffffffffff"
+        api_resource.admin._upsert_cards([variation, plain])
+        assert _new_rarity(api_resource, variation, plain) == [False, True]
+
+    def test_the_set_code_is_not_a_key_and_the_scryfall_id_breaks_the_tie(self, api_resource: APIResource) -> None:
+        """Two sets, one date, one batch, one number: the smaller id wins whatever the codes are."""
+        oracle_id = str(uuid.uuid4())
+        by_code = _new_rarity_printing(oracle_id, "nri", "7", "2001-01-01")
+        by_id = _new_rarity_printing(oracle_id, "nrz", "7", "2001-01-01")
+        by_code["id"], by_id["id"] = "ffffffff-ffff-4fff-bfff-ffffffffffff", "00000000-0000-4000-8000-000000000002"
+        api_resource.admin._upsert_cards([by_code, by_id])
+        assert _new_rarity(api_resource, by_code, by_id) == [False, True]
+
+    def test_the_release_batch_orders_two_sets_of_one_day(self, api_resource: APIResource) -> None:
+        """`pal99` is in batch 1 of 1999-01-01 and an unlisted set in batch 0, so it comes first -- code order and id both against it."""
+        assert (19990101, "pal99", 1) in RELEASE_BATCHES
+        oracle_id = str(uuid.uuid4())
+        listed = _new_rarity_printing(oracle_id, "pal99", "3", "1999-01-01")
+        unlisted = _new_rarity_printing(oracle_id, "zzz99", "3", "1999-01-01")
+        listed["id"], unlisted["id"] = "00000000-0000-4000-8000-000000000003", "ffffffff-ffff-4fff-bfff-ffffffffffff"
+        api_resource.admin._upsert_cards([listed, unlisted])
+        assert _new_rarity(api_resource, listed, unlisted) == [False, True]
+
+    def test_the_date_comes_before_the_batch(self, api_resource: APIResource) -> None:
+        """A batch-1 set released the day BEFORE a batch-0 set is still first."""
+        oracle_id = str(uuid.uuid4())
+        earlier_in_batch_one = _new_rarity_printing(oracle_id, "pal99", "3", "1999-01-01")
+        later_in_batch_zero = _new_rarity_printing(oracle_id, "zzz99", "3", "1999-01-02")
+        api_resource.admin._upsert_cards([earlier_in_batch_one, later_in_batch_zero])
+        assert _new_rarity(api_resource, earlier_in_batch_one, later_in_batch_zero) == [True, False]
+
+    def test_the_release_batch_applies_to_its_own_date_only(self, api_resource: APIResource) -> None:
+        """The batch is per (date, set): `pal99` on another day is batch 0, and the id decides."""
+        oracle_id = str(uuid.uuid4())
+        listed = _new_rarity_printing(oracle_id, "pal99", "3", "1999-01-02")
+        unlisted = _new_rarity_printing(oracle_id, "zzz99", "3", "1999-01-02")
+        listed["id"], unlisted["id"] = "00000000-0000-4000-8000-000000000004", "ffffffff-ffff-4fff-bfff-ffffffffffff"
+        api_resource.admin._upsert_cards([listed, unlisted])
+        assert _new_rarity(api_resource, listed, unlisted) == [True, False]
+
+    @pytest.mark.parametrize("set_type", ["promo", "memorabilia", "from_the_vault", "treasure_chest"])
+    def test_an_excluded_set_type_is_never_new_and_does_not_hold_the_flag_back(
+        self, api_resource: APIResource, set_type: str
+    ) -> None:
+        oracle_id = str(uuid.uuid4())
+        excluded = _new_rarity_printing(oracle_id, "nrj", "1", "2001-01-01", set_type=set_type)
+        expansion = _new_rarity_printing(oracle_id, "nrk", "1", "2005-01-01")
+        api_resource.admin._upsert_cards([excluded, expansion])
+        assert _new_rarity(api_resource, excluded, expansion) == [False, True]
+
+    def test_a_masterpiece_printing_is_new_only_in_wot(self, api_resource: APIResource) -> None:
+        oracle_id = str(uuid.uuid4())
+        expedition = _new_rarity_printing(oracle_id, "exp", "1", "2001-01-01", "mythic", set_type="masterpiece")
+        api_resource.admin._upsert_cards([expedition])
+        assert _new_rarity(api_resource, expedition) == [False]
+
+        other = str(uuid.uuid4())
+        wot = _new_rarity_printing(other, "wot", "1", "2001-01-01", "mythic", set_type="masterpiece")
+        later = _new_rarity_printing(other, "nrl", "1", "2005-01-01", "mythic")
+        api_resource.admin._upsert_cards([wot, later])
+        assert _new_rarity(api_resource, wot, later) == [True, False]
+
+    def test_other_promo_types_and_serialized_printings_still_count(self, api_resource: APIResource) -> None:
+        """Only the SET types exclude: a serialized printing (4 of Scryfall's 38,943) is new."""
+        oracle_id = str(uuid.uuid4())
+        serialized = _new_rarity_printing(oracle_id, "nrm", "1", "2001-01-01", promo_types=["serialized"])
+        later = _new_rarity_printing(oracle_id, "nrn", "1", "2005-01-01")
+        api_resource.admin._upsert_cards([serialized, later])
+        assert _new_rarity(api_resource, serialized, later) == [True, False]
+
+    def test_a_card_whose_every_printing_is_excluded_has_no_new_printing(self, api_resource: APIResource) -> None:
+        """Not NULL: the sync has been over it, and the answer is no -- in the complement."""
+        oracle_id = str(uuid.uuid4())
+        promo = _new_rarity_printing(oracle_id, "nro", "1", "2001-01-01", set_type="promo")
+        api_resource.admin._upsert_cards([promo])
+        assert _new_rarity(api_resource, promo) == [False]
+        assert _new_rarity_complement(api_resource, promo) == [True]
+
+    def test_an_earlier_printing_takes_the_flag_from_the_one_that_held_it(self, api_resource: APIResource) -> None:
+        """A new printing changes the answer on a SIBLING the import did not touch."""
+        oracle_id = str(uuid.uuid4())
+        held = _new_rarity_printing(oracle_id, "nrp", "1", "2005-01-01")
+        api_resource.admin._upsert_cards([held])
+        assert _new_rarity(api_resource, held) == [True]
+
+        earlier = _new_rarity_printing(oracle_id, "nrq", "1", "2001-01-01")
+        api_resource.admin._upsert_cards([earlier])
+        assert _new_rarity(api_resource, held, earlier) == [False, True]
+
+    def test_the_rarity_is_part_of_the_group(self, api_resource: APIResource) -> None:
+        oracle_id = str(uuid.uuid4())
+        common = _new_rarity_printing(oracle_id, "nrr", "1", "2001-01-01", "common")
+        uncommon = _new_rarity_printing(oracle_id, "nrs", "1", "2002-01-01", "uncommon")
+        special = _new_rarity_printing(oracle_id, "nrt", "1", "2003-01-01", "special")
+        bonus = _new_rarity_printing(oracle_id, "nru", "1", "2004-01-01", "bonus")
+        api_resource.admin._upsert_cards([common, uncommon, special, bonus])
+        assert _new_rarity(api_resource, common, uncommon, special, bonus) == [True, True, True, True]
+
+    def test_an_unreached_row_answers_neither_polarity(self, api_resource: APIResource) -> None:
+        """NULL means not computed: in `new:rarity` and in `-new:rarity` alike."""
+        card = _new_rarity_printing(str(uuid.uuid4()), "nrv", "1", "2001-01-01")
+        api_resource.admin._upsert_cards([card])
+        with api_resource.app_context.writer_pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("UPDATE magic.cards SET new_rarity = NULL WHERE scryfall_id = %(sid)s", {"sid": card["id"]})
+            conn.commit()
+        assert _new_rarity(api_resource, card) == [None]
+        assert _new_rarity_complement(api_resource, card) == [None]
+
+    def test_sync_converges_and_a_reimport_does_not_blank_the_flag(self, api_resource: APIResource) -> None:
+        oracle_id = str(uuid.uuid4())
+        card = _new_rarity_printing(oracle_id, "nrw", "1", "2001-01-01")
+        api_resource.admin._upsert_cards([card])
+        assert _new_rarity(api_resource, card) == [True]
+
+        # Nothing moved, so a second sync rewrites no row at all.
+        with api_resource.app_context.writer_pool.connection() as conn:
+            assert api_resource.admin._sync_new_rarity(conn) == 0
+
+        # The bulk stream never carries the column; a re-import that rewrites the row must leave
+        # it standing rather than reset it to NULL.
+        reimport = _new_rarity_printing(oracle_id, "nrw", "1", "2001-01-01")
+        reimport["id"] = card["id"]
+        reimport["oracle_text"] = "changed so the reimport writes"
+        with patch.object(AdminResource, "_sync_new_rarity", return_value=0):
+            api_resource.admin._upsert_cards([reimport])
+        assert _new_rarity(api_resource, card) == [True]
 
 
 # ---------------------------------------------------------------------------

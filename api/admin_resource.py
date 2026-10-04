@@ -47,6 +47,7 @@ from cachebox import TTLCache
 from api.card_processing import preprocess_card
 from api.db.bulk_upsert import bulk_upsert as _bulk_upsert
 from api.parsing.db_info import CHEAPEST_NEGATED_TERM, CHEAPEST_SHIFTS, CHEAPEST_TERM, CHEAPEST_UNKNOWN
+from api.release_batches import RELEASE_BATCHES
 from api.scryfall_bulk_data_fetcher import BulkDataKey, ScryfallBulkDataFetcher
 from api.settings import settings
 from api.tag_import import import_art_tags as _import_art_tags
@@ -435,6 +436,114 @@ FROM proposed
 WHERE
     cards.scryfall_id = proposed.scryfall_id AND
     cards.cheapest_codes IS DISTINCT FROM proposed.cheapest_codes
+"""
+
+
+# By ORACLE id, as the two syncs above: a card's first printing at a rarity is only its first if
+# every row of the card is in the chunk that ranks them.
+_NEW_RARITY_SYNC_CHUNK_COUNT = 4
+
+# Set types whose printings are never `new:rarity` on Scryfall, and the one masterpiece set that is.
+# See _build_new_rarity_sql.
+_NEW_RARITY_EXCLUDED_SET_TYPES = ("promo", "memorabilia", "from_the_vault", "treasure_chest")
+_NEW_RARITY_MASTERPIECE_EXCEPTION = "wot"
+
+
+def _build_new_rarity_sql(*, chunked: bool = True) -> str:
+    """Build the `new:rarity` sync statement: is each printing the first of its card at its rarity?
+
+    Scryfall's `new:rarity` finds the printings that are the first of their card at their rarity.
+    "First" is over the card's other printings, so neither a SQL row nor the engine's `tri()` can
+    decide it at query time; it is decided here, once per import.
+
+    The rule, measured on api.scryfall.com 2026-10-04 by reading the whole list (`new:rarity`,
+    `unique=prints`, extras in: 38,943 printings) against the same day's `default_cards` bulk file,
+    and exact there -- 38,943 of 38,943, nothing missing, nothing over:
+
+        per card (oracle id) and RARITY, the one printing that is least by
+          (release date, release batch, first integer of the collector number, variation last,
+           Scryfall id)
+        among the printings OUTSIDE the set types promo, memorabilia, from_the_vault and
+        treasure_chest, and outside every masterpiece set but `wot`
+
+    Each clause is evidence, not a reading of the name (groups are (card, rarity) pairs; the count
+    is how many pick a different printing than Scryfall's without the clause):
+
+    - the release BATCH is the order Scryfall gives sets that released the same day
+      (api/release_batches.py): 18 groups wrong without it.
+    - the collector number compares as its FIRST INTEGER (`236s` is 236, `GRN-103` is 103, a lone
+      star is 0), not as the string: 2,230 groups wrong the other way. The set code is no key
+      between it and the id: with one, 15 groups are wrong.
+    - `variation: true` sorts after its plain twin: 33 groups wrong without that key.
+    - the excluded set types: Scryfall's list holds no printing of a promo, memorabilia,
+      from_the_vault or treasure_chest set (4,761 groups wrong without the exclusion). A
+      masterpiece printing is on it only in `wot` (16 printings, every one this order picks); no
+      other masterpiece set has one (`e:mps` is 0, though 54 of its printings would be the first
+      of their card at their rarity). No field of a card or of `/sets` tells `wot` from the other
+      masterpiece sets, so it is a measured exception, kept as one.
+    - SERIALIZED printings count (4 of the 38,943), and promo TYPES other than the set types
+      above exclude nothing.
+    - the negated term is the plain complement (79,532: with 38,943 that is all 118,475 printings
+      Scryfall holds, extras in), and `new:rarity` neither opens extras nor widens the search to
+      other languages.
+
+    The ranking is over the rows this table holds. Scryfall's is over every printing of the card,
+    including the digital-only ones `preprocess_card` drops, so a card whose first printing at a
+    rarity was dropped has its first PAPER printing flagged here instead, and a printing Scryfall
+    flags that was dropped is simply not here.
+
+    NOT `new:language`: the same order over every row of a (card, language) pair answers 285,528
+    of Scryfall's 285,760 rows, 232 short by one shape (two sets released the same day, where
+    Scryfall takes one set first and nothing published says which), so it is not stored.
+
+    Rows with a NULL oracle_id keep a NULL column. Callers pass ``num_chunks`` and ``chunk_index``
+    as query parameters unless ``chunked`` is false, which is the unchunked statement
+    api/db/2026-10-04-03-new-rarity.sql backfills with; chunking is by ``hashtext(oracle_id)`` so
+    a card's rows share a chunk.
+    """
+    excluded = ", ".join(f"'{set_type}'" for set_type in _NEW_RARITY_EXCLUDED_SET_TYPES)
+    batches = ",\n    ".join(f"({date}, '{set_code}', {batch})" for date, set_code, batch in RELEASE_BATCHES)
+    chunk = "\n      AND (abs(hashtext(cards.oracle_id::text)) %% %(num_chunks)s) = %(chunk_index)s" if chunked else ""
+    return f"""
+WITH release_batches (released_on, set_code, batch) AS (
+    VALUES
+    {batches}
+), candidates AS (
+    SELECT
+        cards.scryfall_id,
+        cards.oracle_id,
+        cards.card_rarity_text AS rarity,
+        cards.released_at,
+        COALESCE(release_batches.batch, 0) AS batch,
+        COALESCE(NULLIF(substring(cards.collector_number FROM '[0-9]+'), '')::numeric, 0) AS first_number,
+        COALESCE(cards.raw_card_blob->>'variation', 'false') = 'true' AS is_variation,
+        COALESCE(cards.raw_card_blob->>'set_type', '') NOT IN ({excluded})
+            AND (COALESCE(cards.raw_card_blob->>'set_type', '') <> 'masterpiece' OR cards.card_set_code = '{_NEW_RARITY_MASTERPIECE_EXCEPTION}') AS is_eligible
+    FROM magic.cards cards
+    LEFT JOIN release_batches
+        ON release_batches.released_on = to_char(cards.released_at, 'YYYYMMDD')::int
+        AND release_batches.set_code = cards.card_set_code
+    WHERE cards.oracle_id IS NOT NULL{chunk}
+), ranked AS (
+    SELECT
+        candidates.scryfall_id,
+        row_number() OVER (
+            PARTITION BY candidates.oracle_id, candidates.rarity
+            ORDER BY candidates.released_at, candidates.batch, candidates.first_number, candidates.is_variation, candidates.scryfall_id
+        ) AS place
+    FROM candidates
+    WHERE candidates.is_eligible
+), proposed AS (
+    SELECT candidates.scryfall_id, COALESCE(ranked.place = 1, false) AS new_rarity
+    FROM candidates
+    LEFT JOIN ranked ON ranked.scryfall_id = candidates.scryfall_id
+)
+UPDATE magic.cards
+SET new_rarity = proposed.new_rarity
+FROM proposed
+WHERE
+    cards.scryfall_id = proposed.scryfall_id AND
+    cards.new_rarity IS DISTINCT FROM proposed.new_rarity
 """
 
 
@@ -1142,6 +1251,41 @@ class AdminResource:
             logger.info("Synced cheapest codes on %d printings", updated_count)
         return updated_count
 
+    def _sync_new_rarity(self, conn: Connection) -> int:
+        """Sync `new_rarity` -- each printing's answer to Scryfall's `new:rarity`.
+
+        Runs after every import, and not only when a card gains a printing: a new printing can be
+        the card's first at its rarity and take the flag from a printing that held it, so only a
+        whole-card recompute reaches the rows the import did not touch. Touches only rows whose
+        flag differs, so a re-import that moved nothing writes nothing. See _build_new_rarity_sql
+        for the rule.
+
+        Args:
+        ----
+            conn (Connection): open connection; committed here once per chunk.
+
+        Returns:
+        -------
+            int: rows whose flag changed.
+
+        """
+        updated_count = 0
+        sync_sql = _build_new_rarity_sql()
+        with conn.cursor() as cursor:
+            for chunk_index in range(_NEW_RARITY_SYNC_CHUNK_COUNT):
+                cursor.execute(
+                    sync_sql,
+                    {
+                        "num_chunks": _NEW_RARITY_SYNC_CHUNK_COUNT,
+                        "chunk_index": chunk_index,
+                    },
+                )
+                updated_count += cursor.rowcount
+                conn.commit()
+        if updated_count:
+            logger.info("Synced new:rarity on %d printings", updated_count)
+        return updated_count
+
     def _add_is_tag_to_printings(self, *, is_tag: str) -> dict[str, Any]:
         """Add a specific is: tag to all printings matching that tag using Scryfall search.
 
@@ -1567,6 +1711,7 @@ class AdminResource:
                     self._sync_boolean_is_tags(conn)
                     self._sync_print_counts(conn)
                     self._sync_cheapest_codes(conn)
+                    self._sync_new_rarity(conn)
 
                 if cards_sent == 0:
                     if stream.raw == 0:

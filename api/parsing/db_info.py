@@ -27,6 +27,7 @@ class ParserClass(StrEnum):
     DATE = "date"  # Date fields with full date values
     YEAR = "year"  # Year fields with 4-digit year values
     CURRENCY = "currency"  # `cheapest:` -- the value is one of a closed set of currency words
+    NEW = "new"  # `new:` -- the value is one of a closed set of words; only `rarity` is answered
 
 
 class FieldInfo:
@@ -226,6 +227,17 @@ DB_COLUMNS = [
         search_aliases=["cheapest"],
         parser_class=ParserClass.CURRENCY,
     ),
+    # Scryfall's `new:rarity`: the printing is the first of its card at its rarity. "First" is over
+    # the card's other printings, which no row sees at query time, so the answer is decided at import
+    # and stored as one boolean -- see NEW_KEYWORD_COLUMNS below and _build_new_rarity_sql in
+    # api/admin_resource.py. A parser class of its own because the value is a closed vocabulary and
+    # because only one of Scryfall's sixteen `new:` values is answered here.
+    FieldInfo(
+        db_column_name="new_rarity",
+        field_type=FieldType.NUMERIC,
+        search_aliases=["new"],
+        parser_class=ParserClass.NEW,
+    ),
     FieldInfo(
         db_column_name="produced_mana",
         field_type=FieldType.JSONB_OBJECT,
@@ -399,6 +411,14 @@ CHEAPEST_TERM = 1
 CHEAPEST_NEGATED_TERM = 2
 CHEAPEST_UNKNOWN = 4
 CHEAPEST_SHIFTS: dict[str, int] = {"usd": 0, "eur": 3, "tix": 6}
+
+
+# The `new:` values this parser answers, and the column each one reads. Scryfall honours sixteen
+# (`new:rarity`, `new:language`, `new:art`, `new:flavor`, ...); `new:rarity` is the one measured to
+# be exactly a list of printings on api.scryfall.com (2026-10-04, 38,943 of 38,943). The others are
+# refused here -- `new:language` was measured too and is NOT exact, the rest were not measured --
+# so no `new:` term returns cards that are not Scryfall's.
+NEW_KEYWORD_COLUMNS: dict[str, str] = {"rarity": "new_rarity"}
 
 
 CARD_SUPERTYPES = {

@@ -22,7 +22,7 @@ use super::{
     TextField, TextSearchField, Tri, SortedTrigramIndex, VocabInterner, ARTIST_NONE, NONE_STR, TYPE_ARTIFACT, TYPE_CREATURE,
     TYPE_ENCHANTMENT, TYPE_INSTANT, TYPE_LAND, TYPE_LEGENDARY, TYPE_PLANESWALKER, TYPE_SNOW, TYPE_SORCERY,
     ARTIST_COUNT_NONE, PRINT_COUNT_NONE,
-    CheapestCurrency, CHEAPEST_CODES_NONE, CHEAPEST_NEGATED_TERM, CHEAPEST_TERM, CHEAPEST_UNKNOWN,
+    CheapestCurrency, CHEAPEST_CODES_NONE, CHEAPEST_NEGATED_TERM, CHEAPEST_TERM, CHEAPEST_UNKNOWN, NEW_RARITY_NONE,
 };
 use rkyv::{rancor::Error, Archived};
 use std::collections::HashMap;
@@ -264,6 +264,7 @@ fn stub_printing(scryfall_id: u128, illustration_id: u128, prefer_score: Option<
         card_is_tags: Vec::new(),
         card_frame_data: Vec::new(),
         artist_count: ARTIST_COUNT_NONE,
+        new_rarity: NEW_RARITY_NONE,
         cheapest_codes: CHEAPEST_CODES_NONE,
         artwork_group_id: 0, // placeholder; store_of overwrites via assign_artwork_groups
     }
@@ -13732,4 +13733,81 @@ fn the_cheapest_codes_ride_padding_too() {
     assert!(offset_of!(APrint, cheapest_codes) >= after_artist_count);
     assert!(offset_of!(APrint, cheapest_codes) + 2 <= offset_of!(APrint, card_legalities));
     assert_eq!(offset_of!(APrint, card_legalities), after_artist_count.next_multiple_of(8), "the codes pushed the legality word");
+}
+
+// ─── new:rarity ───────────────────────────────────────────────────────────────
+
+/// `new:rarity` reads one byte `_sync_new_rarity` wrote at import; the engine decides nothing. Two
+/// cards, shaped on what api.scryfall.com answers (2026-10-04):
+///
+///   card 1, printings 1-4
+///     1  the first of its card at its rarity           -> `new:rarity`
+///     2  a later printing at the same rarity           -> `-new:rarity`
+///     3  the first at ANOTHER rarity                   -> `new:rarity`
+///     4  not yet computed (the column is NULL)         -> NULL: in neither polarity
+///   card 2, printing 5: its only printing, so the first at its rarity
+#[test]
+fn new_rarity_reads_the_bit_written_at_import() {
+    fn leaf() -> FilterExpr {
+        let json = serde_json::json!({ "node_type": "NewNode", "kwargs": { "value": "rarity" } });
+        super::filter::build_filter(&json).expect("new:rarity builds")
+    }
+    fn found(data: &CardData, mut filter: FilterExpr, unique: &str) -> Vec<u128> {
+        let bytes = rkyv::to_bytes::<Error>(data).expect("serialize");
+        let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+        let (_, page) = run_query(&QueryCtx::from(a), &mut filter, None, unique, "default", "name", "asc", 100, 0);
+        let mut out: Vec<u128> =
+            page.iter().map(|r| if unique == "card" { u128::from(r.0.oracle_id) } else { u128::from(r.1.scryfall_id) }).collect();
+        out.sort_unstable();
+        out
+    }
+    let not = |f: FilterExpr| FilterExpr::Not(Box::new(f));
+
+    let mut vocab = VocabInterner::new();
+    let cards = (1..=2).map(|id| stub_card(id, TYPE_CREATURE, &[], &mut vocab)).collect();
+    // Printing ids are sequential: card 1 owns 1-4, card 2 owns 5.
+    let mut data = store_of(cards, &[4, 1], vocab);
+    assert_eq!(data.printings[3].new_rarity, NEW_RARITY_NONE, "printing 4 is the not-yet-computed row");
+    for (printing, stored) in data.printings.iter_mut().zip([1u8, 0, 1]) {
+        printing.new_rarity = stored;
+    }
+    data.printings[4].new_rarity = 1;
+
+    assert_eq!(found(&data, leaf(), "printing"), vec![1, 3, 5]);
+    // The negated term is the complement of the computed rows, and NULL stays NULL.
+    assert_eq!(found(&data, not(leaf()), "printing"), vec![2]);
+    let anywhere = FilterExpr::Or(vec![leaf(), not(leaf())]);
+    assert!(!found(&data, anywhere, "printing").contains(&4), "an uncomputed row answers nothing");
+
+    // Under unique=card a card matches when SOME printing of it does.
+    assert_eq!(found(&data, leaf(), "card"), vec![1, 2]);
+    assert_eq!(found(&data, not(leaf()), "card"), vec![1]);
+
+    // The answer is the printing's own, and the planner has to know it; no index counts it.
+    let f = leaf();
+    assert!(super::estimator::has_printing_varying_leaf(&f));
+    assert!(super::filter::touches_printing_field(&f));
+    assert_eq!(super::filter::verify_cost_tier(&f), super::filter::MASK_COMPARE_NS100);
+
+    // The Python node validates the word; only `rarity` is a value the engine builds.
+    for bad in ["language", "art", "Rarity", ""] {
+        let json = serde_json::json!({ "node_type": "NewNode", "kwargs": { "value": bad } });
+        assert!(super::filter::build_filter(&json).is_err(), "{bad:?}");
+    }
+}
+
+/// The flag took the one byte of padding the printing already had after `artist_count`, so the
+/// store does not grow for the keyword. Pinned, like the codes, as a RELATION between offsets:
+/// `new_rarity` sits directly after `artist_count` and pushes neither `cheapest_codes` nor the
+/// 8-aligned legality word.
+#[test]
+fn new_rarity_rides_padding_too() {
+    use std::mem::offset_of;
+    type APrint = Archived<Printing>;
+
+    let after_artist_count = offset_of!(APrint, artist_count) + 1;
+    assert_eq!(offset_of!(APrint, new_rarity), after_artist_count);
+    assert!(offset_of!(APrint, new_rarity) < offset_of!(APrint, cheapest_codes));
+    assert_eq!(offset_of!(APrint, cheapest_codes), after_artist_count + 1, "the flag pushed the codes");
+    assert_eq!(offset_of!(APrint, card_legalities), after_artist_count.next_multiple_of(8), "the flag pushed the legality word");
 }

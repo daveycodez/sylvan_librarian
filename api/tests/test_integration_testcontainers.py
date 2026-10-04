@@ -127,6 +127,31 @@ _CHEAPEST_LANE_CASES: list[tuple[str, set[str]]] = [
     ("-(cheapest:usd or cheapest:tix)", {"2", "4", "6"}),
 ]
 
+# The set test_new_rarity_agrees_on_both_lanes imports into, and what both lanes must answer.
+# One card (oracle id A) and a second (B), every printing named by its collector number:
+#   card A   1  rare      2001-01-01   the first rare                              -> new
+#            2  rare      2005-01-01   a reprint                                   -> not
+#            3  uncommon  2002-01-01   the first uncommon                          -> new
+#            4  rare      2001-01-01   same day as 1, a variation (variation last) -> not
+#            5  rare      2000-01-01   a promo-set printing, outside the rule      -> not
+#   card B   6  mythic    2001-01-01   its only printing                           -> new
+#            7  rare      2003-01-01   its masterpiece printing (not wot)          -> not
+#   card C   8  common    2001-01-01   the sync's column put back to NULL           -> in neither
+_NEW_RARITY_SET = "zzn"
+_NEW_RARITY_LANE_CASES: list[tuple[str, set[str]]] = [
+    ("new:rarity", {"1", "3", "6"}),
+    ("NEW=Rarity", {"1", "3", "6"}),
+    ('new:"rarity"', {"1", "3", "6"}),
+    ("-new:rarity", {"2", "4", "5", "7"}),
+    ("-(new:rarity)", {"2", "4", "5", "7"}),
+    ("-(-new:rarity)", {"1", "3", "6"}),
+    ("new:rarity or -new:rarity", {"1", "2", "3", "4", "5", "6", "7"}),
+    ("new:rarity r:rare", {"1"}),
+    ("new:rarity -r:rare", {"3", "6"}),
+    ("-new:rarity r:rare", {"2", "4", "5", "7"}),
+    ("new:rarity or r:rare", {"1", "2", "3", "4", "5", "6", "7"}),
+]
+
 
 class TestContainerIntegration:
     """Integration tests using testcontainers with real PostgreSQL."""
@@ -651,6 +676,84 @@ class TestContainerIntegration:
         finally:
             with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
                 cursor.execute("DELETE FROM magic.cards WHERE card_set_code = %s", (_CHEAPEST_SET,))
+                conn.commit()
+            api_resource.app_context.engine = saved_engine
+            shm_path.unlink(missing_ok=True)
+            shm_path.with_suffix(".lock").unlink(missing_ok=True)
+
+    @pytest.mark.usefixtures("engine_enabled")
+    def test_new_rarity_agrees_on_both_lanes(self: TestContainerIntegration, api_resource: APIResource) -> None:
+        """`new:rarity` and its negation answer alike in SQL and the engine.
+
+        End to end: the printings go through the importer, whose sync decides `new_rarity`; the
+        engine is loaded from the table; and both lanes are asked the same questions, per
+        printing. That covers what the unit tests cannot -- that the migration added the column,
+        that ENGINE_COLUMNS selects it and the loader reads it, and that a column the sync has not
+        written (NULL) comes out the same on both sides.
+        """
+        card_a, card_b, card_c = (str(uuid.uuid4()) for _ in range(3))
+
+        def printing(oracle_id: str, number: str, rarity: str, released_at: str, **extra: object) -> dict:
+            card = make_raw_card(name=f"New Rarity Lane {oracle_id[:8]}", rarity=rarity)
+            return (
+                card
+                | {
+                    "oracle_id": oracle_id,
+                    "set": _NEW_RARITY_SET,
+                    "collector_number": number,
+                    "released_at": released_at,
+                    "set_type": "expansion",
+                }
+                | extra
+            )
+
+        printings = [
+            printing(card_a, "1", "rare", "2001-01-01"),
+            printing(card_a, "2", "rare", "2005-01-01"),
+            printing(card_a, "3", "uncommon", "2002-01-01"),
+            printing(card_a, "4", "rare", "2001-01-01", variation=True),
+            printing(card_a, "5", "rare", "2000-01-01", set_type="promo"),
+            printing(card_b, "6", "mythic", "2001-01-01"),
+            printing(card_b, "7", "rare", "2003-01-01", set_type="masterpiece"),
+            printing(card_c, "8", "common", "2001-01-01"),
+        ]
+        numbers = {card["collector_number"] for card in printings}
+
+        def answer(search: object, query: str) -> set[str]:
+            cards = search(**(search_kwargs(query, limit=1000) | {"unique": UniqueOn.PRINTING}))["cards"]
+            return {card["collector_number"] for card in cards}
+
+        def names(search: object, query: str) -> set[str]:
+            return {card["name"] for card in search(**(search_kwargs(query, limit=1000) | {"unique": UniqueOn.CARD}))["cards"]}
+
+        # Private store for the same reason test_cubecobra_ordering swaps one in.
+        shm_path = pathlib.Path(tempfile.gettempdir()) / f"sylvan_librarian_it_{uuid.uuid4().hex}"
+        saved_engine = api_resource.app_context.engine
+        api_resource.app_context.engine = QueryEngine(shm_path=str(shm_path))
+        try:
+            api_resource.admin._upsert_cards(printings)
+            with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
+                cursor.execute("UPDATE magic.cards SET new_rarity = NULL WHERE oracle_id = %s", (card_c,))
+                conn.commit()
+            api_resource.app_context.reload_engine(force=True)
+
+            for query, expected in _NEW_RARITY_LANE_CASES:
+                in_set = f"e:{_NEW_RARITY_SET} ({query})"
+                sql = answer(api_resource._search_sql, in_set)
+                engine = answer(api_resource._search_engine, in_set)
+                assert sql == engine, query
+                assert sql == expected, query
+                assert sql <= numbers
+                # And on rows this test did not shape: the three fixture cards, which the sync
+                # reached with whatever their blobs hold, grouped by card. Scoped by name because
+                # the session database also holds every other test file's cards.
+                fixture_cards = f'({query}) (name:"lightning bolt" or name:"serra angel" or name:"black lotus")'
+                sql_cards = names(api_resource._search_sql, fixture_cards)
+                engine_cards = names(api_resource._search_engine, fixture_cards)
+                assert sql_cards == engine_cards, query
+        finally:
+            with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
+                cursor.execute("DELETE FROM magic.cards WHERE card_set_code = %s", (_NEW_RARITY_SET,))
                 conn.commit()
             api_resource.app_context.engine = saved_engine
             shm_path.unlink(missing_ok=True)

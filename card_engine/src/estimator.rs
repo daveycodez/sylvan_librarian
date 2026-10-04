@@ -99,6 +99,8 @@ pub(crate) fn has_printing_varying_leaf(f: &FilterExpr) -> bool {
         FilterExpr::ArtistMatch { .. } | FilterExpr::FlavorMatch { .. } => true,
         // ...and so are the cheapest codes: the answer is the printing's, not the card's.
         FilterExpr::Cheapest { .. } => true,
+        // ...and `new:rarity`: the printing's own bit.
+        FilterExpr::NewRarity => true,
         FilterExpr::TextContains { field, .. } => matches!(field, TextSearchField::FlavorTextLower),
         FilterExpr::TextExact { field, .. } | FilterExpr::TextRegex { field, .. } => matches!(
             field,
@@ -356,6 +358,8 @@ fn estimate_leaf(f: &FilterExpr, indexes: &Archived<CardIndexes>, n_cards: u32, 
         FilterExpr::ExactName(_) => unknown(n),
         // No index answers `cheapest:`; it is a bit test on each candidate printing.
         FilterExpr::Cheapest { .. } => unknown(n),
+        // Nor does one answer `new:rarity`; it is a byte read off each candidate printing.
+        FilterExpr::NewRarity => unknown(n),
 
         FilterExpr::NumericCmp { lhs, op, rhs } => {
             // Only the simple `Field(f) op Const(c)` / `Const op Field(f)`

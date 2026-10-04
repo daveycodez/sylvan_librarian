@@ -96,4 +96,6 @@ ENGINE_COLUMNS: list[str] = [
     # `cheapest:usd` / `cheapest:eur` / `cheapest:tix`: the printing's stored answers, one
     # smallint _sync_cheapest_codes writes at import.
     "cheapest_codes",
+    # `new:rarity`: the printing's stored answer, one boolean _sync_new_rarity writes at import.
+    "new_rarity",
 ]

@@ -346,6 +346,14 @@ struct Printing {
     // `artist_ids`), written by `_sync_print_counts` beside the card-level counts above.
     // ARTIST_COUNT_NONE = not yet counted.
     artist_count: u8,
+    // Scryfall's `new:rarity`: this printing is the first of its card at its rarity, as
+    // `_sync_new_rarity` (api/admin_resource.py) decided it at import -- over the card's OTHER
+    // printings, which `tri()` cannot see, holding one card and one printing. 0 or 1;
+    // NEW_RARITY_NONE = not yet computed (a NULL column). Declared directly after `artist_count`
+    // on purpose, ahead of `cheapest_codes`: the byte after `artist_count` is padding, so this
+    // takes it and neither the codes nor the 8-aligned legality word move and the archived
+    // printing stays 160 bytes. Pinned by `new_rarity_rides_padding_too`.
+    new_rarity: u8,
     // Scryfall's `cheapest:usd` / `cheapest:eur` / `cheapest:tix`: this printing's answers to each
     // term AND to each negated term, three bits per currency, as `_sync_cheapest_codes`
     // (api/admin_resource.py) decided them at import against the card's lowest price -- which
@@ -422,7 +430,8 @@ struct CardRow {
     paper_set_count: u16,
     illustration_count: u16,
     artist_count: u8,
-    // `cheapest_codes` as stored; see Printing.
+    // `new_rarity` and `cheapest_codes` as stored; see Printing.
+    new_rarity: u8,
     cheapest_codes: u16,
 
     card_subtypes: Vec<u16>,
@@ -765,6 +774,26 @@ pub(crate) fn cheapest_answer(codes: u16, currency: CheapestCurrency, negated_te
     Some(bits & if negated_term { CHEAPEST_NEGATED_TERM } else { CHEAPEST_TERM } != 0)
 }
 
+/// "Not yet computed" for `Printing.new_rarity`: the column is NULL until `_sync_new_rarity` has run
+/// over the card.
+pub(crate) const NEW_RARITY_NONE: u8 = u8::MAX;
+
+/// A printing's answer to `new:rarity`, read off its stored byte. None is SQL's NULL: the column
+/// has not been computed for it, which is in neither the term nor its complement.
+pub(crate) fn new_rarity_answer(stored: u8) -> Option<bool> {
+    match stored {
+        NEW_RARITY_NONE => None,
+        v => Some(v != 0),
+    }
+}
+
+/// `new_rarity` as stored, or the sentinel when the column is NULL or absent (rows older than the
+/// column, hand-built test dicts).
+fn new_rarity(d: &Bound<PyDict>, key: &str) -> u8 {
+    let Some(v) = d.get_item(key).ok().flatten() else { return NEW_RARITY_NONE };
+    v.extract::<bool>().map_or(NEW_RARITY_NONE, u8::from)
+}
+
 /// `cheapest_codes` as stored, or the sentinel when the column is NULL or absent (rows older
 /// than the column, hand-built test dicts).
 fn cheapest_codes(d: &Bound<PyDict>, key: &str) -> u16 {
@@ -973,6 +1002,7 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
         paper_set_count: count_u16(d, "card_paper_set_count"),
         illustration_count: count_u16(d, "card_illustration_count"),
         artist_count: count_u8(d, "artist_count"),
+        new_rarity: new_rarity(d, "new_rarity"),
         cheapest_codes: cheapest_codes(d, "cheapest_codes"),
 
         card_types,
@@ -13407,7 +13437,11 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 // `cheapest:eur` / `cheapest:tix` and their negated terms. Two more bytes of the same padding, so
 // again no row size moves and only this constant rejects an older archive -- which would be read
 // with old padding as the codes.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026100402;
+//
+// 2026100403 — `Printing` gains `new_rarity`, the stored answer to Scryfall's `new:rarity`. One more
+// byte of the same padding (the one after `artist_count`), so again no row size moves and only this
+// constant rejects an older archive -- which would be read with old padding as the flag.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026100403;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -14018,6 +14052,7 @@ impl QueryEngine {
                 price_tix: row.price_tix,
                 prefer_score: row.prefer_score,
                 artist_count: row.artist_count,
+                new_rarity: row.new_rarity,
                 cheapest_codes: row.cheapest_codes,
                 card_legalities: row.card_legalities,
                 card_art_tags: row.card_art_tags,
