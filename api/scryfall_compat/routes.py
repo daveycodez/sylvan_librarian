@@ -1443,6 +1443,7 @@ class ScryfallCardsRoutes(ScryfallResponder):
         self._require_setup_complete()
         where, params = "TRUE", {}
         if q and q.strip():
+            self.app_context.ensure_set_groups()  # `g:<set>`, as `_search` does before it parses
             try:
                 where, params = generate_sql_query(parse_scryfall_query(q))
             except QueryBudgetExceeded as err:
@@ -1624,6 +1625,7 @@ class ScryfallCardsRoutes(ScryfallResponder):
         """
         if not q or not q.strip():
             return None, None
+        self.app_context.ensure_set_groups()  # `g:<set>`, as `_search` does before it parses
         try:
             return parse_scryfall_query(q), None
         except QueryBudgetExceeded as err:

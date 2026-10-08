@@ -970,7 +970,9 @@ class AdminResource:
         Returns:
             A summary of the load.
         """
-        return _import_sets(self.app_context.writer_pool, self._bulk_data_fetcher)
+        result = _import_sets(self.app_context.writer_pool, self._bulk_data_fetcher)
+        self.app_context.ensure_set_groups(force=True)  # `g:<set>` reads the list just mirrored
+        return result
 
     @route()
     def import_catalogs(self, **_: object) -> dict[str, Any]:
@@ -1007,6 +1009,10 @@ class AdminResource:
                 step(self.app_context.writer_pool, self._bulk_data_fetcher)
             except Exception:
                 logger.exception("%s import failed; continuing with the rest of the import", name)
+        # `g:<set>` reads its release groups from the set list just mirrored. Other workers pick the
+        # new list up on their next query via last_import_time; this one would too, but a group
+        # typed right after the import should not have to wait for that.
+        self.app_context.ensure_set_groups(force=True)
 
     @route()
     def import_all_is_tags(self, **_: object) -> dict[str, Any]:

@@ -874,6 +874,9 @@ class APIResource(ScryfallCardsRoutes, ScryfallReferenceRoutes):
         query = query or ""
         try:
             with timer("parse"):
+                # `g:<set>` resolves against a registry this process fills from magic.sets; a
+                # no-op after the first search per import, and never a reason for a search to fail.
+                self.app_context.ensure_set_groups()
                 parsed_query = parse_scryfall_query(query)
         except QueryBudgetExceeded as err:
             log_ctx = bounded_query_log_context(query)
