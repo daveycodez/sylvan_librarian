@@ -371,6 +371,37 @@ def _release_group_sets(node: BinaryOperatorNode) -> QueryNode:
     return members[0] if len(members) == 1 else OrNode(members)
 
 
+def _release_group_other_sets(node: BinaryOperatorNode) -> QueryNode | None:
+    """What a minus written ON a `g:` term negates: the group's OTHER sets, not the one it names.
+
+    Measured on api.scryfall.com 2026-10-08. `-g:ecc` is 117,902 printings, exactly
+    `-(e:aecl or e:ecl or e:pecl or e:tecc or e:tecl or e:yecl)`, where the complement of `g:ecc`
+    is 117,726 -- the difference is ecc's own 176:
+
+        -g:ecc e:ecc      176, all of ecc          -(g:ecc) e:ecc    404
+        -g:ecc e:ecl      404                      -g:tecc e:tecc    13, all of tecc
+        -g:tecc e:ecc     404                      -g:lea            everything
+        -g:zzzz           everything
+
+    So the minus on the term drops the rest of the group and spares the named set, while a minus
+    on parentheses around the term is the true complement -- which is what the generic NotNode
+    case already produces, and why this returns None for a parenthesised leaf. None too for a
+    value that names no group by itself (a comparison, a regex, an empty value): those are
+    negated as the nothing they match.
+
+    A set with no parent and no child has no other sets, and neither has a code no listed set
+    carries; negating none of them is negating the set no card is in, which is every card.
+    """
+    value = getattr(node.rhs, "value", None)
+    if node.parenthesised or node.operator not in (":", "=") or not isinstance(node.rhs, StringValueNode) or not value:
+        return None
+    group = release_group(value)
+    others = [_set_leaf(node, member) for member in group[1]] if group is not None else []
+    if not others:
+        return _set_leaf(node, "")
+    return others[0] if len(others) == 1 else OrNode(others)
+
+
 def _expand_release_group_leaves(node: QueryNode) -> tuple[QueryNode, bool]:
     """Replace `g:` / `group:` leaves with the sets they mean; return `(node, changed)`."""
     cls = node.__class__
@@ -383,6 +414,10 @@ def _expand_release_group_leaves(node: QueryNode) -> tuple[QueryNode, bool]:
             changed |= op_changed
         return (cls(operands), True) if changed else (node, False)
     if cls is NotNode:
+        if _is_release_group_leaf(node.operand):
+            other_sets = _release_group_other_sets(node.operand)
+            if other_sets is not None:
+                return NotNode(other_sets), True
         new_op, changed = _expand_release_group_leaves(node.operand)
         return (NotNode(new_op), True) if changed else (node, False)
     if _is_release_group_leaf(node):
@@ -397,6 +432,9 @@ def expand_release_groups(query: Query) -> Query:
     api.scryfall.com the two are one answer in one order. The rule and its measurements are in
     `api.parsing.set_groups`, which also holds the registry this reads. Nothing after this pass
     knows the keyword: the SQL path and the Rust engine both see ordinary set leaves.
+
+    A minus written on the term itself keeps the set it names (`-g:ecc e:ecc` is all of ecc);
+    see `_release_group_other_sets`.
     """
     root, changed = _expand_release_group_leaves(query.root)
     if not changed:

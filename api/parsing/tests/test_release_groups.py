@@ -213,15 +213,35 @@ class TestTheRewrite:
             ("g:tecc or cmc=3", "e:ecc or e:tecc or cmc=3"),
             ("(g:tecc or g:pbig) r:m", "(e:ecc or e:tecc or e:big or e:pbig or e:tbig) r:m"),
             ("g:tecc g:ecc", "(e:ecc or e:tecc) " + spelled_out(["ecl", *ECL_CHILDREN, "tecc"])),
-            # Negated, a group is the complement of its sets.
-            ("-g:tecc", "-(e:ecc or e:tecc)"),
+            # A minus on parentheses around the term is the complement of the group.
             ("-(g:tecc)", "-(e:ecc or e:tecc)"),
-            ("-g:lea", "-e:lea"),
-            ("-g:tecc e:ecl", "-(e:ecc or e:tecc) e:ecl"),
+            ("-( g:tecc )", "-(e:ecc or e:tecc)"),
+            ("-((g:tecc))", "-(e:ecc or e:tecc)"),
+            ("-(g:lea)", "-e:lea"),
+            ("-(g:tecc) e:ecl", "-(e:ecc or e:tecc) e:ecl"),
+            ("-(g:tecc or t:elf)", "-(e:ecc or e:tecc or t:elf)"),
+            ("-(g:tecc t:elf)", "-((e:ecc or e:tecc) t:elf)"),
+            ("-(g:zzzz)", "-e:zzzz"),
+            # A minus written ON the term drops the rest of the group and keeps the set it names.
+            ("-g:tecc", "-e:ecc"),
+            ("-g:ecc", "-(e:aecl or e:ecl or e:pecl or e:tecc or e:tecl or e:yecl)"),
+            ("-group:ECC", "-g:ecc"),
+            ("-g=ecc", "-g:ecc"),
+            ('-g:"Lorwyn Eclipsed Commander"', "-g:ecc"),
+            ("(-g:tecc)", "-e:ecc"),
+            ("-g:tecc e:tecc", "-e:ecc e:tecc"),
+            ("t:elf or -g:tecc", "t:elf or -e:ecc"),
+            ("-(-g:tecc)", "-(-e:ecc)"),
+            # ...so with no other set to drop it drops nothing: every card.
+            ("-g:lea", '-e:""'),
+            ("-g:zzzz", '-e:""'),
+            # A comparison, a regex and an empty value are negated as the nothing they match.
+            ("-g>=ecc", '-e:""'),
+            ("-g:/ecc/", '-e:""'),
+            ('-g:""', '-e:""'),
             # A value no listed set has is the `e:` term of that value, which matches nothing.
             ("g:zzzz", "e:zzzz"),
             ("g:ec", "e:ec"),
-            ("-g:zzzz", "-e:zzzz"),
             ("g:zzzz or cmc=3", "e:zzzz or cmc=3"),
             # A comparison, a regex and an empty value name no group: the set no card is in.
             ("g>=ecc", 'e:""'),
@@ -252,4 +272,10 @@ class TestTheRewrite:
     def test_an_unloaded_registry_degrades_to_the_named_set(self) -> None:
         replace_set_groups([])
         assert sql("g:ecc") == sql("e:ecc")
-        assert sql("-g:ecc") == sql("-e:ecc")
+        assert sql("-(g:ecc)") == sql("-e:ecc")
+        assert sql("-g:ecc") == sql('-e:""')
+
+    def test_parentheses_around_any_other_term_still_change_nothing(self) -> None:
+        for query in ("e:ecc", "t:elf", "cmc>=3", "o:flying", "is:split"):
+            assert sql(f"-({query})") == sql(f"-{query}")
+            assert sql(f"({query}) r:m") == sql(f"{query} r:m")
