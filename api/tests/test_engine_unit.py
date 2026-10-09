@@ -592,10 +592,102 @@ class TestNewRarity:
         assert set(_names(_run(firsts, "-new:rarity", unique="card")[1])) == {"Lightning Bolt", "Black Lotus"}
         assert _run(firsts, "new:rarity", unique="card")[0] == 2
 
-    @pytest.mark.parametrize("query", ["new:language", "new:art", "new:", "new>rarity", "new!=rarity"])
+    @pytest.mark.parametrize("query", ["new:language", "new:flavor", "new:", "new>rarity", "new!=rarity"])
     def test_a_value_that_is_not_answered_does_not_parse(self, firsts: QueryEngine, query: str) -> None:
         with pytest.raises(ValueError, match="arse"):
             _run(firsts, query)
+
+
+_NEW_CARD, _NEW_FRAME, _NEW_FOIL, _NEW_NONFOIL, _NEW_ART = 1, 2, 64, 128, 512
+
+
+@pytest.fixture(scope="module", name="flagged")
+def flagged_fixture(fresh_engine: Callable[[], QueryEngine]) -> QueryEngine:
+    """The fixture store with `new_flags` stamped on two cards, as `_sync_new_flags` would.
+
+    Lightning Bolt's ten printings (in fixture order): the 1st is the card's first on paper, in its
+    frame, in nonfoil and of its artwork; the 2nd its first in foil; the rest are first of nothing
+    (0, computed). Black Lotus's five: the 1st is first on paper, in its frame and in both finishes,
+    in an artwork another card printed first; the rest are 0. Every other row keeps a NULL column
+    -- the sync has not reached it.
+    """
+    rows = json.loads(_FIXTURE.read_text())
+    stamps = {
+        "Lightning Bolt": [_NEW_CARD | _NEW_FRAME | _NEW_NONFOIL | _NEW_ART, _NEW_FOIL],
+        "Black Lotus": [_NEW_CARD | _NEW_FRAME | _NEW_FOIL | _NEW_NONFOIL],
+    }
+    seen = dict.fromkeys(stamps, 0)
+    for row in rows:
+        name = row["card_name"]
+        if name in seen:
+            row["new_flags"] = stamps[name][seen[name]] if seen[name] < len(stamps[name]) else 0
+            seen[name] += 1
+    e = fresh_engine()
+    e.reload([{column: row.get(column) for column in ENGINE_COLUMNS} for row in rows])
+    return e
+
+
+class TestNewFlags:
+    """`new:card`, `new:frame`, `new:foil`, `new:nonfoil` and `new:art` through the parser and the loader.
+
+    The engine decides nothing and knows no value by name: the answers are one smallint
+    `_sync_new_flags` writes at import and ENGINE_COLUMNS selects, and the query carries its bit.
+    """
+
+    def test_the_column_is_selected_for_the_engine(self) -> None:
+        """A Rust field is inert until ENGINE_COLUMNS selects its column."""
+        assert "new_flags" in ENGINE_COLUMNS
+
+    @pytest.mark.parametrize(
+        ("query", "total"),
+        [
+            ("new:card", 2),
+            ("new:frame", 2),
+            ("new:foil", 2),
+            ("new:nonfoil", 2),
+            ("new:art", 1),
+            # Every spelling of a value is the value.
+            ("new:paper", 2),
+            ("new=printed", 2),
+            ('NEW:"Cardboard"', 2),
+            ("new:illustration", 1),
+            # The negation is the plain complement of the computed rows; the rest are NULL.
+            ("-new:card", 13),
+            ("-new:foil", 13),
+            ("-new:art", 14),
+            ("-(-new:art)", 1),
+            # A row the sync has not reached is in neither the term nor its complement.
+            ("new:card or -new:card", 15),
+            ("new:art -new:art", 0),
+            # Each value reads its own bit.
+            ("new:card new:foil", 1),
+            ("new:card -new:foil", 1),
+            ("new:foil -new:card", 1),
+            ("new:art new:nonfoil", 1),
+            ("new:art new:foil", 0),
+            # Composed with other terms.
+            ("new:card t:instant", 1),
+            ("new:foil t:artifact", 1),
+            ("-new:nonfoil t:artifact", 4),
+        ],
+    )
+    def test_printings(self, flagged: QueryEngine, query: str, total: int) -> None:
+        assert _run(flagged, query)[0] == total
+
+    def test_under_unique_card_a_card_matches_when_some_printing_does(self, flagged: QueryEngine) -> None:
+        assert set(_names(_run(flagged, "new:art", unique="card")[1])) == {"Lightning Bolt"}
+        assert set(_names(_run(flagged, "-new:art", unique="card")[1])) == {"Lightning Bolt", "Black Lotus"}
+        assert set(_names(_run(flagged, "new:foil", unique="card")[1])) == {"Lightning Bolt", "Black Lotus"}
+
+    def test_a_row_older_than_the_column_answers_nothing(self, firsts: QueryEngine) -> None:
+        """`firsts` carries `new_rarity` and no `new_flags` at all: every row is NULL here."""
+        assert _run(firsts, "new:card or -new:card")[0] == 0
+        assert _run(firsts, "new:rarity")[0] == 3
+
+    @pytest.mark.parametrize("query", ["new:language", "new:flavor", "new:mtgo", "new:game", "new:artist", "new>card", "new!=art"])
+    def test_a_value_that_is_not_answered_does_not_parse(self, flagged: QueryEngine, query: str) -> None:
+        with pytest.raises(ValueError, match="arse"):
+            _run(flagged, query)
 
 
 class TestArithmetic:

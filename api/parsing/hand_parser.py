@@ -554,7 +554,7 @@ class Parser:
             return lhs
 
         # ── `cheapest:` (a closed vocabulary of currencies) and `new:` (a closed vocabulary of
-        #    which only `rarity` is answered): each a node of its own ──
+        #    which the measured values are answered): each a node of its own ──
         if pc in (ParserClass.CURRENCY, ParserClass.NEW) and next_tok.type == TT.OP:
             return self.parse_cheapest() if pc == ParserClass.CURRENCY else self.parse_new()
 
@@ -823,9 +823,9 @@ class Parser:
     def parse_new(self) -> NewNode:
         """Parse the operator and value of `new:`: `:` or `=`, then one of the words answered.
 
-        Scryfall honours sixteen `new:` words and ignores the rest with a warning; only `rarity`
-        is answered here, and any other word or operator is refused, as an unknown colour is.
-        The word may be quoted.
+        Scryfall honours twenty-nine `new:` words and ignores the rest with a warning; the ones
+        NewNode.from_word knows are answered here, and any other word or operator is refused, as
+        an unknown colour is. The word may be quoted.
         """
         op_tok = self.consume()  # OP
         if op_tok.value not in (":", "="):

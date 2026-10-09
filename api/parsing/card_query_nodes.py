@@ -18,7 +18,11 @@ from api.parsing.db_info import (
     CHEAPEST_TERM,
     CHEAPEST_UNKNOWN,
     FORMAT_CODE_TO_NAME,
+    NEW_FLAG_BITS,
+    NEW_KEYWORD_ALIASES,
     NEW_KEYWORD_COLUMNS,
+    NEW_KEYWORD_EXPLANATIONS,
+    NEW_KEYWORD_VALUES,
     FieldType,
     ParserClass,
 )
@@ -607,55 +611,67 @@ class CheapestNode(QueryNode):
 
 
 class NewNode(QueryNode):
-    """Scryfall's `new:rarity`: the printing is the first of its card at its rarity.
+    """Scryfall's `new:<value>`: the printing is the first with something -- `new:rarity` the first of its card at its rarity.
 
     A node of its own rather than a comparison because the answer is not a property of the row --
-    "first" is over the card's other printings -- so it is decided at import and read here from
-    `magic.cards.new_rarity` (see `_build_new_rarity_sql` in api/admin_resource.py, which carries
-    the measured rule). Two-valued on a computed row: `-new:rarity` is the plain complement
-    (79,532 printings against `new:rarity`'s 38,943 on api.scryfall.com, 2026-10-04: all 118,475), so
-    an ordinary `NotNode` around it is right. A row the sync has not reached is NULL, in neither.
+    "first" is over other printings -- so it is decided at import and read here: `rarity` from
+    `magic.cards.new_rarity`, every other value from one bit of `magic.cards.new_flags` (see
+    `_build_new_rarity_sql` and `_build_new_flags_sql` in api/admin_resource.py, which carry the
+    measured rules). Two-valued on a computed row: `-new:rarity` is the plain complement (79,532
+    printings against `new:rarity`'s 38,943 on api.scryfall.com, 2026-10-04: all 118,475), and so
+    is the negation of each other value, so an ordinary `NotNode` around it is right. A row the
+    sync has not reached is NULL, in neither.
 
-    `value` is the word after the operator, canonical (`rarity`). Scryfall honours sixteen
-    `new:` words; only the ones in NEW_KEYWORD_COLUMNS are answered here, and `from_word` refuses
-    the rest rather than return a list that is not Scryfall's.
+    `value` is the word after the operator, canonical (`rarity`, `card`, `art` ...). Scryfall honours
+    twenty-nine words, fourteen lists; the ones in NEW_KEYWORD_VALUES are answered here, under
+    the spellings NEW_KEYWORD_ALIASES adds, and `from_word` refuses the rest rather than return a
+    list that is not Scryfall's.
     """
 
     def __init__(self, value: str) -> None:
-        """Initialize from a canonical value (`rarity`); see `from_word` for user input."""
-        if value not in NEW_KEYWORD_COLUMNS:
+        """Initialize from a canonical value (`rarity`, `card` ...); see `from_word` for user input."""
+        if value not in NEW_KEYWORD_VALUES:
             msg = f"Unknown new: value: {value}"
             raise ValueError(msg)
         self.value = value
 
     @classmethod
     def from_word(cls, word: str) -> NewNode:
-        """Build the term from the word a user typed, in any case.
+        """Build the term from the word a user typed, in any case, under any spelling answered.
 
         Raises:
             ValueError: If the word is not a `new:` value this parser answers.
         """
         value = word.strip().lower()
-        if value not in NEW_KEYWORD_COLUMNS:
-            msg = f"Unknown new: value: {word}. The values answered are: {tuple(NEW_KEYWORD_COLUMNS)}"
+        value = NEW_KEYWORD_ALIASES.get(value, value)
+        if value not in NEW_KEYWORD_VALUES:
+            msg = f"Unknown new: value: {word}. The values answered are: {(*NEW_KEYWORD_VALUES, *NEW_KEYWORD_ALIASES)}"
             raise ValueError(msg)
         return cls(value)
 
     def kwargs(self) -> dict:
-        """Return this node's kwargs dict for Rust engine JSON serialization."""
+        """Return this node's kwargs dict for Rust engine JSON serialization.
+
+        A value read from `new_flags` carries its bit as `mask`, so the vocabulary and its bit
+        numbers exist once, here; `rarity` has a column of its own and carries none.
+        """
+        if self.value in NEW_FLAG_BITS:
+            return {"value": self.value, "mask": NEW_FLAG_BITS[self.value]}
         return {"value": self.value}
 
     def to_sql(self, context: QueryContext) -> str:
-        """Generate SQL reading this value's column.
+        """Generate SQL reading this value's column, or its bit of `new_flags`.
 
-        The column is NULL until the sync has reached the card, which a `NOT` leaves NULL.
+        Either is NULL until the sync has reached the row, which a `NOT` leaves NULL.
         """
         del context
+        if self.value in NEW_FLAG_BITS:
+            return f"((card.new_flags & {NEW_FLAG_BITS[self.value]}) <> 0)"
         return f"card.{NEW_KEYWORD_COLUMNS[self.value]}"
 
     def to_human_explanation(self) -> str:
         """Return a human-readable explanation of the term."""
-        return f"the printing is the first of its card at its {self.value}"
+        return NEW_KEYWORD_EXPLANATIONS[self.value]
 
     def __repr__(self) -> str:
         """Return a string representation of the NewNode."""

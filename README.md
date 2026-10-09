@@ -86,6 +86,7 @@ Sylvan Librarian is an open source implementation of Scryfall, a Magic: The Gath
 | **Pricing Data**           | `usd:`, `eur:`, `tix:`                        | ✔        | ✔           | Complete with all comparison operators                    |
 | **Cheapest Printing**      | `cheapest:usd`, `cheapest:eur`, `cheapest:tix` | ✔       | ✔           | The printings carrying their card's lowest price          |
 | **First at a Rarity**      | `new:rarity`                                  | ✔        | ✔           | The first printing of a card at its rarity                |
+| **First Printings**        | `new:card`, `new:frame`, `new:foil`, `new:nonfoil`, `new:art` | ✔ | ✔  | A card's first printing on paper, in a frame, in a finish; an artwork's first printing |
 | **Advanced Logic**         | `AND`, `OR`, `NOT`, `()`                      | ✔        | ✔           | Full boolean logic support                                |
 | **Keywords**               | `keyword:`                                    | ✔        | ✔           | JSONB object storage                                      |
 | **Mana Costs**             | `mana:`, `m:`                                 | ✔        | ✔           | Both JSONB and text representations                       |

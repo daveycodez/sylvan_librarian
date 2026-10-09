@@ -368,7 +368,7 @@ def create_new_parser(quoted_string: ParserElement) -> ParserElement:
     """Create the parser for `new:<value>`.
 
     Takes `:` or `=` only and a word, bare or quoted, validated in the parse action against the
-    values Scryfall's `new:` is answered for here (`rarity`); it mirrors hand_parser.parse_new.
+    values Scryfall's `new:` is answered for here (NewNode.from_word); it mirrors hand_parser.parse_new.
     A `-` in front is the ordinary negation: `-new:rarity` is the complement, so no folding is
     needed as it is for `cheapest:`.
 

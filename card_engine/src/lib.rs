@@ -378,6 +378,17 @@ struct Printing {
     // #629's replacement for comparing/deduping on the full illustration_id UUID
     // in the artwork-mode match-count and emission hot paths.
     artwork_group_id: u16,
+
+    // Scryfall's `new:card`, `new:frame`, `new:foil`, `new:nonfoil` and `new:art`: this printing is
+    // the first of its card on paper, in its frame, in a finish, or the first anywhere with its
+    // artwork, as `_sync_new_flags` (api/admin_resource.py) decided it at import -- over OTHER
+    // printings, which `tri()` cannot see, holding one card and one printing. One bit a value
+    // (NEW_FLAG_BITS in api/parsing/db_info.py; the query carries its bit as a mask, so the engine
+    // holds no table of them). NEW_FLAGS_NONE = not yet computed (a NULL column). Declared last on
+    // purpose: `artwork_group_id` ends two bytes into the struct's last 8-aligned word, so these
+    // two ride the padding after it and the archived printing stays 160 bytes. Pinned by
+    // `new_flags_ride_the_tail_padding`.
+    new_flags: u16,
 }
 
 /// Parse-time row: one DB row (= one printing) with every field, before the
@@ -430,9 +441,10 @@ struct CardRow {
     paper_set_count: u16,
     illustration_count: u16,
     artist_count: u8,
-    // `new_rarity` and `cheapest_codes` as stored; see Printing.
+    // `new_rarity`, `cheapest_codes` and `new_flags` as stored; see Printing.
     new_rarity: u8,
     cheapest_codes: u16,
+    new_flags: u16,
 
     card_subtypes: Vec<u16>,
     card_keywords: Vec<u16>,
@@ -794,6 +806,27 @@ fn new_rarity(d: &Bound<PyDict>, key: &str) -> u8 {
     v.extract::<bool>().map_or(NEW_RARITY_NONE, u8::from)
 }
 
+/// "Not yet computed" for `Printing.new_flags`: the column is NULL until `_sync_new_flags` has run.
+/// The column is a smallint, so no stored value has the top bit and none is this.
+pub(crate) const NEW_FLAGS_NONE: u16 = u16::MAX;
+
+/// A printing's answer to the `new:` value whose bit is `mask`, read off its stored flags. None is
+/// SQL's NULL: the column has not been computed for it, which is in neither the term nor its
+/// complement.
+pub(crate) fn new_flag_answer(stored: u16, mask: u16) -> Option<bool> {
+    match stored {
+        NEW_FLAGS_NONE => None,
+        flags => Some(flags & mask != 0),
+    }
+}
+
+/// `new_flags` as stored, or the sentinel when the column is NULL, absent (rows older than the
+/// column, hand-built test dicts) or not a smallint's non-negative half.
+fn new_flags(d: &Bound<PyDict>, key: &str) -> u16 {
+    let Some(v) = d.get_item(key).ok().flatten() else { return NEW_FLAGS_NONE };
+    v.extract::<i64>().ok().and_then(|flags| u16::try_from(flags).ok()).filter(|flags| *flags <= i16::MAX as u16).unwrap_or(NEW_FLAGS_NONE)
+}
+
 /// `cheapest_codes` as stored, or the sentinel when the column is NULL or absent (rows older
 /// than the column, hand-built test dicts).
 fn cheapest_codes(d: &Bound<PyDict>, key: &str) -> u16 {
@@ -1004,6 +1037,7 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
         artist_count: count_u8(d, "artist_count"),
         new_rarity: new_rarity(d, "new_rarity"),
         cheapest_codes: cheapest_codes(d, "cheapest_codes"),
+        new_flags: new_flags(d, "new_flags"),
 
         card_types,
         card_subtypes: str_list_to_ids(d, "card_subtypes", vocab)?,
@@ -13441,7 +13475,12 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 // 2026100403 — `Printing` gains `new_rarity`, the stored answer to Scryfall's `new:rarity`. One more
 // byte of the same padding (the one after `artist_count`), so again no row size moves and only this
 // constant rejects an older archive -- which would be read with old padding as the flag.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026100403;
+//
+// 2026100902 — `Printing` gains `new_flags`, the stored answers to Scryfall's `new:card`,
+// `new:frame`, `new:foil`, `new:nonfoil` and `new:art`. Two bytes of the padding after
+// `artwork_group_id`, at the end of the struct, so once more no row size moves and only this
+// constant rejects an older archive -- which would be read with old padding as the flags.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026100902;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -14059,6 +14098,7 @@ impl QueryEngine {
                 card_is_tags: row.card_is_tags,
                 card_frame_data: row.card_frame_data,
                 artwork_group_id: 0, // placeholder; assign_artwork_groups fills every printing below
+                new_flags: row.new_flags,
             });
         }
         offsets.push(printings.len() as u32);

@@ -27,7 +27,7 @@ class ParserClass(StrEnum):
     DATE = "date"  # Date fields with full date values
     YEAR = "year"  # Year fields with 4-digit year values
     CURRENCY = "currency"  # `cheapest:` -- the value is one of a closed set of currency words
-    NEW = "new"  # `new:` -- the value is one of a closed set of words; only `rarity` is answered
+    NEW = "new"  # `new:` -- the value is one of a closed set of words; see NEW_KEYWORD_VALUES
 
 
 class FieldInfo:
@@ -227,11 +227,13 @@ DB_COLUMNS = [
         search_aliases=["cheapest"],
         parser_class=ParserClass.CURRENCY,
     ),
-    # Scryfall's `new:rarity`: the printing is the first of its card at its rarity. "First" is over
-    # the card's other printings, which no row sees at query time, so the answer is decided at import
-    # and stored as one boolean -- see NEW_KEYWORD_COLUMNS below and _build_new_rarity_sql in
-    # api/admin_resource.py. A parser class of its own because the value is a closed vocabulary and
-    # because only one of Scryfall's sixteen `new:` values is answered here.
+    # Scryfall's `new:<value>`: the printing is the first of its card with something -- at its rarity,
+    # on paper, in its frame, in foil -- or the first anywhere with its artwork. "First" is over other
+    # printings, which no row sees at query time, so the answers are decided at import and stored --
+    # one boolean for `rarity`, one bit of `new_flags` for each other value; see NEW_KEYWORD_COLUMNS
+    # and NEW_FLAG_BITS below and the two syncs in api/admin_resource.py. A parser class of its own
+    # because the value is a closed vocabulary and only the measured part of Scryfall's is answered.
+    # The FieldInfo names the first of the two columns; NewNode picks the one a value reads.
     FieldInfo(
         db_column_name="new_rarity",
         field_type=FieldType.NUMERIC,
@@ -413,12 +415,59 @@ CHEAPEST_UNKNOWN = 4
 CHEAPEST_SHIFTS: dict[str, int] = {"usd": 0, "eur": 3, "tix": 6}
 
 
-# The `new:` values this parser answers, and the column each one reads. Scryfall honours sixteen
-# (`new:rarity`, `new:language`, `new:art`, `new:flavor`, ...); `new:rarity` is the one measured to
-# be exactly a list of printings on api.scryfall.com (2026-10-04, 38,943 of 38,943). The others are
-# refused here -- `new:language` was measured too and is NOT exact, the rest were not measured --
-# so no `new:` term returns cards that are not Scryfall's.
+# `new:rarity` and the boolean column it reads -- the first `new:` value answered, measured
+# 2026-10-04 (38,943 of 38,943 printings on api.scryfall.com) and synced by _sync_new_rarity.
 NEW_KEYWORD_COLUMNS: dict[str, str] = {"rarity": "new_rarity"}
+
+# The `new:` values answered from `magic.cards.new_flags`, and the bit of that smallint each reads.
+# Each was measured to be exactly a list of printings on api.scryfall.com (2026-10-09, the whole
+# list read with extras and variations in against that day's `default_cards`;
+# _build_new_flags_sql in api/admin_resource.py carries the rule and the counts):
+#
+#   card     the card's first printing on paper                                   35,158 of 35,158
+#   frame    the card's first printing in each frame (1993, 1997, 2003, 2015, future)   45,061 of 45,061
+#   foil     the card's first paper printing in traditional foil                  29,671 of 29,671
+#   nonfoil  the card's first paper printing in nonfoil                           35,018 of 35,018
+#   art      the first printing anywhere of each artwork, across cards            52,064 of 52,064
+#
+# The bit numbers leave gaps on purpose. They are the positions the downstream port stores the same
+# answers at, and the gaps are the values Scryfall honours that THIS table cannot answer, because
+# the importer drops the printings they are decided over: bits 2-5 are `mtgo`, `arena`, `astral` and
+# `sega` (a card's first printing in a game -- the digital printings are not imported), bit 8 is
+# `flavor` (decided by a printing's FRONT face, and a two-faced printing is stored as one face, the
+# last) and bit 10 is `language` (decided over every language's rows; only one row a printing is
+# imported). A value takes its bit when the rows it needs arrive; until then it is refused like any
+# unknown word, so no `new:` term returns a list that is not Scryfall's.
+NEW_FLAG_BITS: dict[str, int] = {
+    "card": 1 << 0,
+    "frame": 1 << 1,
+    "foil": 1 << 6,
+    "nonfoil": 1 << 7,
+    "art": 1 << 9,
+}
+
+# The other spellings Scryfall honours for the values above, each measured to be the same list as
+# the value it names (2026-10-09): `new:paper` is `new:card` id for id over all 35,158 printings,
+# and `printed`, `cardboard` and `illustration` return what their value does on every query tried.
+NEW_KEYWORD_ALIASES: dict[str, str] = {
+    "paper": "card",
+    "printed": "card",
+    "cardboard": "card",
+    "illustration": "art",
+}
+
+# Every canonical `new:` value answered, in the order the error message lists them.
+NEW_KEYWORD_VALUES: tuple[str, ...] = (*NEW_KEYWORD_COLUMNS, *NEW_FLAG_BITS)
+
+# What each value's printing is the first of, for the human explanation of a query.
+NEW_KEYWORD_EXPLANATIONS: dict[str, str] = {
+    "rarity": "the printing is the first of its card at its rarity",
+    "card": "the printing is the first of its card on paper",
+    "frame": "the printing is the first of its card in its frame",
+    "foil": "the printing is the first of its card in foil",
+    "nonfoil": "the printing is the first of its card in nonfoil",
+    "art": "the printing is the first with its artwork",
+}
 
 
 CARD_SUPERTYPES = {

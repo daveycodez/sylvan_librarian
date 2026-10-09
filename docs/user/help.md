@@ -129,6 +129,23 @@ new:rarity set:KHM
 t:dragon new:rarity r:mythic
 ```
 
+`new:` has other values, each finding the printings that are the first with something. `-new:` in front of any of them finds the rest.
+
+| Term | Finds |
+| --- | --- |
+| `new:card` (or `new:paper`, `new:printed`, `new:cardboard`) | A card's first printing |
+| `new:frame` | A card's first printing in each frame (1993, 1997, 2003, 2015, future) |
+| `new:foil` | A card's first printing in traditional foil |
+| `new:nonfoil` | A card's first nonfoil printing |
+| `new:art` (or `new:illustration`) | The first printing of each artwork, whichever card it is on |
+
+```
+new:card set:KHM
+new:art a:"Rebecca Guay"
+t:angel new:foil year<=2005
+-new:art set:M21
+```
+
 ### Set
 
 Use `set:` with the set code.

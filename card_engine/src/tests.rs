@@ -22,7 +22,7 @@ use super::{
     TextField, TextSearchField, Tri, SortedTrigramIndex, VocabInterner, ARTIST_NONE, NONE_STR, TYPE_ARTIFACT, TYPE_CREATURE,
     TYPE_ENCHANTMENT, TYPE_INSTANT, TYPE_LAND, TYPE_LEGENDARY, TYPE_PLANESWALKER, TYPE_SNOW, TYPE_SORCERY,
     ARTIST_COUNT_NONE, PRINT_COUNT_NONE,
-    CheapestCurrency, CHEAPEST_CODES_NONE, CHEAPEST_NEGATED_TERM, CHEAPEST_TERM, CHEAPEST_UNKNOWN, NEW_RARITY_NONE,
+    CheapestCurrency, CHEAPEST_CODES_NONE, CHEAPEST_NEGATED_TERM, CHEAPEST_TERM, CHEAPEST_UNKNOWN, NEW_FLAGS_NONE, NEW_RARITY_NONE,
 };
 use rkyv::{rancor::Error, Archived};
 use std::collections::HashMap;
@@ -267,6 +267,7 @@ fn stub_printing(scryfall_id: u128, illustration_id: u128, prefer_score: Option<
         new_rarity: NEW_RARITY_NONE,
         cheapest_codes: CHEAPEST_CODES_NONE,
         artwork_group_id: 0, // placeholder; store_of overwrites via assign_artwork_groups
+        new_flags: NEW_FLAGS_NONE,
     }
 }
 
@@ -13810,4 +13811,115 @@ fn new_rarity_rides_padding_too() {
     assert!(offset_of!(APrint, new_rarity) < offset_of!(APrint, cheapest_codes));
     assert_eq!(offset_of!(APrint, cheapest_codes), after_artist_count + 1, "the flag pushed the codes");
     assert_eq!(offset_of!(APrint, card_legalities), after_artist_count.next_multiple_of(8), "the flag pushed the legality word");
+}
+
+/// `new:card`, `new:frame`, `new:foil`, `new:nonfoil` and `new:art` each read one bit of the smallint
+/// `_sync_new_flags` wrote at import; the engine decides nothing and holds no table of the values --
+/// the query carries its bit. Two cards:
+///
+///   card 1, printings 1-4
+///     1  flags 1 | 2 | 128 | 512   the card's first printing: on paper, in its frame, in nonfoil, of its art
+///     2  flags 64                  a later printing, the first in foil
+///     3  flags 0                   computed, and first of nothing -> in every complement
+///     4  not yet computed (the column is NULL) -> NULL: in neither polarity of any value
+///   card 2, printing 5: flags 1 | 2 | 64 | 128, its only printing, in an artwork card 1 printed first
+#[test]
+fn new_flags_read_the_bits_written_at_import() {
+    const CARD: u16 = 1 << 0;
+    const FRAME: u16 = 1 << 1;
+    const FOIL: u16 = 1 << 6;
+    const NONFOIL: u16 = 1 << 7;
+    const ART: u16 = 1 << 9;
+    fn leaf(value: &str, mask: u16) -> FilterExpr {
+        let json = serde_json::json!({ "node_type": "NewNode", "kwargs": { "value": value, "mask": mask } });
+        super::filter::build_filter(&json).expect("new:<value> builds")
+    }
+    fn found(data: &CardData, mut filter: FilterExpr, unique: &str) -> Vec<u128> {
+        let bytes = rkyv::to_bytes::<Error>(data).expect("serialize");
+        let a = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+        let (_, page) = run_query(&QueryCtx::from(a), &mut filter, None, unique, "default", "name", "asc", 100, 0);
+        let mut out: Vec<u128> =
+            page.iter().map(|r| if unique == "card" { u128::from(r.0.oracle_id) } else { u128::from(r.1.scryfall_id) }).collect();
+        out.sort_unstable();
+        out
+    }
+    let not = |f: FilterExpr| FilterExpr::Not(Box::new(f));
+
+    let mut vocab = VocabInterner::new();
+    let cards = (1..=2).map(|id| stub_card(id, TYPE_CREATURE, &[], &mut vocab)).collect();
+    // Printing ids are sequential: card 1 owns 1-4, card 2 owns 5.
+    let mut data = store_of(cards, &[4, 1], vocab);
+    assert_eq!(data.printings[3].new_flags, NEW_FLAGS_NONE, "printing 4 is the not-yet-computed row");
+    for (printing, stored) in data.printings.iter_mut().zip([CARD | FRAME | NONFOIL | ART, FOIL, 0]) {
+        printing.new_flags = stored;
+    }
+    data.printings[4].new_flags = CARD | FRAME | FOIL | NONFOIL;
+
+    // Each value reads its own bit and no other's.
+    for (value, mask, yes, no) in [
+        ("card", CARD, vec![1, 5], vec![2, 3]),
+        ("frame", FRAME, vec![1, 5], vec![2, 3]),
+        ("foil", FOIL, vec![2, 5], vec![1, 3]),
+        ("nonfoil", NONFOIL, vec![1, 5], vec![2, 3]),
+        ("art", ART, vec![1], vec![2, 3, 5]),
+    ] {
+        assert_eq!(found(&data, leaf(value, mask), "printing"), yes, "new:{value}");
+        // The negated term is the complement of the computed rows, and NULL stays NULL.
+        assert_eq!(found(&data, not(leaf(value, mask)), "printing"), no, "-new:{value}");
+        let anywhere = FilterExpr::Or(vec![leaf(value, mask), not(leaf(value, mask))]);
+        assert_eq!(found(&data, anywhere, "printing"), vec![1, 2, 3, 5], "an uncomputed row answers nothing: {value}");
+    }
+
+    // Under unique=card a card matches when SOME printing of it does.
+    assert_eq!(found(&data, leaf("art", ART), "card"), vec![1]);
+    assert_eq!(found(&data, not(leaf("art", ART)), "card"), vec![1, 2]);
+    assert_eq!(found(&data, leaf("foil", FOIL), "card"), vec![1, 2]);
+    // Two values on one printing, and a value beside `new:rarity`, which reads its own byte.
+    assert_eq!(found(&data, FilterExpr::And(vec![leaf("card", CARD), leaf("foil", FOIL)]), "printing"), vec![5]);
+    let rarity = serde_json::json!({ "node_type": "NewNode", "kwargs": { "value": "rarity" } });
+    data.printings[1].new_rarity = 1;
+    let both = FilterExpr::And(vec![super::filter::build_filter(&rarity).expect("new:rarity builds"), leaf("foil", FOIL)]);
+    assert_eq!(found(&data, both, "printing"), vec![2]);
+
+    // The answer is the printing's own, and the planner has to know it; no index counts it.
+    let f = leaf("card", CARD);
+    assert!(super::estimator::has_printing_varying_leaf(&f));
+    assert!(super::filter::touches_printing_field(&f));
+    assert_eq!(super::filter::verify_cost_tier(&f), super::filter::MASK_COMPARE_NS100);
+
+    // The stored answer: NULL is neither, a set bit is the term, a clear one its complement.
+    assert_eq!(super::new_flag_answer(NEW_FLAGS_NONE, CARD), None);
+    assert_eq!(super::new_flag_answer(CARD | ART, ART), Some(true));
+    assert_eq!(super::new_flag_answer(CARD | ART, FOIL), Some(false));
+    assert_eq!(super::new_flag_answer(0, CARD), Some(false));
+
+    // A value with no bit, a zero bit, or the sentinel's top bit does not build.
+    for kwargs in [
+        serde_json::json!({ "value": "card" }),
+        serde_json::json!({ "value": "card", "mask": 0 }),
+        serde_json::json!({ "value": "card", "mask": 1 << 15 }),
+        serde_json::json!({ "value": "card", "mask": 1 << 16 }),
+        serde_json::json!({ "value": "card", "mask": "1" }),
+        serde_json::json!({ "value": "", "mask": null }),
+    ] {
+        let json = serde_json::json!({ "node_type": "NewNode", "kwargs": kwargs });
+        assert!(super::filter::build_filter(&json).is_err(), "{json}");
+    }
+}
+
+/// The flags took two bytes of the padding the printing already had at its END, so the store does
+/// not grow for five keywords. Pinned as a RELATION between offsets: `new_flags` sits directly
+/// after `artwork_group_id`, inside the struct's last 8-aligned word, and moves nothing before it.
+#[test]
+fn new_flags_ride_the_tail_padding() {
+    use std::mem::{offset_of, size_of};
+    type APrint = Archived<Printing>;
+
+    let after_artwork_group = offset_of!(APrint, artwork_group_id) + 2;
+    assert_eq!(offset_of!(APrint, new_flags), after_artwork_group);
+    assert_eq!(size_of::<APrint>(), after_artwork_group.next_multiple_of(8), "the flags grew the printing");
+    assert!(offset_of!(APrint, new_flags) + 2 <= size_of::<APrint>());
+    // ...and the two fields that took the earlier padding are where they were.
+    assert_eq!(offset_of!(APrint, new_rarity), offset_of!(APrint, artist_count) + 1);
+    assert_eq!(offset_of!(APrint, card_legalities), (offset_of!(APrint, artist_count) + 1).next_multiple_of(8));
 }

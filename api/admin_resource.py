@@ -46,8 +46,8 @@ from cachebox import TTLCache
 
 from api.card_processing import preprocess_card
 from api.db.bulk_upsert import bulk_upsert as _bulk_upsert
-from api.parsing.db_info import CHEAPEST_NEGATED_TERM, CHEAPEST_SHIFTS, CHEAPEST_TERM, CHEAPEST_UNKNOWN
-from api.release_batches import RELEASE_BATCHES
+from api.parsing.db_info import CHEAPEST_NEGATED_TERM, CHEAPEST_SHIFTS, CHEAPEST_TERM, CHEAPEST_UNKNOWN, NEW_FLAG_BITS
+from api.release_batches import RELEASE_BATCHES, RELEASE_BATCHES_2026_10
 from api.scryfall_bulk_data_fetcher import BulkDataKey, ScryfallBulkDataFetcher
 from api.settings import settings
 from api.tag_import import import_art_tags as _import_art_tags
@@ -544,6 +544,201 @@ FROM proposed
 WHERE
     cards.scryfall_id = proposed.scryfall_id AND
     cards.new_rarity IS DISTINCT FROM proposed.new_rarity
+"""
+
+
+# The one printing Scryfall's order puts first among the rows of its card that share its release
+# date and batch, where the keys below say otherwise. See _build_new_flags_sql.
+_NEW_ORDER_LEADS = ("bc9c39d1-1e10-4cd3-a4b1-b6eb7c1a0b65",)  # plg21/J2, Orb of Dragonkind
+
+# ...and the two Scryfall puts first among rows that tie on everything before the id, where the id
+# says otherwise. See _build_new_flags_sql.
+_NEW_TIE_LEADS = (
+    "646ff18e-9d6a-4a55-838c-0bd88b8c9fae",  # ltr/401, Gandalf, Friend of the Shire
+    "770ea046-3008-4d4e-b316-e6c5e80422d3",  # ltr/404, Frodo Baggins
+)
+
+# The two memorabilia sets whose printings count toward `new:art`. See _build_new_flags_sql.
+_NEW_ART_MEMORABILIA_SETS = ("o90p", "olgc")
+
+
+def _build_new_flags_sql() -> str:
+    """Build the `new_flags` sync statement: which `new:` lists is each printing on?
+
+    Scryfall's `new:<value>` finds the printings that are the FIRST with something. "First" is over
+    other printings, so neither a SQL row nor the engine's `tri()` can decide it at query time; it
+    is decided here, once per import, one bit of a smallint per value (NEW_FLAG_BITS).
+
+    The rule, measured on api.scryfall.com 2026-10-09 by reading each whole list (`new:<value>`,
+    `unique=prints`, extras and variations in) against that day's `default_cards` bulk file
+    (118,602 rows). Every value is one shape,
+
+        per GROUP, over the rows that are ELIGIBLE, the one row that is least by
+          (release date, release batch, variation last, the collector number's digits as one
+           integer, Scryfall id)
+
+    and a value chooses only its group and who is eligible. Memorabilia is eligible for none of
+    them (but for two sets of `new:art`):
+
+        card     group: the card (oracle id). Eligible: a printing whose `games` hold `paper`.
+                 35,158 of 35,158, nothing missing and nothing over. `new:paper` is the same list
+                 id for id.
+        frame    group: the card and the printing's `frame` (1993, 1997, 2003, 2015, future) --
+                 not the frame effects, not the border. Every row is eligible. 45,061 of 45,061.
+        foil     group: the card. Eligible: a PAPER printing whose `finishes` hold `foil` -- the
+                 traditional foil, not `etched`. 29,671 of 29,671.
+        nonfoil  group: the card. Eligible: a PAPER printing whose `finishes` hold `nonfoil`.
+                 35,018 of 35,018.
+        art      group: the illustration id, ACROSS cards -- an artwork a second card reuses is
+                 new once -- and the rows with no illustration id are one group. Eligible: every
+                 row outside memorabilia, and inside it the sets `olgc` and `o90p`. 52,064 of
+                 52,064.
+
+    Each clause is evidence, not a reading of the name:
+
+    - the release BATCH is the order Scryfall gives sets that released the same day, as
+      re-measured in October (RELEASE_BATCHES_2026_10 in api/release_batches.py). With the table
+      `new:rarity` reads, measured in September, the five lists are between 150 and 424 printings
+      off; with this one they are exact.
+    - the collector number compares as EVERY digit of it read as one integer
+      (`collector_number_int`: `1N07` is 107), not as its first integer: `psus/14` is before
+      `pjjt/1N07` on 2007-01-01 in one batch, and is Soltari Priest's `new:frame`.
+    - a VARIATION sorts after every plain row of its date and batch, whatever their numbers:
+      Mirage's misprint `mir/87†` carries Shaper Guildmage's artwork and a lower number than
+      `mir/91` of the same day, and `mir/91` is the `new:art` one. It is flagged like any other
+      row when it is its group's first -- Zombify's `ody/171†` is the card's first printing in
+      the 2015 frame and is `new:frame`, and `a25/116` after it is not. Scryfall hides variations
+      from a search unless `include_variations=true` is asked, which makes such a group look as
+      if it had no new printing; this table shows variations, so it answers as Scryfall does
+      with them shown.
+    - the SET CODE is no key and neither is the set type: promos, masterpieces and box sets are
+      first wherever the order puts them (713 of the 35,158 `new:card` printings are promos).
+      `new:rarity`'s excluded set types are that value's own.
+    - `olgc` and `o90p` (`new:art`): the 29 of their rows that lead an artwork are on Scryfall's
+      list (27 and 2), and no row of any other memorabilia set is. No field of a card or of
+      `/sets` tells the two from the others: a measured exception, kept as one, as `wot` is for
+      `new:rarity`.
+    - three printings depart from the order and are named. `plg21/J2`: Orb of Dragonkind's three
+      Japanese promos J1, J2, J3 share a date, a batch and every field but the number, the id and
+      the artwork, and Scryfall answers J2 -- to `new:card`, to `new:frame`, to `prefer:oldest`,
+      and first under `order=released` -- where the number and the id both say J1
+      (_NEW_ORDER_LEADS). `ltr/401` and `ltr/404` are `new:art` though their prerelease twins
+      `pltr/401s` and `pltr/404s` carry the lower ids, where the id decides every other such tie
+      of that list (_NEW_TIE_LEADS). Each is a measured exception, kept as one.
+    - the negated term is the plain complement, and no value opens extras or widens the search to
+      other languages.
+
+    The ranking is over the rows this table holds, and what the table holds is the importer's
+    decision. Three things follow, measured on the same file through `preprocess_card` (99,887
+    rows kept):
+
+    - a printing Scryfall flags that was dropped is simply not here (3,152 of `new:card`'s, 5,861
+      of `new:frame`'s, 1,587 of `new:foil`'s, 3,100 of `new:nonfoil`'s, 4,781 of `new:art`'s).
+    - a group whose first printing was dropped has its first KEPT printing flagged here instead:
+      5 printings of `new:card`, 587 of `new:frame` (577 of them cards that reached a frame first
+      on Magic Online or Arena), 3 of `new:foil`, 5 of `new:nonfoil`, 189 of `new:art` (162 an
+      artwork first printed digitally).
+    - a two-faced printing is stored as ONE row, its last face, so the illustration read is the
+      back's where Scryfall reads the front's: 10 printings (the Ixalan treasure-chest lands
+      `pxtc`, whose fronts reuse the Ixalan artwork and whose backs are new) are `new:art` here
+      and not there.
+
+    Every printing Scryfall flags that the table holds is flagged here, for all five values.
+
+    NOT the other values Scryfall honours. `new:mtgo`, `new:arena`, `new:astral`, `new:sega` and
+    `new:game` are a card's first printing in a game, and the importer keeps paper printings only.
+    `new:flavor` is decided by a printing's FRONT face, which a two-faced printing's row does not
+    hold: 53 printings Scryfall flags and the table holds would be missed and 143 flagged in
+    error. `new:language` is over every language's rows. `new:artist` has no rule that fits (the
+    nearest is 2,663 of 2,756). Their bits are left free (NEW_FLAG_BITS).
+
+    One statement, unchunked, unlike the syncs above: `new:art`'s groups cross cards, so no chunk
+    by oracle id holds a group. The ranking is a read; only rows whose flags differ are written,
+    so an import that moved no first printing writes nothing. The five fields it needs of
+    `raw_card_blob` are taken with ONE `jsonb_to_record` a row: each `->` on the column detoasts
+    the whole blob again, and seven of them made the read 8.7 s on 99,887 rows where this is 1.5 s.
+    """
+    batches = ",\n    ".join(f"({date}, '{set_code}', {batch})" for date, set_code, batch in RELEASE_BATCHES_2026_10)
+    order_leads = ", ".join(f"'{scryfall_id}'" for scryfall_id in _NEW_ORDER_LEADS)
+    tie_leads = ", ".join(f"'{scryfall_id}'" for scryfall_id in _NEW_TIE_LEADS)
+    art_sets = ", ".join(f"'{set_code}'" for set_code in _NEW_ART_MEMORABILIA_SETS)
+    bits = NEW_FLAG_BITS
+    return f"""
+WITH release_batches (released_on, set_code, batch) AS (
+    VALUES
+    {batches}
+), candidates AS (
+    SELECT
+        cards.scryfall_id,
+        cards.oracle_id,
+        cards.illustration_id,
+        cards.released_at,
+        COALESCE(release_batches.batch, 0) AS batch,
+        cards.scryfall_id NOT IN ({order_leads}) AS after_order_lead,
+        COALESCE(blob.variation, false) AS is_variation,
+        COALESCE(cards.collector_number_int, 0) AS number,
+        cards.scryfall_id NOT IN ({tie_leads}) AS after_tie_lead,
+        blob.frame AS frame,
+        COALESCE(blob.set_type, '') <> 'memorabilia' AS counts,
+        COALESCE(blob.set_type, '') <> 'memorabilia'
+            OR cards.card_set_code IN ({art_sets}) AS counts_as_art,
+        COALESCE(blob.games, '[]'::jsonb) ? 'paper' AS is_paper,
+        COALESCE(blob.finishes, '[]'::jsonb) ? 'foil' AS has_foil,
+        COALESCE(blob.finishes, '[]'::jsonb) ? 'nonfoil' AS has_nonfoil
+    FROM magic.cards cards
+    CROSS JOIN LATERAL jsonb_to_record(cards.raw_card_blob)
+        AS blob (variation boolean, frame text, set_type text, games jsonb, finishes jsonb)
+    LEFT JOIN release_batches
+        ON release_batches.released_on = to_char(cards.released_at, 'YYYYMMDD')::int
+        AND release_batches.set_code = cards.card_set_code
+), eligible AS (
+    SELECT
+        candidates.*,
+        candidates.counts AND candidates.is_paper AS for_card,
+        candidates.counts AND candidates.is_paper AND candidates.has_foil AS for_foil,
+        candidates.counts AND candidates.is_paper AND candidates.has_nonfoil AS for_nonfoil,
+        ROW(
+            candidates.released_at,
+            candidates.batch,
+            candidates.after_order_lead,
+            candidates.is_variation,
+            candidates.number,
+            candidates.after_tie_lead,
+            candidates.scryfall_id
+        ) AS place
+    FROM candidates
+), ranked AS (
+    SELECT
+        eligible.scryfall_id,
+        eligible.for_card
+            AND row_number() OVER (PARTITION BY eligible.oracle_id, eligible.for_card ORDER BY eligible.place) = 1 AS leads_card,
+        eligible.counts
+            AND row_number() OVER (PARTITION BY eligible.oracle_id, eligible.counts, eligible.frame ORDER BY eligible.place) = 1 AS leads_frame,
+        eligible.for_foil
+            AND row_number() OVER (PARTITION BY eligible.oracle_id, eligible.for_foil ORDER BY eligible.place) = 1 AS leads_foil,
+        eligible.for_nonfoil
+            AND row_number() OVER (PARTITION BY eligible.oracle_id, eligible.for_nonfoil ORDER BY eligible.place) = 1 AS leads_nonfoil,
+        eligible.counts_as_art
+            AND row_number() OVER (PARTITION BY eligible.illustration_id, eligible.counts_as_art ORDER BY eligible.place) = 1 AS leads_art
+    FROM eligible
+), proposed AS (
+    SELECT
+        ranked.scryfall_id,
+        (
+            CASE WHEN ranked.leads_card THEN {bits["card"]} ELSE 0 END
+            + CASE WHEN ranked.leads_frame THEN {bits["frame"]} ELSE 0 END
+            + CASE WHEN ranked.leads_foil THEN {bits["foil"]} ELSE 0 END
+            + CASE WHEN ranked.leads_nonfoil THEN {bits["nonfoil"]} ELSE 0 END
+            + CASE WHEN ranked.leads_art THEN {bits["art"]} ELSE 0 END
+        )::smallint AS new_flags
+    FROM ranked
+)
+UPDATE magic.cards
+SET new_flags = proposed.new_flags
+FROM proposed
+WHERE
+    cards.scryfall_id = proposed.scryfall_id AND
+    cards.new_flags IS DISTINCT FROM proposed.new_flags
 """
 
 
@@ -1286,6 +1481,32 @@ class AdminResource:
             logger.info("Synced new:rarity on %d printings", updated_count)
         return updated_count
 
+    def _sync_new_flags(self, conn: Connection) -> int:
+        """Sync `new_flags` -- each printing's answers to Scryfall's `new:card`, `new:frame`, `new:foil`, `new:nonfoil` and `new:art`.
+
+        Runs after every import, and not only when a card gains a printing: a new printing can be
+        the first of a group and take the flag from a printing that held it -- of another card,
+        for `new:art` -- so only a whole-table ranking reaches the rows the import did not touch.
+        Touches only rows whose flags differ, so a re-import that moved nothing writes nothing. See
+        _build_new_flags_sql for the rule and for why this one is not chunked.
+
+        Args:
+        ----
+            conn (Connection): open connection; committed here.
+
+        Returns:
+        -------
+            int: rows whose flags changed.
+
+        """
+        with conn.cursor() as cursor:
+            cursor.execute(_build_new_flags_sql())
+            updated_count = cursor.rowcount
+            conn.commit()
+        if updated_count:
+            logger.info("Synced new: flags on %d printings", updated_count)
+        return updated_count
+
     def _add_is_tag_to_printings(self, *, is_tag: str) -> dict[str, Any]:
         """Add a specific is: tag to all printings matching that tag using Scryfall search.
 
@@ -1712,6 +1933,7 @@ class AdminResource:
                     self._sync_print_counts(conn)
                     self._sync_cheapest_codes(conn)
                     self._sync_new_rarity(conn)
+                    self._sync_new_flags(conn)
 
                 if cards_sent == 0:
                     if stream.raw == 0:

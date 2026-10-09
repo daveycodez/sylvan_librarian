@@ -98,4 +98,7 @@ ENGINE_COLUMNS: list[str] = [
     "cheapest_codes",
     # `new:rarity`: the printing's stored answer, one boolean _sync_new_rarity writes at import.
     "new_rarity",
+    # `new:card` / `new:frame` / `new:foil` / `new:nonfoil` / `new:art`: the printing's stored
+    # answers, one smallint _sync_new_flags writes at import.
+    "new_flags",
 ]

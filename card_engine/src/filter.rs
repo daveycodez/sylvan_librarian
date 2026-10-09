@@ -567,6 +567,18 @@ pub(crate) enum FilterExpr {
     /// 38,943 all of Scryfall's printings), so the ordinary `Not` is right. A row the sync has not reached is SQL NULL, in neither.
     NewRarity,
 
+    /// Scryfall's `new:card`, `new:frame`, `new:foil`, `new:nonfoil` and `new:art`: the printing is
+    /// the first with something, as `_sync_new_flags` (api/admin_resource.py) decided it at import;
+    /// its statement's docstring carries the measured rule (each value exact on api.scryfall.com,
+    /// 2026-10-09). `mask` is the value's bit of `Printing.new_flags`, sent by the Python node, so
+    /// the vocabulary and its bit numbers exist once, there.
+    ///
+    /// Two-valued on a computed row, like `NewRarity`: the negation is the plain complement and the
+    /// ordinary `Not` is right. A row the sync has not reached is SQL NULL, in neither.
+    NewFlag {
+        mask: u16,
+    },
+
     NumericCmp {
         lhs: NumExpr,
         op: CmpOp,
@@ -778,6 +790,7 @@ pub(crate) fn verify_cost_tier(f: &FilterExpr) -> u32 {
         | FilterExpr::ExactName(_)
         | FilterExpr::Cheapest { .. }
         | FilterExpr::NewRarity
+        | FilterExpr::NewFlag { .. }
         | FilterExpr::NumericCmp { .. }
         | FilterExpr::TextExact { .. }
         | FilterExpr::ColorCmp { .. }
@@ -945,7 +958,7 @@ fn leaf_compares_printing_field(f: &FilterExpr) -> bool {
         // The cheapest codes are the printing's own: one printing of a card is its cheapest, the next is not.
         FilterExpr::Cheapest { .. } => true,
         // ...and so is `new:rarity`: a card's first printing at a rarity is one of its printings.
-        FilterExpr::NewRarity => true,
+        FilterExpr::NewRarity | FilterExpr::NewFlag { .. } => true,
         // Exhaustive over TextSearchField (no `matches!`), same reason as num_pdep.
         FilterExpr::TextContains { field, .. } => match field {
             TextSearchField::FlavorTextLower => true,
@@ -1544,6 +1557,11 @@ impl FilterExpr {
                 super::new_rarity_answer(p.new_rarity).map_or(Tri::Null, tri_bool)
             }
 
+            FilterExpr::NewFlag { mask } => {
+                let Some(p) = printing else { return Tri::PrintingDep };
+                super::new_flag_answer(u16::from(p.new_flags), *mask).map_or(Tri::Null, tri_bool)
+            }
+
             FilterExpr::NumericCmp { lhs, op, rhs } => {
                 numeric_cmp_tri(lhs, *op, rhs, &|f| field_num(card, printing, f))
             }
@@ -1877,11 +1895,15 @@ pub(crate) fn build_filter(v: &Value) -> Result<FilterExpr, String> {
         }
 
         // `new:<value>`. The Python node has already validated the word the user typed (case,
-        // quotes) against the values answered; `rarity` is the only one, and anything else is an
-        // error rather than a silent no-match.
+        // quotes, spellings) against the values answered. `rarity` reads a column of its own; every
+        // other value arrives with the bit of `new_flags` it reads, and a value with no usable bit
+        // is an error rather than a silent no-match. The top bit is NEW_FLAGS_NONE's alone.
         "NewNode" => match kw["value"].as_str().unwrap_or("") {
             "rarity" => Ok(FilterExpr::NewRarity),
-            other => Err(format!("unknown new: value: {other}")),
+            other => match kw["mask"].as_u64().and_then(|mask| u16::try_from(mask).ok()) {
+                Some(mask) if mask != 0 && mask <= i16::MAX as u16 => Ok(FilterExpr::NewFlag { mask }),
+                _ => Err(format!("unknown new: value: {other}")),
+            },
         },
 
         "CardBinaryOperatorNode" => build_binary(kw),

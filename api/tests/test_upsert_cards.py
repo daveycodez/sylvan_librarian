@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing
+import re
 import uuid
 from unittest.mock import patch
 
@@ -15,6 +16,7 @@ from api.admin_resource import (
     AdminResource,
     _build_boolean_is_tags_sql,
     _build_cheapest_codes_sql,
+    _build_new_flags_sql,
     _build_new_rarity_sql,
     _build_print_counts_sql,
 )
@@ -23,7 +25,8 @@ from api.card_processing import preprocess_card
 from api.db.bulk_upsert import bulk_upsert
 from api.parsing import QueryContext
 from api.parsing.card_query_nodes import CheapestNode, NewNode
-from api.release_batches import RELEASE_BATCHES
+from api.parsing.db_info import NEW_FLAG_BITS
+from api.release_batches import RELEASE_BATCHES, RELEASE_BATCHES_2026_10
 from api.scryfall_bulk_data_fetcher import BulkDataKey
 from api.tests.helpers import make_raw_card
 from api.tests.support import mock_app_context
@@ -1032,6 +1035,354 @@ class TestNewRarity:
         with patch.object(AdminResource, "_sync_new_rarity", return_value=0):
             api_resource.admin._upsert_cards([reimport])
         assert _new_rarity(api_resource, card) == [True]
+
+
+class TestBuildNewFlagsSql:
+    """_build_new_flags_sql ranks the whole table in one statement, and the migration backfills with it."""
+
+    def test_the_statement_is_not_chunked_and_has_no_parameters(self) -> None:
+        """`new:art`'s groups cross cards, so no chunk by oracle id would hold one."""
+        sql = _build_new_flags_sql()
+        assert "%(" not in sql
+        assert "hashtext" not in sql
+        assert "PARTITION BY eligible.illustration_id" in sql
+        # Only rows whose flags differ are rewritten.
+        assert "cards.new_flags IS DISTINCT FROM proposed.new_flags" in sql
+
+    def test_migration_backfill_decides_the_same_way(self) -> None:
+        """The migration's one-off backfill is the sync statement around the release batches of its day.
+
+        The batches are compared as a subset and not token for token: the table is a snapshot
+        that is meant to be re-measured, and a refresh must not ask for an edit to an applied
+        migration, which setup_schema answers by dropping the schema.
+        """
+        migration = next(m for m in get_migrations() if m["file_name"] == "2026-10-09-01-new-flags.sql")["file_contents"]
+
+        def parts(sql: str) -> tuple[list[str], list[str]]:
+            # The statement from the first CTE to the end, whitespace folded, and its batch rows apart.
+            statement = sql[sql.index("WITH release_batches") :].rstrip().rstrip(";")
+            rows = re.findall(r"\(\d{8}, '[a-z0-9]+', \d+\)", statement)
+            return re.sub(r"\(\d{8}, '[a-z0-9]+', \d+\),?", "", statement).split(), rows
+
+        migration_statement, migration_rows = parts(migration)
+        sync_statement, sync_rows = parts(_build_new_flags_sql())
+        assert migration_statement == sync_statement
+        assert len(migration_rows) == 303, "the table as measured in October 2026"
+        assert len(sync_rows) == len(RELEASE_BATCHES_2026_10) >= len(migration_rows)
+
+    def test_every_release_batch_is_in_the_statement(self) -> None:
+        sql = _build_new_flags_sql()
+        assert sql.count("\n    (") == len(RELEASE_BATCHES_2026_10)
+        for date, set_code, batch in RELEASE_BATCHES_2026_10:
+            assert f"({date}, '{set_code}', {batch})" in sql
+
+    @pytest.mark.parametrize("table", [RELEASE_BATCHES, RELEASE_BATCHES_2026_10], ids=["september", "october"])
+    def test_both_release_batch_tables_are_well_formed(self, table: tuple[tuple[int, str, int], ...]) -> None:
+        keys = [(date, set_code) for date, set_code, _ in table]
+        assert keys == sorted(keys), "kept sorted so a diff of a refresh is readable"
+        assert len(set(keys)) == len(keys), "one batch per (date, set)"
+        for date, set_code, batch in table:
+            assert 19930801 <= date <= 20991231
+            assert set_code == set_code.lower()
+            assert set_code.isalnum()
+            assert batch >= 1, "batch 0 is what an unlisted (date, set) already is"
+
+    def test_the_october_table_holds_the_boundaries_a_code_order_hides(self) -> None:
+        """A set and its promo set released the same day in different batches: `eld | peld`, `akh | mp2`."""
+        october = {(date, set_code): batch for date, set_code, batch in RELEASE_BATCHES_2026_10}
+        september = {(date, set_code): batch for date, set_code, batch in RELEASE_BATCHES}
+        for key in [(20191004, "peld"), (20170428, "mp2"), (20160122, "pogw")]:
+            assert key in october
+            assert key not in september
+
+    def test_every_value_writes_its_own_bit(self) -> None:
+        sql = _build_new_flags_sql()
+        for value, bit in NEW_FLAG_BITS.items():
+            assert f"ranked.leads_{value} THEN {bit} ELSE 0" in sql
+        bits = list(NEW_FLAG_BITS.values())
+        assert all(bit & (bit - 1) == 0 for bit in bits), "one bit each"
+        assert len(set(bits)) == len(bits)
+        assert sum(bits) < 2**15, "a smallint, and the engine keeps the top bit for NULL"
+
+
+def _new_flag_printing(oracle_id: str, set_code: str, number: str, released_at: str, **extra: object) -> dict:
+    """One raw printing of the card `oracle_id` for the `new_flags` tests: on paper, in both finishes, with its own artwork."""
+    card = make_raw_card(name=f"New Flags Test {oracle_id[:8]}")
+    return (
+        card
+        | {
+            "oracle_id": oracle_id,
+            "set": set_code,
+            "collector_number": number,
+            "released_at": released_at,
+            "set_type": "expansion",
+            "frame": "2015",
+            "finishes": ["nonfoil", "foil"],
+            "illustration_id": str(uuid.uuid4()),
+        }
+        | extra
+    )
+
+
+def _new_flags(api_resource: APIResource, value: str, *cards: dict, negated: bool = False) -> list:
+    """`new:<value>` (or its negation) for each card, through the SQL the parser generates."""
+    sql = NewNode(value).to_sql(QueryContext())
+    answer = f"NOT ({sql})" if negated else sql
+    with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
+        cursor.execute(
+            f"SELECT card.scryfall_id::text AS sid, ({answer}) AS answer FROM magic.cards AS card WHERE card.scryfall_id = ANY(%(ids)s::uuid[])",
+            {"ids": [card["id"] for card in cards]},
+        )
+        answers = {row["sid"]: row["answer"] for row in cursor.fetchall()}
+    return [answers[card["id"]] for card in cards]
+
+
+LOW_ID, HIGH_ID = "00000000-0000-4000-8000-0000000000{:02x}", "ffffffff-ffff-4fff-bfff-ffffffffff{:02x}"
+
+
+class TestNewFlags:
+    """`new_flags` is written at import: which of Scryfall's `new:` lists is this printing on?
+
+    Each rule below was measured on api.scryfall.com 2026-10-09, each list read whole; the docstring
+    of `_build_new_flags_sql` carries them.
+    """
+
+    def test_the_earliest_printing_is_new_in_everything_and_a_reprint_in_nothing(self, api_resource: APIResource) -> None:
+        oracle_id = str(uuid.uuid4())
+        art = str(uuid.uuid4())
+        first = _new_flag_printing(oracle_id, "nfa", "1", "2001-01-01", illustration_id=art)
+        reprint = _new_flag_printing(oracle_id, "nfb", "1", "2005-01-01", illustration_id=art)
+        api_resource.admin._upsert_cards([reprint, first])
+
+        for value in NEW_FLAG_BITS:
+            assert _new_flags(api_resource, value, first, reprint) == [True, False], value
+            assert _new_flags(api_resource, value, first, reprint, negated=True) == [False, True], f"-{value}: the plain complement"
+
+    def test_each_value_has_its_own_group(self, api_resource: APIResource) -> None:
+        """A reprint is new where it is the first of something: a frame, a finish, an artwork."""
+        oracle_id = str(uuid.uuid4())
+        first = _new_flag_printing(oracle_id, "nfc", "1", "2001-01-01", frame="1997", finishes=["nonfoil"])
+        new_frame = _new_flag_printing(
+            oracle_id, "nfd", "1", "2005-01-01", frame="2003", finishes=["nonfoil"], illustration_id=first["illustration_id"]
+        )
+        new_foil = _new_flag_printing(
+            oracle_id, "nfe", "1", "2006-01-01", frame="2003", finishes=["foil"], illustration_id=first["illustration_id"]
+        )
+        new_art = _new_flag_printing(oracle_id, "nff", "1", "2007-01-01", frame="2003", finishes=["nonfoil", "foil"])
+        cards = [first, new_frame, new_foil, new_art]
+        api_resource.admin._upsert_cards(cards)
+
+        assert _new_flags(api_resource, "card", *cards) == [True, False, False, False]
+        assert _new_flags(api_resource, "frame", *cards) == [True, True, False, False]
+        assert _new_flags(api_resource, "foil", *cards) == [False, False, True, False]
+        assert _new_flags(api_resource, "nonfoil", *cards) == [True, False, False, False]
+        assert _new_flags(api_resource, "art", *cards) == [True, False, False, True]
+
+    def test_the_frame_is_the_frame_alone(self, api_resource: APIResource) -> None:
+        """Not the frame effects and not the border: a showcase printing in the same frame is not new."""
+        oracle_id = str(uuid.uuid4())
+        plain = _new_flag_printing(oracle_id, "nfg", "1", "2001-01-01")
+        showcase = _new_flag_printing(oracle_id, "nfg", "300", "2001-01-01", frame_effects=["showcase"], border_color="borderless")
+        future = _new_flag_printing(oracle_id, "nfh", "1", "2002-01-01", frame="future")
+        api_resource.admin._upsert_cards([plain, showcase, future])
+        assert _new_flags(api_resource, "frame", plain, showcase, future) == [True, False, True]
+
+    def test_etched_is_not_foil(self, api_resource: APIResource) -> None:
+        oracle_id = str(uuid.uuid4())
+        etched = _new_flag_printing(oracle_id, "nfi", "1", "2001-01-01", finishes=["etched"])
+        foil = _new_flag_printing(oracle_id, "nfj", "1", "2005-01-01", finishes=["foil"])
+        api_resource.admin._upsert_cards([etched, foil])
+        assert _new_flags(api_resource, "foil", etched, foil) == [False, True]
+        assert _new_flags(api_resource, "nonfoil", etched, foil) == [False, False], "the card has no nonfoil printing"
+        assert _new_flags(api_resource, "card", etched, foil) == [True, False]
+
+    def test_the_artwork_is_one_group_across_cards(self, api_resource: APIResource) -> None:
+        """An artwork a second card reuses is new once, on whichever card printed it first."""
+        art = str(uuid.uuid4())
+        original = _new_flag_printing(str(uuid.uuid4()), "nfk", "1", "2001-01-01", illustration_id=art)
+        reuse = _new_flag_printing(str(uuid.uuid4()), "nfl", "1", "2005-01-01", illustration_id=art)
+        api_resource.admin._upsert_cards([reuse, original])
+        assert _new_flags(api_resource, "art", original, reuse) == [True, False]
+        assert _new_flags(api_resource, "card", original, reuse) == [True, True], "each is its own card's first printing"
+
+    def test_the_printings_with_no_illustration_are_one_group(self, api_resource: APIResource) -> None:
+        """Earlier than any other row of the table, so the first of them leads every row that has none."""
+        first = _new_flag_printing(str(uuid.uuid4()), "nfm", "1", "1801-01-01", illustration_id=None)
+        second = _new_flag_printing(str(uuid.uuid4()), "nfn", "1", "1801-01-02", illustration_id=None)
+        api_resource.admin._upsert_cards([first, second])
+        assert _new_flags(api_resource, "art", first, second) == [True, False]
+
+    def test_the_collector_number_compares_as_all_its_digits(self, api_resource: APIResource) -> None:
+        """9 before 10, and `1N07` is 107 -- after 14, where its first integer (1) says before."""
+        for numbers, first_number in [(("10", "9"), "9"), (("1N07", "14"), "14"), (("236s", "100"), "100"), (("★", "1"), "★")]:
+            oracle_id = str(uuid.uuid4())
+            printings = [_new_flag_printing(oracle_id, f"o{i}x", number, "2001-01-01") for i, number in enumerate(numbers)]
+            api_resource.admin._upsert_cards(printings)
+            expected = [number == first_number for number in numbers]
+            assert _new_flags(api_resource, "card", *printings) == expected, numbers
+
+    def test_a_variation_that_leads_its_group_is_new(self, api_resource: APIResource) -> None:
+        """The card's first printing in a frame is a variation: it is the new one, and the next printing in that frame is not."""
+        oracle_id = str(uuid.uuid4())
+        original = _new_flag_printing(oracle_id, "nfo", "171", "2001-01-01", frame="1997")
+        variation = _new_flag_printing(oracle_id, "nfo", "171\u2020", "2001-01-01", frame="2015", variation=True)
+        later = _new_flag_printing(oracle_id, "nfp", "116", "2018-01-01", frame="2015")
+        api_resource.admin._upsert_cards([original, variation, later])
+        assert _new_flags(api_resource, "frame", original, variation, later) == [True, True, False]
+        assert _new_flags(api_resource, "frame", variation, later, negated=True) == [False, True]
+        assert _new_flags(api_resource, "card", original, variation, later) == [True, False, False]
+
+    def test_a_variation_sorts_after_every_plain_row_of_its_date_whatever_their_numbers(self, api_resource: APIResource) -> None:
+        """A misprint with a LOWER number does not lead the plain printing of the same day."""
+        art = str(uuid.uuid4())
+        misprint = _new_flag_printing(str(uuid.uuid4()), "nfq", "87†", "2001-01-01", illustration_id=art, variation=True)
+        plain = _new_flag_printing(str(uuid.uuid4()), "nfq", "91", "2001-01-01", illustration_id=art)
+        misprint["id"], plain["id"] = LOW_ID.format(1), HIGH_ID.format(1)
+        api_resource.admin._upsert_cards([misprint, plain])
+        assert _new_flags(api_resource, "art", misprint, plain) == [False, True]
+
+    def test_the_set_code_is_not_a_key_and_the_scryfall_id_breaks_the_tie(self, api_resource: APIResource) -> None:
+        oracle_id = str(uuid.uuid4())
+        by_code = _new_flag_printing(oracle_id, "nfr", "7", "2001-01-01")
+        by_id = _new_flag_printing(oracle_id, "nfz", "7", "2001-01-01")
+        by_code["id"], by_id["id"] = HIGH_ID.format(2), LOW_ID.format(2)
+        api_resource.admin._upsert_cards([by_code, by_id])
+        assert _new_flags(api_resource, "card", by_code, by_id) == [False, True]
+
+    def test_the_release_batch_orders_two_sets_of_one_day_and_the_date_comes_first(self, api_resource: APIResource) -> None:
+        """`pal99` is in batch 1 of 1999-01-01 and an unlisted set in batch 0, so the unlisted one is first -- the id against it."""
+        assert (19990101, "pal99", 1) in RELEASE_BATCHES_2026_10
+        oracle_id = str(uuid.uuid4())
+        listed = _new_flag_printing(oracle_id, "pal99", "3", "1999-01-01")
+        unlisted = _new_flag_printing(oracle_id, "zzy99", "3", "1999-01-01")
+        listed["id"], unlisted["id"] = LOW_ID.format(3), HIGH_ID.format(3)
+        api_resource.admin._upsert_cards([listed, unlisted])
+        assert _new_flags(api_resource, "card", listed, unlisted) == [False, True]
+
+        other = str(uuid.uuid4())
+        earlier_in_batch_one = _new_flag_printing(other, "pal99", "3", "1999-01-01")
+        later_in_batch_zero = _new_flag_printing(other, "zzy99", "3", "1999-01-02")
+        api_resource.admin._upsert_cards([earlier_in_batch_one, later_in_batch_zero])
+        assert _new_flags(api_resource, "card", earlier_in_batch_one, later_in_batch_zero) == [True, False]
+
+    def test_no_set_type_but_memorabilia_is_outside(self, api_resource: APIResource) -> None:
+        """Promos, masterpieces and box sets are first wherever the order puts them; `new:rarity`'s exclusions are its own."""
+        for set_type in ["promo", "masterpiece", "box", "from_the_vault", "treasure_chest"]:
+            oracle_id = str(uuid.uuid4())
+            early = _new_flag_printing(oracle_id, "nfs", "1", "2001-01-01", set_type=set_type)
+            expansion = _new_flag_printing(oracle_id, "nft", "1", "2005-01-01")
+            api_resource.admin._upsert_cards([early, expansion])
+            assert _new_flags(api_resource, "card", early, expansion) == [True, False], set_type
+            assert _new_rarity(api_resource, early, expansion)[1] is (set_type != "box"), set_type
+
+    def test_memorabilia_is_never_new_and_does_not_hold_a_flag_back(self, api_resource: APIResource) -> None:
+        oracle_id = str(uuid.uuid4())
+        art = str(uuid.uuid4())
+        memorabilia = _new_flag_printing(oracle_id, "nfu", "1", "2001-01-01", set_type="memorabilia", illustration_id=art)
+        expansion = _new_flag_printing(oracle_id, "nfv", "1", "2005-01-01", illustration_id=art)
+        api_resource.admin._upsert_cards([memorabilia, expansion])
+        for value in NEW_FLAG_BITS:
+            assert _new_flags(api_resource, value, memorabilia, expansion) == [False, True], value
+            assert _new_flags(api_resource, value, memorabilia, negated=True) == [True], f"-{value}: computed, and no"
+
+    @pytest.mark.parametrize("set_code", ["olgc", "o90p"])
+    def test_two_memorabilia_sets_count_toward_the_artwork_and_toward_nothing_else(
+        self, api_resource: APIResource, set_code: str
+    ) -> None:
+        oracle_id = str(uuid.uuid4())
+        art = str(uuid.uuid4())
+        oversized = _new_flag_printing(oracle_id, set_code, "1", "2001-01-01", set_type="memorabilia", illustration_id=art)
+        expansion = _new_flag_printing(oracle_id, "nfw", "1", "2005-01-01", illustration_id=art)
+        api_resource.admin._upsert_cards([oversized, expansion])
+        assert _new_flags(api_resource, "art", oversized, expansion) == [True, False]
+        assert _new_flags(api_resource, "card", oversized, expansion) == [False, True]
+        assert _new_flags(api_resource, "frame", oversized, expansion) == [False, True]
+
+    def test_a_printing_off_paper_is_new_in_its_frame_and_artwork_only(self, api_resource: APIResource) -> None:
+        """`new:card`, `new:foil` and `new:nonfoil` are over paper printings; the importer drops the others today, so write one."""
+        oracle_id = str(uuid.uuid4())
+        art = str(uuid.uuid4())
+        digital = _new_flag_printing(oracle_id, "nfx", "1", "2001-01-01", illustration_id=art)
+        paper = _new_flag_printing(oracle_id, "nfy", "1", "2005-01-01", illustration_id=art)
+        api_resource.admin._upsert_cards([digital, paper])
+        with api_resource.app_context.writer_pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                "UPDATE magic.cards SET raw_card_blob = jsonb_set(raw_card_blob, '{games}', '[\"mtgo\"]') WHERE scryfall_id = %(sid)s",
+                {"sid": digital["id"]},
+            )
+            conn.commit()
+            api_resource.admin._sync_new_flags(conn)
+        assert _new_flags(api_resource, "card", digital, paper) == [False, True]
+        assert _new_flags(api_resource, "foil", digital, paper) == [False, True]
+        assert _new_flags(api_resource, "nonfoil", digital, paper) == [False, True]
+        assert _new_flags(api_resource, "frame", digital, paper) == [True, False]
+        assert _new_flags(api_resource, "art", digital, paper) == [True, False]
+
+    def test_the_measured_leads_come_first_where_the_keys_say_otherwise(self, api_resource: APIResource) -> None:
+        """`plg21/J2` leads J1 of the same day (a lower number and id); `ltr/401` leads a twin that ties to the id."""
+        oracle_id = str(uuid.uuid4())
+        lead = _new_flag_printing(oracle_id, "plg21", "J2", "2021-06-18")
+        lower = _new_flag_printing(oracle_id, "plg21", "J1", "2021-06-18")
+        lead["id"], lower["id"] = "bc9c39d1-1e10-4cd3-a4b1-b6eb7c1a0b65", LOW_ID.format(4)
+        earlier = _new_flag_printing(str(uuid.uuid4()), "nga", "1", "2021-06-17", illustration_id=lower["illustration_id"])
+        api_resource.admin._upsert_cards([lead, lower, earlier])
+        assert _new_flags(api_resource, "card", lead, lower) == [True, False]
+        assert _new_flags(api_resource, "art", lower) == [False], "a lead passes its own date and batch, not an earlier day"
+
+        art = str(uuid.uuid4())
+        tie_lead = _new_flag_printing(str(uuid.uuid4()), "ltr", "401", "2023-06-23", illustration_id=art)
+        twin = _new_flag_printing(str(uuid.uuid4()), "pltr", "401s", "2023-06-23", illustration_id=art)
+        lower_number = _new_flag_printing(str(uuid.uuid4()), "ltr", "50", "2023-06-23")
+        tie_lead["id"], twin["id"] = "646ff18e-9d6a-4a55-838c-0bd88b8c9fae", LOW_ID.format(5)
+        api_resource.admin._upsert_cards([tie_lead, twin, lower_number])
+        assert _new_flags(api_resource, "art", tie_lead, twin) == [True, False]
+
+    def test_an_earlier_printing_takes_the_flags_from_the_one_that_held_them_even_on_another_card(
+        self, api_resource: APIResource
+    ) -> None:
+        """A new printing changes the answer on rows the import did not touch."""
+        art = str(uuid.uuid4())
+        held = _new_flag_printing(str(uuid.uuid4()), "ngb", "1", "2005-01-01", illustration_id=art)
+        api_resource.admin._upsert_cards([held])
+        assert _new_flags(api_resource, "art", held) == [True]
+        assert _new_flags(api_resource, "card", held) == [True]
+
+        other_card = _new_flag_printing(str(uuid.uuid4()), "ngc", "1", "2001-01-01", illustration_id=art)
+        earlier = _new_flag_printing(held["oracle_id"], "ngd", "1", "2002-01-01")
+        api_resource.admin._upsert_cards([other_card, earlier])
+        assert _new_flags(api_resource, "art", held, other_card) == [False, True]
+        assert _new_flags(api_resource, "card", held, earlier) == [False, True]
+
+    def test_an_unreached_row_answers_neither_polarity(self, api_resource: APIResource) -> None:
+        """NULL means not computed: in `new:card` and in `-new:card` alike."""
+        card = _new_flag_printing(str(uuid.uuid4()), "ngf", "1", "2001-01-01")
+        api_resource.admin._upsert_cards([card])
+        with api_resource.app_context.writer_pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("UPDATE magic.cards SET new_flags = NULL WHERE scryfall_id = %(sid)s", {"sid": card["id"]})
+            conn.commit()
+        for value in NEW_FLAG_BITS:
+            assert _new_flags(api_resource, value, card) == [None]
+            assert _new_flags(api_resource, value, card, negated=True) == [None]
+
+    def test_sync_converges_and_a_reimport_does_not_blank_the_flags(self, api_resource: APIResource) -> None:
+        oracle_id = str(uuid.uuid4())
+        card = _new_flag_printing(oracle_id, "ngg", "1", "2001-01-01")
+        api_resource.admin._upsert_cards([card])
+        assert _new_flags(api_resource, "card", card) == [True]
+
+        # Nothing moved, so a second sync rewrites no row at all.
+        with api_resource.app_context.writer_pool.connection() as conn:
+            assert api_resource.admin._sync_new_flags(conn) == 0
+
+        # The bulk stream never carries the column; a re-import that rewrites the row must leave
+        # it standing rather than reset it to NULL.
+        reimport = card | {"oracle_text": "changed so the reimport writes"}
+        with patch.object(AdminResource, "_sync_new_flags", return_value=0):
+            api_resource.admin._upsert_cards([reimport])
+        assert _new_flags(api_resource, "card", card) == [True]
+        with api_resource.app_context.reader_pool.connection() as conn, conn.cursor() as cursor:
+            cursor.execute("SELECT new_flags FROM magic.cards WHERE scryfall_id = %(sid)s", {"sid": card["id"]})
+            assert cursor.fetchone()["new_flags"] == sum(NEW_FLAG_BITS.values())
 
 
 # ---------------------------------------------------------------------------
