@@ -67,20 +67,38 @@ matching row while building the `Match` tuple, not once per comparison.
 
 ### The colour ranking — measured
 
-Scryfall's `order=color` is eleven buckets, taken over 923 legendary creatures and lands spanning
-every colour shape:
+Scryfall's `order=color` is three blocks, each in the order the game prints its colour
+combinations:
 
 ```
-W → U → B → R → G → 2-colour → 3-colour → 4-colour → 5-colour → colourless → land
+W U B R G · WU UB BR RG GW WB UR BG RW GU · WUB UBR BRG RGW GWU WBG URW BGU RWB GUR
+          · WUBR UBRG BRGW RGWU GWUB · WUBRG · none
 ```
 
-Two things worth noting, because neither is what a reader would guess. Multicolour is bucketed by
-**how many** colours, not by which — within 2-colour the order is whatever the secondary sort gives,
-so all guild pairs tie. And colourless sorts *after* every coloured bucket rather than before,
-with lands after that; a naive popcount would put colourless first.
+1. cards with a colour that are not lands, by their **colours**;
+2. colourless cards that are not lands, by their **colour identity** (Eldrazi Skyspawner, devoid
+   with a blue cost, ahead of Sol Ring);
+3. lands, by their **colour identity** whatever their colours (Dryad Arbor beside Forest, Wastes
+   last).
 
-The rank is `0..=10`, computable from the bitmask's popcount, its single set bit for the mono cases,
-and a `TYPE_LAND` check. Trivially inside the exact-f32 range.
+Inside a block the rows are by name, ascending in **both** directions: `dir=desc` reverses the
+blocks and not the names. A transforming or modal double-faced card has no colours of its own on
+Scryfall and is read by its **front face** in both respects — Brigid, Clachan's Heart (white front,
+green back) is a white card, Emeria's Call (a sorcery whose back is a land) is a white card,
+Westvale Abbey (a land whose back is a black creature) is a land.
+
+Measured on api.scryfall.com, 2026-10-09: `e:znr` and `is:transform (t:land or t:artifact)` in both
+directions, `e:isd`, `t:land c>=1`, `c>=4 -t:land year>=2015` and
+`e:mom (t:artifact or t:land or is:dfc)` — 1,232 rows, none out of this order. (An earlier reading,
+over 923 cards on 2026-08-09, took the pairs to tie and bucketed multicolour by how many colours;
+they do not tie.)
+
+The front face is not something a stored row holds, so the place is decided at import
+(`color_order_rank` in `api/card_processing.py`) and stored as `magic.cards.color_order`: 0..30 for
+block 1, 32..63 for block 2, 64..95 for block 3. The SQL path sorts by the column with
+`lower(card_name) ASC` under it; the engine reads the same number into `OracleCard::color_order`
+and packs the name rank under it (`color_sort_primary`), reflecting the block and not the name
+under `desc`.
 
 ### `set` and `artist` need a stored rank
 

@@ -1,5 +1,5 @@
 use super::{
-    renumber_coll_vocab,
+    renumber_coll_vocab, COLOR_ORDER_NONE,
     and_child_rank, assign_name_ranks,
     build_numeric_index, build_oracle_text_index, build_trigram_index,
     build_rarity_index, build_flavor_index, build_hybrid_tag_index, build_layout_hybrid_index, bitmap_beats_postings, HybridTagIndex, build_sort_permutations,
@@ -206,6 +206,7 @@ fn stub_card(oracle_id: u128, card_types: u16, subtypes: &[&str], vocab: &mut Vo
         card_colors: 0,
         card_color_identity: 0,
         produced_mana: 0,
+        color_order: COLOR_ORDER_NONE,
         card_types,
         legality_divergent: false,
         oracle_id,
@@ -10620,6 +10621,161 @@ fn order_name_sorts_and_paginates() {
     };
     assert_eq!(ids("asc"), [4, 2], "within the tie: lower edhrec rank first");
     assert_eq!(ids("desc"), [4, 2], "secondaries keep their order under desc");
+}
+
+// ─── order=color ──────────────────────────────────────────────────────────────
+//
+// See `color_sort_primary`. The engine does not decide where a card sits -- the importer does, and
+// writes it to `color_order` -- so what is pinned here is what the engine does WITH that number:
+// blocks in the stored order, names ascending under a block in both directions, and a card with
+// no value after every card that has one.
+
+/// Eighteen real cards, one of every shape `order=color` treats differently, each with the
+/// `color_order` `color_order_rank` writes for it (api/tests/color_order_cards.py holds the card
+/// objects and asserts these same numbers), in an order that is neither answer. The edhrec ranks
+/// are the cards' own, and run against the name order inside every block that holds two cards.
+const COLOR_ORDER_POOL: [(&str, u8, Option<u32>); 18] = [
+    ("wastes", 95, None),
+    ("sol ring", 63, Some(1)),
+    ("hengegate pathway // mistgate pathway", 69, Some(1159)),
+    ("forest", 68, None),
+    ("dryad arbor", 68, Some(773)),
+    ("westvale abbey // ormendahl, profane prince", 66, Some(1474)),
+    ("eldrazi skyspawner", 33, Some(12717)),
+    ("transguild courier", 30, Some(17941)),
+    ("nicol bolas, the ravager // nicol bolas, the arisen", 16, Some(5294)),
+    ("boros charm", 13, Some(182)),
+    ("fire // ice", 11, Some(13168)),
+    ("arlinn kord // arlinn, embraced by the moon", 8, Some(8413)),
+    ("grizzly bears", 4, Some(8107)),
+    ("lightning bolt", 3, Some(157)),
+    ("valki, god of lies // tibalt, cosmic impostor", 2, Some(6217)),
+    ("search for azcanta // azcanta, the sunken ruin", 1, Some(3983)),
+    ("swords to plowshares", 0, Some(11)),
+    ("emeria's call // emeria, shattered skyclave", 0, Some(2783)),
+];
+
+fn color_order_store(pool: &[(&str, u8, Option<u32>)]) -> CardData {
+    let mut vocab = VocabInterner::new();
+    let mut cards: Vec<OracleCard> = pool
+        .iter()
+        .enumerate()
+        .map(|(i, &(name, color_order, edhrec_rank))| {
+            let mut c = stub_card((i + 1) as u128, TYPE_CREATURE, &[], &mut vocab);
+            c.card_name_lower = InlineStr::from_str(name);
+            c.card_name_folded = c.card_name_lower;
+            c.color_order = color_order;
+            c.edhrec_rank = edhrec_rank;
+            c
+        })
+        .collect();
+    assign_name_ranks(&mut cards);
+    let counts = vec![1; cards.len()];
+    let mut data = store_of(cards, &counts, vocab);
+    data.indexes.sort_perms = build_sort_permutations(&data.cards, &data.offsets);
+    data
+}
+
+fn names_by_color(data: &CardData, unique: &str, direction: &str, limit: usize, offset: usize) -> Vec<String> {
+    let bytes = rkyv::to_bytes::<Error>(data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let mut all = FilterExpr::True;
+    let (total, page) = run_query(&QueryCtx::from(archived), &mut all, None, unique, "default", "color", direction, limit, offset);
+    assert_eq!(total, data.cards.len());
+    page.iter().map(|(c, _)| c.card_name_lower.as_str().to_string()).collect()
+}
+
+/// Scryfall's own answer for these eighteen names under `order=color`, in both directions
+/// (api.scryfall.com, 2026-10-08). Descending is NOT the ascending answer reversed: the blocks
+/// turn and the names under them do not -- Emeria's Call before Swords to Plowshares both ways,
+/// Dryad Arbor before Forest both ways.
+#[test]
+fn order_color_is_the_stored_block_with_the_name_ascending_under_it_in_both_directions() {
+    let data = color_order_store(&COLOR_ORDER_POOL);
+    let ascending = [
+        "emeria's call // emeria, shattered skyclave",
+        "swords to plowshares",
+        "search for azcanta // azcanta, the sunken ruin",
+        "valki, god of lies // tibalt, cosmic impostor",
+        "lightning bolt",
+        "grizzly bears",
+        "arlinn kord // arlinn, embraced by the moon",
+        "fire // ice",
+        "boros charm",
+        "nicol bolas, the ravager // nicol bolas, the arisen",
+        "transguild courier",
+        "eldrazi skyspawner",
+        "sol ring",
+        "westvale abbey // ormendahl, profane prince",
+        "dryad arbor",
+        "forest",
+        "hengegate pathway // mistgate pathway",
+        "wastes",
+    ];
+    let descending = [
+        "wastes",
+        "hengegate pathway // mistgate pathway",
+        "dryad arbor",
+        "forest",
+        "westvale abbey // ormendahl, profane prince",
+        "sol ring",
+        "eldrazi skyspawner",
+        "transguild courier",
+        "nicol bolas, the ravager // nicol bolas, the arisen",
+        "boros charm",
+        "fire // ice",
+        "arlinn kord // arlinn, embraced by the moon",
+        "grizzly bears",
+        "lightning bolt",
+        "valki, god of lies // tibalt, cosmic impostor",
+        "search for azcanta // azcanta, the sunken ruin",
+        "emeria's call // emeria, shattered skyclave",
+        "swords to plowshares",
+    ];
+    for unique in ["card", "printing", "artwork"] {
+        assert_eq!(names_by_color(&data, unique, "asc", 100, 0), ascending, "unique={unique} asc");
+        assert_eq!(names_by_color(&data, unique, "desc", 100, 0), descending, "unique={unique} desc");
+        // A page boundary inside a block cuts the same order.
+        assert_eq!(names_by_color(&data, unique, "asc", 3, 1), ascending[1..4], "unique={unique} asc page");
+        assert_eq!(names_by_color(&data, unique, "desc", 3, 2), descending[2..5], "unique={unique} desc page");
+    }
+}
+
+/// A card whose `color_order` was never written sorts after every card that has one, ascending and
+/// descending, and the cards without one are by name among themselves like any other block. Two
+/// cards with one name fall to the edhrec rank, ascending in both directions.
+#[test]
+fn order_color_puts_a_card_with_no_stored_order_last_and_breaks_a_shared_name_by_edhrec() {
+    let data = color_order_store(&[
+        ("zebra unwritten", COLOR_ORDER_NONE, Some(1)),
+        ("apple unwritten", COLOR_ORDER_NONE, Some(2)),
+        ("wastes", 95, None),
+        ("twin", 0, Some(60)),
+        ("twin", 0, Some(20)),
+        // Past the importer's range: read as the last real block, never as "missing" or a wrap.
+        ("out of range", 200, Some(3)),
+    ]);
+    let ids = |direction: &str| -> Vec<u128> {
+        let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+        let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+        let mut all = FilterExpr::True;
+        let (_, page) = run_query(&QueryCtx::from(archived), &mut all, None, "card", "default", "color", direction, 100, 0);
+        page.iter().map(|(c, _)| u128::from(c.oracle_id)).collect()
+    };
+    assert_eq!(ids("asc"), [5, 4, 6, 3, 2, 1]);
+    assert_eq!(ids("desc"), [6, 3, 5, 4, 2, 1]);
+}
+
+/// The key itself: the block decides before the name, the name before the edhrec rank, and no
+/// real block reaches the missing one in either direction.
+#[test]
+fn color_sort_key_orders_block_then_name_then_edhrec() {
+    let data = color_order_store(&[("b", 0, Some(9)), ("a", 1, Some(1)), ("a", 95, Some(1)), ("c", COLOR_ORDER_NONE, Some(1))]);
+    let bytes = rkyv::to_bytes::<Error>(&data).expect("serialize");
+    let archived = rkyv::access::<Archived<CardData>, Error>(&bytes).expect("access");
+    let key = |i: usize, descending: bool| sort_key_bits(&archived.cards[i], &archived.printings[i], SortCol::Color, descending);
+    assert!(key(0, false) < key(1, false) && key(1, false) < key(2, false) && key(2, false) < key(3, false));
+    assert!(key(2, true) < key(1, true) && key(1, true) < key(0, true) && key(0, true) < key(3, true));
 }
 
 // ─── Verifier cost ordering ───────────────────────────────────────────────────

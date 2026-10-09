@@ -122,25 +122,6 @@ def pagination_ceiling() -> int:
     return int((time.time() - PAGINATION_BASE_TIMESTAMP) // PAGINATION_GROWTH_INTERVAL_SECONDS)
 
 
-# `order=color`, as SQL. The eleven buckets Scryfall sorts colour into, measured 2026-08-09 over 923
-# cards spanning every colour shape: mono WUBRG, then multicolour by HOW MANY colours (guild pairs
-# tie), then colourless, then lands. Two of those are not what a colour bitmask would give -- the
-# colourless bucket sorts last rather than first, and lands after it -- which is why this is a CASE
-# rather than an expression over card_colors. Mirrors color_sort_rank in card_engine/src/lib.rs; the
-# two must agree or the SQL and engine paths order the same query differently.
-_COLOR_ORDER_SQL = """
-        (CASE
-            WHEN card_colors = '{"W": true}'::jsonb THEN 0
-            WHEN card_colors = '{"U": true}'::jsonb THEN 1
-            WHEN card_colors = '{"B": true}'::jsonb THEN 2
-            WHEN card_colors = '{"R": true}'::jsonb THEN 3
-            WHEN card_colors = '{"G": true}'::jsonb THEN 4
-            WHEN (SELECT count(1) FROM jsonb_object_keys(card_colors)) > 1
-                THEN 3 + (SELECT count(1) FROM jsonb_object_keys(card_colors))
-            WHEN card_types ? 'Land' THEN 10
-            ELSE 9
-        END)"""
-
 RESULT_FIELD_COLUMNS: dict[str, str] = {
     "name": "card_name",
     "set_code": "card_set_code",
@@ -944,10 +925,11 @@ class APIResource:
             # codes are stored lowercase but nothing constrains them to be.
             CardOrdering.ARTIST: "lower(card_artist)",
             CardOrdering.SET: "lower(card_set_code)",
-            # Scryfall's colour order is eleven buckets, not the colour bitmask -- WUBRG, then
-            # multicolour by how many colours, then colourless, then lands. Measured 2026-08-09;
-            # mirrors color_sort_rank in card_engine/src/lib.rs, which the engine path uses.
-            CardOrdering.COLOR: _COLOR_ORDER_SQL,
+            # Scryfall's colour order is not an expression over card_colors: it is the game's own
+            # order of the colour combinations, by the front face, with colourless cards and lands
+            # placed by identity. That is decided at import (color_order_rank in
+            # api/card_processing.py) and stored, so this path and the engine sort by one number.
+            CardOrdering.COLOR: "color_order",
         }.get(orderby, "edhrec_rank")
         sql_direction = {
             "asc": "ASC",
@@ -981,7 +963,13 @@ class APIResource:
         _result_cols = ",\n                    ".join(
             f"{RESULT_FIELD_COLUMNS[name]}{RESULT_FIELD_OUTPUT_CAST.get(name, '')} AS {name}" for name in resolved_fields
         )
-        _order_by = f"""sort_value {sql_direction} NULLS LAST,
+        # Inside one colour block Scryfall's rows are by name, ascending in BOTH directions:
+        # `dir=desc` reverses the blocks and not the names under them. The engine packs the name
+        # rank under the block the same way (sort_key_bits). lower() for the reason order=name has.
+        _name_under_color = orderby == CardOrdering.COLOR
+        _tiebreak_col = "\n                    lower(card_name) AS sort_name," if _name_under_color else ""
+        _tiebreak_order = "\n                    sort_name ASC," if _name_under_color else ""
+        _order_by = f"""sort_value {sql_direction} NULLS LAST,{_tiebreak_order}
                     edhrec_rank ASC NULLS LAST,
                     prefer_score DESC NULLS LAST"""
         _count_nulls = ",\n                    ".join(f"null AS {name}" for name in resolved_fields)
@@ -991,7 +979,7 @@ class APIResource:
             query_sql = f"""
             WITH matching_cards AS NOT MATERIALIZED (
                 SELECT
-                    {_select_cols}
+                    {_select_cols}{_tiebreak_col}
                     {sql_orderby} AS sort_value
                 FROM
                     magic.cards AS card
@@ -1023,7 +1011,7 @@ class APIResource:
             query_sql = f"""
             WITH distinct_cards AS (
                 SELECT DISTINCT ON ({distinct_on})
-                    {_select_cols}
+                    {_select_cols}{_tiebreak_col}
                     {sql_orderby} AS sort_value
                 FROM
                     magic.cards AS card

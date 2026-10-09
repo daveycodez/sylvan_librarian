@@ -64,6 +64,7 @@ def test_orderby_column_in_compiled_sql(stub_api_resource: APIResource, ordering
 EXPECTED_SORT_COLUMNS = {
     CardOrdering.ARTIST: "lower(card_artist)",
     CardOrdering.CMC: "cmc",
+    CardOrdering.COLOR: "color_order",
     CardOrdering.CUBECOBRA: "cubecobra_score",
     CardOrdering.EDHREC: "edhrec_rank",
     CardOrdering.EUR: "price_eur",
@@ -79,8 +80,7 @@ EXPECTED_SORT_COLUMNS = {
 
 
 def test_every_ordering_has_an_expected_column() -> None:
-    """COLOR is the one ordering whose sort key is an expression rather than a column."""
-    assert set(EXPECTED_SORT_COLUMNS) | {CardOrdering.COLOR} == set(CardOrdering)
+    assert set(EXPECTED_SORT_COLUMNS) == set(CardOrdering)
 
 
 @pytest.mark.parametrize("ordering", sorted(EXPECTED_SORT_COLUMNS), ids=str)
@@ -94,10 +94,14 @@ def test_ordering_sorts_by_its_own_column(stub_api_resource: APIResource, orderi
     assert needle in _compiled_sql(stub_api_resource, ordering)
 
 
-def test_color_sorts_by_the_bucket_expression(stub_api_resource: APIResource) -> None:
-    """Scryfall's colour order is eleven buckets, not the colour bitmask — see the CASE in api_resource."""
+def test_color_breaks_a_block_by_name_ascending_whatever_the_direction(stub_api_resource: APIResource) -> None:
+    """Scryfall's `dir=desc` turns the colour blocks and not the names inside them.
+
+    So the name is its own ORDER BY term, always ascending, between the stored block and the edhrec
+    tiebreak every ordering has -- and only `order=color` carries it.
+    """
     compiled = _compiled_sql(stub_api_resource, CardOrdering.COLOR)
-    assert "AS sort_value FROM magic.cards" in compiled
-    # Colourless after every coloured bucket, and lands after that: the two parts a bitmask gets wrong.
-    assert "WHEN card_types ? 'Land' THEN 10" in compiled
-    assert "ELSE 9" in compiled
+    assert ", lower(card_name) AS sort_name, color_order AS sort_value FROM magic.cards" in compiled
+    assert "ORDER BY sort_value ASC NULLS LAST, sort_name ASC, edhrec_rank ASC NULLS LAST" in compiled
+    for ordering in sorted(set(CardOrdering) - {CardOrdering.COLOR}):
+        assert "sort_name" not in _compiled_sql(stub_api_resource, ordering), ordering

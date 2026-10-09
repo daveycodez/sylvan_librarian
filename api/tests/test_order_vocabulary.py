@@ -18,8 +18,10 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import pytest
 
+from api.card_processing import color_order_rank
 from api.enums import AUTO_DESCENDING_ORDERINGS, CardOrdering, SortDirection, resolve_direction
 from api.parsing import parse_scryfall_query
+from api.tests.color_order_cards import ASCENDING_NAMES, COLOR_ORDER_CARDS, DESCENDING_NAMES
 from card_engine import QueryEngine
 
 if TYPE_CHECKING:
@@ -123,6 +125,9 @@ class TestEngineKnowsEveryOrdering:
                     "card_set_code": f"s{(i * 19) % 40:02d}",
                     "card_artist": f"Artist {(i * 23) % 40:03d}",
                     "card_colors": colors[i % len(colors)],
+                    # Written at import on a real row (color_order_rank); here just one more
+                    # permutation, with a gap the importer also leaves.
+                    "color_order": (i * 31) % 96,
                     "type_line": "Land" if i % 9 == 0 else "Creature — Test",
                     "oracle_text": f"text {i}",
                     "prefer_score": float(rng.randrange(100)),
@@ -169,3 +174,91 @@ class TestEngineKnowsEveryOrdering:
         ids = _ordered_ids(engine, CardOrdering.RELEASED, SortDirection.ASC)
         assert ids != _ordered_ids(engine, CardOrdering.RELEASED, SortDirection.DESC)
         assert len(set(ids)) == 40
+
+
+class TestEngineColorOrder:
+    """`order=color` on the engine: the stored block, then the name ascending in both directions.
+
+    The engine does not decide where a card sits; `color_order` does, and the importer writes it.
+    These rows carry the colours and types of the face a faced card's row is stored with today (the
+    last one), which is the wrong face for five of the eighteen -- so a key that still read
+    `card_colors` or `card_types` would put Westvale Abbey with the black cards and Emeria's Call
+    with the lands, and fail.
+    """
+
+    @staticmethod
+    def _row(index: int, card: dict[str, Any], color_order: int | None) -> dict[str, Any]:
+        stored_face = card["card_faces"][-1] if "card_faces" in card else card
+        colors = card["colors"] if "colors" in card else stored_face["colors"]
+        return {
+            "scryfall_id": f"{index:08x}-0000-4000-8000-{index:012x}",
+            "oracle_id": f"{index:08x}-1111-4111-8111-{index:012x}",
+            "illustration_id": f"{index:08x}-2222-4222-8222-{index:012x}",
+            "card_name": card["name"],
+            "card_name_lower": card["name"].lower(),
+            "card_name_folded": card["name"].lower(),
+            "card_colors": dict.fromkeys(colors, True),
+            "card_color_identity": dict.fromkeys(card["color_identity"], True),
+            "type_line": stored_face["type_line"],
+            "edhrec_rank": card.get("edhrec_rank"),
+            "color_order": color_order,
+            "cmc": 0,
+            "oracle_text": "",
+        }
+
+    @staticmethod
+    def _names(engine: QueryEngine, direction: SortDirection, unique: str = "card") -> list[str]:
+        _total, cards = engine.query(
+            filters=parse_scryfall_query("cmc>=0"),
+            unique=unique,
+            prefer="default",
+            orderby=str(CardOrdering.COLOR),
+            direction=str(direction),
+            limit=1_000,
+            offset=0,
+            fields=["name"],
+        )
+        return [str(c["name"]) for c in cards]
+
+    @pytest.fixture(scope="class", name="engine")
+    def engine_fixture(self, tmp_path_factory: pytest.TempPathFactory) -> QueryEngine:
+        engine = QueryEngine(str(tmp_path_factory.mktemp("color-order") / "color.store"))
+        assert engine.reload_begin()
+        # Loaded back to front, so store order is neither answer.
+        engine.add_batch(
+            [self._row(i, card, color_order_rank(card)) for i, (_rank, card) in enumerate(reversed(COLOR_ORDER_CARDS))]
+        )
+        engine.reload_commit()
+        return engine
+
+    @pytest.mark.parametrize("unique", ["card", "printing", "artwork"])
+    def test_ascending_is_scryfalls_answer(self, engine: QueryEngine, unique: str) -> None:
+        assert self._names(engine, SortDirection.ASC, unique) == ASCENDING_NAMES
+
+    @pytest.mark.parametrize("unique", ["card", "printing", "artwork"])
+    def test_descending_turns_the_blocks_and_not_the_names(self, engine: QueryEngine, unique: str) -> None:
+        names = self._names(engine, SortDirection.DESC, unique)
+        assert names == DESCENDING_NAMES
+        assert names != ASCENDING_NAMES[::-1]
+
+    def test_a_row_with_no_stored_order_sorts_last_in_both_directions(self, tmp_path_factory: pytest.TempPathFactory) -> None:
+        """NULL (a row written before the column existed), an absent key and an out-of-range value alike."""
+        engine = QueryEngine(str(tmp_path_factory.mktemp("color-order-null") / "color.store"))
+        wastes, sol_ring = (
+            {"name": name, "colors": [], "color_identity": [], "type_line": type_line}
+            for name, type_line in [("Wastes", "Basic Land"), ("Sol Ring", "Artifact")]
+        )
+        rows = [
+            self._row(1, {"name": "Null Order", "colors": ["W"], "color_identity": ["W"], "type_line": "Instant"}, None),
+            self._row(2, wastes, color_order_rank(wastes)),
+            self._row(3, {"name": "Beyond The Range", "colors": ["W"], "color_identity": ["W"], "type_line": "Instant"}, 96),
+            self._row(4, sol_ring, color_order_rank(sol_ring)),
+        ]
+        absent = self._row(5, {"name": "Absent Key", "colors": ["W"], "color_identity": ["W"], "type_line": "Instant"}, None)
+        del absent["color_order"]
+        assert engine.reload_begin()
+        engine.add_batch([*rows, absent])
+        engine.reload_commit()
+        unwritten = ["Absent Key", "Beyond The Range", "Null Order"]
+        assert self._names(engine, SortDirection.ASC) == ["Sol Ring", "Wastes", *unwritten]
+        assert self._names(engine, SortDirection.DESC) == ["Wastes", "Sol Ring", *unwritten]

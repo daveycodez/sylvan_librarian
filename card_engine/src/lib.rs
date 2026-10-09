@@ -242,6 +242,9 @@ struct OracleCard {
     card_colors: u8,
     card_color_identity: u8,
     produced_mana: u8,
+    // Where the card sorts under `order=color` (COLOR_ORDER_NONE = not computed): the
+    // `color_order` column, decided at import from the front face. See `sort_key_bits`.
+    color_order: u8,
     card_types: u16,
     // True for the ~556 oracle ids whose printings carry different legality
     // words (non-tournament printings: 30A, Collectors' Edition, gold border).
@@ -356,6 +359,7 @@ struct CardRow {
     card_colors: u8,
     card_color_identity: u8,
     produced_mana: u8,
+    color_order: u8,
     card_types: u16,
 
     scryfall_id: u128,
@@ -835,6 +839,7 @@ fn card_from_pydict(d: &Bound<PyDict>, it: &mut Interner, vocab: &mut VocabInter
         card_colors: jsonb_color_to_bits(d, "card_colors"),
         card_color_identity: jsonb_color_to_bits(d, "card_color_identity"),
         produced_mana: jsonb_color_to_bits(d, "produced_mana"),
+        color_order: opt_u8(d, "color_order").filter(|&v| v <= COLOR_ORDER_MAX).unwrap_or(COLOR_ORDER_NONE),
 
         cmc: opt_u8(d, "cmc"), // Un-set cards have fractional cmc, but we don't load those into the dataset
         creature_power: opt_i8(d, "creature_power"),
@@ -5799,23 +5804,38 @@ fn released_sort_ord(yyyymmdd: u32) -> u32 {
     y * 372 + m.saturating_sub(1) * 31 + d.saturating_sub(1)
 }
 
-/// Scryfall's `order=color` bucketing, measured 2026-08-09 over 923 cards spanning every colour
-/// shape: `W U B R G`, then multicolour by HOW MANY colours (not which -- guild pairs tie and fall
-/// to the secondary sort), then colourless, then lands. Two parts of that are not what a popcount
-/// would give: colourless sorts last rather than first, and lands sort after it.
-fn color_sort_rank(colors: u8, type_bits: u16) -> u32 {
-    // WUBRG in Scryfall's order; the bit values are color_to_bit's. The C bit is masked off rather
-    // than counted: a colourless card ranks by being colourless, and C alongside a real colour
-    // would otherwise read as an extra colour.
-    const MONO_ORDER: [u8; 5] = [1, 2, 4, 8, 16];
-    const WUBRG: u8 = 1 | 2 | 4 | 8 | 16;
-    let colors = colors & WUBRG;
-    match colors.count_ones() {
-        0 if type_bits & TYPE_LAND != 0 => 10,
-        0 => 9,
-        1 => MONO_ORDER.iter().position(|&bit| colors == bit).unwrap_or(0) as u32,
-        n => 3 + n, // 2 colours -> 5, 3 -> 6, 4 -> 7, 5 -> 8
-    }
+/// `OracleCard::color_order` when the `color_order` column was NULL or absent: sorts after every
+/// card that has one, in both directions.
+const COLOR_ORDER_NONE: u8 = u8::MAX;
+/// The largest value the importer writes: 64 (the land block) + 31 (no colour identity).
+const COLOR_ORDER_MAX: u8 = 95;
+
+/// The primary key for `order=color`: the card's place in Scryfall's colour order with its name
+/// rank packed under it, so that inside one block the rows are by name.
+///
+/// The place itself is not computed here. It is `color_order`, written at import by
+/// `color_order_rank` (api/card_processing.py) from the whole Scryfall card, because the rule reads
+/// the FRONT face of a multi-faced card and this store does not hold one: coloured non-lands by
+/// their colours in the game's printed order (W U B R G, WU UB BR RG GW WB UR BG RW GU, the shards,
+/// the wedges, the four-colour sets, all five), then colourless non-lands by colour identity, then
+/// lands by colour identity. The SQL path sorts by the same column.
+///
+/// THE NAME DOES NOT TURN WITH THE DIRECTION. `dir=desc` on Scryfall reverses the blocks and leaves
+/// the names inside each ascending (Dryad Arbor before Forest both ways), so the block is reflected
+/// here and the name rank is not -- which is why this cannot go through the f32 primary, whose
+/// direction is one negation of the whole value. Eight bits of block over twenty-four of name rank
+/// (ranks stay below 2^24, see `name_rank`); a card with no `color_order` takes the block past
+/// every real one, in both directions, like any other missing sort value.
+fn color_sort_primary(card: &AOracleCard, descending: bool) -> u32 {
+    const NAME_RANK_BITS: u32 = 24;
+    // One past the largest reflected block (0x7e - 0), so "missing" is last ascending and descending.
+    const MISSING_BLOCK: u32 = 0x7f;
+    let block = match card.color_order {
+        COLOR_ORDER_NONE => MISSING_BLOCK,
+        order if descending => u32::from(0x7e - order.min(COLOR_ORDER_MAX)),
+        order => u32::from(order.min(COLOR_ORDER_MAX)),
+    };
+    (block << NAME_RANK_BITS) | u32::from(card.name_rank).min((1 << NAME_RANK_BITS) - 1)
 }
 
 /// Map an f32 to a u32 that orders like `f32::total_cmp` (sign-flip trick).
@@ -5840,6 +5860,7 @@ fn f32_sort_bits(v: f32) -> u32 {
 /// `Match`'s size (`(u64, u32, u32)` is 16 bytes with no padding, against `(u128, u32, u32)`'s 32
 /// -- `u128` forces 16-byte alignment) for every executor that builds a `Vec<Match>`.
 fn sort_key_bits(card: &AOracleCard, p: &APrinting, sort_col: SortCol, descending: bool) -> u64 {
+    let e = card.edhrec_rank.as_ref().map(|v| u32::from(*v)).unwrap_or(u32::MAX);
     let primary: Option<f32> = match sort_col {
         SortCol::Cmc        => card.cmc.as_ref().map(|v| f32::from(*v)),
         SortCol::Power      => card.creature_power.as_ref().map(|v| f32::from(*v)),
@@ -5856,7 +5877,8 @@ fn sort_key_bits(card: &AOracleCard, p: &APrinting, sort_col: SortCol, descendin
         SortCol::Name       => Some(u32::from(card.name_rank) as f32),
         // Packed rather than raw: yyyymmdd exceeds the exact-f32 range (see released_sort_ord).
         SortCol::Released   => p.released_at_int.as_ref().map(|v| released_sort_ord(u32::from(*v)) as f32),
-        SortCol::Color      => Some(color_sort_rank(card.card_colors, u16::from(card.card_types)) as f32),
+        // The one column whose primary is not a single reflected number -- see color_sort_primary.
+        SortCol::Color      => return (u64::from(color_sort_primary(card, descending)) << 32) | u64::from(e),
         // Dense ranks assigned post-load; the stored code and artist id do not sort alphabetically
         // on their own (see assign_set_ranks / assign_artist_ranks).
         SortCol::Set        => Some(u32::from(p.set_rank) as f32),
@@ -5872,7 +5894,6 @@ fn sort_key_bits(card: &AOracleCard, p: &APrinting, sort_col: SortCol, descendin
         SortCol::Artist     => (p.card_artist_vid != ARTIST_NONE).then(|| u32::from(p.artist_rank) as f32),
     };
     let pk = primary.map_or(u32::MAX, |v| f32_sort_bits(if descending { -v } else { v }));
-    let e = card.edhrec_rank.as_ref().map(|v| u32::from(*v)).unwrap_or(u32::MAX);
     ((pk as u64) << 32) | (e as u64)
 }
 
@@ -13460,7 +13481,12 @@ const ARCHIVE_MAGIC: [u8; 8] = *b"ATCARDS\0";
 // `order=` values sort by (#913). Struct sizes DO move here, so the header would catch it on its
 // own — the bump is what says which layout an equal-sized future one was, and keeps this branch's
 // value ahead of main's rather than behind it after the merge.
-const ARCHIVE_FORMAT_VERSION: u32 = 2026090803;
+//
+// 2026100901 — `OracleCard` gains `color_order`, the card's place under `order=color`, read from
+// the column of the same name. One byte that lands in padding the struct already had, so NEITHER
+// header size moves and this bump is the only thing that tells a store without the byte from one
+// with it.
+const ARCHIVE_FORMAT_VERSION: u32 = 2026100901;
 const ARCHIVE_HEADER_LEN: usize = 16;
 
 fn archive_header() -> [u8; ARCHIVE_HEADER_LEN] {
@@ -14018,6 +14044,7 @@ impl QueryEngine {
                     card_colors: row.card_colors,
                     card_color_identity: row.card_color_identity,
                     produced_mana: row.produced_mana,
+                    color_order: row.color_order,
                     card_types: row.card_types,
                     legality_divergent: false,
                     oracle_id: row.oracle_id,

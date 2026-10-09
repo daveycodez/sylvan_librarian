@@ -25,9 +25,11 @@ first: a `SortCol` variant and a `sort_key_bits` arm, plus
 - **`released`** packs `yyyymmdd` down to `y*372 + (m-1)*31 + (d-1)` before the sort key. The key
   rounds through f32, exact only below 2^24; a raw `20260809` is past that and collides dates a day
   or two apart. `released_at_int` itself is unchanged, since the date and year filters read it.
-- **`color`** is eleven buckets — `W U B R G`, multicolour by how many colours, colourless, land.
-  Measured, because two parts are not what a colour bitmask gives: colourless sorts last rather
-  than first, and lands after it.
+- **`color`** is the game's own order of the colour combinations — `W U B R G`, the ten pairs, the
+  ten triples, the four-colour sets, all five — then colourless cards and then lands, each by
+  colour identity, with the name ascending inside a block in both directions. A multi-faced card
+  is read by its front face, which the stored row does not hold, so the place is decided at import
+  and stored (`color_order`); both paths sort by that one number.
 - **`set` and `artist`** get dense ranks on the printing, assigned post-load like `name_rank`
   already is. Neither sorts from what the key can reach: a set code is a string, and
   `card_artist_vid` is intern order. `ARCHIVE_FORMAT_VERSION` bumps so an existing store rebuilds.
