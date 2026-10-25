@@ -12488,6 +12488,9 @@ fn explain_analyze(
         order.shuffle(&mut rng);
         for &participant in &order {
             let mut round_filter = filter.clone();
+            // Each participant runs the query afresh, so each gets the escalation pool a real query
+            // gets; otherwise plans x rounds runs would share one query's worth of regex retries.
+            refill_regex_escalation_pool();
             // Bound rather than consumed, so the clock read below excludes every participant's own
             // deallocation — otherwise the plans, which hold their result, would be measured on
             // different terms from the two that discard it.

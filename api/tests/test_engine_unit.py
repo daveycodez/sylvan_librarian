@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from api.parsing import parse_scryfall_query
-from card_engine import QueryEngine, UnknownFieldError
+from card_engine import QueryEngine, UnknownFieldError, UnsupportedRegexError
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
@@ -1495,3 +1495,83 @@ class TestRouterDispatchScope:
                 assert picked[0] in scope, f"{query}@{limit}: picked {picked[0]}, which this acquire cannot run"
                 checked += 1
         assert checked, "no query in PLANE_QUERIES acquired through a plane or candidate list"
+
+
+class TestRegexEscalation:
+    """A regex candidate that exhausts the per-candidate backtrack limit is retried at higher limits.
+
+    `[^.]*` followed by a lookahead loop that can take the same characters is quadratic in the
+    sentence, and on these real oracle texts it takes more than the flat 8,192 steps to prove a
+    match. Each such card used to refuse the whole query: both queries below were a 400 "Search query
+    contains an unsupported regular expression." on sylvan-librarian.com while api.scryfall.com
+    answers 15 and 2,200 cards. The retries are paid from a per-query pool, so an exponential pattern
+    is still refused, and the next query starts with the pool full.
+    """
+
+    ASHLING = (
+        "Elemental permanent spells you cast from your hand gain evoke {4} as you cast them. (If you cast a spell for "
+        "its evoke cost, it's sacrificed when it enters.)\nWhenever you sacrifice a nontoken Elemental, create a token "
+        "that's a copy of it. The token gains haste until end of turn. At the beginning of your next end step, "
+        "sacrifice it unless you pay {W}{U}{B}{R}{G}."
+    )
+    SOLEMN_SIMULACRUM = (
+        "When this creature enters, you may search your library for a basic land card, put that card onto the "
+        "battlefield tapped, then shuffle.\nWhen this creature dies, you may draw a card."
+    )
+    TRIPLICATE_TITAN = (
+        "Flying, vigilance, trample\nWhen this creature dies, create a 3/3 colorless Golem artifact creature token "
+        "with flying, a 3/3 colorless Golem artifact creature token with vigilance, and a 3/3 colorless Golem "
+        "artifact creature token with trample."
+    )
+    TEMPERED_SACRIFICE = r"o:/whenever you sacrifice[^.]*((?!\. whenever).)*?create/"
+    TEMPERED_TRIGGER = r"o:/(when|whenever) [^.]*((?!\.)(.))*?(create|draw) a/"
+
+    @staticmethod
+    def _load(engine: QueryEngine, cards: list[tuple[str, str]]) -> QueryEngine:
+        engine.reload([{"card_name": name, "oracle_id": f"o{i}", "oracle_text": text} for i, (name, text) in enumerate(cards)])
+        return engine
+
+    def test_a_quadratic_candidate_is_answered_not_refused(self, fresh_engine: Callable[[], QueryEngine]) -> None:
+        e = self._load(
+            fresh_engine(),
+            [
+                ("Ashling, the Limitless", self.ASHLING),
+                ("Solemn Simulacrum", self.SOLEMN_SIMULACRUM),
+                ("Triplicate Titan", self.TRIPLICATE_TITAN),
+                ("Lightning Bolt", "Lightning Bolt deals 3 damage to any target."),
+            ],
+        )
+        total, cards = _run(e, self.TEMPERED_SACRIFICE, unique="card")
+        assert total == 1
+        assert _names(cards) == ["Ashling, the Limitless"]
+        total, cards = _run(e, self.TEMPERED_TRIGGER, unique="card")
+        assert total == 3
+        assert sorted(_names(cards)) == ["Ashling, the Limitless", "Solemn Simulacrum", "Triplicate Titan"]
+
+    def test_the_retry_pool_is_per_query(self, fresh_engine: Callable[[], QueryEngine]) -> None:
+        # Each of these 50 cards needs the first retry (32,768 steps); the 4,194,304-step pool pays for
+        # 128 of them. One run fits (this path verifies a candidate up to twice, so up to 100 retries);
+        # three runs charge at least 150 between them, so every run after the first is answered only
+        # because the pool refills when a query starts.
+        cards = [(f"Ashling Copy {i:02d}", self.ASHLING) for i in range(50)]
+        e = self._load(fresh_engine(), [*cards, ("Long A", "a" * 60 + "b")])
+        for _ in range(3):
+            total, _ = _run(e, self.TEMPERED_SACRIFICE, unique="card")
+            assert total == 50
+        # An exponential pattern (each `a` can be either branch) still climbs every retry, empties the
+        # pool and is refused...
+        with pytest.raises(UnsupportedRegexError, match="regex execution limit exceeded"):
+            _run(e, "o:/((?=a)a|a)*c/", unique="card")
+        # ...and leaves nothing behind for the next query.
+        total, _ = _run(e, self.TEMPERED_SACRIFICE, unique="card")
+        assert total == 50
+
+    def test_explain_analyze_gives_each_run_its_own_pool(self, fresh_engine: Callable[[], QueryEngine]) -> None:
+        # explain_analyze binds once and then runs every plan, the acquire and the router for each of
+        # its rounds; those runs together need far more retries than one pool holds.
+        cards = [(f"Ashling Copy {i:02d}", self.ASHLING) for i in range(50)]
+        e = self._load(fresh_engine(), cards)
+        result = e.explain_analyze(
+            filters=parse_scryfall_query(self.TEMPERED_SACRIFICE), unique="card", num_warmups=1, num_trials=3
+        )
+        assert result["plans"]

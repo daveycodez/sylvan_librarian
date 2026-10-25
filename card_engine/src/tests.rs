@@ -10678,15 +10678,96 @@ fn regex_backtrack_exhaustion_surfaces_as_match_failure() {
     };
     use fancy_regex::RegexBuilder;
 
+    // The repeated group holds the lookahead, so the whole `(...)+` runs on the backtracking VM and
+    // stays exponential at every rung of the escalation ladder. (`(?=a)(a+)+b` no longer does here:
+    // fancy-regex hands its `(a+)+b` to the linear engine, so the first rung answers it, correctly,
+    // with no match.)
     clear_regex_match_failed();
-    let re = RegexBuilder::new("(?i)(?=a)(a+)+b")
+    let re = RegexBuilder::new("(?i)((?=a)a+)+b")
         .backtrack_limit(8)
         .build()
         .expect("pattern compiles");
+    let re = crate::filter::SearchRegex::from_base_for_test(re);
     let hay = format!("{}c", "a".repeat(40));
     assert!(!regex_is_match_for_test(&re, &hay));
     let msg = take_regex_match_failed().expect("backtrack exhaustion must set failure flag");
     assert!(msg.starts_with(REGEX_MATCH_ERR_PREFIX));
+}
+
+/// A candidate that needs more than `REGEX_BACKTRACK_LIMIT` steps is retried up
+/// `REGEX_ESCALATION_LIMITS` instead of refusing the whole query.
+///
+/// A class loop followed by a lookahead loop that can take the same characters makes the VM try
+/// every split between the two — quadratic in the sentence, not exponential. Each text below is a
+/// real oracle text that MATCHES and that the flat 8,192 refused (checked first, so the test fails
+/// if a text stops needing the ladder): on sylvan-librarian.com both queries were a 400 "Search
+/// query contains an unsupported regular expression." where api.scryfall.com answers 15 and 2,200
+/// cards. Triplicate Titan needs the second rung.
+#[test]
+fn regex_budget_escalates_for_a_quadratic_candidate() {
+    use crate::filter::{
+        clear_regex_match_failed, regex_is_match_for_test, take_regex_match_failed, REGEX_BACKTRACK_LIMIT,
+    };
+
+    let effluence_devourer = "whenever you sacrifice effluence devourer or another creature, it perpetually gains \"{2}, exile this card from your graveyard: create an x/x green ooze creature token, where x is this card's power. activate only as a sorcery.\"\nblitz {b}{r}{g} (if you cast this spell for its blitz cost, it gains haste and \"when this creature dies, draw a card.\" sacrifice it at the beginning of the next end step.)";
+    let ashling = "elemental permanent spells you cast from your hand gain evoke {4} as you cast them. (if you cast a spell for its evoke cost, it's sacrificed when it enters.)\nwhenever you sacrifice a nontoken elemental, create a token that's a copy of it. the token gains haste until end of turn. at the beginning of your next end step, sacrifice it unless you pay {w}{u}{b}{r}{g}.";
+    let solemn_simulacrum = "when this creature enters, you may search your library for a basic land card, put that card onto the battlefield tapped, then shuffle.\nwhen this creature dies, you may draw a card.";
+    let triplicate_titan = "flying, vigilance, trample\nwhen this creature dies, create a 3/3 colorless golem artifact creature token with flying, a 3/3 colorless golem artifact creature token with vigilance, and a 3/3 colorless golem artifact creature token with trample.";
+    let cases = [
+        (r"whenever you sacrifice[^.]*((?!\. whenever).)*?create", effluence_devourer),
+        (r"whenever you sacrifice[^.]*((?!\. whenever).)*?create", ashling),
+        (r"(when|whenever) [^.]*((?!\.)(.))*?(create|draw) a", solemn_simulacrum),
+        (r"(when|whenever) [^.]*((?!\.)(.))*?(create|draw) a", triplicate_titan),
+    ];
+    for (pattern, text) in cases {
+        let flat = fancy_regex::RegexBuilder::new(&format!("(?i){pattern}"))
+            .backtrack_limit(REGEX_BACKTRACK_LIMIT)
+            .build()
+            .expect("pattern compiles");
+        assert!(
+            matches!(flat.is_match(text), Err(fancy_regex::Error::RuntimeError(_))),
+            "{pattern:?} must exhaust the flat budget on {text:?}, or this case tests nothing"
+        );
+        let re = crate::filter::compile_search_regex_for_test(pattern);
+        clear_regex_match_failed();
+        assert!(regex_is_match_for_test(&re, text), "{pattern:?} must match {text:?}");
+        assert!(take_regex_match_failed().is_none(), "{pattern:?} refused a quadratic candidate");
+    }
+    // The answer is the pattern's, not the ladder's: a candidate it does not match still does not.
+    let re = crate::filter::compile_search_regex_for_test(r"whenever you sacrifice[^.]*((?!\. whenever).)*?create");
+    clear_regex_match_failed();
+    let no_match = "whenever you sacrifice another creature or artifact, put a +1/+1 counter on target creature you control and it gains trample until end of turn. whenever a creature dies, create a 1/1 black rat creature token.";
+    assert!(!regex_is_match_for_test(&re, no_match));
+    assert!(take_regex_match_failed().is_none());
+}
+
+/// The ladder draws on a per-query pool, so an exponential pattern still exhausts it and is
+/// refused — and `clear_regex_match_failed`, which every query runs before it binds its filter,
+/// refills it, so one refused query does not leave the next one without.
+#[test]
+fn regex_escalation_pool_is_per_query() {
+    use crate::filter::{clear_regex_match_failed, regex_is_match_for_test, take_regex_match_failed};
+
+    let exponential = crate::filter::compile_search_regex_for_test("((?=a)a+)+(?!b)b");
+    let quadratic = crate::filter::compile_search_regex_for_test(r"whenever you sacrifice[^.]*((?!\. whenever).)*?create");
+    let hay = format!("{}b", "a".repeat(60));
+    let ashling = "elemental permanent spells you cast from your hand gain evoke {4} as you cast them. (if you cast a spell for its evoke cost, it's sacrificed when it enters.)\nwhenever you sacrifice a nontoken elemental, create a token that's a copy of it. the token gains haste until end of turn. at the beginning of your next end step, sacrifice it unless you pay {w}{u}{b}{r}{g}.";
+
+    clear_regex_match_failed();
+    // One climb does not empty the pool (it holds more than one top rung); four exponential
+    // candidates in the same query do, each climbing as far as what is left can pay.
+    for _ in 0..8 {
+        assert!(!regex_is_match_for_test(&exponential, &hay));
+        assert!(take_regex_match_failed().is_some(), "an exponential candidate must still exhaust the budget");
+    }
+    // The flag was taken, but the pool is still empty within this query: a quadratic candidate that
+    // needs a rung now has nothing to climb with, and is refused rather than answered `false`.
+    assert!(!regex_is_match_for_test(&quadratic, ashling));
+    assert!(take_regex_match_failed().is_some(), "an emptied pool must refuse, not answer false");
+
+    clear_regex_match_failed();
+    assert!(regex_is_match_for_test(&quadratic, ashling), "the next query starts with a full pool");
+    assert!(take_regex_match_failed().is_none());
 }
 
 // And children reorder cheapest-tier-first regardless of written order, and

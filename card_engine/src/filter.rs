@@ -5,7 +5,39 @@ use super::{AOracleCard, APrinting, AStrings, str_at, mana_lane, lane_add, lanes
 use super::legality::{LEGALITY_LEGAL, LEGALITY_BANNED, LEGALITY_RESTRICTED, format_shift};
 
 /// Public search TextRegex backtrack cap — calibrated in docs/issues/security-regex-execution-budget.md.
+///
+/// This is what every candidate may spend. A candidate that runs out is not refused at once: it is
+/// retried up [`REGEX_ESCALATION_LIMITS`], out of the query's [`REGEX_ESCALATION_POOL`].
 pub(crate) const REGEX_BACKTRACK_LIMIT: usize = 8192;
+
+/// The limits a candidate that exhausted [`REGEX_BACKTRACK_LIMIT`] is retried at, in order, each
+/// retry charged to the query's [`REGEX_ESCALATION_POOL`].
+///
+/// 8,192 per candidate is a price on the text as well as on the pattern, and an ordinary pattern
+/// can pay more than that on one long card without being pathological. A class loop followed by a
+/// lookahead loop that can take the same characters —
+/// `whenever you sacrifice[^.]*((?!\. whenever).)*?create` — makes the VM try every split between
+/// the two: quadratic in the sentence, not exponential. A card that MATCHES proves it only after
+/// the greedy class has backed off far enough, which on a long oracle text is more than 8,192
+/// steps, so the first such card refused the whole query as `regex execution limit exceeded` where
+/// api.scryfall.com answers 15 cards.
+///
+/// A raised per-candidate limit would multiply what EVERY candidate may spend, which is exactly the
+/// cost the 8,192 bounds. The ladder spends more only on the candidates that need it and only out of
+/// a fixed per-query pool, so the most a query can add is the pool — and a genuinely exponential
+/// pattern (`((?=a)a+)+(?!b)b`) climbs it, empties it, and is refused exactly as before.
+///
+/// ×4 per rung, so a text that needs 16,384 steps is charged 32,768 and not a whole top rung.
+pub(crate) const REGEX_ESCALATION_LIMITS: [usize; 4] = [32_768, 131_072, 524_288, 2_097_152];
+
+/// Backtracks the [`REGEX_ESCALATION_LIMITS`] retries may spend in one query, per thread; refilled
+/// by [`clear_regex_match_failed`] when the query starts.
+///
+/// Each retry is charged its whole limit up front — fancy_regex does not report what it actually
+/// spent — so this bounds the extra work from above: 128 first-rung rescues, or one climb to the top
+/// rung and most of a second. Only when the pool cannot pay for the next rung does the query fail
+/// as it did before the ladder.
+pub(crate) const REGEX_ESCALATION_POOL: usize = 4_194_304;
 
 /// Prefix on `build_filter` errors that must surface as `UnsupportedRegexError`, not `RetryableQueryError`.
 pub(crate) const REGEX_COMPILE_ERR_PREFIX: &str = "regex_compile:";
@@ -13,22 +45,68 @@ pub(crate) const REGEX_COMPILE_ERR_PREFIX: &str = "regex_compile:";
 /// Prefix on runtime regex match failures (`is_match` backtrack exhaustion, etc.).
 pub(crate) const REGEX_MATCH_ERR_PREFIX: &str = "regex_match:";
 
-pub(crate) fn compile_search_regex(pattern: &str) -> Result<Regex, String> {
-    fancy_regex::RegexBuilder::new(&format!("(?i){pattern}"))
-        .backtrack_limit(REGEX_BACKTRACK_LIMIT)
-        .build()
+/// A compiled public-search regex: the pattern at [`REGEX_BACKTRACK_LIMIT`], plus one slot per
+/// [`REGEX_ESCALATION_LIMITS`] rung, each compiled from the same source the first time a candidate
+/// needs it — which nearly no query ever does. Cloning shares the rungs (`FilterExpr` is cloned per
+/// plan by `explain_analyze`).
+#[derive(Clone, Debug)]
+pub(crate) struct SearchRegex {
+    base: Regex,
+    rungs: Arc<[OnceLock<Option<Regex>>; REGEX_ESCALATION_LIMITS.len()]>,
+}
+
+impl SearchRegex {
+    fn new(base: Regex) -> Self {
+        SearchRegex { base, rungs: Arc::default() }
+    }
+
+    /// The source the pattern was compiled from, `(?i)` prefix included.
+    pub(crate) fn as_str(&self) -> &str {
+        self.base.as_str()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_base_for_test(base: Regex) -> Self {
+        SearchRegex::new(base)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn base(&self) -> &Regex {
+        &self.base
+    }
+}
+
+fn build_search_regex(source: &str, limit: usize) -> Result<Regex, FancyError> {
+    fancy_regex::RegexBuilder::new(source).backtrack_limit(limit).build()
+}
+
+pub(crate) fn compile_search_regex(pattern: &str) -> Result<SearchRegex, String> {
+    build_search_regex(&format!("(?i){pattern}"), REGEX_BACKTRACK_LIMIT)
+        .map(SearchRegex::new)
         .map_err(|e| format!("{REGEX_COMPILE_ERR_PREFIX}{e}"))
 }
 
 use std::cell::Cell;
+use std::sync::{Arc, OnceLock};
 
 thread_local! {
     static REGEX_MATCH_FAILED: Cell<bool> = const { Cell::new(false) };
+
+    /// What this query's [`REGEX_ESCALATION_LIMITS`] retries have spent of [`REGEX_ESCALATION_POOL`].
+    static REGEX_ESCALATION_SPENT: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Reset before bind/evaluate so a prior query on this thread cannot poison the next.
+/// Reset before bind/evaluate so a prior query on this thread cannot poison the next — and refill
+/// the query's [`REGEX_ESCALATION_POOL`], for the same reason.
 pub(crate) fn clear_regex_match_failed() {
     REGEX_MATCH_FAILED.with(|c| c.set(false));
+    REGEX_ESCALATION_SPENT.with(|c| c.set(0));
+}
+
+/// Refill the query's [`REGEX_ESCALATION_POOL`] without touching the failure flag: for a caller that
+/// runs one bound filter more than once and means each run as its own query (`explain_analyze`).
+pub(crate) fn refill_regex_escalation_pool() {
+    REGEX_ESCALATION_SPENT.with(|c| c.set(0));
 }
 
 /// Take and clear the failure flag; `Some(message)` when a match aborted at runtime.
@@ -43,27 +121,56 @@ pub(crate) fn take_regex_match_failed() -> Option<String> {
     })
 }
 
-fn regex_is_match(re: &Regex, hay: &str) -> bool {
+/// Charge `limit` to the query's escalation pool; false (and nothing charged) when it cannot pay.
+fn charge_regex_escalation(limit: usize) -> bool {
+    REGEX_ESCALATION_SPENT.with(|spent| {
+        let next = spent.get().saturating_add(limit);
+        if next > REGEX_ESCALATION_POOL {
+            return false;
+        }
+        spent.set(next);
+        true
+    })
+}
+
+/// Exceeding [`REGEX_BACKTRACK_LIMIT`] — and then every [`REGEX_ESCALATION_LIMITS`] rung the query's
+/// pool can still pay for — returns `false` AND raises `REGEX_MATCH_FAILED`, which the query entry
+/// points read and turn into an unsupported-regex error rather than a silently short answer.
+fn regex_is_match(re: &SearchRegex, hay: &str) -> bool {
     if REGEX_MATCH_FAILED.with(|c| c.get()) {
         return false;
     }
-    match re.is_match(hay) {
-        Ok(m) => m,
-        Err(FancyError::RuntimeError(_)) => {
-            REGEX_MATCH_FAILED.with(|c| c.set(true));
-            false
-        }
-        Err(_) => false,
+    match re.base.is_match(hay) {
+        Ok(m) => return m,
+        Err(FancyError::RuntimeError(_)) => {}
+        Err(_) => return false,
     }
+    for (rung, &limit) in re.rungs.iter().zip(REGEX_ESCALATION_LIMITS.iter()) {
+        if !charge_regex_escalation(limit) {
+            break;
+        }
+        // The rung compiles the source the base already compiled from, so it cannot fail where the
+        // base did not; `None` is only a defensive stop.
+        let Some(rung) = rung.get_or_init(|| build_search_regex(re.base.as_str(), limit).ok()) else {
+            break;
+        };
+        match rung.is_match(hay) {
+            Ok(m) => return m,
+            Err(FancyError::RuntimeError(_)) => {}
+            Err(_) => return false,
+        }
+    }
+    REGEX_MATCH_FAILED.with(|c| c.set(true));
+    false
 }
 
 #[cfg(test)]
-pub(crate) fn regex_is_match_for_test(re: &Regex, hay: &str) -> bool {
+pub(crate) fn regex_is_match_for_test(re: &SearchRegex, hay: &str) -> bool {
     regex_is_match(re, hay)
 }
 
 #[cfg(test)]
-pub(crate) fn compile_search_regex_for_test(pattern: &str) -> Regex {
+pub(crate) fn compile_search_regex_for_test(pattern: &str) -> SearchRegex {
     compile_search_regex(pattern).expect("test regex should compile")
 }
 
@@ -560,7 +667,7 @@ pub(crate) enum FilterExpr {
     },
     TextRegex {
         field: TextField,
-        regex: Regex,
+        regex: SearchRegex,
     },
 
     ColorCmp {
