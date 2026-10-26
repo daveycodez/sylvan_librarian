@@ -7,11 +7,12 @@ use super::legality::{LEGALITY_LEGAL, LEGALITY_BANNED, LEGALITY_RESTRICTED, form
 /// Public search TextRegex backtrack cap — calibrated in docs/issues/security-regex-execution-budget.md.
 ///
 /// This is what every candidate may spend. A candidate that runs out is not refused at once: it is
-/// retried up [`REGEX_ESCALATION_LIMITS`], out of the query's [`REGEX_ESCALATION_POOL`].
+/// retried up [`REGEX_ESCALATION_LIMITS`], out of the query's escalation pool
+/// ([`size_regex_escalation_pool`]).
 pub(crate) const REGEX_BACKTRACK_LIMIT: usize = 8192;
 
 /// The limits a candidate that exhausted [`REGEX_BACKTRACK_LIMIT`] is retried at, in order, each
-/// retry charged to the query's [`REGEX_ESCALATION_POOL`].
+/// retry charged to the query's escalation pool.
 ///
 /// 8,192 per candidate is a price on the text as well as on the pattern, and an ordinary pattern
 /// can pay more than that on one long card without being pathological. A class loop followed by a
@@ -24,20 +25,28 @@ pub(crate) const REGEX_BACKTRACK_LIMIT: usize = 8192;
 ///
 /// A raised per-candidate limit would multiply what EVERY candidate may spend, which is exactly the
 /// cost the 8,192 bounds. The ladder spends more only on the candidates that need it and only out of
-/// a fixed per-query pool, so the most a query can add is the pool — and a genuinely exponential
-/// pattern (`((?=a)a+)+(?!b)b`) climbs it, empties it, and is refused exactly as before.
+/// a per-query pool, so the most a query can add is the pool — and a genuinely exponential pattern
+/// (`((?=a)a+)+(?!b)b`) fails every rung on the first candidate that needs one and is refused
+/// exactly as before, after one climb (4,177,920 steps).
 ///
-/// ×4 per rung, so a text that needs 16,384 steps is charged 32,768 and not a whole top rung.
-pub(crate) const REGEX_ESCALATION_LIMITS: [usize; 4] = [32_768, 131_072, 524_288, 2_097_152];
+/// ×2 per rung, so a retry is charged at most twice what the candidate needed: most candidates that
+/// need a retry need less than 16,384 steps.
+pub(crate) const REGEX_ESCALATION_LIMITS: [usize; 8] =
+    [16_384, 32_768, 65_536, 131_072, 262_144, 524_288, 1_048_576, 2_097_152];
 
-/// Backtracks the [`REGEX_ESCALATION_LIMITS`] retries may spend in one query, per thread; refilled
-/// by [`clear_regex_match_failed`] when the query starts.
+/// Backtracks the [`REGEX_ESCALATION_LIMITS`] retries may spend in one query, per card in the
+/// corpus: 1/16 of the [`REGEX_BACKTRACK_LIMIT`] every card may already spend, so retries can add at
+/// most 1/16 to the steps a query was already allowed. On the 32,011 cards of the 2026-10-09 bulk
+/// file that is 16,389,632 steps.
 ///
 /// Each retry is charged its whole limit up front — fancy_regex does not report what it actually
-/// spent — so this bounds the extra work from above: 128 first-rung rescues, or one climb to the top
-/// rung and most of a second. Only when the pool cannot pay for the next rung does the query fail
-/// as it did before the ladder.
-pub(crate) const REGEX_ESCALATION_POOL: usize = 4_194_304;
+/// spent — so this bounds the extra work from above. Only when the pool cannot pay for the next rung
+/// does the query fail as it did before the ladder.
+pub(crate) const REGEX_ESCALATION_POOL_PER_CARD: usize = REGEX_BACKTRACK_LIMIT / 16;
+
+/// The smallest escalation pool, for a small corpus (and for a query that does not size it): one
+/// candidate's climb to the top rung, plus a little.
+pub(crate) const REGEX_ESCALATION_POOL_MIN: usize = 4_194_304;
 
 /// Prefix on `build_filter` errors that must surface as `UnsupportedRegexError`, not `RetryableQueryError`.
 pub(crate) const REGEX_COMPILE_ERR_PREFIX: &str = "regex_compile:";
@@ -76,8 +85,21 @@ impl SearchRegex {
     }
 }
 
+/// Every public-search regex is compiled here, the base and each rung alike.
+///
+/// `seek(true)` turns on fancy_regex's seek prefilter, which that crate ships off. Without it an
+/// unanchored search enters the backtracking VM at EVERY character of the text, and every failed
+/// start is charged to the budget, so the budget measured the length of the text as much as the
+/// pattern. With it, fancy_regex derives a lookaround-free over-approximation of the pattern
+/// (lookarounds dropped, backreferences widened), finds the next position where that could match on
+/// the linear engine, and enters the VM only there. A text with no such position never enters the
+/// VM. Under `(when|whenever) [^.]*((?!\.)(.))*?(create|draw) a`, 5,947 of 38,791 oracle texts ran
+/// out of 8,192 steps without it and 277 with it. It changes where the VM starts, never what
+/// matches: the approximation only over-matches, and every position it skips is one the pattern
+/// cannot match from (checked over the whole corpus; see the PR). A pattern with no fancy feature
+/// never reaches the VM, so this does nothing to it.
 fn build_search_regex(source: &str, limit: usize) -> Result<Regex, FancyError> {
-    fancy_regex::RegexBuilder::new(source).backtrack_limit(limit).build()
+    fancy_regex::RegexBuilder::new(source).backtrack_limit(limit).seek(true).build()
 }
 
 pub(crate) fn compile_search_regex(pattern: &str) -> Result<SearchRegex, String> {
@@ -86,27 +108,53 @@ pub(crate) fn compile_search_regex(pattern: &str) -> Result<SearchRegex, String>
         .map_err(|e| format!("{REGEX_COMPILE_ERR_PREFIX}{e}"))
 }
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
+
+/// Answers by pattern source, then by text; see `REGEX_ESCALATED_ANSWERS`.
+type EscalatedAnswers = HashMap<Box<str>, HashMap<Box<str>, bool>>;
 
 thread_local! {
     static REGEX_MATCH_FAILED: Cell<bool> = const { Cell::new(false) };
 
-    /// What this query's [`REGEX_ESCALATION_LIMITS`] retries have spent of [`REGEX_ESCALATION_POOL`].
+    /// This query's escalation pool: what its [`REGEX_ESCALATION_LIMITS`] retries may spend.
+    static REGEX_ESCALATION_POOL: Cell<usize> = const { Cell::new(REGEX_ESCALATION_POOL_MIN) };
+
+    /// What this query's [`REGEX_ESCALATION_LIMITS`] retries have spent of its pool.
     static REGEX_ESCALATION_SPENT: Cell<usize> = const { Cell::new(0) };
+
+    /// This query's answers that took a retry, by pattern source and then text. The executors check
+    /// a matching card twice — once to count it, and again if it lands on the page — and cards that
+    /// share an oracle text share it; without this each such check would climb, and be charged,
+    /// again. Only ever written on the retry path, so a query that never runs out of steps pays one
+    /// empty `clear` for it. Keyed by content rather than by address, so it cannot answer for a
+    /// different pattern or text.
+    static REGEX_ESCALATED_ANSWERS: RefCell<EscalatedAnswers> = RefCell::new(HashMap::new());
 }
 
 /// Reset before bind/evaluate so a prior query on this thread cannot poison the next — and refill
-/// the query's [`REGEX_ESCALATION_POOL`], for the same reason.
+/// the query's escalation pool, for the same reason. The pool starts at [`REGEX_ESCALATION_POOL_MIN`]
+/// until [`size_regex_escalation_pool`] sizes it.
 pub(crate) fn clear_regex_match_failed() {
     REGEX_MATCH_FAILED.with(|c| c.set(false));
-    REGEX_ESCALATION_SPENT.with(|c| c.set(0));
+    REGEX_ESCALATION_POOL.with(|c| c.set(REGEX_ESCALATION_POOL_MIN));
+    refill_regex_escalation_pool();
 }
 
-/// Refill the query's [`REGEX_ESCALATION_POOL`] without touching the failure flag: for a caller that
-/// runs one bound filter more than once and means each run as its own query (`explain_analyze`).
+/// Size this query's escalation pool for a corpus of `n_cards`: [`REGEX_ESCALATION_POOL_PER_CARD`]
+/// each, and never less than [`REGEX_ESCALATION_POOL_MIN`].
+pub(crate) fn size_regex_escalation_pool(n_cards: usize) {
+    let pool = n_cards.saturating_mul(REGEX_ESCALATION_POOL_PER_CARD).max(REGEX_ESCALATION_POOL_MIN);
+    REGEX_ESCALATION_POOL.with(|c| c.set(pool));
+}
+
+/// Refill the query's escalation pool (and forget its retried answers) without touching the failure
+/// flag: for a caller that runs one bound filter more than once and means each run as its own query
+/// (`explain_analyze`).
 pub(crate) fn refill_regex_escalation_pool() {
     REGEX_ESCALATION_SPENT.with(|c| c.set(0));
+    REGEX_ESCALATED_ANSWERS.with(|m| m.borrow_mut().clear());
 }
 
 /// Take and clear the failure flag; `Some(message)` when a match aborted at runtime.
@@ -123,9 +171,10 @@ pub(crate) fn take_regex_match_failed() -> Option<String> {
 
 /// Charge `limit` to the query's escalation pool; false (and nothing charged) when it cannot pay.
 fn charge_regex_escalation(limit: usize) -> bool {
+    let pool = REGEX_ESCALATION_POOL.with(Cell::get);
     REGEX_ESCALATION_SPENT.with(|spent| {
         let next = spent.get().saturating_add(limit);
-        if next > REGEX_ESCALATION_POOL {
+        if next > pool {
             return false;
         }
         spent.set(next);
@@ -145,6 +194,10 @@ fn regex_is_match(re: &SearchRegex, hay: &str) -> bool {
         Err(FancyError::RuntimeError(_)) => {}
         Err(_) => return false,
     }
+    let known = REGEX_ESCALATED_ANSWERS.with(|m| m.borrow().get(re.as_str()).and_then(|a| a.get(hay)).copied());
+    if let Some(m) = known {
+        return m;
+    }
     for (rung, &limit) in re.rungs.iter().zip(REGEX_ESCALATION_LIMITS.iter()) {
         if !charge_regex_escalation(limit) {
             break;
@@ -155,7 +208,16 @@ fn regex_is_match(re: &SearchRegex, hay: &str) -> bool {
             break;
         };
         match rung.is_match(hay) {
-            Ok(m) => return m,
+            Ok(m) => {
+                REGEX_ESCALATED_ANSWERS.with(|answers| {
+                    let mut answers = answers.borrow_mut();
+                    match answers.get_mut(re.as_str()) {
+                        Some(a) => a.insert(hay.into(), m),
+                        None => answers.entry(re.as_str().into()).or_default().insert(hay.into(), m),
+                    };
+                });
+                return m;
+            }
             Err(FancyError::RuntimeError(_)) => {}
             Err(_) => return false,
         }

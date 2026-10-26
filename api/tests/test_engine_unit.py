@@ -1502,10 +1502,11 @@ class TestRegexEscalation:
 
     `[^.]*` followed by a lookahead loop that can take the same characters is quadratic in the
     sentence, and on these real oracle texts it takes more than the flat 8,192 steps to prove a
-    match. Each such card used to refuse the whole query: both queries below were a 400 "Search query
-    contains an unsupported regular expression." on sylvan-librarian.com while api.scryfall.com
-    answers 15 and 2,200 cards. The retries are paid from a per-query pool, so an exponential pattern
-    is still refused, and the next query starts with the pool full.
+    match (or a miss), even with the seek prefilter. Each such card used to refuse the whole query:
+    both queries below were a 400 "Search query contains an unsupported regular expression." on
+    sylvan-librarian.com while api.scryfall.com answers 15 and 2,200 cards. The retries are paid from
+    a per-query pool, so an exponential pattern is still refused, and the next query starts with the
+    pool full.
     """
 
     ASHLING = (
@@ -1514,17 +1515,34 @@ class TestRegexEscalation:
         "that's a copy of it. The token gains haste until end of turn. At the beginning of your next end step, "
         "sacrifice it unless you pay {W}{U}{B}{R}{G}."
     )
-    SOLEMN_SIMULACRUM = (
-        "When this creature enters, you may search your library for a basic land card, put that card onto the "
-        "battlefield tapped, then shuffle.\nWhen this creature dies, you may draw a card."
+    EFFLUENCE_DEVOURER = (
+        'Whenever you sacrifice Effluence Devourer or another creature, it perpetually gains "{2}, Exile this card '
+        "from your graveyard: Create an X/X green Ooze creature token, where X is this card's power. Activate only as "
+        'a sorcery."\nBlitz {B}{R}{G} (If you cast this spell for its blitz cost, it gains haste and "When this '
+        'creature dies, draw a card." Sacrifice it at the beginning of the next end step.)'
+    )
+    UNDEAD_SERVANT = (
+        "When this creature enters, create a 2/2 black Zombie creature token for each card named Undead Servant in your graveyard."
+    )
+    VOICE_OF_RESURGENCE = (
+        "Whenever an opponent casts a spell during your turn and when this creature dies, create a green and white "
+        "Elemental creature token with \"This token's power and toughness are each equal to the number of creatures "
+        'you control."'
     )
     TRIPLICATE_TITAN = (
         "Flying, vigilance, trample\nWhen this creature dies, create a 3/3 colorless Golem artifact creature token "
         "with flying, a 3/3 colorless Golem artifact creature token with vigilance, and a 3/3 colorless Golem "
         "artifact creature token with trample."
     )
+    PONDERING_MAGE = (
+        "When this creature enters, look at the top three cards of your library, then put them back in any order. "
+        "You may shuffle. Draw a card."
+    )
     TEMPERED_SACRIFICE = r"o:/whenever you sacrifice[^.]*((?!\. whenever).)*?create/"
     TEMPERED_TRIGGER = r"o:/(when|whenever) [^.]*((?!\.)(.))*?(create|draw) a/"
+    # Each `a` can be either branch, and `(?!c)c` never matches, so every way of splitting the run is
+    # tried; the seek prefilter's approximation, `(a|a)*c`, does match, so the VM is entered.
+    EXPONENTIAL = r"o:/((?=a)a|a)*(?!c)c/"
 
     @staticmethod
     def _load(engine: QueryEngine, cards: list[tuple[str, str]]) -> QueryEngine:
@@ -1536,40 +1554,55 @@ class TestRegexEscalation:
             fresh_engine(),
             [
                 ("Ashling, the Limitless", self.ASHLING),
-                ("Solemn Simulacrum", self.SOLEMN_SIMULACRUM),
+                ("Effluence Devourer", self.EFFLUENCE_DEVOURER),
+                ("Undead Servant", self.UNDEAD_SERVANT),
+                ("Voice of Resurgence", self.VOICE_OF_RESURGENCE),
                 ("Triplicate Titan", self.TRIPLICATE_TITAN),
+                ("Pondering Mage", self.PONDERING_MAGE),
                 ("Lightning Bolt", "Lightning Bolt deals 3 damage to any target."),
             ],
         )
-        total, cards = _run(e, self.TEMPERED_SACRIFICE, unique="card")
-        assert total == 1
-        assert _names(cards) == ["Ashling, the Limitless"]
-        total, cards = _run(e, self.TEMPERED_TRIGGER, unique="card")
-        assert total == 3
-        assert sorted(_names(cards)) == ["Ashling, the Limitless", "Solemn Simulacrum", "Triplicate Titan"]
+        for unique in ("card", "printing"):
+            total, cards = _run(e, self.TEMPERED_SACRIFICE, unique=unique)
+            assert total == 2
+            assert sorted(_names(cards)) == ["Ashling, the Limitless", "Effluence Devourer"]
+            # Pondering Mage needs a retry too, and is still not a match: its "draw a" follows a period.
+            total, cards = _run(e, self.TEMPERED_TRIGGER, unique=unique)
+            assert total == 5
+            assert sorted(_names(cards)) == [
+                "Ashling, the Limitless",
+                "Effluence Devourer",
+                "Triplicate Titan",
+                "Undead Servant",
+                "Voice of Resurgence",
+            ]
 
     def test_the_retry_pool_is_per_query(self, fresh_engine: Callable[[], QueryEngine]) -> None:
-        # Each of these 50 cards needs the first retry (32,768 steps); the 4,194,304-step pool pays for
-        # 128 of them. One run fits (this path verifies a candidate up to twice, so up to 100 retries);
-        # three runs charge at least 150 between them, so every run after the first is answered only
-        # because the pool refills when a query starts.
-        cards = [(f"Ashling Copy {i:02d}", self.ASHLING) for i in range(50)]
-        e = self._load(fresh_engine(), [*cards, ("Long A", "a" * 60 + "b")])
+        # A corpus this small gets the smallest pool, 4,194,304 steps. One exponential candidate's climb
+        # through every retry takes all but 16,384 of it, less than these two cards' first retries.
+        e = self._load(
+            fresh_engine(),
+            [
+                ("Ashling, the Limitless", self.ASHLING),
+                ("Effluence Devourer", self.EFFLUENCE_DEVOURER),
+                ("Long A", "a" * 60 + "c"),
+            ],
+        )
         for _ in range(3):
+            # An exponential pattern still climbs every retry and is refused...
+            with pytest.raises(UnsupportedRegexError, match="regex execution limit exceeded"):
+                _run(e, self.EXPONENTIAL, unique="card")
+            # ...and leaves nothing behind for the next query, which is answered only because the pool
+            # refills when a query starts.
             total, _ = _run(e, self.TEMPERED_SACRIFICE, unique="card")
-            assert total == 50
-        # An exponential pattern (each `a` can be either branch) still climbs every retry, empties the
-        # pool and is refused...
-        with pytest.raises(UnsupportedRegexError, match="regex execution limit exceeded"):
-            _run(e, "o:/((?=a)a|a)*c/", unique="card")
-        # ...and leaves nothing behind for the next query.
-        total, _ = _run(e, self.TEMPERED_SACRIFICE, unique="card")
-        assert total == 50
+            assert total == 2
 
     def test_explain_analyze_gives_each_run_its_own_pool(self, fresh_engine: Callable[[], QueryEngine]) -> None:
         # explain_analyze binds once and then runs every plan, the acquire and the router for each of
-        # its rounds; those runs together need far more retries than one pool holds.
-        cards = [(f"Ashling Copy {i:02d}", self.ASHLING) for i in range(50)]
+        # its rounds. Each of these 50 distinct texts needs a retry, so one run's retries fit in the pool
+        # and all the runs' together would not: each run gets a full pool (and forgets the answers it
+        # did not pay for), as a real query would.
+        cards = [(f"Ashling Copy {i:02d}", f"{self.ASHLING}\nCopy {i}.") for i in range(50)]
         e = self._load(fresh_engine(), cards)
         result = e.explain_analyze(
             filters=parse_scryfall_query(self.TEMPERED_SACRIFICE), unique="card", num_warmups=1, num_trials=3

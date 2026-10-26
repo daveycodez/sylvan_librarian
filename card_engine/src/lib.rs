@@ -13505,6 +13505,7 @@ fn bind_and_split_filter(
     // never executed the load path themselves.
     sync_format_shifts(&data.format_shifts);
     clear_regex_match_failed();
+    size_regex_escalation_pool(data.cards.len());
     let mut filter_expr = build_filter(&json_val).map_err(map_build_filter_err)?;
     filter_expr.bind(&data.coll_vocab, &data.artist_vocab, &data.mana_vocab, &data.indexes.flavor, &data.strings);
     check_regex_match_failed()?;
